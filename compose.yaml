@@ -13,10 +13,8 @@ services:
         condition: service_started
     environment:
       OPS_DOMAIN: ${OPS_DOMAIN:?Set OPS_DOMAIN in .env}
-      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
     ports:
       - "80:80"
-      - "443:443"
       - "9443:9443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro

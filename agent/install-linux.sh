@@ -14,5 +14,5 @@ install -m 0644 "$(dirname "$0")/tram-agent.service" /etc/systemd/system/tram-ag
 systemctl daemon-reload
 
 echo "Installed. Enroll with:"
-echo "  sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py enroll --server https://ops.example.com --token 'ONE_TIME_TOKEN'"
+echo "  sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py enroll --server http://ops.example.com --token 'ONE_TIME_TOKEN'"
 echo "Then start: sudo systemctl enable --now tram-agent"

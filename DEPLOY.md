@@ -11,7 +11,6 @@ ops.example.com -> PUBLIC_IP_CUA_SERVER
 ```bash
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
 sudo ufw allow 9443/tcp
 sudo ufw enable
 ```
@@ -46,7 +45,6 @@ POSTGRES_PASSWORD=$(openssl rand -hex 32)
 SETUP_TOKEN=$(openssl rand -hex 32)
 GUACAMOLE_JSON_SECRET=$(openssl rand -hex 16)
 sed -i "s|^OPS_DOMAIN=.*|OPS_DOMAIN=ops.example.com|" .env
-sed -i "s|^ACME_EMAIL=.*|ACME_EMAIL=admin@example.com|" .env
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" .env
 sed -i "s|^SETUP_TOKEN=.*|SETUP_TOKEN=$SETUP_TOKEN|" .env
 sed -i "s|^GUACAMOLE_JSON_SECRET=.*|GUACAMOLE_JSON_SECRET=$GUACAMOLE_JSON_SECRET|" .env
@@ -102,7 +100,7 @@ sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 cad
 ## 9. Mở wizard
 
 ```text
-https://ops.example.com
+http://ops.example.com
 ```
 
 ## 10. Nhập kết nối PostgreSQL
@@ -140,7 +138,7 @@ Mật khẩu: tối thiểu 14 ký tự
 ## 12. Nhập URL dashboard
 
 ```text
-Dashboard URL: https://ops.example.com
+Dashboard URL: http://ops.example.com
 Mã thiết lập: giá trị SETUP_TOKEN ở bước 5
 ```
 

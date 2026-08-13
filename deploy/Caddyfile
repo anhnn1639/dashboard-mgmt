@@ -1,11 +1,10 @@
 {
-    email {$ACME_EMAIL}
     servers {
         strict_sni_host on
     }
 }
 
-{$OPS_DOMAIN} {
+http://{$OPS_DOMAIN} {
     encode zstd gzip
 
     @agentEnroll path /api/v1/enroll
@@ -26,7 +25,6 @@
     }
 
     header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
         Referrer-Policy "same-origin"
         Permissions-Policy "camera=(), microphone=(), geolocation=()"
@@ -34,8 +32,8 @@
     }
 }
 
-{$OPS_DOMAIN}:9443 {
-    tls {
+https://{$OPS_DOMAIN}:9443 {
+    tls internal {
         client_auth {
             mode require_and_verify
             trust_pool file /etc/caddy/pki/agent-ca.crt

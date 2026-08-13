@@ -91,7 +91,7 @@ docker compose -f compose.yaml -f compose.external.yaml up -d
 docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
-Mở `https://ops.example.com`. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
+Mở `http://ops.example.com`. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
 
 1. Nhập máy chủ PostgreSQL, port, database, tài khoản, mật khẩu và chế độ SSL. Với PostgreSQL trong Compose dùng host `postgres`, port `5432` và các giá trị `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` trong `.env`.
 2. Tạo tài khoản admin local đầu tiên với mật khẩu tối thiểu 14 ký tự.
@@ -106,7 +106,7 @@ API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và au
 Đăng nhập lấy access token:
 
 ```bash
-ACCESS_TOKEN=$(curl -fsS https://ops.example.com/api/v1/auth/login \
+ACCESS_TOKEN=$(curl -fsS http://ops.example.com/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_ADMIN_PASSWORD"}' | jq -r .access_token)
 ```
@@ -114,7 +114,7 @@ ACCESS_TOKEN=$(curl -fsS https://ops.example.com/api/v1/auth/login \
 Token dùng một lần, hết hạn sau 24 giờ:
 
 ```bash
-curl -fsS https://ops.example.com/api/v1/enrollment-tokens \
+curl -fsS http://ops.example.com/api/v1/enrollment-tokens \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"label":"server-batch-01","expires_hours":24,"max_uses":1}'
@@ -129,7 +129,7 @@ Yêu cầu Python 3 và `venv`. Trên Oracle Linux 7, Python hệ thống có th
 ```bash
 sudo bash agent/install-linux.sh
 sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
-  enroll --server https://ops.example.com --token 'tvo_ONE_TIME_TOKEN'
+  enroll --server http://ops.example.com --token 'tvo_ONE_TIME_TOKEN'
 sudo systemctl enable --now tram-agent
 sudo systemctl status tram-agent
 ```
@@ -143,7 +143,7 @@ Chạy PowerShell 64-bit bằng quyền Administrator. MVP hiện cần Python 3
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\agent\install-windows.ps1 `
-  -Server "https://ops.example.com" `
+  -Server "http://ops.example.com" `
   -EnrollmentToken "tvo_ONE_TIME_TOKEN"
 ```
 
