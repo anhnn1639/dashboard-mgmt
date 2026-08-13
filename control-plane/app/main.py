@@ -591,6 +591,11 @@ def startup() -> None:
         return
 
 
+@app.get("/livez")
+def livez() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     state = database_state()

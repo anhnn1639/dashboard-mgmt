@@ -50,6 +50,9 @@ class ClassificationTests(unittest.TestCase):
 
     def test_login_and_empty_fleet(self):
         with TestClient(app) as client:
+            live = client.get("/livez")
+            self.assertEqual(live.status_code, 200)
+            self.assertEqual(live.json(), {"status": "ok"})
             setup = client.get("/api/v1/setup/status")
             self.assertEqual(setup.status_code, 200)
             self.assertTrue(setup.json()["setupRequired"])
