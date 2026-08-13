@@ -50,6 +50,10 @@ class ClassificationTests(unittest.TestCase):
 
     def test_login_and_empty_fleet(self):
         with TestClient(app) as client:
+            setup = client.get("/api/v1/setup/status")
+            self.assertEqual(setup.status_code, 200)
+            self.assertTrue(setup.json()["setupRequired"])
+            self.assertTrue(setup.json()["databaseConnected"])
             login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-only-password-123456"})
             self.assertEqual(login.status_code, 200)
             token = login.json()["access_token"]

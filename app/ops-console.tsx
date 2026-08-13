@@ -5,6 +5,18 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
 
+type SetupStatus = {
+  setupRequired: boolean;
+  databaseConfigured: boolean;
+  databaseConnected: boolean;
+  schemaReady: boolean;
+  adminExists: boolean;
+  secretsReady: boolean;
+  dashboardUrl: string;
+  setupTokenRequired: boolean;
+  status: "ready" | "setup_required";
+};
+
 type Server = {
   id: string;
   name: string;
@@ -27,21 +39,12 @@ type Server = {
   tags: string[];
 };
 
-const demoServers: Server[] = [
-  { id: "srv-001", name: "web-prod-01", osFamily: "linux", os: "Ubuntu Server", version: "24.04.3 LTS", address: "10.20.1.11", environment: "Production", health: "healthy", agentVersion: "0.1.0", lastSeen: "8 giây trước", cpu: 34, memory: 62, disk: 48, uptime: "42 ngày", updates: 6, alerts: 0, services: 18, owner: "Platform", tags: ["web", "nginx", "hcm"] },
-  { id: "srv-002", name: "ora-db-01", osFamily: "linux", os: "Oracle Linux", version: "8.10", address: "10.20.2.21", environment: "Production", health: "warning", agentVersion: "0.1.0", lastSeen: "12 giây trước", cpu: 71, memory: 84, disk: 69, uptime: "187 ngày", updates: 18, alerts: 2, services: 26, owner: "Database", tags: ["oracle", "database", "hn"] },
-  { id: "srv-003", name: "legacy-app-07", osFamily: "linux", os: "Oracle Linux", version: "7.9", address: "10.20.3.47", environment: "Production", health: "critical", agentVersion: "0.1.0", lastSeen: "31 giây trước", cpu: 92, memory: 89, disk: 91, uptime: "302 ngày", updates: 43, alerts: 4, services: 15, owner: "ERP", tags: ["legacy", "erp"] },
-  { id: "srv-004", name: "dc-hcm-01", osFamily: "windows", os: "Windows Server", version: "2025 Datacenter", address: "10.30.1.10", environment: "Production", health: "healthy", agentVersion: "0.1.0", lastSeen: "6 giây trước", cpu: 18, memory: 47, disk: 38, uptime: "19 ngày", updates: 2, alerts: 0, services: 92, owner: "Identity", tags: ["ad-ds", "dns", "hcm"] },
-  { id: "srv-005", name: "files-hn-02", osFamily: "windows", os: "Windows Server", version: "2025 Standard", address: "10.30.2.22", environment: "Production", health: "warning", agentVersion: "0.1.0", lastSeen: "18 giây trước", cpu: 42, memory: 76, disk: 86, uptime: "73 ngày", updates: 9, alerts: 1, services: 71, owner: "Workplace", tags: ["files", "smb", "hn"] },
-  { id: "srv-006", name: "build-stg-01", osFamily: "windows", os: "Windows Server", version: "2025 Standard", address: "10.40.1.31", environment: "Staging", health: "offline", agentVersion: "0.1.0", lastSeen: "17 phút trước", cpu: 0, memory: 0, disk: 54, uptime: "—", updates: 12, alerts: 1, services: 0, owner: "Engineering", tags: ["build", "staging"] },
-];
-
 const navItems = [
   { id: "overview", icon: "⌂", label: "Tổng quan" },
   { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3 },
   { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3 },
-  { id: "sessions", icon: "↗", label: "Phiên truy cập", count: 2 },
-  { id: "jobs", icon: "▶", label: "Công việc", count: 5 },
+  { id: "sessions", icon: "↗", label: "Phiên truy cập" },
+  { id: "jobs", icon: "▶", label: "Công việc" },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán" },
   { id: "access", icon: "◎", label: "Người dùng & vai trò" },
 ];
@@ -78,7 +81,9 @@ function ServerTable({ servers, onSelect }: { servers: Server[]; onSelect: (serv
 }
 
 export function OpsConsole() {
-  const [servers, setServers] = useState(demoServers);
+  const [servers, setServers] = useState<Server[]>([]);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [setupStatusError, setSetupStatusError] = useState("");
   const [token, setToken] = useState("");
   const [authReady, setAuthReady] = useState(false);
   const [active, setActive] = useState("overview");
@@ -88,6 +93,15 @@ export function OpsConsole() {
   const [modal, setModal] = useState<"user" | "job" | "command" | "session" | null>(null);
   const [toast, setToast] = useState("");
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+    fetch("/api/v1/setup/status", { headers: { Accept: "application/json" } })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("Control plane chưa sẵn sàng")))
+      .then((data: SetupStatus) => { if (mounted) setSetupStatus(data); })
+      .catch((reason) => { if (mounted) setSetupStatusError(reason instanceof Error ? reason.message : "Không thể kiểm tra trạng thái hệ thống"); });
+    return () => { mounted = false; };
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -133,6 +147,7 @@ export function OpsConsole() {
   }), [servers, scope, filter, query]);
 
   const online = servers.filter((s) => s.health !== "offline").length;
+  const availability = servers.length ? Math.round(online / servers.length * 100) : 0;
   const warnings = servers.reduce((sum, s) => sum + s.alerts, 0);
   const updates = servers.reduce((sum, s) => sum + s.updates, 0);
   const navCount = (id: string, fallback?: number) => id === "linux" ? servers.filter((server) => server.osFamily === "linux").length : id === "windows" ? servers.filter((server) => server.osFamily === "windows").length : fallback;
@@ -161,7 +176,9 @@ export function OpsConsole() {
 
   const title = active === "linux" ? "Máy chủ Linux" : active === "windows" ? "Máy chủ Windows" : active === "sessions" ? "Phiên truy cập" : active === "jobs" ? "Công việc vận hành" : active === "audit" ? "Nhật ký kiểm toán" : active === "access" ? "Người dùng & vai trò" : "Trung tâm vận hành";
 
-  if (!authReady) return <div className="auth-loading">Đang khởi tạo phiên bảo mật…</div>;
+  if (setupStatusError) return <SystemUnavailable message={setupStatusError} />;
+  if (!setupStatus || !authReady) return <div className="auth-loading">Đang kiểm tra cấu hình hệ thống…</div>;
+  if (setupStatus.setupRequired) return <SetupScreen status={setupStatus} onComplete={(dashboardUrl) => { window.sessionStorage.removeItem("tram_ops_token"); setToken(""); setSetupStatus({ ...setupStatus, setupRequired: false, databaseConfigured: true, databaseConnected: true, schemaReady: true, adminExists: true, secretsReady: true, dashboardUrl, status: "ready" }); }} />;
   if (!token) return <LoginScreen onLogin={(nextToken) => { window.sessionStorage.setItem("tram_ops_token", nextToken); setToken(nextToken); }} />;
 
   return (
@@ -191,24 +208,19 @@ export function OpsConsole() {
 
           {active === "overview" && <>
             <section className="stat-grid" aria-label="Tóm tắt hạ tầng">
-              <article className="stat-card"><div className="stat-top"><span className="stat-icon blue">▦</span><span className="delta good">+2 tháng này</span></div><strong>{servers.length}</strong><h3>Tổng máy chủ</h3><p><i className="online-dot" /> {online} đang kết nối</p></article>
-              <article className="stat-card"><div className="stat-top"><span className="stat-icon green">✓</span><span className="delta good">{Math.round(online / servers.length * 100)}%</span></div><strong>{online}</strong><h3>Agent trực tuyến</h3><p><i className="muted-dot" /> {servers.length - online} mất kết nối</p></article>
+              <article className="stat-card"><div className="stat-top"><span className="stat-icon blue">▦</span><span className="delta good">PostgreSQL</span></div><strong>{servers.length}</strong><h3>Tổng máy chủ</h3><p><i className="online-dot" /> {online} đang kết nối</p></article>
+              <article className="stat-card"><div className="stat-top"><span className="stat-icon green">✓</span><span className="delta good">{availability}%</span></div><strong>{online}</strong><h3>Agent trực tuyến</h3><p><i className="muted-dot" /> {servers.length - online} mất kết nối</p></article>
               <article className="stat-card"><div className="stat-top"><span className="stat-icon amber">!</span><span className="delta warn">Cần xử lý</span></div><strong>{warnings}</strong><h3>Cảnh báo đang mở</h3><p>{servers.filter(s => s.health === "critical").length} nguy cấp · {servers.filter(s => s.health === "warning").length} cảnh báo</p></article>
               <article className="stat-card"><div className="stat-top"><span className="stat-icon violet">↥</span><span className="delta">7 ngày</span></div><strong>{updates}</strong><h3>Bản vá chờ cài</h3><p>{servers.filter(s => s.updates > 0).length} máy chủ bị ảnh hưởng</p></article>
             </section>
 
             <section className="overview-grid">
-              <article className="panel health-panel"><div className="panel-head"><div><h2>Sức khỏe hạ tầng</h2><p>Trạng thái 24 giờ gần nhất</p></div><button>24 giờ⌄</button></div><div className="health-chart"><div className="donut" style={{ "--healthy": `${Math.round(online / servers.length * 100) * 3.6}deg` } as React.CSSProperties}><span><b>{Math.round(online / servers.length * 100)}%</b><small>khả dụng</small></span></div><div className="health-legend"><div><i className="green-bg" /><span>Ổn định<small>{servers.filter(s => s.health === "healthy").length} máy chủ</small></span><b>{servers.filter(s => s.health === "healthy").length}</b></div><div><i className="amber-bg" /><span>Cảnh báo<small>Cần theo dõi</small></span><b>{servers.filter(s => s.health === "warning").length}</b></div><div><i className="red-bg" /><span>Nguy cấp / Offline<small>Cần xử lý ngay</small></span><b>{servers.filter(s => ["critical", "offline"].includes(s.health)).length}</b></div></div></div></article>
-              <article className="panel activity-panel"><div className="panel-head"><div><h2>Hoạt động gần đây</h2><p>Audit log trực tiếp</p></div><button onClick={() => setActive("audit")}>Xem tất cả →</button></div><div className="activity-list">
-                <div><span className="activity-icon green">✓</span><p><b>Cập nhật gói thành công</b><small>web-prod-01 · bởi Minh Trần</small></p><time>2 phút</time></div>
-                <div><span className="activity-icon blue">↗</span><p><b>Mở phiên SSH</b><small>ora-db-01 · bởi Anh Nguyễn</small></p><time>8 phút</time></div>
-                <div><span className="activity-icon violet">＋</span><p><b>Đã tạo local user</b><small>dc-hcm-01 · svc_backup</small></p><time>23 phút</time></div>
-                <div><span className="activity-icon amber">!</span><p><b>Dung lượng ổ đĩa vượt ngưỡng</b><small>legacy-app-07 · /var</small></p><time>41 phút</time></div>
-              </div></article>
+              <article className="panel health-panel"><div className="panel-head"><div><h2>Sức khỏe hạ tầng</h2><p>Trạng thái 24 giờ gần nhất</p></div><button>24 giờ⌄</button></div><div className="health-chart"><div className="donut" style={{ "--healthy": `${availability * 3.6}deg` } as React.CSSProperties}><span><b>{availability}%</b><small>khả dụng</small></span></div><div className="health-legend"><div><i className="green-bg" /><span>Ổn định<small>{servers.filter(s => s.health === "healthy").length} máy chủ</small></span><b>{servers.filter(s => s.health === "healthy").length}</b></div><div><i className="amber-bg" /><span>Cảnh báo<small>Cần theo dõi</small></span><b>{servers.filter(s => s.health === "warning").length}</b></div><div><i className="red-bg" /><span>Nguy cấp / Offline<small>Cần xử lý ngay</small></span><b>{servers.filter(s => ["critical", "offline"].includes(s.health)).length}</b></div></div></div></article>
+              <article className="panel activity-panel"><div className="panel-head"><div><h2>Hoạt động gần đây</h2><p>Dữ liệu audit từ PostgreSQL</p></div><button onClick={() => setActive("audit")}>Mở nhật ký →</button></div><div className="overview-empty"><span>≡</span><b>Xem nhật ký kiểm toán</b><p>Các sự kiện thật được ghi vào chuỗi audit trong database, không hiển thị dữ liệu minh họa.</p><button className="button ghost" onClick={() => setActive("audit")}>Xem sự kiện</button></div></article>
             </section>
           </>}
 
-          {active === "sessions" ? <SessionsView notify={notify} /> : active === "jobs" ? <JobsView /> : active === "audit" ? <AuditView /> : active === "access" ? <AccessView notify={notify} /> : <section className="panel fleet-panel"><div className="panel-head fleet-head"><div><h2>{scope ? `Danh sách ${scope === "linux" ? "Linux" : "Windows"}` : "Toàn bộ máy chủ"}</h2><p>{visibleServers.length} máy chủ · dữ liệu agent theo thời gian thực</p></div><div className="filters"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>Tất cả</button><button className={filter === "healthy" ? "active" : ""} onClick={() => setFilter("healthy")}>Ổn định</button><button className={filter === "warning" ? "active" : ""} onClick={() => setFilter("warning")}>Cảnh báo</button><button className={filter === "critical" ? "active" : ""} onClick={() => setFilter("critical")}>Nguy cấp</button></div></div>{loading ? <div className="loading-line" /> : null}<ServerTable servers={visibleServers} onSelect={setSelected} /></section>}
+          {active === "sessions" ? <SessionsView token={token} /> : active === "jobs" ? <JobsView token={token} /> : active === "audit" ? <AuditView token={token} /> : active === "access" ? <AccessView token={token} /> : <section className="panel fleet-panel"><div className="panel-head fleet-head"><div><h2>{scope ? `Danh sách ${scope === "linux" ? "Linux" : "Windows"}` : "Toàn bộ máy chủ"}</h2><p>{visibleServers.length} máy chủ · dữ liệu agent theo thời gian thực</p></div><div className="filters"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>Tất cả</button><button className={filter === "healthy" ? "active" : ""} onClick={() => setFilter("healthy")}>Ổn định</button><button className={filter === "warning" ? "active" : ""} onClick={() => setFilter("warning")}>Cảnh báo</button><button className={filter === "critical" ? "active" : ""} onClick={() => setFilter("critical")}>Nguy cấp</button></div></div>{loading ? <div className="loading-line" /> : null}<ServerTable servers={visibleServers} onSelect={setSelected} /></section>}
         </div>
       </section>
 
@@ -220,6 +232,90 @@ export function OpsConsole() {
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </main>
   );
+}
+
+function SystemUnavailable({ message }: { message: string }) {
+  return <div className="login-page"><div className="login-glow" /><section className="system-unavailable"><span className="setup-state-icon">!</span><p className="login-eyebrow">CONTROL PLANE OFFLINE</p><h1>Không thể kiểm tra cấu hình</h1><p>{message}. Hãy kiểm tra API control plane rồi tải lại trang.</p><button className="button primary" onClick={() => window.location.reload()}>Thử lại</button></section></div>;
+}
+
+function SetupScreen({ status, onComplete }: { status: SetupStatus; onComplete: (dashboardUrl: string) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const form = new FormData(event.currentTarget);
+    const password = String(form.get("admin_password") ?? "");
+    if (password !== String(form.get("admin_password_confirm") ?? "")) {
+      setError("Mật khẩu quản trị nhập lại chưa khớp.");
+      setBusy(false);
+      return;
+    }
+    const dashboardUrl = String(form.get("dashboard_url") ?? "").replace(/\/$/, "");
+    try {
+      const response = await fetch("/api/v1/setup/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          database: {
+            host: form.get("db_host"),
+            port: Number(form.get("db_port")),
+            database: form.get("db_name"),
+            username: form.get("db_username"),
+            password: form.get("db_password"),
+            sslmode: form.get("db_sslmode"),
+          },
+          admin: {
+            username: form.get("admin_username"),
+            display_name: form.get("admin_display_name"),
+            password,
+          },
+          dashboard_url: dashboardUrl,
+          setup_token: form.get("setup_token") ?? "",
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể hoàn tất thiết lập");
+      onComplete(data.dashboardUrl ?? dashboardUrl);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Không thể hoàn tất thiết lập");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <main className="setup-page">
+    <div className="setup-orbit" />
+    <header className="setup-header"><div className="login-brand"><span className="brand-mark">V</span><div><b>TRẠM</b><small>VẬN HÀNH</small></div></div><span className="setup-badge"><i /> THIẾT LẬP LẦN ĐẦU</span></header>
+    <div className="setup-layout">
+      <aside className="setup-intro">
+        <p className="login-eyebrow">SECURE CONTROL PLANE</p>
+        <h1>Khởi tạo trung tâm vận hành</h1>
+        <p>Kết nối PostgreSQL, tạo quản trị viên local đầu tiên và xác lập địa chỉ chính thức cho dashboard.</p>
+        <ol className="setup-steps">
+          <li className="active"><span>01</span><div><b>PostgreSQL</b><small>Kết nối và khởi tạo schema</small></div></li>
+          <li className="active"><span>02</span><div><b>Quản trị viên</b><small>Tài khoản local toàn quyền đầu tiên</small></div></li>
+          <li className="active"><span>03</span><div><b>Địa chỉ dashboard</b><small>URL chuẩn dùng bởi agent và gateway</small></div></li>
+        </ol>
+        <div className="setup-note"><span>◆</span><p><b>Dữ liệu tập trung trong PostgreSQL</b><small>Tài khoản, máy chủ, tác vụ, cấu hình và audit được lưu bền vững. Khóa mã hóa được giữ tách biệt trong volume bảo mật.</small></p></div>
+      </aside>
+
+      <form className="setup-card" onSubmit={submit}>
+        <div className="setup-card-head"><div><p className="login-eyebrow">BƯỚC KHỞI TẠO</p><h2>Cấu hình hệ thống</h2></div><div className={`connection-state ${status.databaseConnected ? "connected" : ""}`}><i />{status.databaseConnected ? "Đã kết nối" : "Chưa kết nối DB"}</div></div>
+
+        <fieldset><legend><span>01</span><div><b>Kết nối PostgreSQL</b><small>Database cần tồn tại và tài khoản phải có quyền tạo bảng.</small></div></legend><div className="setup-grid three"><label>Máy chủ<input name="db_host" defaultValue="postgres" required placeholder="postgres.example.internal" autoComplete="off" /></label><label>Cổng<input name="db_port" type="number" min="1" max="65535" defaultValue="5432" required /></label><label>SSL<select name="db_sslmode" defaultValue="prefer"><option value="prefer">Ưu tiên SSL</option><option value="require">Bắt buộc SSL</option><option value="verify-ca">Xác minh CA</option><option value="verify-full">Xác minh đầy đủ</option><option value="disable">Tắt SSL</option></select></label></div><div className="setup-grid"><label>Tên database<input name="db_name" defaultValue="tramops" required autoComplete="off" /></label><label>Tài khoản database<input name="db_username" defaultValue="tramops" required autoComplete="username" /></label></div><label>Mật khẩu database<input name="db_password" type="password" required autoComplete="current-password" /></label></fieldset>
+
+        <fieldset><legend><span>02</span><div><b>Admin local đầu tiên</b><small>Dùng để đăng nhập khi chưa tích hợp hệ thống định danh doanh nghiệp.</small></div></legend><div className="setup-grid"><label>Tên đăng nhập<input name="admin_username" defaultValue="admin" minLength={3} pattern="[A-Za-z0-9_.@-]+" required autoComplete="username" /></label><label>Tên hiển thị<input name="admin_display_name" defaultValue="Platform Administrator" required /></label></div><div className="setup-grid"><label>Mật khẩu<input name="admin_password" type="password" minLength={14} required autoComplete="new-password" placeholder="Tối thiểu 14 ký tự" /></label><label>Nhập lại mật khẩu<input name="admin_password_confirm" type="password" minLength={14} required autoComplete="new-password" /></label></div></fieldset>
+
+        <fieldset><legend><span>03</span><div><b>Địa chỉ dashboard</b><small>URL HTTPS mà người dùng và agent có thể truy cập.</small></div></legend><label>Dashboard URL<input name="dashboard_url" type="url" defaultValue={typeof window !== "undefined" ? window.location.origin : "https://ops.example.com"} required placeholder="https://ops.example.com" /></label>{status.setupTokenRequired && <label>Mã thiết lập<input name="setup_token" type="password" required autoComplete="one-time-code" /><small className="field-hint">Giá trị SETUP_TOKEN do người triển khai cung cấp.</small></label>}</fieldset>
+
+        {error && <div className="setup-error"><span>!</span><p><b>Chưa thể hoàn tất thiết lập</b><small>{error}</small></p></div>}
+        <div className="setup-actions"><p><span>◆</span> Mật khẩu database không được gửi về trình duyệt sau khi lưu.</p><button className="button primary" disabled={busy}>{busy ? "Đang kiểm tra và khởi tạo…" : "Kiểm tra kết nối & hoàn tất"}</button></div>
+      </form>
+    </div>
+  </main>;
 }
 
 function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
@@ -248,22 +344,31 @@ function ServerDrawer({ server, close, openUser, openSession, notify }: { server
   return <><button className="drawer-scrim" onClick={close} aria-label="Đóng chi tiết" /><aside className="drawer"><div className="drawer-top"><button onClick={close}>×</button><span className={`os-avatar large ${server.osFamily}`}>{server.osFamily === "windows" ? "W" : ">_"}</span><div><span className={`status ${server.health}`}><i />{healthLabel[server.health]}</span><h2>{server.name}</h2><p>{server.os} {server.version}</p></div><button className="row-more">•••</button></div><div className="drawer-actions"><button className="connect" onClick={openSession}><span>↗</span><b>{server.osFamily === "windows" ? "Remote Desktop" : "Mở SSH"}</b><small>Qua gateway bảo mật</small></button><button onClick={() => notify("Đã gửi yêu cầu thu thập thông tin mới.")}><span>↻</span><b>Làm mới</b><small>Đồng bộ agent</small></button></div><div className="drawer-tabs"><button className="active">Tổng quan</button><button>Dịch vụ</button><button>Tài khoản</button><button>Nhật ký</button></div><div className="drawer-body"><h3>Tài nguyên</h3><div className="resource-grid"><div><span><b>CPU</b><strong>{server.cpu}%</strong></span><MiniBar value={server.cpu} /></div><div><span><b>Bộ nhớ</b><strong>{server.memory}%</strong></span><MiniBar value={server.memory} /></div><div><span><b>Ổ đĩa</b><strong>{server.disk}%</strong></span><MiniBar value={server.disk} dangerAt={90} /></div></div><h3>Thông tin hệ thống</h3><dl className="detail-list"><div><dt>Địa chỉ quản trị</dt><dd>{server.address}</dd></div><div><dt>Môi trường</dt><dd><span className="tag">{server.environment}</span></dd></div><div><dt>Thời gian hoạt động</dt><dd>{server.uptime}</dd></div><div><dt>Dịch vụ</dt><dd>{server.services} đang chạy</dd></div><div><dt>Agent</dt><dd>v{server.agentVersion} · mTLS</dd></div><div><dt>Đơn vị phụ trách</dt><dd>{server.owner}</dd></div></dl><h3>Tác vụ nhanh</h3><div className="quick-actions"><button onClick={openUser}><span>＋</span>Tạo tài khoản</button><button onClick={() => notify(`Đã xếp lịch cài ${server.updates} bản vá.`)}><span>↥</span>Cài bản vá <em>{server.updates}</em></button><button onClick={() => notify("Đang tải danh sách dịch vụ…")}><span>⚙</span>Quản lý dịch vụ</button><button onClick={() => notify("Đã mở trình xem event/journal.")}><span>≡</span>Xem nhật ký</button></div></div></aside></>;
 }
 
-function SessionsView({ notify }: { notify: (message: string) => void }) {
-  return <section className="panel view-panel"><div className="panel-head"><div><h2>Phiên đang hoạt động</h2><p>Mọi phiên đều được ghi lại và gắn với danh tính người vận hành.</p></div><span className="live-pill"><i />2 đang trực tiếp</span></div><div className="session-list"><article><span className="session-protocol ssh">SSH</span><div><b>ora-db-01</b><small>10.20.2.21 · Anh Nguyễn</small></div><time>00:18:42</time><span className="recording">● ĐANG GHI</span><button onClick={() => notify("Mở lại phiên SSH đang hoạt động…")}>Mở phiên →</button></article><article><span className="session-protocol rdp">RDP</span><div><b>files-hn-02</b><small>10.30.2.22 · Minh Trần</small></div><time>00:07:16</time><span className="recording">● ĐANG GHI</span><button onClick={() => notify("Mở lại phiên RDP đang hoạt động…")}>Mở phiên →</button></article></div><div className="subhead"><div><h3>Bản ghi gần đây</h3><p>Lưu giữ 180 ngày · mã hóa AES-256 phía lưu trữ</p></div><button className="button ghost">Xuất báo cáo</button></div><div className="recording-list"><div><span className="play">▶</span><p><b>web-prod-01 · SSH</b><small>12/08/2026, 16:42 · 24 phút · Hoàng Lê</small></p><span className="verified">✓ Đã xác minh</span><button>Phát lại</button></div><div><span className="play">▶</span><p><b>dc-hcm-01 · RDP</b><small>12/08/2026, 14:08 · 51 phút · Anh Nguyễn</small></p><span className="verified">✓ Đã xác minh</span><button>Phát lại</button></div><div><span className="play">▶</span><p><b>legacy-app-07 · SSH</b><small>11/08/2026, 21:13 · 13 phút · Minh Trần</small></p><span className="verified">✓ Đã xác minh</span><button>Phát lại</button></div></div></section>;
+function SessionsView({ token }: { token: string }) {
+  const [items, setItems] = useState<Array<{ id: string; serverName: string; protocol: string; username: string; createdBy: string; status: string; startedAt: string }>>([]);
+  useEffect(() => { fetch("/api/v1/sessions", { headers: { Authorization: `Bearer ${token}` } }).then((response) => response.ok ? response.json() : Promise.reject()).then((data) => setItems(data.items ?? [])).catch(() => setItems([])); }, [token]);
+  return <section className="panel view-panel"><div className="panel-head"><div><h2>Lịch sử phiên truy cập</h2><p>Mọi phiên được lưu trong PostgreSQL và gắn với danh tính người vận hành.</p></div><span className="live-pill"><i />{items.filter((item) => item.status === "launched").length} đã khởi tạo</span></div><div className="session-list">{items.length ? items.map((item) => <article key={item.id}><span className={`session-protocol ${item.protocol}`}>{item.protocol.toUpperCase()}</span><div><b>{item.serverName}</b><small>{item.username} · {item.createdBy}</small></div><time>{new Date(item.startedAt).toLocaleString("vi-VN")}</time><span className="recording">● CÓ GHI</span><span /></article>) : <div className="empty-state">Chưa có phiên truy cập nào trong database.</div>}</div></section>;
 }
 
-function JobsView() {
-  const jobs = [{ name: "Cài bản vá bảo mật tháng 08", target: "4 máy chủ", owner: "Anh Nguyễn", status: "Đang chạy", progress: 68 }, { name: "Tạo tài khoản svc_backup", target: "dc-hcm-01", owner: "Minh Trần", status: "Chờ phê duyệt", progress: 0 }, { name: "Khởi động lại nginx", target: "web-prod-01", owner: "Hoàng Lê", status: "Hoàn tất", progress: 100 }, { name: "Kiểm tra dung lượng /var", target: "3 máy chủ Linux", owner: "Hệ thống", status: "Hoàn tất", progress: 100 }];
-  return <section className="panel view-panel"><div className="panel-head"><div><h2>Luồng công việc</h2><p>Tác vụ có cấu trúc, kiểm soát phê duyệt và có thể truy vết.</p></div><button className="button ghost">Bộ lọc⌄</button></div><div className="jobs-table"><div className="jobs-row head"><span>Công việc</span><span>Đích</span><span>Người tạo</span><span>Tiến độ</span><span>Trạng thái</span></div>{jobs.map((job) => <div className="jobs-row" key={job.name}><p><b>{job.name}</b><small>JOB-{Math.floor(2100 + job.progress)}</small></p><span>{job.target}</span><span>{job.owner}</span><div className="job-progress"><MiniBar value={job.progress} /><small>{job.progress}%</small></div><span className={`job-state ${job.status === "Hoàn tất" ? "done" : job.status === "Đang chạy" ? "running" : "pending"}`}>{job.status}</span></div>)}</div></section>;
+function JobsView({ token }: { token: string }) {
+  const [jobs, setJobs] = useState<Array<{ id: string; serverId: string; action: string; status: string; risk: string; reason: string; createdAt: string }>>([]);
+  useEffect(() => { fetch("/api/v1/jobs", { headers: { Authorization: `Bearer ${token}` } }).then((response) => response.ok ? response.json() : Promise.reject()).then((data) => setJobs(data.items ?? [])).catch(() => setJobs([])); }, [token]);
+  const statusLabel = (status: string) => ({ pending_approval: "Chờ phê duyệt", queued: "Đang chờ agent", dispatched: "Đang chạy", succeeded: "Hoàn tất", failed: "Thất bại" }[status] ?? status);
+  return <section className="panel view-panel"><div className="panel-head"><div><h2>Luồng công việc</h2><p>Tác vụ có cấu trúc, kiểm soát phê duyệt và lưu trong PostgreSQL.</p></div></div><div className="jobs-table"><div className="jobs-row head"><span>Công việc</span><span>Máy chủ</span><span>Mức rủi ro</span><span>Thời điểm</span><span>Trạng thái</span></div>{jobs.length ? jobs.map((job) => <div className="jobs-row" key={job.id}><p><b>{job.action}</b><small>{job.reason}</small></p><span>{job.serverId.slice(0, 8)}</span><span>{job.risk}</span><time>{new Date(job.createdAt).toLocaleString("vi-VN")}</time><span className={`job-state ${job.status === "succeeded" ? "done" : ["queued", "dispatched"].includes(job.status) ? "running" : "pending"}`}>{statusLabel(job.status)}</span></div>) : <div className="empty-state">Chưa có công việc nào trong database.</div>}</div></section>;
 }
 
-function AuditView() {
-  const rows = [{ time: "11:08:42", actor: "anh.nguyen", action: "session.ssh.open", target: "ora-db-01", result: "Thành công", ip: "172.18.4.21" }, { time: "10:56:17", actor: "minh.tran", action: "user.create.request", target: "dc-hcm-01", result: "Chờ duyệt", ip: "172.18.4.18" }, { time: "10:41:03", actor: "system", action: "agent.checkin.missed", target: "build-stg-01", result: "Cảnh báo", ip: "—" }, { time: "10:22:51", actor: "hoang.le", action: "service.restart", target: "web-prod-01/nginx", result: "Thành công", ip: "172.18.4.32" }, { time: "09:58:04", actor: "anh.nguyen", action: "patch.schedule", target: "linux:production", result: "Thành công", ip: "172.18.4.21" }];
-  return <section className="panel view-panel"><div className="panel-head"><div><h2>Nhật ký bất biến</h2><p>Chuỗi sự kiện có hash liên kết, hỗ trợ điều tra và tuân thủ.</p></div><div className="audit-integrity">◆ Chuỗi hash hợp lệ</div></div><div className="audit-table"><div className="audit-row head"><span>Thời gian</span><span>Chủ thể</span><span>Hành động</span><span>Đối tượng</span><span>Kết quả</span><span>IP nguồn</span></div>{rows.map((row) => <div className="audit-row" key={row.time + row.action}><time>{row.time}</time><b>{row.actor}</b><code>{row.action}</code><span>{row.target}</span><span className={row.result === "Thành công" ? "result-good" : "result-warn"}>{row.result}</span><span>{row.ip}</span></div>)}</div></section>;
+function AuditView({ token }: { token: string }) {
+  const [rows, setRows] = useState<Array<{ id: string; occurredAt: string; actor: string; action: string; target: string; result: string; sourceIp: string }>>([]);
+  const [forbidden, setForbidden] = useState(false);
+  useEffect(() => { fetch("/api/v1/audit", { headers: { Authorization: `Bearer ${token}` } }).then((response) => { if (response.status === 403) setForbidden(true); return response.ok ? response.json() : Promise.reject(); }).then((data) => setRows(data.items ?? [])).catch(() => setRows([])); }, [token]);
+  return <section className="panel view-panel"><div className="panel-head"><div><h2>Nhật ký bất biến</h2><p>Chuỗi sự kiện có hash liên kết và được lưu trong PostgreSQL.</p></div><div className="audit-integrity">◆ Chuỗi hash liên kết</div></div><div className="audit-table"><div className="audit-row head"><span>Thời gian</span><span>Chủ thể</span><span>Hành động</span><span>Đối tượng</span><span>Kết quả</span><span>IP nguồn</span></div>{rows.length ? rows.map((row) => <div className="audit-row" key={row.id}><time>{new Date(row.occurredAt).toLocaleString("vi-VN")}</time><b>{row.actor}</b><code>{row.action}</code><span>{row.target}</span><span className={row.result === "success" ? "result-good" : "result-warn"}>{row.result}</span><span>{row.sourceIp || "—"}</span></div>) : <div className="empty-state">{forbidden ? "Vai trò hiện tại không có quyền đọc audit." : "Chưa có sự kiện audit trong database."}</div>}</div></section>;
 }
 
-function AccessView({ notify }: { notify: (message: string) => void }) {
-  return <div className="access-grid"><section className="panel view-panel"><div className="panel-head"><div><h2>Vai trò truy cập</h2><p>Quyền tối thiểu theo chức năng.</p></div><button className="button primary" onClick={() => notify("Mở trình tạo vai trò mới…")}>＋ Vai trò</button></div><div className="role-list"><article><span>AD</span><p><b>Platform Admin</b><small>Toàn quyền · cần MFA · 3 thành viên</small></p><em>28 quyền</em></article><article><span>OP</span><p><b>Server Operator</b><small>Vận hành không quản lý RBAC · 8 thành viên</small></p><em>17 quyền</em></article><article><span>DB</span><p><b>Database Team</b><small>Chỉ máy chủ nhãn database · 4 thành viên</small></p><em>9 quyền</em></article><article><span>AU</span><p><b>Auditor</b><small>Chỉ đọc log và bản ghi · 2 thành viên</small></p><em>5 quyền</em></article></div></section><aside className="panel policy-panel"><h2>Kiểm soát phiên</h2><div className="policy-toggle"><span><b>Bắt buộc MFA</b><small>Mọi tài khoản đặc quyền</small></span><input aria-label="Bắt buộc MFA" type="checkbox" defaultChecked /></div><div className="policy-toggle"><span><b>Ghi lại phiên</b><small>Không cho người dùng tắt</small></span><input aria-label="Ghi lại phiên" type="checkbox" defaultChecked /></div><div className="policy-toggle"><span><b>Phê duyệt 4 mắt</b><small>Cho tác vụ nguy hiểm</small></span><input aria-label="Phê duyệt 4 mắt" type="checkbox" defaultChecked /></div><div className="policy-toggle"><span><b>Che dữ liệu nhạy cảm</b><small>Trong typescript SSH</small></span><input aria-label="Che dữ liệu nhạy cảm" type="checkbox" defaultChecked /></div></aside></div>;
+function AccessView({ token }: { token: string }) {
+  const [users, setUsers] = useState<Array<{ id: string; username: string; displayName: string; role: string; enabled: boolean; createdAt: string }>>([]);
+  const [forbidden, setForbidden] = useState(false);
+  useEffect(() => { fetch("/api/v1/users", { headers: { Authorization: `Bearer ${token}` } }).then((response) => { if (response.status === 403) setForbidden(true); return response.ok ? response.json() : Promise.reject(); }).then((data) => setUsers(data.items ?? [])).catch(() => setUsers([])); }, [token]);
+  return <div className="access-grid"><section className="panel view-panel"><div className="panel-head"><div><h2>Người dùng local</h2><p>Tài khoản và vai trò được đọc trực tiếp từ PostgreSQL.</p></div></div><div className="role-list">{users.length ? users.map((user) => <article key={user.id}><span>{user.role.slice(0, 2).toUpperCase()}</span><p><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></p><em>{user.enabled ? user.role : "đã khóa"}</em></article>) : <div className="empty-state">{forbidden ? "Chỉ admin được xem danh sách người dùng." : "Chưa có người dùng trong database."}</div>}</div></section><aside className="panel policy-panel"><h2>Vai trò hệ thống</h2><div className="policy-summary"><b>admin</b><small>Toàn quyền quản trị và phê duyệt.</small></div><div className="policy-summary"><b>operator</b><small>Vận hành máy chủ và mở phiên.</small></div><div className="policy-summary"><b>viewer</b><small>Đọc dữ liệu và chạy tác vụ an toàn.</small></div><div className="policy-summary"><b>auditor</b><small>Đọc audit và lịch sử phiên.</small></div></aside></div>;
 }
 
 function JobModal({ close, notify, servers, token }: { close: () => void; notify: (message: string) => void; servers: Server[]; token: string }) {

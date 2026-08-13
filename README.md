@@ -68,14 +68,12 @@ chmod 600 .env deploy/pki/agent-ca.key
 Sửa `.env` và sinh secret ngẫu nhiên:
 
 ```bash
-openssl rand -hex 32        # JWT_SECRET
-openssl rand -base64 32 | tr '+/' '-_'  # JOB_SECRET_KEY (Fernet)
 openssl rand -base64 32     # POSTGRES_PASSWORD
-openssl rand -base64 32     # BOOTSTRAP_ADMIN_PASSWORD
+openssl rand -hex 32        # SETUP_TOKEN
 openssl rand -hex 16        # GUACAMOLE_JSON_SECRET: đúng 32 ký tự hex
 ```
 
-Không commit `.env`, private key CA hoặc recording. Sao lưu `agent-ca.key` ngoại tuyến; mất key sẽ không cấp/renew agent certificate, lộ key phải rotate toàn bộ agent. `JOB_SECRET_KEY` mã hóa password/secret trong tham số job trước khi ghi Postgres; mất key sẽ làm các job đang chờ không thể giải mã.
+Không commit `.env`, private key CA hoặc recording. Sao lưu `agent-ca.key` ngoại tuyến; mất key sẽ không cấp/renew agent certificate, lộ key phải rotate toàn bộ agent. Wizard lần đầu tự sinh `JWT_SECRET` và `JOB_SECRET_KEY`, sau đó lưu chuỗi kết nối cùng hai khóa này trong volume `api_config` có quyền hạn chế. Cần sao lưu volume này cùng PostgreSQL; mất `JOB_SECRET_KEY` sẽ làm các job đang chờ không thể giải mã.
 
 ### 3. Khởi động
 
@@ -87,7 +85,13 @@ docker compose ps
 docker compose logs -f caddy api
 ```
 
-Mở `https://ops.example.com` và đăng nhập bằng `BOOTSTRAP_ADMIN_USER` / `BOOTSTRAP_ADMIN_PASSWORD`. Đổi mật khẩu bootstrap sau khi bổ sung giao diện quản lý user hoặc trực tiếp qua quy trình quản trị database có kiểm soát.
+Mở `https://ops.example.com`. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
+
+1. Nhập máy chủ PostgreSQL, port, database, tài khoản, mật khẩu và chế độ SSL. Với PostgreSQL trong Compose dùng host `postgres`, port `5432` và các giá trị `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` trong `.env`.
+2. Tạo tài khoản admin local đầu tiên với mật khẩu tối thiểu 14 ký tự.
+3. Nhập URL chính thức của dashboard và `SETUP_TOKEN` nếu đã cấu hình.
+
+API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và audit event trong một luồng. Sau khi hoàn tất, wizard bị khóa và dashboard chuyển sang màn hình đăng nhập. Toàn bộ dữ liệu nghiệp vụ được lưu trong PostgreSQL; volume `api_config` chỉ giữ thông tin bootstrap và khóa mã hóa không nên lưu chung với dữ liệu đã mã hóa.
 
 ## Cài agent
 
