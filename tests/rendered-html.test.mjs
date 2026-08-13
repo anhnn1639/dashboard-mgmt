@@ -1,0 +1,30 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+async function render() {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  return worker.fetch(new Request("http://localhost/", { headers: { accept: "text/html" } }), { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } }, { waitUntil() {}, passThroughOnException() {} });
+}
+
+test("server-renders the secure operations console shell", async () => {
+  const response = await render();
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+  const html = await response.text();
+  assert.match(html, /<title>Trạm Vận Hành<\/title>/i);
+  assert.match(html, /Đang khởi tạo phiên bảo mật/);
+  assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
+});
+
+test("dashboard includes automatic Windows and Linux fleet views", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /Máy chủ Linux/);
+  assert.match(source, /Máy chủ Windows/);
+  assert.match(source, /server\.osFamily === scope/);
+  assert.match(source, /\/api\/v1\/servers/);
+  assert.match(source, /Phiên truy cập/);
+  assert.match(source, /Nhật ký kiểm toán/);
+});

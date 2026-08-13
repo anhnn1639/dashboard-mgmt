@@ -1,0 +1,12 @@
+.git
+.next
+.vinext
+.wrangler
+.pnpm-store
+node_modules
+dist
+.env
+deploy/pki
+recordings
+__pycache__
+*.pyc

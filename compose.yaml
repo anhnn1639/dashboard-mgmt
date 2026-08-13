@@ -1,0 +1,115 @@
+name: tram-van-hanh
+
+services:
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      dashboard:
+        condition: service_started
+      guacamole:
+        condition: service_started
+    environment:
+      OPS_DOMAIN: ${OPS_DOMAIN:?Set OPS_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "9443:9443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/pki/agent-ca.crt:/etc/caddy/pki/agent-ca.crt:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge, control]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose: ["3000"]
+    networks: [control]
+
+  api:
+    build: ./control-plane
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-tramops}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tramops}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      BOOTSTRAP_ADMIN_USER: ${BOOTSTRAP_ADMIN_USER:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?Set BOOTSTRAP_ADMIN_PASSWORD}
+      AGENT_CA_CERT: /run/secrets/agent-ca.crt
+      AGENT_CA_KEY: /run/secrets/agent-ca.key
+      GUACAMOLE_URL: /guacamole
+      GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
+      JOB_SECRET_KEY: ${JOB_SECRET_KEY:?Set JOB_SECRET_KEY}
+      RECORDING_ROOT: /recordings
+    volumes:
+      - ./deploy/pki/agent-ca.crt:/run/ca-src/agent-ca.crt:ro
+      - ./deploy/pki/agent-ca.key:/run/ca-src/agent-ca.key:ro
+      - recordings:/recordings:ro
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [control]
+
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tramops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-tramops}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tramops} -d ${POSTGRES_DB:-tramops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [control]
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    restart: unless-stopped
+    volumes:
+      - recordings:/recordings
+    expose: ["4822"]
+    networks: [session]
+
+  guacamole:
+    image: guacamole/guacamole:1.6.0
+    restart: unless-stopped
+    depends_on: [guacd]
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: 4822
+      JSON_ENABLED: "true"
+      JSON_SECRET_KEY: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
+      WEBAPP_CONTEXT: guacamole
+      REMOTE_IP_VALVE_ENABLED: "true"
+    expose: ["8080"]
+    volumes:
+      - recordings:/recordings:ro
+    networks: [session, edge]
+
+networks:
+  edge:
+  control:
+    internal: true
+  session:
+
+volumes:
+  postgres_data:
+  recordings:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,22 @@
+[Unit]
+Description=Tram Van Hanh Server Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py --config /etc/tram-agent/agent.json --log-file /var/log/tram-agent/agent.log run
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

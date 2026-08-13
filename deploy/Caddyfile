@@ -1,0 +1,57 @@
+{
+    email {$ACME_EMAIL}
+    servers {
+        strict_sni_host on
+    }
+}
+
+{$OPS_DOMAIN} {
+    encode zstd gzip
+
+    @agentEnroll path /api/v1/enroll
+    handle @agentEnroll {
+        reverse_proxy api:8000
+    }
+
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+
+    handle /guacamole/* {
+        reverse_proxy guacamole:8080
+    }
+
+    handle {
+        reverse_proxy dashboard:3000
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "same-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+}
+
+{$OPS_DOMAIN}:9443 {
+    tls {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /etc/caddy/pki/agent-ca.crt
+        }
+    }
+
+    @agent path /api/v1/agent/*
+    handle @agent {
+        reverse_proxy api:8000 {
+            header_up -Authorization
+            header_up -X-Agent-Cert-Fingerprint
+            header_up -X-Agent-Cert-Subject
+            header_up X-Agent-Cert-Fingerprint {tls_client_fingerprint}
+            header_up X-Agent-Cert-Subject {tls_client_subject}
+        }
+    }
+
+    respond "Not found" 404
+}
