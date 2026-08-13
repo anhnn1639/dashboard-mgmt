@@ -127,7 +127,7 @@ Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token ch
 Yêu cầu Python 3 và `venv`. Trên Oracle Linux 7, Python hệ thống có thể quá cũ; cài Python 3.9+ từ repository được tổ chức phê duyệt trước khi chạy.
 
 ```bash
-sudo bash agent/install-linux.sh
+sudo sh agent/install-linux.sh
 sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
   enroll --server http://ops.example.com --token 'tvo_ONE_TIME_TOKEN'
 sudo systemctl enable --now tram-agent

@@ -1,16 +1,31 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo bash agent/install-linux.sh" >&2
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run as root: sudo sh agent/install-linux.sh" >&2
   exit 1
 fi
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates
+fi
+
+for required_command in python3 install systemctl; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    echo "Missing required command: $required_command" >&2
+    exit 1
+  fi
+done
+
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 python3 -m venv /opt/tram-agent/venv
-/opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$(dirname "$0")/requirements.txt"
-install -m 0750 "$(dirname "$0")/tram_agent.py" /opt/tram-agent/tram_agent.py
-install -m 0644 "$(dirname "$0")/tram-agent.service" /etc/systemd/system/tram-agent.service
+/opt/tram-agent/venv/bin/pip install --no-cache-dir --upgrade pip
+/opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$script_dir/requirements.txt"
+install -m 0750 "$script_dir/tram_agent.py" /opt/tram-agent/tram_agent.py
+install -m 0644 "$script_dir/tram-agent.service" /etc/systemd/system/tram-agent.service
 systemctl daemon-reload
 
 echo "Installed. Enroll with:"
