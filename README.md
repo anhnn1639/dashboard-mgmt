@@ -78,11 +78,17 @@ Không commit `.env`, private key CA hoặc recording. Sao lưu `agent-ca.key` n
 ### 3. Khởi động
 
 ```bash
-docker compose pull
-docker compose build
-docker compose up -d
-docker compose ps
-docker compose logs -f caddy api
+# Test: PostgreSQL chạy trong Docker
+docker compose -f compose.yaml -f compose.test.yaml pull
+docker compose -f compose.yaml -f compose.test.yaml build
+docker compose -f compose.yaml -f compose.test.yaml up -d
+docker compose -f compose.yaml -f compose.test.yaml ps
+
+# Production: PostgreSQL bên ngoài, cấu hình EXTERNAL_DATABASE_URL trong .env
+docker compose -f compose.yaml -f compose.external.yaml pull
+docker compose -f compose.yaml -f compose.external.yaml build
+docker compose -f compose.yaml -f compose.external.yaml up -d
+docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
 Mở `https://ops.example.com`. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:

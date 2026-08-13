@@ -61,19 +61,42 @@ bash deploy/generate-pki.sh
 chmod 600 deploy/pki/agent-ca.key
 ```
 
-## 7. Khởi động website
+## 7A. Chạy test với PostgreSQL trong Docker
 
 ```bash
-sudo docker compose pull
-sudo docker compose build
-sudo docker compose up -d
-sudo docker compose ps
+sudo docker compose -f compose.yaml -f compose.test.yaml pull
+sudo docker compose -f compose.yaml -f compose.test.yaml build
+sudo docker compose -f compose.yaml -f compose.test.yaml up -d
+sudo docker compose -f compose.yaml -f compose.test.yaml ps
 ```
 
-## 8. Kiểm tra log
+## 7B. Chạy với PostgreSQL bên ngoài
 
 ```bash
-sudo docker compose logs --tail=100 caddy api postgres dashboard
+nano .env
+```
+
+```text
+EXTERNAL_DATABASE_URL=postgresql+psycopg://USERNAME:PASSWORD@DB_HOST:5432/DB_NAME?sslmode=require
+```
+
+```bash
+sudo docker compose -f compose.yaml -f compose.external.yaml pull
+sudo docker compose -f compose.yaml -f compose.external.yaml build
+sudo docker compose -f compose.yaml -f compose.external.yaml up -d
+sudo docker compose -f compose.yaml -f compose.external.yaml ps
+```
+
+## 8A. Kiểm tra log bản test
+
+```bash
+sudo docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 caddy api postgres dashboard
+```
+
+## 8B. Kiểm tra log bản PostgreSQL bên ngoài
+
+```bash
+sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 caddy api dashboard
 ```
 
 ## 9. Mở wizard
@@ -84,6 +107,8 @@ https://ops.example.com
 
 ## 10. Nhập kết nối PostgreSQL
 
+### Bản test
+
 ```text
 Máy chủ: postgres
 Cổng: 5432
@@ -91,6 +116,17 @@ SSL: Ưu tiên SSL
 Tên database: tramops
 Tài khoản database: tramops
 Mật khẩu database: giá trị POSTGRES_PASSWORD ở bước 5
+```
+
+### PostgreSQL bên ngoài
+
+```text
+Máy chủ: DB_HOST
+Cổng: 5432
+SSL: Bắt buộc SSL
+Tên database: DB_NAME
+Tài khoản database: USERNAME
+Mật khẩu database: PASSWORD
 ```
 
 ## 11. Tạo admin local
@@ -115,12 +151,22 @@ Nhấn: Kiểm tra kết nối & hoàn tất
 Đăng nhập bằng tài khoản admin vừa tạo
 ```
 
-## 14. Cập nhật phiên bản sau này
+## 14A. Cập nhật bản test
 
 ```bash
 cd dashboard-mgmt
 git pull --ff-only
-sudo docker compose build
-sudo docker compose up -d
-sudo docker compose ps
+sudo docker compose -f compose.yaml -f compose.test.yaml build
+sudo docker compose -f compose.yaml -f compose.test.yaml up -d
+sudo docker compose -f compose.yaml -f compose.test.yaml ps
+```
+
+## 14B. Cập nhật bản PostgreSQL bên ngoài
+
+```bash
+cd dashboard-mgmt
+git pull --ff-only
+sudo docker compose -f compose.yaml -f compose.external.yaml build
+sudo docker compose -f compose.yaml -f compose.external.yaml up -d
+sudo docker compose -f compose.yaml -f compose.external.yaml ps
 ```

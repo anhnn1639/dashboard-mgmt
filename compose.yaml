@@ -60,22 +60,6 @@ services:
       retries: 8
     networks: [control]
 
-  postgres:
-    image: postgres:17.6-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-tramops}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-tramops}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tramops} -d ${POSTGRES_DB:-tramops}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks: [control]
-
   guacd:
     image: guacamole/guacd:1.6.0
     restart: unless-stopped
@@ -107,7 +91,6 @@ networks:
   session:
 
 volumes:
-  postgres_data:
   recordings:
   caddy_data:
   caddy_config:
