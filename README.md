@@ -124,7 +124,7 @@ Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token ch
 
 ### 2. Ubuntu 24.04 / Oracle Linux 7, 8
 
-Yêu cầu Python 3 và `venv`. Trên Oracle Linux 7, Python hệ thống có thể quá cũ; cài Python 3.9+ từ repository được tổ chức phê duyệt trước khi chạy.
+Trên Ubuntu, bộ cài tự cài Python 3, `venv` và OpenSSH Server. Trên Oracle Linux 7, Python hệ thống có thể quá cũ; cài Python 3.9+ và OpenSSH Server từ repository được tổ chức phê duyệt trước khi chạy.
 
 ```bash
 sudo sh agent/install-linux.sh

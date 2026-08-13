@@ -47,6 +47,7 @@ services:
       BOOTSTRAP_CONFIG_PATH: /var/lib/tram-ops/bootstrap.json
       AGENT_CA_CERT: /run/secrets/agent-ca.crt
       AGENT_CA_KEY: /run/secrets/agent-ca.key
+      CADDY_ROOT_CA: /caddy-data/caddy/pki/authorities/local/root.crt
       GUACAMOLE_URL: /guacamole
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
@@ -55,13 +56,14 @@ services:
       - ./deploy/pki:/run/ca-src:ro
       - recordings:/recordings:ro
       - api_config:/var/lib/tram-ops
+      - caddy_data:/caddy-data:ro
     expose: ["8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
       interval: 15s
       timeout: 5s
       retries: 8
-    networks: [control]
+    networks: [control, session]
 
   guacd:
     image: guacamole/guacd:1.6.0

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,7 @@ class Settings(BaseSettings):
     agent_ca_cert: str = "/run/secrets/agent-ca.crt"
     agent_ca_key: str = "/run/secrets/agent-ca.key"
     agent_cert_days: int = 90
+    caddy_root_ca: str = "/caddy-data/caddy/pki/authorities/local/root.crt"
     guacamole_url: str = "/guacamole"
     guacamole_json_secret: str = ""
     job_secret_key: str = ""
@@ -727,6 +729,10 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     if record.expected_os_family and record.expected_os_family != family:
         raise HTTPException(status_code=400, detail="Agent OS does not match enrollment policy")
     cert_pem, fingerprint, cert_expires = sign_agent_csr(payload.csr_pem, payload.agent_id)
+    try:
+        server_ca_certificate = Path(settings.caddy_root_ca).read_text()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Caddy server CA is unavailable; restart Caddy and retry enrollment") from exc
     server = db.get(Server, payload.agent_id)
     if server and server.cert_fingerprint:
         raise HTTPException(status_code=409, detail="Agent is already enrolled")
@@ -754,7 +760,15 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     db.commit()
     canonical = db.get(SystemSetting, "dashboard_url")
     dashboard_host = urlsplit(canonical.value).hostname if canonical else request.url.hostname
-    return {"agent_id": payload.agent_id, "certificate": cert_pem, "ca_certificate": Path(settings.agent_ca_cert).read_text(), "expires_at": cert_expires.isoformat(), "os_family": family, "category": "Windows" if family == "windows" else "Linux", "agent_endpoint": "https://" + str(dashboard_host) + ":9443/api/v1/agent"}
+    return {"agent_id": payload.agent_id, "certificate": cert_pem, "ca_certificate": Path(settings.agent_ca_cert).read_text(), "server_ca_certificate": server_ca_certificate, "expires_at": cert_expires.isoformat(), "os_family": family, "category": "Windows" if family == "windows" else "Linux", "agent_endpoint": "https://" + str(dashboard_host) + ":9443/api/v1/agent"}
+
+
+@app.get("/api/v1/agent-server-ca")
+def agent_server_ca():
+    try:
+        return {"certificate": Path(settings.caddy_root_ca).read_text()}
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Caddy server CA is unavailable") from exc
 
 
 @app.post("/api/v1/agent/checkin")
@@ -874,8 +888,17 @@ def launch_session(payload: SessionLaunchRequest, request: Request, user: User =
         raise HTTPException(status_code=400, detail="RDP is reserved for Windows servers")
     if payload.protocol == "ssh" and server.os_family != "linux":
         raise HTTPException(status_code=400, detail="SSH is reserved for Linux servers")
+    if not server.address:
+        raise HTTPException(status_code=409, detail="Máy chủ chưa cung cấp địa chỉ quản trị")
+    port = 3389 if payload.protocol == "rdp" else 22
+    try:
+        with socket.create_connection((server.address, port), timeout=4):
+            pass
+    except OSError as exc:
+        protocol_name = "RDP" if payload.protocol == "rdp" else "SSH"
+        raise HTTPException(status_code=409, detail=f"Không thể kết nối {protocol_name} tới {server.address}:{port}. Kiểm tra dịch vụ và firewall trên máy đích.") from exc
     session_id = str(uuid.uuid4())
-    common = {"hostname": server.address, "port": "3389" if payload.protocol == "rdp" else "22", "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"}
+    common = {"hostname": server.address, "port": str(port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript"})
         if server.ssh_host_key:

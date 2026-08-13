@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.1.1"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
@@ -280,6 +280,8 @@ def enroll(config: Config, token: str) -> None:
     config.key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     config.cert_file.write_text(data["certificate"], encoding="utf-8")
     config.ca_file.write_text(data["ca_certificate"], encoding="utf-8")
+    config.server_ca_file = config.path.parent / "server-ca.crt"
+    config.server_ca_file.write_text(data["server_ca_certificate"], encoding="utf-8")
     config.agent_endpoint = data["agent_endpoint"].rstrip("/")
     config.save()
     try:
@@ -290,6 +292,23 @@ def enroll(config: Config, token: str) -> None:
     LOG.info("enrolled %s as %s; category=%s", config.agent_id, data["os_family"], data["category"])
 
 
+def ensure_server_ca(config: Config) -> None:
+    if config.server_ca_file and config.server_ca_file.is_file():
+        return
+    if not config.server_url:
+        raise RuntimeError("server_url is required to retrieve the server CA")
+    response = requests.get(config.server_url + "/api/v1/agent-server-ca", timeout=30)
+    response.raise_for_status()
+    certificate = response.json().get("certificate", "")
+    if "BEGIN CERTIFICATE" not in certificate:
+        raise RuntimeError("Control plane returned an invalid server CA")
+    config.server_ca_file = config.path.parent / "server-ca.crt"
+    config.server_ca_file.parent.mkdir(parents=True, exist_ok=True)
+    config.server_ca_file.write_text(certificate, encoding="utf-8")
+    config.save()
+    LOG.info("installed control-plane server CA")
+
+
 def post_result(config: Config, job_id: str, exit_code: int, output: str) -> None:
     response = requests.post(f"{config.agent_endpoint}/jobs/{job_id}/result", json={"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output}, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
     response.raise_for_status()
@@ -298,8 +317,10 @@ def post_result(config: Config, job_id: str, exit_code: int, output: str) -> Non
 def loop(config: Config, once: bool = False) -> None:
     if not all(path.exists() for path in [config.cert_file, config.key_file, config.ca_file]):
         raise RuntimeError("Agent is not enrolled")
+    ensure_server_ca(config)
     last_inventory = 0.0
     inventory = collect_inventory()
+    expensive_metrics_pending = False
     backoff = config.interval
     while True:
         try:
@@ -307,12 +328,16 @@ def loop(config: Config, once: bool = False) -> None:
             send_inventory = timestamp - last_inventory >= config.inventory_interval
             if send_inventory:
                 inventory = collect_inventory()
-            payload = {"agent_id": config.agent_id, "agent_version": AGENT_VERSION, "inventory": inventory if send_inventory else None, "metrics": collect_metrics(inventory, include_expensive=send_inventory)}
+            include_expensive = expensive_metrics_pending and not send_inventory
+            payload = {"agent_id": config.agent_id, "agent_version": AGENT_VERSION, "inventory": inventory if send_inventory else None, "metrics": collect_metrics(inventory, include_expensive=include_expensive)}
             response = requests.post(config.agent_endpoint + "/checkin", json=payload, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
             response.raise_for_status()
             data = response.json()
             if send_inventory:
                 last_inventory = timestamp
+                expensive_metrics_pending = True
+            elif include_expensive:
+                expensive_metrics_pending = False
             for job in data.get("jobs", []):
                 LOG.info("job %s action=%s", job["id"], job["action"])
                 try:

@@ -114,19 +114,21 @@ export function OpsConsole() {
   useEffect(() => {
     if (!token) return;
     let mounted = true;
-    fetch("/api/v1/servers", { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } })
+    const loadServers = () => fetch("/api/v1/servers", { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } })
       .then((response) => {
         if (response.status === 401) {
           window.sessionStorage.removeItem("tram_ops_token");
           setToken("");
-          return Promise.reject();
+          throw new Error("Unauthorized");
         }
-        return response.ok ? response.json() : Promise.reject();
+        return response.ok ? response.json() : Promise.reject(new Error("Unable to load servers"));
       })
       .then((data) => { if (mounted && Array.isArray(data.items)) setServers(data.items); })
       .catch(() => undefined)
       .finally(() => { if (mounted) setLoading(false); });
-    return () => { mounted = false; };
+    void loadServers();
+    const timer = window.setInterval(() => { void loadServers(); }, 15_000);
+    return () => { mounted = false; window.clearInterval(timer); };
   }, [token]);
 
   useEffect(() => {
@@ -378,7 +380,7 @@ function JobModal({ close, notify, servers, token }: { close: () => void; notify
 
 function SessionModal({ close, notify, server, token }: { close: () => void; notify: (message: string) => void; server: Server; token: string }) {
   async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); const protocol = server.osFamily === "windows" ? "rdp" : "ssh"; const sessionWindow = window.open("about:blank", "_blank"); if (sessionWindow) sessionWindow.opener = null; try { const response = await fetch("/api/v1/sessions/launch", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ server_id: server.id, protocol, username: form.get("username"), password: form.get("password") }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail ?? "Không thể tạo phiên"); close(); if (sessionWindow) sessionWindow.location.href = data.url; else window.location.href = data.url; notify(`Đã tạo phiên ${protocol.toUpperCase()} có ghi lại.`); } catch (reason) { sessionWindow?.close(); notify(reason instanceof Error ? reason.message : "Không thể tạo phiên"); } }
-  return <div className="modal-backdrop"><button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại" onClick={close} /><form className="modal" onSubmit={submit}><div className="modal-head"><div><span className="modal-icon">↗</span><div><h2>{server.osFamily === "windows" ? "Remote Desktop" : "Phiên SSH"}</h2><p>{server.name} · phiên được ghi lại</p></div></div><button type="button" onClick={close}>×</button></div><label>Tên đăng nhập<input name="username" required autoComplete="username" /></label><label>Mật khẩu phiên<input type="password" name="password" required autoComplete="current-password" /></label><div className="warning-box"><b>Thông tin xác thực dùng một lần</b><p>Mật khẩu chỉ được đưa vào token Guacamole mã hóa, không được lưu trong database hoặc audit log.</p></div><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary">Mở phiên & bắt đầu ghi</button></div></form></div>;
+  return <div className="modal-backdrop"><button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại" onClick={close} /><form className="modal" onSubmit={submit}><div className="modal-head"><div><span className="modal-icon">↗</span><div><h2>{server.osFamily === "windows" ? "Remote Desktop" : "Phiên SSH"}</h2><p>{server.name} · phiên được ghi lại</p></div></div><button type="button" onClick={close}>×</button></div><label>Tên đăng nhập<input name="username" required autoComplete="username" placeholder={server.osFamily === "linux" ? "Ví dụ: ubuntu" : undefined} /></label><label>Mật khẩu phiên<input type="password" name="password" required autoComplete="current-password" /></label><div className="warning-box"><b>{server.osFamily === "linux" ? "Không dùng root trên Ubuntu mặc định" : "Thông tin xác thực dùng một lần"}</b><p>{server.osFamily === "linux" ? "Dùng tài khoản thường đã đặt mật khẩu, ví dụ ubuntu. Có thể đặt bằng lệnh: sudo passwd ubuntu." : "Mật khẩu chỉ được đưa vào token Guacamole mã hóa, không được lưu trong database hoặc audit log."}</p></div><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary">Mở phiên & bắt đầu ghi</button></div></form></div>;
 }
 
 function CommandPalette({ close, servers, select }: { close: () => void; servers: Server[]; select: (server: Server) => void }) {
