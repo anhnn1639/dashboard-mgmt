@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
 import socket
+import ssl
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -16,6 +18,9 @@ from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
 import jwt
+import pyotp
+import qrcode
+import qrcode.image.svg
 from argon2 import PasswordHasher
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, padding, serialization
@@ -25,6 +30,9 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from ldap3 import ALL, SUBTREE, Connection, Server as LDAPServer, Tls
+from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, select, text
@@ -89,6 +97,15 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(160), default="")
     role: Mapped[str] = mapped_column(String(30), default="viewer")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class MFACredential(Base):
+    __tablename__ = "mfa_credentials"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    secret_encrypted: Mapped[str] = mapped_column(Text)
+    enrolled: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_counter: Mapped[int] = mapped_column(Integer, default=-1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
@@ -192,8 +209,36 @@ class RemoteSession(Base):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=1024)
+    source: Literal["local", "domain"] = "local"
+
+
+class MFAVerifyRequest(BaseModel):
+    challenge_token: str
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class PlatformUserCreateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    display_name: str = Field(min_length=1, max_length=160)
+    password: str = Field(min_length=14, max_length=1024)
+    role: Literal["admin", "operator", "viewer", "auditor"] = "viewer"
+
+
+class LDAPConfigRequest(BaseModel):
+    enabled: bool = False
+    host: str = Field(default="", max_length=255)
+    port: int = Field(default=636, ge=1, le=65535)
+    use_ssl: bool = True
+    base_dn: str = Field(default="", max_length=512)
+    bind_dn: str = Field(default="", max_length=512)
+    bind_password: str = Field(default="", max_length=1024)
+    ca_certificate: str = Field(default="", max_length=65536)
+    user_attribute: str = Field(default="sAMAccountName", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    display_attribute: str = Field(default="displayName", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    domain_label: str = Field(default="DOMAIN", pattern=r"^[A-Za-z0-9_.-]{1,15}$")
+    default_role: Literal["viewer", "operator", "auditor"] = "viewer"
 
 
 class EnrollmentTokenRequest(BaseModel):
@@ -308,18 +353,30 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "service.stop": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
     "user.create": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
     "user.disable": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "user.enable": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "user.delete": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
+    "user.password.reset": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
     "group.create": {"roles": {"admin", "operator"}, "risk": "medium", "approval": True},
+    "group.delete": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
     "user.add_group": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "group.remove_user": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "user.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
+    "group.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "patch.scan": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "patch.install_security": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
     "logs.read": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low", "approval": False},
     "process.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
+    "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
+    "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
+    "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
 }
 
 
-app = FastAPI(title="Trạm Vận Hành API", version="0.1.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Trạm Vận Hành API", version="0.2.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -479,6 +536,86 @@ def audit(db: Session, actor: str, action: str, target: str, request: Request | 
 def issue_jwt(user: User) -> str:
     timestamp = now()
     return jwt.encode({"sub": user.id, "username": user.username, "role": user.role, "iss": settings.jwt_issuer, "iat": timestamp, "exp": timestamp + timedelta(minutes=settings.jwt_ttl_minutes)}, settings.jwt_secret, algorithm="HS256")
+
+
+def issue_mfa_challenge(user: User) -> str:
+    timestamp = now()
+    return jwt.encode({"sub": user.id, "purpose": "mfa", "iss": settings.jwt_issuer, "iat": timestamp, "exp": timestamp + timedelta(minutes=5)}, settings.jwt_secret, algorithm="HS256")
+
+
+def mfa_login_response(db: Session, user: User) -> dict[str, Any]:
+    credential = db.get(MFACredential, user.id)
+    if credential is None:
+        secret = pyotp.random_base32()
+        credential = MFACredential(user_id=user.id, secret_encrypted=job_fernet().encrypt(secret.encode()).decode())
+        db.add(credential)
+        db.flush()
+    else:
+        try:
+            secret = job_fernet().decrypt(credential.secret_encrypted.encode()).decode()
+        except InvalidToken as exc:
+            raise HTTPException(status_code=503, detail="Không thể đọc cấu hình MFA") from exc
+    response: dict[str, Any] = {"mfa_required": True, "setup_required": not credential.enrolled, "challenge_token": issue_mfa_challenge(user), "user": {"username": user.username, "displayName": user.display_name, "role": user.role}}
+    if not credential.enrolled:
+        uri = pyotp.TOTP(secret).provisioning_uri(name=user.username, issuer_name="Trạm Vận Hành")
+        image = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage)
+        stream = io.BytesIO()
+        image.save(stream)
+        response.update({"provisioning_uri": uri, "qr_svg": "data:image/svg+xml;base64," + base64.b64encode(stream.getvalue()).decode()})
+    return response
+
+
+def read_ldap_config(db: Session, include_secret: bool = False) -> dict[str, Any]:
+    setting = db.get(SystemSetting, "ldap_config")
+    if not setting or not setting.value:
+        return {"enabled": False}
+    try:
+        config = json.loads(setting.value)
+    except (TypeError, ValueError):
+        return {"enabled": False}
+    encrypted = config.pop("bind_password_encrypted", "")
+    if include_secret and encrypted:
+        try:
+            config["bind_password"] = job_fernet().decrypt(encrypted.encode()).decode()
+        except InvalidToken as exc:
+            raise HTTPException(status_code=503, detail="Không thể đọc mật khẩu LDAP") from exc
+    config["password_configured"] = bool(encrypted)
+    return config
+
+
+def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
+    config = read_ldap_config(db, include_secret=True)
+    if not config.get("enabled"):
+        raise HTTPException(status_code=503, detail="Đăng nhập Domain chưa được cấu hình")
+    if not username or not password:
+        return None
+    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if config.get("use_ssl", True) else None
+    ldap_server = LDAPServer(config["host"], port=int(config.get("port", 636)), use_ssl=bool(config.get("use_ssl", True)), tls=tls, get_info=ALL, connect_timeout=8)
+    try:
+        with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=10) as service:
+            attribute = config.get("user_attribute", "sAMAccountName")
+            service.search(config["base_dn"], f"({attribute}={escape_filter_chars(username)})", search_scope=SUBTREE, attributes=[config.get("display_attribute", "displayName")], size_limit=2)
+            if len(service.entries) != 1:
+                return None
+            entry = service.entries[0]
+            user_dn = entry.entry_dn
+            display_value = getattr(entry, config.get("display_attribute", "displayName"), None)
+            display_name = str(display_value.value) if display_value and display_value.value else username
+        with Connection(ldap_server, user=user_dn, password=password, auto_bind=True, receive_timeout=10):
+            pass
+    except Exception:
+        return None
+    canonical = f"{config.get('domain_label', 'DOMAIN')}\\{username}"
+    if len(canonical) > 80:
+        return None
+    user = db.execute(select(User).where(User.username == canonical)).scalar_one_or_none()
+    if user is None:
+        user = User(username=canonical, password_hash="!LDAP", display_name=display_name, role=config.get("default_role", "viewer"))
+        db.add(user)
+        db.flush()
+    else:
+        user.display_name = display_name
+    return user
 
 
 def current_user(authorization: str | None = Header(default=None), db: Session = Depends(db_session)) -> User:
@@ -663,18 +800,49 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginRequest, request: Request, db: Session = Depends(db_session)):
-    user = db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none()
-    valid = False
-    if user:
+    user = authenticate_ldap(db, payload.username, payload.password) if payload.source == "domain" else db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none()
+    valid = payload.source == "domain" and user is not None
+    if payload.source == "local" and user:
         try:
             valid = password_hasher.verify(user.password_hash, payload.password)
         except Exception:
             valid = False
     if not user or not valid or not user.enabled:
-        audit(db, payload.username, "auth.login", "dashboard", request, "denied")
+        audit(db, payload.username, f"auth.{payload.source}.login", "dashboard", request, "denied")
         db.commit()
         raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng")
-    audit(db, user.username, "auth.login", "dashboard", request)
+    audit(db, user.username, f"auth.{payload.source}.password", "dashboard", request)
+    response = mfa_login_response(db, user)
+    db.commit()
+    return response
+
+
+@app.post("/api/v1/auth/mfa/verify")
+def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = Depends(db_session)):
+    try:
+        claims = jwt.decode(payload.challenge_token, settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Phiên MFA đã hết hạn") from exc
+    if claims.get("purpose") != "mfa":
+        raise HTTPException(status_code=401, detail="Phiên MFA không hợp lệ")
+    user = db.get(User, claims.get("sub"))
+    credential = db.get(MFACredential, claims.get("sub"))
+    if not user or not credential or not user.enabled:
+        raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ")
+    try:
+        secret = job_fernet().decrypt(credential.secret_encrypted.encode()).decode()
+    except InvalidToken as exc:
+        raise HTTPException(status_code=503, detail="Không thể đọc cấu hình MFA") from exc
+    totp = pyotp.TOTP(secret)
+    counter = int(now().timestamp()) // totp.interval
+    matched_counter = next((candidate for candidate in range(counter - 1, counter + 2) if candidate > credential.last_counter and hmac.compare_digest(totp.at(candidate * totp.interval), payload.code)), None)
+    if matched_counter is None:
+        audit(db, user.username, "auth.mfa", "dashboard", request, "denied")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Mã MFA không đúng hoặc đã được sử dụng")
+    credential.enrolled = True
+    credential.last_counter = matched_counter
+    audit(db, user.username, "auth.mfa", "dashboard", request)
     db.commit()
     return {"access_token": issue_jwt(user), "token_type": "bearer", "expires_in": settings.jwt_ttl_minutes * 60, "user": {"username": user.username, "displayName": user.display_name, "role": user.role}}
 
@@ -688,6 +856,48 @@ def me(user: User = Depends(current_user)):
 def list_users(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
     users = db.execute(select(User).order_by(User.username)).scalars().all()
     return {"items": [{"id": item.id, "username": item.username, "displayName": item.display_name, "role": item.role, "enabled": item.enabled, "createdAt": aware(item.created_at).isoformat()} for item in users]}
+
+
+@app.post("/api/v1/users", status_code=201)
+def create_platform_user(payload: PlatformUserCreateRequest, request: Request, actor: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    if db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Tên đăng nhập đã tồn tại")
+    user = User(username=payload.username, display_name=payload.display_name, password_hash=password_hasher.hash(payload.password), role=payload.role)
+    db.add(user)
+    db.flush()
+    audit(db, actor.username, "identity.local.create", user.id, request, detail={"username": user.username, "role": user.role})
+    db.commit()
+    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat(), "mfaEnrollmentRequired": True}
+
+
+@app.get("/api/v1/settings/ldap")
+def get_ldap_config(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    config = read_ldap_config(db)
+    config.pop("bind_password", None)
+    return config
+
+
+@app.put("/api/v1/settings/ldap")
+def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    if payload.enabled and (not payload.host or not payload.base_dn):
+        raise HTTPException(status_code=400, detail="LDAP host và Base DN là bắt buộc")
+    current = read_ldap_config(db, include_secret=True)
+    bind_password = payload.bind_password or current.get("bind_password", "")
+    if payload.enabled:
+        try:
+            tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=payload.ca_certificate or None) if payload.use_ssl else None
+            ldap_server = LDAPServer(payload.host, port=payload.port, use_ssl=payload.use_ssl, tls=tls, get_info=ALL, connect_timeout=8)
+            with Connection(ldap_server, user=payload.bind_dn or None, password=bind_password or None, auto_bind=True, receive_timeout=10):
+                pass
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Không thể bind LDAP. Kiểm tra host, certificate LDAPS, Bind DN và mật khẩu.") from exc
+    serialized = payload.model_dump(exclude={"bind_password"})
+    if bind_password:
+        serialized["bind_password_encrypted"] = job_fernet().encrypt(bind_password.encode()).decode()
+    db.merge(SystemSetting(key="ldap_config", value=json.dumps(serialized, separators=(",", ":"))))
+    audit(db, user.username, "settings.ldap.update", payload.host, request, detail={"enabled": payload.enabled, "use_ssl": payload.use_ssl})
+    db.commit()
+    return {**serialized, "password_configured": bool(bind_password)}
 
 
 @app.get("/api/v1/servers")
@@ -876,7 +1086,44 @@ def list_audit(_: User = Depends(require_role("admin", "auditor")), db: Session 
 @app.get("/api/v1/sessions")
 def list_sessions(_: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
     rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
-    return {"items": [{"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None} for item, server_name in rows]}
+    available = available_recording_ids()
+    return {"items": [{"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": item.id in available, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None} for item, server_name in rows]}
+
+
+def available_recording_ids() -> set[str]:
+    root = Path(settings.recording_root).resolve()
+    try:
+        return {candidate.name[:36] for candidate in root.iterdir() if candidate.is_file() and len(candidate.name) > 37 and candidate.name[36] == "-" and not candidate.name.endswith(".typescript")}
+    except OSError:
+        return set()
+
+
+def recording_file(session_id: str) -> Path | None:
+    root = Path(settings.recording_root).resolve()
+    if not root.is_dir():
+        return None
+    try:
+        candidates = sorted(root.glob(f"{session_id}-*"), key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.parent == root and resolved.is_file() and not resolved.name.endswith(".typescript"):
+            return resolved
+    return None
+
+
+@app.get("/api/v1/sessions/{session_id}/recording")
+def read_recording(session_id: str, request: Request, user: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+    session = db.get(RemoteSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    path = recording_file(session.id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Recording chưa sẵn sàng hoặc phiên chưa phát sinh hình ảnh")
+    audit(db, user.username, "session.recording.view", session.id, request)
+    db.commit()
+    return FileResponse(path, media_type="application/octet-stream", filename=f"{session.id}.guac", content_disposition_type="inline", headers={"Cache-Control": "private, no-store"})
 
 
 @app.post("/api/v1/sessions/launch")
@@ -898,7 +1145,7 @@ def launch_session(payload: SessionLaunchRequest, request: Request, user: User =
         protocol_name = "RDP" if payload.protocol == "rdp" else "SSH"
         raise HTTPException(status_code=409, detail=f"Không thể kết nối {protocol_name} tới {server.address}:{port}. Kiểm tra dịch vụ và firewall trên máy đích.") from exc
     session_id = str(uuid.uuid4())
-    common = {"hostname": server.address, "port": str(port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"}
+    common = {"hostname": server.address, "port": str(port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript"})
         if server.ssh_host_key:

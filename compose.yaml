@@ -54,7 +54,7 @@ services:
       RECORDING_ROOT: /recordings
     volumes:
       - ./deploy/pki:/run/ca-src:ro
-      - recordings:/recordings:ro
+      - ${RECORDING_DIR:-./recordings}:/recordings:ro
       - api_config:/var/lib/tram-ops
       - caddy_data:/caddy-data:ro
     expose: ["8000"]
@@ -63,13 +63,25 @@ services:
       interval: 15s
       timeout: 5s
       retries: 8
-    networks: [control, session]
+    networks: [control, session, identity_egress]
+
+  recording-init:
+    image: alpine:3.22
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    command: ["sh", "-c", "chown 1001:1000 /recordings && chmod 2750 /recordings"]
+    volumes:
+      - ${RECORDING_DIR:-./recordings}:/recordings
 
   guacd:
     image: guacamole/guacd:1.6.0
     restart: unless-stopped
+    depends_on:
+      recording-init:
+        condition: service_completed_successfully
     volumes:
-      - recordings:/recordings
+      - ${RECORDING_DIR:-./recordings}:/recordings
     expose: ["4822"]
     networks: [session]
 
@@ -84,9 +96,11 @@ services:
       JSON_SECRET_KEY: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       WEBAPP_CONTEXT: guacamole
       REMOTE_IP_VALVE_ENABLED: "true"
+      RECORDING_ENABLED: "true"
+      RECORDING_SEARCH_PATH: /var/lib/guacamole/recordings
     expose: ["8080"]
     volumes:
-      - recordings:/recordings:ro
+      - ${RECORDING_DIR:-./recordings}:/var/lib/guacamole/recordings:ro
     networks: [session, edge]
 
 networks:
@@ -94,9 +108,9 @@ networks:
   control:
     internal: true
   session:
+  identity_egress:
 
 volumes:
-  recordings:
   caddy_data:
   caddy_config:
   api_config:

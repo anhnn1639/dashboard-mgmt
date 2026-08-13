@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import ipaddress
 import json
 import logging
 import os
@@ -23,14 +24,18 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.1.1"
+AGENT_VERSION = "0.2.0"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
+GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
 ALLOWED_ACTIONS = {
     "inventory.collect", "service.list", "service.restart", "service.start", "service.stop",
-    "user.create", "user.disable", "group.create", "user.add_group", "patch.scan",
+    "user.create", "user.disable", "user.enable", "user.delete", "user.password.reset",
+    "group.create", "group.delete", "user.add_group", "patch.scan",
     "patch.install_security", "logs.read", "process.list", "firewall.list", "system.reboot",
+    "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
+    "firewall.rule.add", "firewall.rule.remove", "network.list",
 }
 
 
@@ -76,6 +81,12 @@ def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: 
     return completed.returncode, output[-100_000:]
 
 
+def run_with_input(command: list[str], input_value: str, timeout: int = 120) -> tuple[int, str]:
+    completed = subprocess.run(command, input=input_value, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+    output = completed.stdout.strip() if completed.returncode == 0 else "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
+    return completed.returncode, output[-100_000:]
+
+
 def powershell(script: str, timeout: int = 120) -> tuple[int, str]:
     encoded = base64.b64encode(script.encode("utf-16le")).decode()
     return run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], timeout=timeout, sensitive=True)
@@ -113,6 +124,37 @@ def ssh_host_key() -> str | None:
     return None
 
 
+def management_facts(os_family: str) -> dict[str, Any]:
+    if os_family == "windows":
+        code, output = powershell("[pscustomobject]@{Users=@(Get-LocalUser|Select Name,Enabled,LastLogon);Groups=@(Get-LocalGroup|ForEach-Object{$g=$_;[pscustomobject]@{name=$g.Name;members=@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue|ForEach-Object Name)}});Storage=@(Get-Volume|Where-Object DriveLetter|Select DriveLetter,FileSystemLabel,FileSystem,Size,SizeRemaining);Services=@(Get-Service|Select Name,DisplayName,Status,StartType)}|ConvertTo-Json -Depth 5 -Compress")
+        if code == 0:
+            try:
+                return json.loads(output)
+            except ValueError:
+                pass
+        return {"Users": [], "Groups": [], "Storage": []}
+    import grp
+    import pwd
+    users = [{"name": item.pw_name, "uid": item.pw_uid, "home": item.pw_dir, "shell": item.pw_shell} for item in pwd.getpwall() if item.pw_uid == 0 or item.pw_uid >= 1000]
+    groups = [{"name": item.gr_name, "gid": item.gr_gid, "members": item.gr_mem} for item in grp.getgrall()]
+    code, output = run(["/usr/bin/lsblk", "--json", "--bytes", "--output", "NAME,PATH,TYPE,FSTYPE,SIZE,MOUNTPOINTS"])
+    try:
+        storage = json.loads(output).get("blockdevices", []) if code == 0 else []
+    except ValueError:
+        storage = []
+    logical_volumes: list[dict[str, Any]] = []
+    if Path("/usr/sbin/lvs").exists():
+        lvs_code, lvs_output = run(["/usr/sbin/lvs", "--reportformat", "json", "--units", "b", "--nosuffix", "--options", "lv_path,vg_name,lv_name,lv_size,data_percent"])
+        if lvs_code == 0:
+            try:
+                logical_volumes = json.loads(lvs_output).get("report", [{}])[0].get("lv", [])
+            except (ValueError, IndexError):
+                pass
+    services_code, services_output = run(["/usr/bin/systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+    services = [{"name": line.split()[0], "state": line.split()[1] if len(line.split()) > 1 else ""} for line in services_output.splitlines() if services_code == 0 and line.strip()]
+    return {"Users": users, "Groups": groups, "Storage": storage, "LogicalVolumes": logical_volumes, "Services": services}
+
+
 def collect_inventory() -> dict[str, Any]:
     system = platform.system().lower()
     if system == "windows":
@@ -132,7 +174,8 @@ def collect_inventory() -> dict[str, Any]:
     boot_path = Path("/proc/sys/kernel/random/boot_id")
     if boot_path.exists():
         boot_id = boot_path.read_text().strip()
-    return {"hostname": socket.gethostname(), "os_family": "windows" if system == "windows" else "linux", "os_name": os_name, "os_version": os_version, "distribution_id": distribution_id, "architecture": platform.machine(), "agent_version": AGENT_VERSION, "addresses": network_addresses(), "boot_id": boot_id, "ssh_host_key": ssh_host_key(), "extra": {"kernel": platform.release(), "python": platform.python_version()}}
+    os_family = "windows" if system == "windows" else "linux"
+    return {"hostname": socket.gethostname(), "os_family": os_family, "os_name": os_name, "os_version": os_version, "distribution_id": distribution_id, "architecture": platform.machine(), "agent_version": AGENT_VERSION, "addresses": network_addresses(), "boot_id": boot_id, "ssh_host_key": ssh_host_key(), "extra": {"kernel": platform.release(), "python": platform.python_version(), **management_facts(os_family)}}
 
 
 def pending_updates(inventory: dict[str, Any]) -> int:
@@ -185,6 +228,26 @@ def require_name(parameters: dict[str, Any], key: str, service: bool = False) ->
     return value
 
 
+def require_group(parameters: dict[str, Any]) -> str:
+    value = str(parameters.get("group", ""))
+    if not GROUP_RE.fullmatch(value):
+        raise ValueError("Invalid group")
+    return value
+
+
+def firewall_parameters(parameters: dict[str, Any]) -> tuple[str, int, str, str, str]:
+    name = require_name(parameters, "name")
+    port = int(parameters.get("port", 0))
+    protocol = str(parameters.get("protocol", "tcp")).lower()
+    action = str(parameters.get("action", "allow")).lower()
+    source = str(parameters.get("source", "any")).strip().lower()
+    if not 1 <= port <= 65535 or protocol not in {"tcp", "udp"} or action not in {"allow", "deny"}:
+        raise ValueError("Invalid firewall rule")
+    if source != "any":
+        source = str(ipaddress.ip_network(source, strict=False))
+    return name, port, protocol, action, source
+
+
 def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
     if action not in ALLOWED_ACTIONS:
         return 126, "Action is not allowlisted by this agent"
@@ -201,14 +264,23 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
             return powershell(f"{cmdlet} -Name '{name}' -ErrorAction Stop; Get-Service -Name '{name}'|Select Name,Status|ConvertTo-Json -Compress")
         return run(["/usr/bin/systemctl", verb, name], timeout=180)
     if action == "group.create":
-        group = require_name(parameters, "group")
+        group = require_group(parameters)
         if windows:
             return powershell(f"if(-not(Get-LocalGroup -Name '{group}' -ErrorAction SilentlyContinue)){{New-LocalGroup -Name '{group}' -ErrorAction Stop}}")
         return run(["/usr/sbin/groupadd", group])
+    if action == "group.delete":
+        group = require_group(parameters)
+        return powershell(f"Remove-LocalGroup -Name '{group}' -ErrorAction Stop") if windows else run(["/usr/sbin/groupdel", group])
+    if action == "user.list":
+        facts = management_facts("windows" if windows else "linux")
+        return 0, json.dumps(facts.get("Users", []), ensure_ascii=False)
+    if action == "group.list":
+        facts = management_facts("windows" if windows else "linux")
+        return 0, json.dumps(facts.get("Groups", []), ensure_ascii=False)
     if action == "user.create":
         username = require_name(parameters, "username")
         groups = parameters.get("groups", [])
-        if not isinstance(groups, list) or any(not NAME_RE.fullmatch(str(group)) for group in groups):
+        if not isinstance(groups, list) or any(not GROUP_RE.fullmatch(str(group)) for group in groups):
             raise ValueError("Invalid groups")
         if windows:
             password = str(parameters.get("password", ""))
@@ -221,14 +293,41 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         if groups:
             command += ["--groups", ",".join(str(group) for group in groups)]
         command.append(username)
-        return run(command)
+        exit_code, output = run(command)
+        if exit_code:
+            return exit_code, output
+        password = str(parameters.get("password", ""))
+        if password:
+            if len(password) < 12 or "\n" in password or ":" in password:
+                raise ValueError("Password must have at least 12 characters and cannot contain ':'")
+            return run_with_input(["/usr/sbin/chpasswd"], f"{username}:{password}\n")
+        return 0, output
     if action == "user.disable":
         username = require_name(parameters, "username")
         return powershell(f"Disable-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/usermod", "--lock", "--expiredate", "1", username])
+    if action == "user.enable":
+        username = require_name(parameters, "username")
+        return powershell(f"Enable-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/usermod", "--unlock", "--expiredate", "", username])
+    if action == "user.delete":
+        username = require_name(parameters, "username")
+        return powershell(f"Remove-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/userdel", "--remove", username])
+    if action == "user.password.reset":
+        username = require_name(parameters, "username")
+        password = str(parameters.get("password", ""))
+        if len(password) < 12 or "\n" in password or ":" in password:
+            raise ValueError("Password must have at least 12 characters and cannot contain ':'")
+        if windows:
+            escaped = password.replace("'", "''")
+            return powershell(f"$p=ConvertTo-SecureString '{escaped}' -AsPlainText -Force;Set-LocalUser -Name '{username}' -Password $p -ErrorAction Stop")
+        return run_with_input(["/usr/sbin/chpasswd"], f"{username}:{password}\n")
     if action == "user.add_group":
         username = require_name(parameters, "username")
-        group = require_name(parameters, "group")
+        group = require_group(parameters)
         return powershell(f"Add-LocalGroupMember -Group '{group}' -Member '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/usermod", "-aG", group, username])
+    if action == "group.remove_user":
+        username = require_name(parameters, "username")
+        group = require_group(parameters)
+        return powershell(f"Remove-LocalGroupMember -Group '{group}' -Member '{username}' -ErrorAction Stop") if windows else run(["/usr/bin/gpasswd", "-d", username, group])
     if action == "patch.scan":
         return 0, json.dumps({"pending_updates": pending_updates(inventory)})
     if action == "patch.install_security":
@@ -260,6 +359,42 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         if inventory["distribution_id"] == "ubuntu" and Path("/usr/sbin/ufw").exists():
             return run(["/usr/sbin/ufw", "status", "verbose"])
         return run(["/usr/bin/firewall-cmd", "--list-all"])
+    if action in {"firewall.rule.add", "firewall.rule.remove"}:
+        name, port, protocol, rule_action, source = firewall_parameters(parameters)
+        if windows:
+            escaped_name = name.replace("'", "''")
+            remote = "Any" if source == "any" else source
+            if action.endswith("add"):
+                windows_action = "Allow" if rule_action == "allow" else "Block"
+                return powershell(f"New-NetFirewallRule -DisplayName 'TramOps-{escaped_name}' -Direction Inbound -Action {windows_action} -Protocol {protocol.upper()} -LocalPort {port} -RemoteAddress '{remote}' -ErrorAction Stop|Select Name,DisplayName,Enabled,Direction,Action|ConvertTo-Json -Compress")
+            return powershell(f"Get-NetFirewallRule -DisplayName 'TramOps-{escaped_name}' -ErrorAction Stop|Remove-NetFirewallRule -ErrorAction Stop")
+        if inventory["distribution_id"] != "ubuntu" or not Path("/usr/sbin/ufw").exists():
+            return 1, "Structured firewall changes currently require Ubuntu UFW"
+        rule = [rule_action]
+        if source != "any":
+            rule += ["from", source, "to", "any"]
+        rule += ["port", str(port), "proto", protocol]
+        if action.endswith("remove"):
+            rule.insert(0, "delete")
+        return run(["/usr/sbin/ufw", "--force", *rule])
+    if action == "storage.list":
+        facts = management_facts("windows" if windows else "linux")
+        return 0, json.dumps(facts.get("Storage", []), ensure_ascii=False)
+    if action == "storage.extend":
+        if windows:
+            drive = str(parameters.get("drive", "")).upper().rstrip(":")
+            if not re.fullmatch(r"[A-Z]", drive):
+                raise ValueError("Invalid Windows drive letter")
+            return powershell(f"$s=Get-PartitionSupportedSize -DriveLetter '{drive}';Resize-Partition -DriveLetter '{drive}' -Size $s.SizeMax -Confirm:$false -ErrorAction Stop;Get-Volume -DriveLetter '{drive}'|Select DriveLetter,Size,SizeRemaining|ConvertTo-Json -Compress", timeout=1800)
+        logical_volume = str(parameters.get("logical_volume", ""))
+        size_gb = int(parameters.get("size_gb", 0))
+        if not re.fullmatch(r"/dev/(?:mapper/)?[A-Za-z0-9_.+/-]{1,180}", logical_volume) or not 1 <= size_gb <= 10240:
+            raise ValueError("Invalid logical volume or extension size")
+        return run(["/usr/sbin/lvextend", "--resizefs", "--size", f"+{size_gb}G", logical_volume], timeout=1800)
+    if action == "network.list":
+        if windows:
+            return powershell("Get-NetIPConfiguration|Select InterfaceAlias,InterfaceDescription,IPv4Address,IPv4DefaultGateway,DNSServer|ConvertTo-Json -Depth 4")
+        return run(["/usr/sbin/ip", "-json", "address"])
     if action == "system.reboot":
         # Schedule the reboot so the agent can report a successful dispatch first.
         if windows:

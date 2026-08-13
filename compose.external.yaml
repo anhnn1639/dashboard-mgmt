@@ -2,7 +2,7 @@ services:
   api:
     environment:
       DATABASE_URL: ${EXTERNAL_DATABASE_URL:?Set EXTERNAL_DATABASE_URL in .env}
-    networks: [control, database_egress]
+    networks: [control, session, identity_egress, database_egress]
 
 networks:
   database_egress:
