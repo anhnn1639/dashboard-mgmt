@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.2.2"
+AGENT_VERSION = "0.2.3"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -521,7 +521,14 @@ def loop(config: Config, once: bool = False) -> None:
                 return
             time.sleep(config.interval)
         except requests.RequestException as exc:
-            LOG.warning("control plane unavailable: %s; retry in %ss", exc, backoff)
+            detail = ""
+            if exc.response is not None:
+                try:
+                    detail = str(exc.response.json().get("detail", ""))
+                except (ValueError, AttributeError):
+                    detail = exc.response.text.strip()[:500]
+            suffix = f" ({detail})" if detail else ""
+            LOG.warning("control plane unavailable: %s%s; retry in %ss", exc, suffix, backoff)
             if once:
                 raise
             time.sleep(backoff)

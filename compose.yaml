@@ -2,7 +2,7 @@ name: tram-van-hanh
 
 services:
   caddy:
-    image: caddy:2.10.2-alpine
+    image: caddy:2.11.4-alpine
     restart: unless-stopped
     depends_on:
       api:
@@ -65,7 +65,7 @@ services:
     networks: [control, session, identity_egress]
 
   caddy-ca-export:
-    image: caddy:2.10.2-alpine
+    image: caddy:2.11.4-alpine
     user: "0:0"
     restart: "no"
     network_mode: none

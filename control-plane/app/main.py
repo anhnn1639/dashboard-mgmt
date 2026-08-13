@@ -640,14 +640,28 @@ def require_role(*roles: str):
 
 
 def verify_agent(request: Request, db: Session, agent_id: str) -> Server:
-    fingerprint = request.headers.get("x-agent-cert-fingerprint", "").replace(":", "").lower()
-    subject = request.headers.get("x-agent-cert-subject", "")
+    encoded_certificate = request.headers.get("x-agent-cert-der", "")
+    fingerprint = ""
+    certificate_agent_id = ""
+    if encoded_certificate:
+        try:
+            certificate = x509.load_der_x509_certificate(base64.b64decode(encoded_certificate, validate=True))
+            fingerprint = certificate.fingerprint(hashes.SHA256()).hex()
+            common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            certificate_agent_id = common_names[0].value if len(common_names) == 1 else ""
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Invalid mTLS client certificate") from None
+    else:
+        fingerprint = request.headers.get("x-agent-cert-fingerprint", "").replace(":", "").lower()
     if not fingerprint:
         raise HTTPException(status_code=401, detail="mTLS client certificate required")
     server = db.get(Server, agent_id)
     if not server or not server.cert_fingerprint or not hmac.compare_digest(server.cert_fingerprint, fingerprint):
         raise HTTPException(status_code=401, detail="Unknown agent certificate")
-    if f"CN={agent_id}" not in subject and f"CN = {agent_id}" not in subject:
+    if encoded_certificate and certificate_agent_id != agent_id:
+        raise HTTPException(status_code=401, detail="Certificate subject mismatch")
+    subject = request.headers.get("x-agent-cert-subject", "")
+    if not encoded_certificate and f"CN={agent_id}" not in subject and f"CN = {agent_id}" not in subject:
         raise HTTPException(status_code=401, detail="Certificate subject mismatch")
     return server
 
@@ -944,8 +958,7 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     except OSError as exc:
         raise HTTPException(status_code=503, detail="Caddy server CA is unavailable; restart Caddy and retry enrollment") from exc
     server = db.get(Server, payload.agent_id)
-    if server and server.cert_fingerprint:
-        raise HTTPException(status_code=409, detail="Agent is already enrolled")
+    replacing_certificate = bool(server and server.cert_fingerprint)
     remote_protocol = "rdp" if family == "windows" else "ssh"
     server = server or Server(id=payload.agent_id, name=payload.inventory.hostname, os_family=family, os_name=payload.inventory.os_name)
     server.name = payload.inventory.hostname
@@ -966,7 +979,7 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     server.verified_os = verification == "verified"
     db.add(server)
     record.uses += 1
-    audit(db, f"agent:{payload.agent_id}", "agent.enroll", payload.agent_id, request, detail={"os_family": family, "distribution": payload.inventory.distribution_id, "verified": server.verified_os})
+    audit(db, f"agent:{payload.agent_id}", "agent.certificate.rotate" if replacing_certificate else "agent.enroll", payload.agent_id, request, detail={"os_family": family, "distribution": payload.inventory.distribution_id, "verified": server.verified_os})
     db.commit()
     canonical = db.get(SystemSetting, "dashboard_url")
     dashboard_host = urlsplit(canonical.value).hostname if canonical else request.url.hostname

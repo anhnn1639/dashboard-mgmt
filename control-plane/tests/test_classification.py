@@ -1,10 +1,13 @@
+import base64
 import os
 import tempfile
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
+import pyotp
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -25,6 +28,7 @@ ca_cert_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
 ca_key_path.write_bytes(ca_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
 os.environ["AGENT_CA_CERT"] = str(ca_cert_path)
 os.environ["AGENT_CA_KEY"] = str(ca_key_path)
+os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 
 from app.main import Inventory, classify_os  # noqa: E402
 from app.main import app, engine  # noqa: E402
@@ -32,9 +36,26 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 
 class ClassificationTests(unittest.TestCase):
+    access_token = ""
+
     @classmethod
     def tearDownClass(cls):
         engine.dispose()
+
+    @classmethod
+    def login_admin(cls, client: TestClient) -> str:
+        if cls.access_token:
+            return cls.access_token
+        login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-only-password-123456"})
+        if login.status_code != 200:
+            raise AssertionError(login.text)
+        data = login.json()
+        secret = parse_qs(urlsplit(data["provisioning_uri"]).query)["secret"][0]
+        verified = client.post("/api/v1/auth/mfa/verify", json={"challenge_token": data["challenge_token"], "code": pyotp.TOTP(secret).now()})
+        if verified.status_code != 200:
+            raise AssertionError(verified.text)
+        cls.access_token = verified.json()["access_token"]
+        return cls.access_token
 
     def test_windows_is_classified_as_windows(self):
         family, verification = classify_os(Inventory(hostname="win-01", os_family="windows", os_name="Microsoft Windows Server 2025", distribution_id="windows"))
@@ -57,17 +78,14 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(setup.status_code, 200)
             self.assertTrue(setup.json()["setupRequired"])
             self.assertTrue(setup.json()["databaseConnected"])
-            login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-only-password-123456"})
-            self.assertEqual(login.status_code, 200)
-            token = login.json()["access_token"]
+            token = self.login_admin(client)
             fleet = client.get("/api/v1/servers", headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(fleet.status_code, 200)
             self.assertIsInstance(fleet.json()["items"], list)
 
     def test_windows_enrollment_is_automatically_categorized(self):
         with TestClient(app) as client:
-            login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-only-password-123456"})
-            headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
             token_response = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "windows-test", "expected_os_family": "windows"})
             self.assertEqual(token_response.status_code, 201)
 
@@ -80,8 +98,21 @@ class ClassificationTests(unittest.TestCase):
 
             issued = x509.load_pem_x509_certificate(enroll.json()["certificate"].encode())
             fingerprint = issued.fingerprint(hashes.SHA256()).hex()
-            checkin = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Fingerprint": fingerprint, "X-Agent-Cert-Subject": f"CN={agent_id}"}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            certificate_der = base64.b64encode(issued.public_bytes(serialization.Encoding.DER)).decode()
+            checkin = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": certificate_der, "X-Agent-Cert-Fingerprint": fingerprint, "X-Agent-Cert-Subject": f"CN={agent_id}"}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
             self.assertEqual(checkin.status_code, 200, checkin.text)
+
+            rotation_token = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "windows-rotation", "expected_os_family": "windows"})
+            replacement_key = ec.generate_private_key(ec.SECP256R1())
+            replacement_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id)])).sign(replacement_key, hashes.SHA256())
+            replacement = client.post("/api/v1/enroll", json={"token": rotation_token.json()["token"], "agent_id": agent_id, "csr_pem": replacement_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-2025-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025 Datacenter", "os_version": "26100", "distribution_id": "windows", "architecture": "AMD64", "agent_version": "0.1.0", "addresses": ["10.30.1.50"]}})
+            self.assertEqual(replacement.status_code, 201, replacement.text)
+            replacement_certificate = x509.load_pem_x509_certificate(replacement.json()["certificate"].encode())
+            replacement_der = base64.b64encode(replacement_certificate.public_bytes(serialization.Encoding.DER)).decode()
+            rejected_old_certificate = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": certificate_der}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            self.assertEqual(rejected_old_certificate.status_code, 401)
+            replacement_checkin = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": replacement_der}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            self.assertEqual(replacement_checkin.status_code, 200, replacement_checkin.text)
 
             windows = client.get("/api/v1/servers?os_family=windows", headers=headers)
             self.assertTrue(any(item["id"] == agent_id and item["osFamily"] == "windows" for item in windows.json()["items"]))
