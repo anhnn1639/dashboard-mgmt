@@ -15,7 +15,7 @@ test("server-renders the secure operations console shell", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
   assert.match(html, /<title>Trạm Vận Hành<\/title>/i);
-  assert.match(html, /Đang khởi tạo phiên bảo mật/);
+  assert.match(html, /Đang kiểm tra cấu hình hệ thống/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -27,4 +27,7 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(source, /\/api\/v1\/servers/);
   assert.match(source, /Phiên truy cập/);
   assert.match(source, /Nhật ký kiểm toán/);
+  assert.match(source, /\/api\/v1\/setup\/status/);
+  assert.match(source, /Kết nối PostgreSQL/);
+  assert.match(source, /Admin local đầu tiên/);
 });

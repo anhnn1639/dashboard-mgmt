@@ -7,11 +7,12 @@ import json
 import os
 import re
 import secrets
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import jwt
 from argon2 import PasswordHasher
@@ -25,14 +26,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, select, text
+from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-    database_url: str = "sqlite:///./tram-ops.db"
-    jwt_secret: str = "change-me"
+    database_url: str = ""
+    jwt_secret: str = ""
     jwt_issuer: str = "tram-van-hanh"
     jwt_ttl_minutes: int = 480
     bootstrap_admin_user: str = "admin"
@@ -45,12 +47,32 @@ class Settings(BaseSettings):
     job_secret_key: str = ""
     allowed_origins: str = ""
     recording_root: str = "/recordings"
+    bootstrap_config_path: str = "/var/lib/tram-ops/bootstrap.json"
+    setup_token: str = ""
+    dashboard_url: str = ""
 
 
 settings = Settings()
+bootstrap_path = Path(settings.bootstrap_config_path)
+
+
+def read_bootstrap_config() -> dict[str, str]:
+    try:
+        raw = json.loads(bootstrap_path.read_text(encoding="utf-8"))
+        return {str(key): str(value) for key, value in raw.items() if value is not None}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+bootstrap_config = read_bootstrap_config()
+settings.database_url = settings.database_url or bootstrap_config.get("database_url", "")
+settings.jwt_secret = settings.jwt_secret or bootstrap_config.get("jwt_secret", "")
+settings.job_secret_key = settings.job_secret_key or bootstrap_config.get("job_secret_key", "")
 password_hasher = PasswordHasher()
-engine = create_engine(settings.database_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+engine: Engine | None = create_engine(settings.database_url, pool_pre_ping=True) if settings.database_url else None
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False) if engine else None
+database_lock = threading.RLock()
+database_error = ""
 
 
 class Base(DeclarativeBase):
@@ -147,6 +169,26 @@ class AuditEvent(Base):
     event_hash: Mapped[str] = mapped_column(String(64), unique=True)
 
 
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+class RemoteSession(Base):
+    __tablename__ = "remote_sessions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
+    protocol: Mapped[str] = mapped_column(String(10))
+    remote_username: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="launched", index=True)
+    recording_name: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -225,6 +267,37 @@ class SessionLaunchRequest(BaseModel):
     height: int = Field(default=900, ge=600, le=4320)
 
 
+class DatabaseSetupRequest(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=5432, ge=1, le=65535)
+    database: str = Field(min_length=1, max_length=63, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+    sslmode: Literal["disable", "prefer", "require", "verify-ca", "verify-full"] = "prefer"
+
+
+class InitialAdminRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    display_name: str = Field(default="Administrator", min_length=1, max_length=160)
+    password: str = Field(min_length=14, max_length=1024)
+
+
+class SetupCompleteRequest(BaseModel):
+    database: DatabaseSetupRequest
+    admin: InitialAdminRequest
+    dashboard_url: str = Field(min_length=8, max_length=2048)
+    setup_token: str = Field(default="", max_length=512)
+
+    @field_validator("dashboard_url")
+    @classmethod
+    def valid_dashboard_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Dashboard URL must be an absolute HTTP(S) URL")
+        return normalized
+
+
 SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "inventory.collect": {"roles": {"admin", "operator"}, "risk": "low", "approval": False},
     "service.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
@@ -250,8 +323,93 @@ if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
+def build_database_url(payload: DatabaseSetupRequest) -> str:
+    return URL.create(
+        drivername="postgresql+psycopg",
+        username=payload.username,
+        password=payload.password,
+        host=payload.host,
+        port=payload.port,
+        database=payload.database,
+        query={"sslmode": payload.sslmode},
+    ).render_as_string(hide_password=False)
+
+
+def save_bootstrap_config(database_url: str, jwt_secret: str, job_secret_key: str) -> None:
+    bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = bootstrap_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"database_url": database_url, "jwt_secret": jwt_secret, "job_secret_key": job_secret_key}, indent=2), encoding="utf-8")
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    temporary.replace(bootstrap_path)
+
+
+def activate_database(database_url: str, *, initialize_schema: bool = True) -> Engine:
+    global engine, SessionLocal, database_error
+    candidate = engine if engine is not None and database_url == settings.database_url else create_engine(database_url, pool_pre_ping=True)
+    try:
+        with candidate.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        if initialize_schema:
+            Base.metadata.create_all(candidate)
+    except Exception as exc:
+        if candidate is not engine:
+            candidate.dispose()
+        database_error = type(exc).__name__
+        raise
+    with database_lock:
+        previous = engine
+        engine = candidate
+        SessionLocal = sessionmaker(bind=candidate, expire_on_commit=False)
+        settings.database_url = database_url
+        database_error = ""
+        if previous is not None and previous is not candidate:
+            previous.dispose()
+    return candidate
+
+
+def database_state() -> dict[str, Any]:
+    configured = bool(settings.database_url)
+    connected = False
+    schema_ready = False
+    admin_exists = False
+    dashboard_url = ""
+    factory = SessionLocal
+    if configured and engine is not None and factory is not None:
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            with factory() as db:
+                schema_ready = inspect(engine).has_table("users") and inspect(engine).has_table("system_settings")
+                if schema_ready:
+                    admin_exists = db.execute(select(User).where(User.role == "admin", User.enabled.is_(True)).limit(1)).scalar_one_or_none() is not None
+                    setting = db.get(SystemSetting, "dashboard_url")
+                    dashboard_url = setting.value if setting else ""
+            connected = True
+        except Exception:
+            connected = False
+    secrets_ready = bool(settings.jwt_secret and settings.job_secret_key)
+    required = not (connected and schema_ready and admin_exists and dashboard_url and secrets_ready)
+    return {
+        "setupRequired": required,
+        "databaseConfigured": configured,
+        "databaseConnected": connected,
+        "schemaReady": schema_ready,
+        "adminExists": admin_exists,
+        "secretsReady": secrets_ready,
+        "dashboardUrl": dashboard_url,
+        "setupTokenRequired": bool(settings.setup_token),
+        "status": "ready" if not required else "setup_required",
+    }
+
+
 def db_session():
-    session = SessionLocal()
+    factory = SessionLocal
+    if factory is None:
+        raise HTTPException(status_code=503, detail="Database setup is required")
+    session = factory()
     try:
         yield session
     finally:
@@ -411,20 +569,89 @@ def encrypt_guacamole_json(payload: dict[str, Any]) -> str:
 
 @app.on_event("startup")
 def startup() -> None:
-    job_fernet()
-    Base.metadata.create_all(engine)
-    with SessionLocal() as db:
-        exists = db.execute(select(User).limit(1)).scalar_one_or_none()
-        if not exists:
-            if not settings.bootstrap_admin_password or len(settings.bootstrap_admin_password) < 14:
-                raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 14 characters on first start")
-            db.add(User(username=settings.bootstrap_admin_user, display_name="Platform Administrator", password_hash=password_hasher.hash(settings.bootstrap_admin_password), role="admin"))
+    if not settings.database_url:
+        return
+    try:
+        activate_database(settings.database_url)
+        factory = SessionLocal
+        if factory is None:
+            return
+        with factory() as db:
+            exists = db.execute(select(User).limit(1)).scalar_one_or_none()
+            if not exists and settings.bootstrap_admin_password:
+                if len(settings.bootstrap_admin_password) < 14:
+                    raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 14 characters")
+                db.add(User(username=settings.bootstrap_admin_user, display_name="Platform Administrator", password_hash=password_hasher.hash(settings.bootstrap_admin_password), role="admin"))
+            if settings.dashboard_url:
+                db.merge(SystemSetting(key="dashboard_url", value=settings.dashboard_url.strip().rstrip("/")))
             db.commit()
+    except Exception:
+        # The API remains available in setup mode so an operator can repair the
+        # connection from the first-run wizard.
+        return
 
 
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    state = database_state()
+    return {"status": "ok" if not state["setupRequired"] else "setup_required"}
+
+
+@app.get("/api/v1/setup/status")
+def setup_status() -> dict[str, Any]:
+    return database_state()
+
+
+@app.post("/api/v1/setup/complete", status_code=201)
+def complete_setup(payload: SetupCompleteRequest, request: Request):
+    current = database_state()
+    if not current["setupRequired"]:
+        raise HTTPException(status_code=409, detail="System setup has already been completed")
+    if settings.setup_token and not hmac.compare_digest(payload.setup_token, settings.setup_token):
+        raise HTTPException(status_code=403, detail="Setup token is invalid")
+
+    database_url = build_database_url(payload.database)
+    jwt_secret = settings.jwt_secret or secrets.token_hex(64)
+    job_secret_key = settings.job_secret_key or Fernet.generate_key().decode()
+    try:
+        candidate = create_engine(database_url, pool_pre_ping=True)
+        with candidate.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        Base.metadata.create_all(candidate)
+        candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
+        with candidate_factory() as db:
+            admin = db.execute(select(User).where(User.role == "admin", User.enabled.is_(True)).limit(1)).scalar_one_or_none()
+            if admin is None:
+                duplicate = db.execute(select(User).where(User.username == payload.admin.username)).scalar_one_or_none()
+                if duplicate:
+                    duplicate.role = "admin"
+                    duplicate.enabled = True
+                    duplicate.display_name = payload.admin.display_name
+                    duplicate.password_hash = password_hasher.hash(payload.admin.password)
+                    admin = duplicate
+                else:
+                    admin = User(username=payload.admin.username, display_name=payload.admin.display_name, password_hash=password_hasher.hash(payload.admin.password), role="admin")
+                    db.add(admin)
+            db.merge(SystemSetting(key="dashboard_url", value=payload.dashboard_url))
+            audit(db, payload.admin.username, "system.setup.complete", "control-plane", request, detail={"dashboard_url": payload.dashboard_url})
+            db.commit()
+        save_bootstrap_config(database_url, jwt_secret, job_secret_key)
+        settings.jwt_secret = jwt_secret
+        settings.job_secret_key = job_secret_key
+        with database_lock:
+            global engine, SessionLocal, database_error
+            previous = engine
+            engine = candidate
+            SessionLocal = candidate_factory
+            settings.database_url = database_url
+            database_error = ""
+            if previous is not None and previous is not candidate:
+                previous.dispose()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Không thể kết nối hoặc khởi tạo PostgreSQL. Hãy kiểm tra máy chủ, database, tài khoản và chế độ SSL.") from exc
+    return {"status": "ready", "dashboardUrl": payload.dashboard_url, "adminUsername": payload.admin.username}
 
 
 @app.post("/api/v1/auth/login")
@@ -448,6 +675,12 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(db_sess
 @app.get("/api/v1/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role}
+
+
+@app.get("/api/v1/users")
+def list_users(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    users = db.execute(select(User).order_by(User.username)).scalars().all()
+    return {"items": [{"id": item.id, "username": item.username, "displayName": item.display_name, "role": item.role, "enabled": item.enabled, "createdAt": aware(item.created_at).isoformat()} for item in users]}
 
 
 @app.get("/api/v1/servers")
@@ -514,7 +747,9 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     record.uses += 1
     audit(db, f"agent:{payload.agent_id}", "agent.enroll", payload.agent_id, request, detail={"os_family": family, "distribution": payload.inventory.distribution_id, "verified": server.verified_os})
     db.commit()
-    return {"agent_id": payload.agent_id, "certificate": cert_pem, "ca_certificate": Path(settings.agent_ca_cert).read_text(), "expires_at": cert_expires.isoformat(), "os_family": family, "category": "Windows" if family == "windows" else "Linux", "agent_endpoint": "https://" + request.url.hostname + ":9443/api/v1/agent"}
+    canonical = db.get(SystemSetting, "dashboard_url")
+    dashboard_host = urlsplit(canonical.value).hostname if canonical else request.url.hostname
+    return {"agent_id": payload.agent_id, "certificate": cert_pem, "ca_certificate": Path(settings.agent_ca_cert).read_text(), "expires_at": cert_expires.isoformat(), "os_family": family, "category": "Windows" if family == "windows" else "Linux", "agent_endpoint": "https://" + str(dashboard_host) + ":9443/api/v1/agent"}
 
 
 @app.post("/api/v1/agent/checkin")
@@ -619,6 +854,12 @@ def list_audit(_: User = Depends(require_role("admin", "auditor")), db: Session 
     return {"items": [{"id": item.id, "occurredAt": aware(item.occurred_at).isoformat(), "actor": item.actor, "action": item.action, "target": item.target, "result": item.result, "sourceIp": item.source_ip, "hash": item.event_hash, "previousHash": item.previous_hash} for item in events]}
 
 
+@app.get("/api/v1/sessions")
+def list_sessions(_: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+    rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
+    return {"items": [{"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None} for item, server_name in rows]}
+
+
 @app.post("/api/v1/sessions/launch")
 def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
     server = db.get(Server, payload.server_id)
@@ -638,6 +879,7 @@ def launch_session(payload: SessionLaunchRequest, request: Request, user: User =
         common.update({"security": "nla", "ignore-cert": "false", "width": str(payload.width), "height": str(payload.height), "resize-method": "display-update"})
     guac_payload = {"username": user.username, "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000), "connections": {server.name: {"protocol": payload.protocol, "parameters": common}}}
     encrypted = encrypt_guacamole_json(guac_payload)
+    db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=payload.username, created_by=user.username, status="launched", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
     audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "recording": True})
     db.commit()
     return {"sessionId": session_id, "url": f"{settings.guacamole_url}/?data={quote(encrypted)}", "expiresIn": 120, "recording": True}
