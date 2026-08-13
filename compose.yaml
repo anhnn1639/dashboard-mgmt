@@ -8,7 +8,7 @@ services:
       api:
         condition: service_healthy
       dashboard:
-        condition: service_started
+        condition: service_healthy
       guacamole:
         condition: service_started
     environment:
@@ -29,6 +29,12 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     expose: ["3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(response => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     networks: [control]
 
   api:

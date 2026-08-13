@@ -14,7 +14,6 @@ RUN pnpm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production HOSTNAME=0.0.0.0 PORT=3000
-RUN corepack enable
 COPY --from=build /app ./
 EXPOSE 3000
-CMD ["pnpm", "start", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["node", "node_modules/vinext/dist/cli.js", "start", "--host", "0.0.0.0", "--port", "3000"]
