@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.2.1"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -408,8 +408,14 @@ def enroll(config: Config, token: str) -> None:
         raise RuntimeError("server_url is required")
     key = ec.generate_private_key(ec.SECP256R1())
     csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, config.agent_id), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Tram Van Hanh Agents")])).sign(key, hashes.SHA256())
-    response = requests.post(config.server_url + "/api/v1/enroll", json={"token": token, "agent_id": config.agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": collect_inventory()}, timeout=60)
-    response.raise_for_status()
+    enrollment_payload = {"token": token, "agent_id": config.agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": collect_inventory()}
+    for attempt in range(30):
+        response = requests.post(config.server_url + "/api/v1/enroll", json=enrollment_payload, timeout=60)
+        if response.status_code != 503 or attempt == 29:
+            response.raise_for_status()
+            break
+        LOG.warning("control-plane CA is not ready; enrollment retry %s/30", attempt + 1)
+        time.sleep(2)
     data = response.json()
     config.key_file.parent.mkdir(parents=True, exist_ok=True)
     config.key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
@@ -452,13 +458,13 @@ def post_result(config: Config, job_id: str, exit_code: int, output: str) -> Non
 def loop(config: Config, once: bool = False) -> None:
     if not all(path.exists() for path in [config.cert_file, config.key_file, config.ca_file]):
         raise RuntimeError("Agent is not enrolled")
-    ensure_server_ca(config)
     last_inventory = 0.0
     inventory = collect_inventory()
     expensive_metrics_pending = False
     backoff = config.interval
     while True:
         try:
+            ensure_server_ca(config)
             timestamp = time.time()
             send_inventory = timestamp - last_inventory >= config.inventory_interval
             if send_inventory:

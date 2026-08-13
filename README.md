@@ -42,6 +42,8 @@ Windows/Linux Agent ── mTLS/9443 ── Caddy ── Control Plane API
 
 Agent chỉ cần kết nối outbound tới control plane. Không cần mở thêm cổng inbound cho agent. `guacd` không được publish ra host; chỉ container Guacamole truy cập được.
 
+Compose tự xuất public root CA của HTTPS/mTLS `9443` từ volume Caddy sang `deploy/pki/server-ca.crt`. API chỉ đọc bản public này; private key CA của Caddy không được chia sẻ sang container API. Agent sẽ tự retry nếu CA chưa sẵn sàng trong vài giây đầu sau khi recreate stack.
+
 ## Cài control plane trên Ubuntu 24.04
 
 ### 1. Chuẩn bị

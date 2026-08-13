@@ -47,7 +47,7 @@ services:
       BOOTSTRAP_CONFIG_PATH: /var/lib/tram-ops/bootstrap.json
       AGENT_CA_CERT: /run/secrets/agent-ca.crt
       AGENT_CA_KEY: /run/secrets/agent-ca.key
-      CADDY_ROOT_CA: /caddy-data/caddy/pki/authorities/local/root.crt
+      CADDY_ROOT_CA: /run/ca-src/server-ca.crt
       GUACAMOLE_URL: /guacamole
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
@@ -56,7 +56,6 @@ services:
       - ./deploy/pki:/run/ca-src:ro
       - ${RECORDING_DIR:-./recordings}:/recordings:ro
       - api_config:/var/lib/tram-ops
-      - caddy_data:/caddy-data:ro
     expose: ["8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
@@ -64,6 +63,26 @@ services:
       timeout: 5s
       retries: 8
     networks: [control, session, identity_egress]
+
+  caddy-ca-export:
+    image: caddy:2.10.2-alpine
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    depends_on:
+      caddy:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -eu;
+        until [ -s /caddy-data/caddy/pki/authorities/local/root.crt ]; do sleep 1; done;
+        cp /caddy-data/caddy/pki/authorities/local/root.crt /export/server-ca.crt.tmp;
+        chmod 0644 /export/server-ca.crt.tmp;
+        mv /export/server-ca.crt.tmp /export/server-ca.crt
+    volumes:
+      - caddy_data:/caddy-data:ro
+      - ./deploy/pki:/export
 
   recording-init:
     image: alpine:3.22
