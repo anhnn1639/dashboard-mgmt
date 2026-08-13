@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.2.1"
+AGENT_VERSION = "0.2.2"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -105,12 +105,41 @@ def parse_os_release() -> dict[str, str]:
 
 def network_addresses() -> list[str]:
     result: list[str] = []
-    for addresses in psutil.net_if_addrs().values():
-        for address in addresses:
-            if address.family in {socket.AF_INET, socket.AF_INET6}:
-                value = address.address.split("%")[0]
-                if value not in result:
-                    result.append(value)
+
+    def add(value: str) -> None:
+        normalized = value.split("%")[0].strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+
+    try:
+        for addresses in psutil.net_if_addrs().values():
+            for address in addresses:
+                if address.family in {socket.AF_INET, socket.AF_INET6}:
+                    add(address.address)
+    except OSError as exc:
+        LOG.warning("psutil cannot enumerate network interfaces: %s", exc)
+
+    if not result and platform.system().lower() == "linux":
+        ip_tool = next((path for path in ("/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip") if Path(path).exists()), "")
+        if ip_tool:
+            code, output = run([ip_tool, "-json", "address", "show"])
+            if code == 0:
+                try:
+                    for interface in json.loads(output):
+                        for address in interface.get("addr_info", []):
+                            if address.get("family") in {"inet", "inet6"}:
+                                add(str(address.get("local", "")))
+                except (TypeError, ValueError):
+                    LOG.warning("ip command returned invalid JSON")
+
+    if not result:
+        hostname = socket.gethostname()
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                for info in socket.getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM):
+                    add(str(info[4][0]))
+            except OSError:
+                continue
     return result
 
 
