@@ -68,7 +68,7 @@ chmod 600 .env deploy/pki/agent-ca.key
 Sửa `.env` và sinh secret ngẫu nhiên:
 
 ```bash
-openssl rand -base64 32     # POSTGRES_PASSWORD
+openssl rand -hex 32        # POSTGRES_PASSWORD
 openssl rand -hex 32        # SETUP_TOKEN
 openssl rand -hex 16        # GUACAMOLE_JSON_SECRET: đúng 32 ký tự hex
 ```

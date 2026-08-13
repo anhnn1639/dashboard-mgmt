@@ -42,7 +42,7 @@ git switch main
 
 ```bash
 cp .env.example .env
-POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d '\n')
+POSTGRES_PASSWORD=$(openssl rand -hex 32)
 SETUP_TOKEN=$(openssl rand -hex 32)
 GUACAMOLE_JSON_SECRET=$(openssl rand -hex 16)
 sed -i "s|^OPS_DOMAIN=.*|OPS_DOMAIN=ops.example.com|" .env
