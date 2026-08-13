@@ -20,7 +20,7 @@ services:
       - "9443:9443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./deploy/pki/agent-ca.crt:/etc/caddy/pki/agent-ca.crt:ro
+      - ./deploy/pki:/etc/caddy/pki:ro
       - caddy_data:/data
       - caddy_config:/config
     networks: [edge, control]
@@ -48,8 +48,7 @@ services:
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
       RECORDING_ROOT: /recordings
     volumes:
-      - ./deploy/pki/agent-ca.crt:/run/ca-src/agent-ca.crt:ro
-      - ./deploy/pki/agent-ca.key:/run/ca-src/agent-ca.key:ro
+      - ./deploy/pki:/run/ca-src:ro
       - recordings:/recordings:ro
       - api_config:/var/lib/tram-ops
     expose: ["8000"]

@@ -6,8 +6,26 @@ pki_dir="$script_dir/pki"
 umask 077
 mkdir -p "$pki_dir"
 
+for pki_file in agent-ca.key agent-ca.crt; do
+  pki_path="$pki_dir/$pki_file"
+  if [[ -d "$pki_path" ]]; then
+    if rmdir "$pki_path" 2>/dev/null; then
+      echo "Removed empty Docker placeholder directory: $pki_path"
+    else
+      echo "Invalid PKI path: $pki_path is a non-empty directory." >&2
+      echo "Move or remove that directory manually, then run this script again." >&2
+      exit 1
+    fi
+  fi
+done
+
 if [[ -e "$pki_dir/agent-ca.key" ]]; then
   echo "PKI already exists at $pki_dir; refusing to overwrite." >&2
+  exit 1
+fi
+
+if [[ -e "$pki_dir/agent-ca.crt" ]]; then
+  echo "PKI certificate already exists without its key at $pki_dir; refusing to overwrite." >&2
   exit 1
 fi
 
