@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import hashlib
 import ipaddress
 import json
 import logging
@@ -16,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import psutil
 import requests
@@ -24,7 +26,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.2.3"
+AGENT_VERSION = "0.2.4"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -67,6 +69,24 @@ class Config:
 
     def tls_verify(self) -> bool | str:
         return str(self.server_ca_file) if self.server_ca_file else True
+
+
+def signed_request(config: Config, method: str, url: str, payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    timestamp = str(int(time.time()))
+    path = urlsplit(url).path
+    message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
+    certificate = x509.load_pem_x509_certificate(config.cert_file.read_bytes())
+    private_key = serialization.load_pem_private_key(config.key_file.read_bytes(), password=None)
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise RuntimeError("Agent private key must be an EC key")
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    return body, {
+        "Content-Type": "application/json",
+        "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
+        "X-Tram-Agent-Timestamp": timestamp,
+        "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
+    }
 
 
 def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False) -> tuple[int, str]:
@@ -480,7 +500,9 @@ def ensure_server_ca(config: Config) -> None:
 
 
 def post_result(config: Config, job_id: str, exit_code: int, output: str) -> None:
-    response = requests.post(f"{config.agent_endpoint}/jobs/{job_id}/result", json={"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output}, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
+    url = f"{config.agent_endpoint}/jobs/{job_id}/result"
+    body, headers = signed_request(config, "POST", url, {"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output})
+    response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
     response.raise_for_status()
 
 
@@ -500,7 +522,9 @@ def loop(config: Config, once: bool = False) -> None:
                 inventory = collect_inventory()
             include_expensive = expensive_metrics_pending and not send_inventory
             payload = {"agent_id": config.agent_id, "agent_version": AGENT_VERSION, "inventory": inventory if send_inventory else None, "metrics": collect_metrics(inventory, include_expensive=include_expensive)}
-            response = requests.post(config.agent_endpoint + "/checkin", json=payload, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
+            url = config.agent_endpoint + "/checkin"
+            body, headers = signed_request(config, "POST", url, payload)
+            response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
             response.raise_for_status()
             data = response.json()
             if send_inventory:

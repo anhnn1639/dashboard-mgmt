@@ -1,6 +1,9 @@
 import base64
+import hashlib
+import json
 import os
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -33,6 +36,19 @@ os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 from app.main import Inventory, classify_os  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+
+def signed_agent_request(private_key: ec.EllipticCurvePrivateKey, certificate: x509.Certificate, path: str, payload: dict) -> tuple[bytes, dict[str, str]]:
+    timestamp = str(int(time.time()))
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    message = f"{timestamp}\nPOST\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    return body, {
+        "Content-Type": "application/json",
+        "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
+        "X-Tram-Agent-Timestamp": timestamp,
+        "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
+    }
 
 
 class ClassificationTests(unittest.TestCase):
@@ -97,9 +113,9 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(enroll.json()["category"], "Windows")
 
             issued = x509.load_pem_x509_certificate(enroll.json()["certificate"].encode())
-            fingerprint = issued.fingerprint(hashes.SHA256()).hex()
-            certificate_der = base64.b64encode(issued.public_bytes(serialization.Encoding.DER)).decode()
-            checkin = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": certificate_der, "X-Agent-Cert-Fingerprint": fingerprint, "X-Agent-Cert-Subject": f"CN={agent_id}"}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            checkin_payload = {"agent_id": agent_id, "agent_version": "0.1.0", "inventory": None, "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}}
+            checkin_body, checkin_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
+            checkin = client.post("/api/v1/agent/checkin", headers=checkin_headers, content=checkin_body)
             self.assertEqual(checkin.status_code, 200, checkin.text)
 
             rotation_token = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "windows-rotation", "expected_os_family": "windows"})
@@ -108,10 +124,11 @@ class ClassificationTests(unittest.TestCase):
             replacement = client.post("/api/v1/enroll", json={"token": rotation_token.json()["token"], "agent_id": agent_id, "csr_pem": replacement_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-2025-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025 Datacenter", "os_version": "26100", "distribution_id": "windows", "architecture": "AMD64", "agent_version": "0.1.0", "addresses": ["10.30.1.50"]}})
             self.assertEqual(replacement.status_code, 201, replacement.text)
             replacement_certificate = x509.load_pem_x509_certificate(replacement.json()["certificate"].encode())
-            replacement_der = base64.b64encode(replacement_certificate.public_bytes(serialization.Encoding.DER)).decode()
-            rejected_old_certificate = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": certificate_der}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            old_body, old_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
+            rejected_old_certificate = client.post("/api/v1/agent/checkin", headers=old_headers, content=old_body)
             self.assertEqual(rejected_old_certificate.status_code, 401)
-            replacement_checkin = client.post("/api/v1/agent/checkin", headers={"X-Agent-Cert-Der": replacement_der}, json={"agent_id": agent_id, "agent_version": "0.1.0", "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}})
+            replacement_body, replacement_headers = signed_agent_request(replacement_key, replacement_certificate, "/api/v1/agent/checkin", checkin_payload)
+            replacement_checkin = client.post("/api/v1/agent/checkin", headers=replacement_headers, content=replacement_body)
             self.assertEqual(replacement_checkin.status_code, 200, replacement_checkin.text)
 
             windows = client.get("/api/v1/servers?os_family=windows", headers=headers)

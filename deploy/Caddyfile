@@ -44,12 +44,6 @@ https://{$OPS_DOMAIN}:9443 {
     handle @agent {
         reverse_proxy api:8000 {
             header_up -Authorization
-            header_up -X-Agent-Cert-Der
-            header_up -X-Agent-Cert-Fingerprint
-            header_up -X-Agent-Cert-Subject
-            header_up X-Agent-Cert-Der {tls_client_certificate_der_base64}
-            header_up X-Agent-Cert-Fingerprint {tls_client_fingerprint}
-            header_up X-Agent-Cert-Subject {tls_client_subject}
         }
     }
 

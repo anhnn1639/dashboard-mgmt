@@ -23,6 +23,7 @@ import qrcode
 import qrcode.image.svg
 from argon2 import PasswordHasher
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, padding, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -639,30 +640,30 @@ def require_role(*roles: str):
     return dependency
 
 
-def verify_agent(request: Request, db: Session, agent_id: str) -> Server:
-    encoded_certificate = request.headers.get("x-agent-cert-der", "")
-    fingerprint = ""
-    certificate_agent_id = ""
-    if encoded_certificate:
-        try:
-            certificate = x509.load_der_x509_certificate(base64.b64decode(encoded_certificate, validate=True))
-            fingerprint = certificate.fingerprint(hashes.SHA256()).hex()
-            common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            certificate_agent_id = common_names[0].value if len(common_names) == 1 else ""
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=401, detail="Invalid mTLS client certificate") from None
-    else:
-        fingerprint = request.headers.get("x-agent-cert-fingerprint", "").replace(":", "").lower()
-    if not fingerprint:
-        raise HTTPException(status_code=401, detail="mTLS client certificate required")
+def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> Server:
+    try:
+        certificate = x509.load_der_x509_certificate(base64.b64decode(request.headers.get("x-tram-agent-certificate", ""), validate=True))
+        timestamp = int(request.headers.get("x-tram-agent-timestamp", ""))
+        signature = base64.b64decode(request.headers.get("x-tram-agent-signature", ""), validate=True)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Signed agent identity is required") from None
+    if abs(int(now().timestamp()) - timestamp) > 300:
+        raise HTTPException(status_code=401, detail="Agent request timestamp is outside the allowed window")
+    fingerprint = certificate.fingerprint(hashes.SHA256()).hex()
     server = db.get(Server, agent_id)
     if not server or not server.cert_fingerprint or not hmac.compare_digest(server.cert_fingerprint, fingerprint):
         raise HTTPException(status_code=401, detail="Unknown agent certificate")
-    if encoded_certificate and certificate_agent_id != agent_id:
+    common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if len(common_names) != 1 or common_names[0].value != agent_id:
         raise HTTPException(status_code=401, detail="Certificate subject mismatch")
-    subject = request.headers.get("x-agent-cert-subject", "")
-    if not encoded_certificate and f"CN={agent_id}" not in subject and f"CN = {agent_id}" not in subject:
-        raise HTTPException(status_code=401, detail="Certificate subject mismatch")
+    message = f"{timestamp}\n{request.method.upper()}\n{request.url.path}\n{hashlib.sha256(body).hexdigest()}".encode()
+    public_key = certificate.public_key()
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise HTTPException(status_code=401, detail="Unsupported agent certificate key")
+    try:
+        public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise HTTPException(status_code=401, detail="Invalid agent request signature") from None
     return server
 
 
@@ -995,8 +996,8 @@ def agent_server_ca():
 
 
 @app.post("/api/v1/agent/checkin")
-def agent_checkin(payload: CheckinRequest, request: Request, db: Session = Depends(db_session)):
-    server = verify_agent(request, db, payload.agent_id)
+async def agent_checkin(payload: CheckinRequest, request: Request, db: Session = Depends(db_session)):
+    server = verify_agent(request, db, payload.agent_id, await request.body())
     if payload.inventory:
         family, verification = classify_os(payload.inventory)
         if family != server.os_family:
@@ -1034,11 +1035,11 @@ def agent_checkin(payload: CheckinRequest, request: Request, db: Session = Depen
 
 
 @app.post("/api/v1/agent/jobs/{job_id}/result")
-def agent_job_result(job_id: str, payload: JobResultRequest, request: Request, db: Session = Depends(db_session)):
+async def agent_job_result(job_id: str, payload: JobResultRequest, request: Request, db: Session = Depends(db_session)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    server = verify_agent(request, db, job.server_id)
+    server = verify_agent(request, db, job.server_id, await request.body())
     job.status = payload.status
     job.exit_code = payload.exit_code
     job.output = payload.output
