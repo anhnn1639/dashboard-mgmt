@@ -100,6 +100,25 @@ psutil cannot enumerate network interfaces: [Errno 97] Address family not suppor
 
 Đây không còn là lỗi làm agent dừng. Agent `0.2.2+` tự chuyển sang `/usr/sbin/ip`, sau đó vẫn thu thập inventory. Có thể giảm mức log sau khi hệ thống hoạt động ổn, nhưng không bỏ fallback.
 
+## Phân tích lỗi SSH Guacamole ngày 14/08/2026
+
+Ảnh lỗi `An internal error has occurred within the Guacamole server` xác nhận token JSON đã mở được Guacamole nhưng phiên bị ngắt trong giai đoạn `guacd` thiết lập SSH. Mã nguồn có một lỗi định dạng cụ thể: agent đọc file host public key thành `KEY_TYPE KEY`, trong khi tham số `host-key` của Guacamole yêu cầu một dòng OpenSSH `known_hosts` đầy đủ dạng `HOST KEY_TYPE KEY`.
+
+API đã được sửa để:
+
+- chuẩn hóa host key theo đúng địa chỉ quản trị mà `guacd` kết nối;
+- kiểm tra allowlist loại key và Base64 trước khi tạo token Guacamole;
+- trả lỗi rõ ràng từ API nếu inventory chứa key hỏng, thay vì chuyển cấu hình sai xuống `guacd`.
+
+Sau khi deploy lại `api`, cần retest SSH. Nếu vẫn lỗi, thu thập đồng thời:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml logs --since=5m guacamole guacd api
+docker compose -f compose.yaml -f compose.test.yaml exec guacd sh -lc 'nc -vz DIA_CHI_MAY_UBUNTU 22'
+```
+
+Không đưa mật khẩu SSH, `.env`, private key hoặc token Guacamole vào log/chat.
+
 ## Kiểm thử đã chạy
 
 Tại commit `96c680e`, bộ test control plane đạt `5/5`:

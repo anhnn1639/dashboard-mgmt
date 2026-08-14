@@ -15,6 +15,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from fastapi import HTTPException
 
 tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
@@ -33,7 +34,7 @@ os.environ["AGENT_CA_CERT"] = str(ca_cert_path)
 os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 
-from app.main import Inventory, classify_os  # noqa: E402
+from app.main import Inventory, classify_os, guacamole_ssh_host_key  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -84,6 +85,21 @@ class ClassificationTests(unittest.TestCase):
     def test_oracle_linux_is_classified_as_linux(self):
         family, verification = classify_os(Inventory(hostname="ol-01", os_family="linux", os_name="Oracle Linux Server 8.10", distribution_id="ol"))
         self.assertEqual((family, verification), ("linux", "verified"))
+
+    def test_guacamole_host_key_is_a_known_hosts_entry(self):
+        encoded_key = base64.b64encode(b"test-ed25519-host-key-material").decode()
+        self.assertEqual(
+            guacamole_ssh_host_key("10.20.1.11", f"ssh-ed25519 {encoded_key}"),
+            f"10.20.1.11 ssh-ed25519 {encoded_key}",
+        )
+        self.assertEqual(
+            guacamole_ssh_host_key("10.20.1.12", f"old-host ssh-ed25519 {encoded_key} comment"),
+            f"10.20.1.12 ssh-ed25519 {encoded_key}",
+        )
+
+    def test_guacamole_rejects_invalid_host_key(self):
+        with self.assertRaisesRegex(HTTPException, "SSH host key"):
+            guacamole_ssh_host_key("10.20.1.11", "ssh-ed25519 not-base64!!!")
 
     def test_login_and_empty_fleet(self):
         with TestClient(app) as client:
