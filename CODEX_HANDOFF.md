@@ -5,6 +5,7 @@
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
+- Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`.
 - Agent mới nhất: `0.4.1`.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
@@ -27,8 +28,8 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `13,582,336` bytes.
-- SHA-256: `AF75F260FB3CB714193D2D8E7F3AC286F525893E4F0584520FF6BED3BFF1DC20`.
-- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31772798824`.
+- SHA-256: `080BF23ADEA876F1801916350D50E8A001097BDC8C1D6895301EABDB7F6B40DC`.
+- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31779167705`.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -128,6 +129,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 - Control plane `14/14`, gồm configured domain, bundle generation, CA pin, OS binding và replay rejection.
 - Agent security `7/7`, gồm parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
+- `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Python `py_compile` pass.
