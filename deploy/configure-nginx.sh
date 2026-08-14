@@ -19,7 +19,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 env_file=$repository_root/.env
 template=$script_dir/nginx-dashboard.conf.example
-caddy_ca=$repository_root/deploy/pki/server-ca.crt
+caddy_ca=$repository_root/deploy/pki/public/server-ca.crt
 
 printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$' || {
   echo "Invalid DNS domain: $domain" >&2

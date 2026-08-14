@@ -7,6 +7,7 @@
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
 - Agent mới nhất: `0.4.1`.
+- Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -50,7 +51,8 @@
 - Nginx host giữ public `80/tcp` (redirect) và `443/tcp` (dashboard/API/Guacamole/enrollment/bootstrap claim).
 - Compose map Caddy HTTPS `443` thành `127.0.0.1:${WEB_BIND_PORT:-3000}`; không publish port Caddy `80/443` trực tiếp.
 - `9443/tcp`: agent mTLS check-in/job/tunnel/file.
-- Nginx reverse proxy tới `https://127.0.0.1:3000`, bật SNI và xác minh bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+- Nginx reverse proxy tới `https://127.0.0.1:3000`, bật SNI và xác minh bằng `deploy/pki/public/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+- `caddy-ca-export` không có network, liên tục chép public root Caddy sang named volume `agent_server_ca` cho API và `deploy/pki/public/server-ca.crt` cho Nginx. API chỉ mount named volume read-only; exporter chỉ mount thư mục public output nên cả hai đều không thấy `caddy_data` private key hoặc `deploy/pki/agent-ca.key`.
 - `.env` luôn bị Git ignore vì chứa secret. `deploy/configure-nginx.sh` backup và upsert ba biến không bí mật `OPS_DOMAIN`, `WEB_BIND_PORT=3000`, `WEB_TLS_TRUST=system`, đồng thời render Nginx từ template được track; không push/ghi đè secret.
 - Không public `3310`, `4822`, `5432` hoặc relay tạm.
 - Agent chỉ cần outbound `443` khi bootstrap và `9443` khi vận hành; không cần inbound agent.
@@ -92,6 +94,18 @@ docker compose -f compose.yaml -f compose.test.yaml ps
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api dashboard clamav guacamole guacd
 ```
 
+Máy nâng cấp từ bản cũ bị lỗi `The agent TLS CA is not available for package generation` phải recreate API và CA exporter để tạo named volume/mount mới:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api caddy-ca-export
+docker compose -f compose.yaml -f compose.test.yaml ps caddy-ca-export api
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=50 caddy-ca-export
+docker compose -f compose.yaml -f compose.test.yaml exec api \
+  python -c "from pathlib import Path; assert Path('/run/server-ca/server-ca.crt').stat().st_size > 0"
+sudo sh deploy/configure-nginx.sh DOMAIN PUBLIC_CERT PUBLIC_KEY /etc/nginx/sites-available/tram-ops
+sudo nginx -t && sudo systemctl reload nginx
+```
+
 `compose.yaml` đã đổi API build context sang repository root để copy agent source và MSI vào `/opt/tram-agent-assets`; bắt buộc rebuild container `api`, không chỉ restart.
 
 `compose.yaml` cũng không còn tranh host port `80/443` với Nginx: web Caddy bind loopback `3000`, còn `9443` vẫn public cho agent mTLS. Dùng `deploy/configure-nginx.sh` thay vì sửa tay nhiều file; certificate public của Nginx phải được endpoint tin cậy mặc định.
@@ -99,6 +113,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api da
 Kết quả mong đợi:
 
 - Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.1`, Linux available và Windows MSI available.
+- `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
 - Không public port nội bộ.
@@ -127,13 +142,15 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `14/14`, gồm configured domain, bundle generation, CA pin, OS binding và replay rejection.
+- Control plane `15/15`, gồm configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding và replay rejection.
 - Agent security `7/7`, gồm parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
+- Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
+- Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
 - GitHub Actions run cuối trên `main` là `31779341117`, pass toàn bộ; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test

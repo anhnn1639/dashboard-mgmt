@@ -2280,11 +2280,13 @@ function AgentPackagesView({ token }: { token: string }) {
     agentVersion: string;
     linuxAvailable: boolean;
     windowsMsiAvailable: boolean;
+    agentTlsCaAvailable: boolean;
     claimTtlMinutes: number;
     webTlsTrust: "internal-ca" | "system";
   } | null>(null);
   const [busy, setBusy] = useState<OSFamily | null>(null);
   const [message, setMessage] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
 
   useEffect(() => {
     fetch("/api/v1/agent-packages/status", {
@@ -2296,15 +2298,17 @@ function AgentPackagesView({ token }: { token: string }) {
         return data;
       })
       .then(setStatus)
-      .catch((reason) =>
-        setMessage(reason instanceof Error ? reason.message : "Không thể đọc cấu hình bộ cài"),
-      );
+      .catch((reason) => {
+        setMessageIsError(true);
+        setMessage(reason instanceof Error ? reason.message : "Không thể đọc cấu hình bộ cài");
+      });
   }, [token]);
 
   async function saveDashboardUrl(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     setMessage("");
+    setMessageIsError(false);
     const response = await fetch("/api/v1/settings/dashboard-url", {
       method: "PUT",
       headers: {
@@ -2318,10 +2322,12 @@ function AgentPackagesView({ token }: { token: string }) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
+      setMessageIsError(true);
       setMessage(data.detail ?? "Không thể cập nhật URL control plane");
       return;
     }
     setStatus((current) => current ? { ...current, dashboardUrl: data.dashboardUrl } : current);
+    setMessageIsError(false);
     setMessage(
       data.existingAgentsNeedMigration
         ? "Đã đổi URL. Bộ cài mới dùng domain mới; agent cũ cần kế hoạch migrate endpoint/CA."
@@ -2337,6 +2343,7 @@ function AgentPackagesView({ token }: { token: string }) {
     const form = new FormData(event.currentTarget);
     setBusy(osFamily);
     setMessage("");
+    setMessageIsError(false);
     try {
       const response = await fetch("/api/v1/agent-packages", {
         method: "POST",
@@ -2370,7 +2377,9 @@ function AgentPackagesView({ token }: { token: string }) {
           ? "Đã tạo MSI dùng một lần. Giữ nguyên tên file, chép sang đúng Windows Server và chạy bằng Administrator."
           : "Đã tạo gói Linux dùng một lần. Chạy: chmod +x <file>.run && sudo ./<file>.run",
       );
+      setMessageIsError(false);
     } catch (reason) {
+      setMessageIsError(true);
       setMessage(reason instanceof Error ? reason.message : "Không thể tạo bộ cài Agent");
     } finally {
       setBusy(null);
@@ -2441,7 +2450,7 @@ function AgentPackagesView({ token }: { token: string }) {
             className="package-option linux"
             type="submit"
             data-os="linux"
-            disabled={busy !== null || status?.linuxAvailable === false}
+            disabled={busy !== null || status?.linuxAvailable === false || status?.agentTlsCaAvailable === false}
           >
             <span>L</span>
             <b>Tải Linux .run</b>
@@ -2451,7 +2460,7 @@ function AgentPackagesView({ token }: { token: string }) {
             className="package-option windows"
             type="submit"
             data-os="windows"
-            disabled={busy !== null || status?.windowsMsiAvailable === false}
+            disabled={busy !== null || status?.windowsMsiAvailable === false || status?.agentTlsCaAvailable === false}
           >
             <span>W</span>
             <b>Tải Windows .msi</b>
@@ -2462,7 +2471,12 @@ function AgentPackagesView({ token }: { token: string }) {
         {status && !status.windowsMsiAvailable && (
           <p className="package-warning">MSI chung chưa có trong API image. Build workflow Windows rồi rebuild container API.</p>
         )}
-        {message && <p className="settings-message">{message}</p>}
+        {status && !status.agentTlsCaAvailable && (
+          <p className="package-warning">
+            CA TLS của kênh Agent chưa được đồng bộ. Kiểm tra container caddy-ca-export rồi recreate API trước khi tải bộ cài.
+          </p>
+        )}
+        {message && <p className={`settings-message${messageIsError ? " error" : ""}`}>{message}</p>}
         <div className="package-security-note">
           Không đổi tên MSI Windows: tên file chứa locator và chế độ xác minh TLS. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
         </div>

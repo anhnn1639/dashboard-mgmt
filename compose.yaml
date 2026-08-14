@@ -51,7 +51,7 @@ services:
       BOOTSTRAP_CONFIG_PATH: /var/lib/tram-ops/bootstrap.json
       AGENT_CA_CERT: /run/secrets/agent-ca.crt
       AGENT_CA_KEY: /run/secrets/agent-ca.key
-      CADDY_ROOT_CA: /run/ca-src/server-ca.crt
+      CADDY_ROOT_CA: /run/server-ca/server-ca.crt
       WEB_TLS_TRUST: ${WEB_TLS_TRUST:-system}
       GUACAMOLE_URL: /guacamole
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
@@ -66,6 +66,9 @@ services:
       FILE_TRANSFER_TTL_HOURS: 24
     volumes:
       - ./deploy/pki:/run/ca-src:ro
+      # The API receives only Caddy's exported public root. It never mounts
+      # caddy_data, which also contains the private internal-CA key.
+      - agent_server_ca:/run/server-ca:ro
       - ${RECORDING_DIR:-./recordings}:/recordings:ro
       - api_config:/var/lib/tram-ops
     expose: ["8000"]
@@ -94,7 +97,7 @@ services:
   caddy-ca-export:
     image: caddy:2.11.4-alpine
     user: "0:0"
-    restart: "no"
+    restart: unless-stopped
     network_mode: none
     depends_on:
       caddy:
@@ -104,12 +107,27 @@ services:
       - >-
         set -eu;
         until [ -s /caddy-data/caddy/pki/authorities/local/root.crt ]; do sleep 1; done;
-        cp /caddy-data/caddy/pki/authorities/local/root.crt /export/server-ca.crt.tmp;
-        chmod 0644 /export/server-ca.crt.tmp;
-        mv /export/server-ca.crt.tmp /export/server-ca.crt
+        while :; do
+          cp /caddy-data/caddy/pki/authorities/local/root.crt /api-export/server-ca.crt.tmp;
+          chmod 0644 /api-export/server-ca.crt.tmp;
+          mv /api-export/server-ca.crt.tmp /api-export/server-ca.crt;
+          cp /caddy-data/caddy/pki/authorities/local/root.crt /host-export/server-ca.crt.tmp;
+          chmod 0644 /host-export/server-ca.crt.tmp;
+          mv /host-export/server-ca.crt.tmp /host-export/server-ca.crt;
+          sleep 60;
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /api-export/server-ca.crt && test -s /host-export/server-ca.crt"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
     volumes:
       - caddy_data:/caddy-data:ro
-      - ./deploy/pki:/export
+      - agent_server_ca:/api-export
+      # Mount only the public-output subdirectory. The exporter cannot read or
+      # overwrite agent-ca.key and other private material in deploy/pki.
+      - ./deploy/pki/public:/host-export
 
   recording-init:
     image: alpine:3.22
@@ -163,5 +181,6 @@ networks:
 volumes:
   caddy_data:
   caddy_config:
+  agent_server_ca:
   api_config:
   clamav_database:

@@ -110,14 +110,28 @@ sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 cad
 Compose không còn chiếm host port `80/443`. Web Caddy chỉ được publish tại
 `127.0.0.1:3000`; agent mTLS vẫn dùng public `9443`.
 
-Chờ Caddy xuất CA dùng để Nginx xác minh upstream:
+Chờ `caddy-ca-export` đồng bộ CA công khai dùng cho cả API và Nginx xác minh upstream:
 
 ```bash
-test -s deploy/pki/server-ca.crt
-curl --cacert deploy/pki/server-ca.crt \
+sudo docker compose -f compose.yaml -f compose.test.yaml ps caddy-ca-export api
+sudo docker compose -f compose.yaml -f compose.test.yaml logs --tail=50 caddy-ca-export
+test -s deploy/pki/public/server-ca.crt
+sudo docker compose -f compose.yaml -f compose.test.yaml exec api \
+  python -c "from pathlib import Path; assert Path('/run/server-ca/server-ca.crt').stat().st_size > 0"
+curl --cacert deploy/pki/public/server-ca.crt \
   --resolve ops.example.com:3000:127.0.0.1 \
   https://ops.example.com:3000/
 ```
+
+`caddy-ca-export` không có network, chỉ đọc volume Caddy và chỉ xuất public root. Nếu
+trang **Bộ cài Agent** báo CA chưa sẵn sàng sau khi nâng cấp, recreate đúng hai service:
+
+```bash
+sudo docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api caddy-ca-export
+```
+
+Sau khi nâng cấp từ đường dẫn CA cũ, chạy lại `deploy/configure-nginx.sh` ở dưới để
+Nginx dùng `deploy/pki/public/server-ca.crt`, rồi kiểm tra `nginx -t` trước khi reload.
 
 Script sau đồng bộ ba biến runtime vào `.env` và render toàn bộ Nginx virtual host
 từ template được Git quản lý. Nó tạo bản backup của cả `.env` và Nginx config nếu
@@ -151,7 +165,7 @@ https://ops.example.com
 ```
 
 Public TLS kết thúc tại Nginx. Hop Nginx tới Caddy vẫn là HTTPS và được xác minh
-bằng `deploy/pki/server-ca.crt`; không cần import CA Caddy vào trình duyệt.
+bằng `deploy/pki/public/server-ca.crt`; không cần import CA Caddy vào trình duyệt.
 
 ## 10. Nhập kết nối PostgreSQL
 

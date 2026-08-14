@@ -50,7 +50,7 @@ Agent chỉ cần kết nối outbound tới control plane. Không cần mở c�
 
 `TunnelHub` hiện giữ trạng thái WebSocket trong bộ nhớ của tiến trình API. Vì vậy bản này phải chạy **một replica API và một Uvicorn worker**; không tăng replica/worker trước khi thay bằng tunnel broker có điều phối phân tán và session affinity.
 
-Compose tự xuất public root CA của HTTPS nội bộ và mTLS `9443` từ volume Caddy sang `deploy/pki/server-ca.crt`. Nginx dùng file này để xác minh kết nối ngược tới Caddy trên loopback `3000`; API chỉ đọc bản public, private key CA không được chia sẻ. Agent sẽ tự retry nếu CA chưa sẵn sàng trong vài giây đầu sau khi recreate stack.
+Compose liên tục đồng bộ public root CA của HTTPS nội bộ và mTLS `9443` từ volume Caddy sang hai đích: named volume `agent_server_ca` chỉ-đọc trong API và `deploy/pki/public/server-ca.crt` trên host cho Nginx. API không mount `caddy_data`; sidecar chỉ mount thư mục public output, vì vậy không bên nào đọc được private key CA nội bộ hoặc `agent-ca.key`. Trang **Bộ cài Agent** hiển thị trạng thái CA và fail-closed cho tới khi bản public hợp lệ đã sẵn sàng.
 
 ## Cài control plane trên Ubuntu 24.04
 
@@ -106,7 +106,7 @@ docker compose -f compose.yaml -f compose.external.yaml up -d
 docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
-Chạy `sudo sh deploy/configure-nginx.sh DOMAIN PUBLIC_CERT PUBLIC_KEY [NGINX_OUTPUT]` để đồng bộ `.env` và render virtual host từ `deploy/nginx-dashboard.conf.example`; sau đó rebuild Compose, kiểm tra `nginx -t` rồi reload. Nginx phải xác minh upstream Caddy bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+Chạy `sudo sh deploy/configure-nginx.sh DOMAIN PUBLIC_CERT PUBLIC_KEY [NGINX_OUTPUT]` để đồng bộ `.env` và render virtual host từ `deploy/nginx-dashboard.conf.example`; sau đó rebuild Compose, kiểm tra `nginx -t` rồi reload. Nginx phải xác minh upstream Caddy bằng `deploy/pki/public/server-ca.crt`; không dùng `proxy_ssl_verify off`.
 
 Mở `https://ops.example.com` qua Nginx. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
 
@@ -144,7 +144,7 @@ MSI trong repository là artifact generic, không chứa domain/token. Trước 
 Đăng nhập lấy access token:
 
 ```bash
-ACCESS_TOKEN=$(curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.com/api/v1/auth/login \
+ACCESS_TOKEN=$(curl -fsS https://ops.example.com/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_ADMIN_PASSWORD"}' | jq -r .access_token)
 ```
@@ -152,7 +152,7 @@ ACCESS_TOKEN=$(curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.c
 Token dùng một lần, hết hạn sau 24 giờ:
 
 ```bash
-curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.com/api/v1/enrollment-tokens \
+curl -fsS https://ops.example.com/api/v1/enrollment-tokens \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"label":"server-batch-01","expires_hours":24,"max_uses":1}'

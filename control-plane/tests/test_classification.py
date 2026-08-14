@@ -105,6 +105,45 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPException, "SSH host key"):
             guacamole_ssh_host_key("10.20.1.11", "ssh-ed25519 not-base64!!!")
 
+    def test_agent_package_generation_fails_closed_when_server_ca_is_missing(self):
+        assert SessionLocal is not None
+        previous_ca_path = settings.caddy_root_ca
+        previous_dashboard_url: str | None = None
+        had_dashboard_url = False
+        settings.caddy_root_ca = str(Path(tmp.name) / "missing-server-ca.crt")
+        try:
+            with TestClient(app) as client:
+                with SessionLocal() as db:
+                    existing = db.get(SystemSetting, "dashboard_url")
+                    had_dashboard_url = existing is not None
+                    previous_dashboard_url = existing.value if existing else None
+                    db.merge(SystemSetting(key="dashboard_url", value="https://ops.company.example"))
+                    db.commit()
+                headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                status = client.get("/api/v1/agent-packages/status", headers=headers)
+                self.assertEqual(status.status_code, 200, status.text)
+                self.assertFalse(status.json()["agentTlsCaAvailable"])
+
+                package = client.post(
+                    "/api/v1/agent-packages",
+                    headers=headers,
+                    json={"label": "missing-ca", "os_family": "linux", "expires_minutes": 15},
+                )
+                self.assertEqual(package.status_code, 503, package.text)
+                self.assertIn("caddy-ca-export", package.json()["detail"])
+
+                public_ca = client.get("/api/v1/agent-server-ca")
+                self.assertEqual(public_ca.status_code, 503, public_ca.text)
+        finally:
+            settings.caddy_root_ca = previous_ca_path
+            with SessionLocal() as db:
+                current = db.get(SystemSetting, "dashboard_url")
+                if had_dashboard_url:
+                    db.merge(SystemSetting(key="dashboard_url", value=previous_dashboard_url or ""))
+                elif current:
+                    db.delete(current)
+                db.commit()
+
     def test_login_and_empty_fleet(self):
         with TestClient(app) as client:
             live = client.get("/livez")
@@ -171,6 +210,7 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(status.json()["agentVersion"], (Path(settings.agent_assets_root) / "VERSION").read_text(encoding="ascii").strip())
             self.assertEqual(app.version, status.json()["agentVersion"])
             self.assertTrue(status.json()["windowsMsiAvailable"])
+            self.assertTrue(status.json()["agentTlsCaAvailable"])
 
             linux_package = client.post(
                 "/api/v1/agent-packages",

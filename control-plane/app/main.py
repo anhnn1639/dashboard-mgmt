@@ -103,6 +103,27 @@ def read_release_version() -> str:
 
 
 RELEASE_VERSION = read_release_version()
+AGENT_SERVER_CA_UNAVAILABLE = (
+    "CA TLS của kênh Agent chưa sẵn sàng; hãy kiểm tra dịch vụ "
+    "caddy-ca-export rồi triển khai lại API."
+)
+
+
+def read_agent_server_ca() -> tuple[str, str]:
+    try:
+        certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
+        fingerprint = certificate_sha256(certificate)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=AGENT_SERVER_CA_UNAVAILABLE) from exc
+    return certificate, fingerprint
+
+
+def agent_server_ca_available() -> bool:
+    try:
+        read_agent_server_ca()
+    except HTTPException:
+        return False
+    return True
 
 
 def read_bootstrap_config() -> dict[str, str]:
@@ -1260,8 +1281,8 @@ def issue_agent_identity(
     if existing and not allow_rotation:
         raise HTTPException(status_code=409, detail="Bootstrap packages cannot replace an existing agent identity")
     cert_pem, fingerprint, cert_expires = sign_agent_csr(csr_pem, agent_id)
+    server_ca_certificate, _ = read_agent_server_ca()
     try:
-        server_ca_certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
         agent_ca_certificate = Path(settings.agent_ca_cert).read_text(encoding="utf-8")
     except OSError as exc:
         raise HTTPException(status_code=503, detail="Control-plane PKI is unavailable; restart Caddy/API and retry enrollment") from exc
@@ -1314,6 +1335,7 @@ def agent_package_status(_: User = Depends(require_role("admin")), db: Session =
         "agentVersion": RELEASE_VERSION,
         "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("VERSION", "tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
         "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
+        "agentTlsCaAvailable": agent_server_ca_available(),
         "claimTtlMinutes": 30,
         "webTlsTrust": settings.web_tls_trust,
     }
@@ -1339,11 +1361,7 @@ def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, u
 @app.post("/api/v1/agent-packages")
 def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
-    try:
-        ca_certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
-        ca_fingerprint = certificate_sha256(ca_certificate)
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="The agent TLS CA is not available for package generation") from exc
+    ca_certificate, ca_fingerprint = read_agent_server_ca()
     bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
     bootstrap_tls_pin = ca_fingerprint if settings.web_tls_trust == "internal-ca" else "system"
     package_id = str(uuid.uuid4())
@@ -1446,10 +1464,8 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
 
 @app.get("/api/v1/agent-server-ca")
 def agent_server_ca():
-    try:
-        return {"certificate": Path(settings.caddy_root_ca).read_text()}
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail="Caddy server CA is unavailable") from exc
+    certificate, _ = read_agent_server_ca()
+    return {"certificate": certificate}
 
 
 def authenticate_agent_websocket(websocket: WebSocket, agent_id: str) -> Server:
