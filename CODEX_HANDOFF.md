@@ -6,6 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Agent mới nhất: `0.4.1`.
+- `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
 ## Zero-touch Agent đã triển khai
@@ -49,6 +50,7 @@
 - Compose map Caddy HTTPS `443` thành `127.0.0.1:${WEB_BIND_PORT:-3000}`; không publish port Caddy `80/443` trực tiếp.
 - `9443/tcp`: agent mTLS check-in/job/tunnel/file.
 - Nginx reverse proxy tới `https://127.0.0.1:3000`, bật SNI và xác minh bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+- `.env` luôn bị Git ignore vì chứa secret. `deploy/configure-nginx.sh` backup và upsert ba biến không bí mật `OPS_DOMAIN`, `WEB_BIND_PORT=3000`, `WEB_TLS_TRUST=system`, đồng thời render Nginx từ template được track; không push/ghi đè secret.
 - Không public `3310`, `4822`, `5432` hoặc relay tạm.
 - Agent chỉ cần outbound `443` khi bootstrap và `9443` khi vận hành; không cần inbound agent.
 - Chỉ đóng `22/3389` thông thường sau khi tunnel staging đã chạy; break-glass chỉ từ bastion MFA.
@@ -91,7 +93,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api da
 
 `compose.yaml` đã đổi API build context sang repository root để copy agent source và MSI vào `/opt/tram-agent-assets`; bắt buộc rebuild container `api`, không chỉ restart.
 
-`compose.yaml` cũng không còn tranh host port `80/443` với Nginx: web Caddy bind loopback `3000`, còn `9443` vẫn public cho agent mTLS. Mẫu virtual host nằm ở `deploy/nginx-dashboard.conf.example`; certificate public của Nginx phải được endpoint tin cậy mặc định.
+`compose.yaml` cũng không còn tranh host port `80/443` với Nginx: web Caddy bind loopback `3000`, còn `9443` vẫn public cho agent mTLS. Dùng `deploy/configure-nginx.sh` thay vì sửa tay nhiều file; certificate public của Nginx phải được endpoint tin cậy mặc định.
 
 Kết quả mong đợi:
 
@@ -125,7 +127,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `14/14`, gồm configured domain, bundle generation, CA pin, OS binding và replay rejection.
-- Agent security `6/6`, gồm parser locator MSI và bootstrap qua TLS public của Nginx.
+- Agent security `7/7`, gồm parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
 - ESLint pass.
 - Vinext production build pass.
 - Python `py_compile` pass.

@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - agent/tram_agent.py
+      - agent/VERSION
       - agent/requirements.txt
       - agent/windows/**
       - .github/workflows/build-agent-msi.yml
@@ -27,7 +28,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir -r agent/requirements.txt pyinstaller==6.16.0
-          pyinstaller --noconfirm --clean --onefile --name tram-agent agent/tram_agent.py
+          pyinstaller --noconfirm --clean --onefile --name tram-agent --add-data "agent/VERSION:." agent/tram_agent.py
 
       - name: Detect optional code-signing certificate
         id: signing
@@ -71,7 +72,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force agent/windows/out | Out-Null
-          wix build agent/windows/Product.wxs -arch x64 -ext WixToolset.Util.wixext -d AgentExe="$pwd/dist/tram-agent.exe" -o agent/windows/out/TramVanHanhAgent.msi
+          $agentVersion = (Get-Content agent/VERSION -Raw).Trim()
+          wix build agent/windows/Product.wxs -arch x64 -ext WixToolset.Util.wixext -d AgentExe="$pwd/dist/tram-agent.exe" -d AgentVersion="$agentVersion" -o agent/windows/out/TramVanHanhAgent.msi
 
       - name: Sign MSI
         if: steps.signing.outputs.enabled == 'true'

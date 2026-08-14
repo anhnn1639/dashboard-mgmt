@@ -86,7 +86,7 @@ openssl rand -hex 16        # GUACAMOLE_JSON_SECRET: đúng 32 ký tự hex
 
 Production đặt `RECORDING_DIR=/srv/tram-ops/recordings` (hoặc mount riêng có quota). Compose tạo quyền host path cho UID/GID của Guacamole; không dùng Docker named volume nên có thể theo dõi và giới hạn dung lượng trực tiếp từ host.
 
-Giữ `WEB_BIND_PORT=3000` và `WEB_TLS_TRUST=system` khi Nginx dùng certificate công khai (ví dụ Let's Encrypt). Certificate public phải được Windows/Linux tin cậy mặc định để bộ cài zero-touch bootstrap qua `443`; agent sau đó nhận CA riêng và vận hành bằng mTLS trực tiếp trên `9443`.
+Giữ `WEB_BIND_PORT=3000` và `WEB_TLS_TRUST=system` khi Nginx dùng certificate công khai (ví dụ Let's Encrypt). Certificate public phải được Windows/Linux tin cậy mặc định để bộ cài zero-touch bootstrap qua `443`; agent sau đó nhận CA riêng và vận hành bằng mTLS trực tiếp trên `9443`. File `.env` chứa secret nên không được commit; `deploy/configure-nginx.sh` backup rồi cập nhật các biến runtime không bí mật trong `.env` hiện hữu.
 
 Không commit `.env`, private key CA hoặc recording. Sao lưu `agent-ca.key` ngoại tuyến; mất key sẽ không cấp/renew agent certificate, lộ key phải rotate toàn bộ agent. Wizard lần đầu tự sinh `JWT_SECRET` và `JOB_SECRET_KEY`, sau đó lưu chuỗi kết nối cùng hai khóa này trong volume `api_config` có quyền hạn chế. Cần sao lưu volume này cùng PostgreSQL; mất `JOB_SECRET_KEY` sẽ làm các job đang chờ không thể giải mã.
 
@@ -106,7 +106,7 @@ docker compose -f compose.yaml -f compose.external.yaml up -d
 docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
-Sao chép `deploy/nginx-dashboard.conf.example` vào virtual host Nginx, thay domain và đường dẫn certificate public, kiểm tra `nginx -t` rồi reload. Nginx phải xác minh upstream Caddy bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+Chạy `sudo sh deploy/configure-nginx.sh DOMAIN PUBLIC_CERT PUBLIC_KEY [NGINX_OUTPUT]` để đồng bộ `.env` và render virtual host từ `deploy/nginx-dashboard.conf.example`; sau đó rebuild Compose, kiểm tra `nginx -t` rồi reload. Nginx phải xác minh upstream Caddy bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
 
 Mở `https://ops.example.com` qua Nginx. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
 

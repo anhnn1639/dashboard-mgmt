@@ -13,6 +13,12 @@ SPEC.loader.exec_module(tram_agent)
 
 
 class AgentSecurityTests(unittest.TestCase):
+    def test_agent_version_comes_from_the_shared_version_file(self):
+        expected = (MODULE_PATH.parent / "VERSION").read_text(encoding="ascii").strip()
+        self.assertEqual(tram_agent.AGENT_VERSION, expected)
+        wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
+        self.assertIn('Version="$(var.AgentVersion)"', wix_source)
+
     def test_tunnel_url_requires_https(self):
         with tempfile.TemporaryDirectory() as directory:
             secure = tram_agent.Config(str(Path(directory) / "agent.json"))

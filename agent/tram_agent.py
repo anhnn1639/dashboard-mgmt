@@ -33,7 +33,19 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.4.1"
+
+def load_agent_version() -> str:
+    runtime_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    try:
+        version = (runtime_root / "VERSION").read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise RuntimeError("Agent VERSION file is missing") from exc
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise RuntimeError("Agent VERSION is invalid")
+    return version
+
+
+AGENT_VERSION = load_agent_version()
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")

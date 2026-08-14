@@ -1,6 +1,5 @@
-# Install this file under /etc/nginx/sites-available/tram-ops after replacing
-# ops.example.com and the two public certificate paths. This file is included
-# inside nginx's http {} context on Ubuntu.
+# Render this template with deploy/configure-nginx.sh. It is included inside
+# nginx's http {} context on Ubuntu.
 
 map $http_upgrade $tram_connection_upgrade {
     default upgrade;
@@ -10,20 +9,23 @@ map $http_upgrade $tram_connection_upgrade {
 server {
     listen 80;
     listen [::]:80;
-    server_name ops.example.com;
-    return 301 https://$host$request_uri;
+    server_name __OPS_DOMAIN__;
+    return 301 https://__OPS_DOMAIN__$request_uri;
 }
 
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name ops.example.com;
+    server_name __OPS_DOMAIN__;
 
     # Use a publicly trusted certificate here so a fresh Windows/Linux agent
     # can validate the initial HTTPS bootstrap without a preinstalled private CA.
-    ssl_certificate /etc/letsencrypt/live/ops.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/ops.example.com/privkey.pem;
+    ssl_certificate __PUBLIC_CERTIFICATE__;
+    ssl_certificate_key __PUBLIC_CERTIFICATE_KEY__;
     ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:TramOpsSSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
 
     client_max_body_size 55m;
 
@@ -35,19 +37,23 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $tram_connection_upgrade;
 
         # Caddy still encrypts and authenticates the local Nginx -> Caddy hop.
         proxy_ssl_server_name on;
-        proxy_ssl_name $host;
-        proxy_ssl_trusted_certificate /home/system/dashboard-mgmt/deploy/pki/server-ca.crt;
+        proxy_ssl_name __OPS_DOMAIN__;
+        proxy_ssl_trusted_certificate __CADDY_CA_CERTIFICATE__;
         proxy_ssl_verify on;
         proxy_ssl_verify_depth 2;
+        proxy_ssl_session_reuse on;
 
         proxy_request_buffering off;
         proxy_buffering off;
+        proxy_connect_timeout 15s;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+        proxy_redirect off;
     }
 }

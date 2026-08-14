@@ -2,7 +2,7 @@
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Tram Van Hanh Agent"
            Manufacturer="Tram Van Hanh"
-           Version="0.4.1"
+           Version="$(var.AgentVersion)"
            UpgradeCode="74D43D78-1E81-4D19-B1F4-4BF35670FD36"
            Scope="perMachine"
            InstallerVersion="500"

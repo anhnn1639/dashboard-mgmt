@@ -168,6 +168,8 @@ class ClassificationTests(unittest.TestCase):
             status = client.get("/api/v1/agent-packages/status", headers=headers)
             self.assertEqual(status.status_code, 200, status.text)
             self.assertEqual(status.json()["dashboardUrl"], "https://ops.company.example")
+            self.assertEqual(status.json()["agentVersion"], (Path(settings.agent_assets_root) / "VERSION").read_text(encoding="ascii").strip())
+            self.assertEqual(app.version, status.json()["agentVersion"])
             self.assertTrue(status.json()["windowsMsiAvailable"])
 
             linux_package = client.post(
@@ -180,6 +182,7 @@ class ClassificationTests(unittest.TestCase):
             marker = b"__TRAM_AGENT_ARCHIVE__\n"
             archive_bytes = linux_package.content.split(marker, 1)[1]
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+                self.assertEqual(archive.extractfile("VERSION").read().decode().strip(), app.version)
                 bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
                 self.assertEqual(bootstrap["server_url"], "https://ops.company.example")
                 self.assertIn("BEGIN CERTIFICATE", bootstrap["server_ca_certificate"])
@@ -192,7 +195,7 @@ class ClassificationTests(unittest.TestCase):
                 "package_secret": bootstrap["package_secret"],
                 "agent_id": linux_id,
                 "csr_pem": linux_csr.public_bytes(serialization.Encoding.PEM).decode(),
-                "inventory": {"hostname": "ubuntu-prod-01", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.4.0", "addresses": ["10.40.1.10"]},
+                "inventory": {"hostname": "ubuntu-prod-01", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.4.1", "addresses": ["10.40.1.10"]},
             }
             claimed = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
             self.assertEqual(claimed.status_code, 201, claimed.text)
@@ -215,13 +218,13 @@ class ClassificationTests(unittest.TestCase):
             mismatch_id = str(uuid.uuid4())
             mismatch_key = ec.generate_private_key(ec.SECP256R1())
             mismatch_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, mismatch_id)])).sign(mismatch_key, hashes.SHA256())
-            mismatch = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": mismatch_id, "csr_pem": mismatch_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "wrong-linux", "os_family": "linux", "os_name": "Ubuntu 24.04", "distribution_id": "ubuntu", "agent_version": "0.4.0"}})
+            mismatch = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": mismatch_id, "csr_pem": mismatch_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "wrong-linux", "os_family": "linux", "os_name": "Ubuntu 24.04", "distribution_id": "ubuntu", "agent_version": "0.4.1"}})
             self.assertEqual(mismatch.status_code, 400)
 
             windows_id = str(uuid.uuid4())
             windows_key = ec.generate_private_key(ec.SECP256R1())
             windows_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, windows_id)])).sign(windows_key, hashes.SHA256())
-            windows_claim = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": windows_id, "csr_pem": windows_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-prod-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025", "distribution_id": "windows", "agent_version": "0.4.0"}})
+            windows_claim = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": windows_id, "csr_pem": windows_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-prod-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025", "distribution_id": "windows", "agent_version": "0.4.1"}})
             self.assertEqual(windows_claim.status_code, 201, windows_claim.text)
 
             settings.web_tls_trust = "system"

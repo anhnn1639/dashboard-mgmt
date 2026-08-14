@@ -55,6 +55,11 @@ chmod 600 .env
 printf 'SETUP_TOKEN=%s\nPOSTGRES_PASSWORD=%s\n' "$SETUP_TOKEN" "$POSTGRES_PASSWORD"
 ```
 
+`.env` chứa secret nên bị Git ignore và không bao giờ được pull/ghi đè. Với máy đã
+cài từ phiên bản cũ, sau khi pull hãy chạy `deploy/configure-nginx.sh` ở bước 8C;
+script sẽ backup rồi upsert `OPS_DOMAIN`, `WEB_BIND_PORT` và `WEB_TLS_TRUST` mà
+không thay đổi password/token hiện hữu.
+
 ## 6. Tạo PKI
 
 ```bash
@@ -114,17 +119,26 @@ curl --cacert deploy/pki/server-ca.crt \
   https://ops.example.com:3000/
 ```
 
-Sao chép `deploy/nginx-dashboard.conf.example` vào virtual host Nginx hiện có,
-thay `ops.example.com`, đường dẫn certificate public và đường dẫn repository nếu
-khác `/home/system/dashboard-mgmt`. Nếu đã có server block cho domain này thì chỉ
-gộp các `location`/`proxy_*`, không bật hai server block trùng nhau.
+Script sau đồng bộ ba biến runtime vào `.env` và render toàn bộ Nginx virtual host
+từ template được Git quản lý. Nó tạo bản backup của cả `.env` và Nginx config nếu
+file đã tồn tại:
 
 ```bash
-sudo cp deploy/nginx-dashboard.conf.example /etc/nginx/sites-available/tram-ops
+sudo sh deploy/configure-nginx.sh \
+  ops.example.com \
+  /etc/letsencrypt/live/ops.example.com/fullchain.pem \
+  /etc/letsencrypt/live/ops.example.com/privkey.pem \
+  /etc/nginx/sites-available/tram-ops
+
 sudo ln -s /etc/nginx/sites-available/tram-ops /etc/nginx/sites-enabled/tram-ops
+sudo docker compose -f compose.yaml -f compose.test.yaml up -d --build
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+Nếu certificate và private key nằm chung một PEM đã được kiểm tra bằng
+`openssl pkey`, có thể truyền cùng một đường dẫn cho tham số thứ hai và thứ ba. Nếu Nginx
+đã có server block khác cho cùng domain, phải disable/gộp file cũ trước khi reload.
 
 Không dùng `proxy_ssl_verify off`. Nginx phải có certificate public được Windows
 và Linux tin cậy mặc định vì `.env` đặt `WEB_TLS_TRUST=system`. Port `3000` không

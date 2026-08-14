@@ -86,6 +86,25 @@ settings = Settings()
 bootstrap_path = Path(settings.bootstrap_config_path)
 
 
+def read_release_version() -> str:
+    candidates = (
+        Path(settings.agent_assets_root) / "VERSION",
+        Path(__file__).resolve().parents[2] / "agent" / "VERSION",
+    )
+    for candidate in candidates:
+        try:
+            version = candidate.read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            return version
+        raise RuntimeError(f"Invalid release VERSION file: {candidate}")
+    raise RuntimeError("Release VERSION file is unavailable")
+
+
+RELEASE_VERSION = read_release_version()
+
+
 def read_bootstrap_config() -> dict[str, str]:
     try:
         raw = json.loads(bootstrap_path.read_text(encoding="utf-8"))
@@ -477,7 +496,7 @@ tunnel_hub = TunnelHub(
 )
 
 
-app = FastAPI(title="Trạm Vận Hành API", version="0.4.1", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Trạm Vận Hành API", version=RELEASE_VERSION, docs_url="/api/docs", openapi_url="/api/openapi.json")
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -1292,8 +1311,8 @@ def agent_package_status(_: User = Depends(require_role("admin")), db: Session =
     dashboard_url = canonical_dashboard_url(db)
     return {
         "dashboardUrl": dashboard_url,
-        "agentVersion": "0.4.1",
-        "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
+        "agentVersion": RELEASE_VERSION,
+        "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("VERSION", "tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
         "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
         "claimTtlMinutes": 30,
         "webTlsTrust": settings.web_tls_trust,

@@ -19,6 +19,7 @@ New-Item -ItemType Directory -Force -Path $InboxDir | Out-Null
 $AgentPython = Join-Path $InstallDir "venv\Scripts\python.exe"
 & $AgentPython -m pip install --disable-pip-version-check --no-cache-dir -r (Join-Path $PSScriptRoot "requirements.txt")
 Copy-Item -Force (Join-Path $PSScriptRoot "tram_agent.py") (Join-Path $InstallDir "tram_agent.py")
+Copy-Item -Force (Join-Path $PSScriptRoot "VERSION") (Join-Path $InstallDir "VERSION")
 
 $EnrollArguments = @((Join-Path $InstallDir "tram_agent.py"), "--config", (Join-Path $DataDir "agent.json"), "enroll", "--server", $Server, "--token", $EnrollmentToken)
 if ($ServerCA) { $EnrollArguments += @("--server-ca", $ServerCA) }

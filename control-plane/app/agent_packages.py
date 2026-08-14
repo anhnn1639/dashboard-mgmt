@@ -76,6 +76,7 @@ def linux_run_bundle(
 ) -> bytes:
     dashboard_netloc(dashboard_url)
     required = {
+        "VERSION": 0o640,
         "tram_agent.py": 0o750,
         "requirements.txt": 0o640,
         "tram-agent.service": 0o640,

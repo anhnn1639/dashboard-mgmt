@@ -32,6 +32,7 @@ python3 -m venv /opt/tram-agent/venv
 /opt/tram-agent/venv/bin/pip install --no-cache-dir --upgrade pip
 /opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$script_dir/requirements.txt"
 install -m 0750 "$script_dir/tram_agent.py" /opt/tram-agent/tram_agent.py
+install -m 0644 "$script_dir/VERSION" /opt/tram-agent/VERSION
 install -m 0644 "$script_dir/tram-agent.service" /etc/systemd/system/tram-agent.service
 systemctl daemon-reload
 
