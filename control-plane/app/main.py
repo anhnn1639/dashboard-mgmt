@@ -304,6 +304,20 @@ class AgentPackageRequest(BaseModel):
     expires_minutes: int = Field(default=30, ge=5, le=60)
 
 
+class DashboardUrlUpdateRequest(BaseModel):
+    dashboard_url: str = Field(min_length=8, max_length=2048)
+    confirm_existing_agents: bool = False
+
+    @field_validator("dashboard_url")
+    @classmethod
+    def valid_dashboard_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Dashboard URL must be an origin-only absolute HTTPS URL")
+        return normalized
+
+
 class Inventory(BaseModel):
     hostname: str = Field(min_length=1, max_length=255)
     os_family: Literal["windows", "linux"]
@@ -1284,6 +1298,23 @@ def agent_package_status(_: User = Depends(require_role("admin")), db: Session =
     }
 
 
+@app.put("/api/v1/settings/dashboard-url")
+def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    request_host = request.url.hostname
+    requested_host = urlsplit(payload.dashboard_url).hostname
+    if request_host and request_host not in {"testserver", "localhost", "127.0.0.1"} and requested_host != request_host:
+        raise HTTPException(status_code=400, detail="Open the dashboard through the requested HTTPS domain before saving it")
+    current = db.get(SystemSetting, "dashboard_url")
+    previous = current.value if current else ""
+    has_agents = db.execute(select(Server.id).limit(1)).scalar_one_or_none() is not None
+    if previous and previous != payload.dashboard_url and has_agents and not payload.confirm_existing_agents:
+        raise HTTPException(status_code=409, detail="Existing agents keep their old endpoint; confirm the domain change after planning their migration")
+    db.merge(SystemSetting(key="dashboard_url", value=payload.dashboard_url))
+    audit(db, user.username, "system.dashboard_url.update", "control-plane", request, detail={"previous": previous, "dashboard_url": payload.dashboard_url, "existing_agents": has_agents})
+    db.commit()
+    return {"dashboardUrl": payload.dashboard_url, "existingAgentsNeedMigration": bool(has_agents and previous != payload.dashboard_url)}
+
+
 @app.post("/api/v1/agent-packages")
 def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
@@ -1373,7 +1404,7 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     record = db.execute(select(EnrollmentToken).where(EnrollmentToken.token_hash == token_digest(payload.token))).scalar_one_or_none()
     if not record or record.uses >= record.max_uses or aware(record.expires_at) < now():
         raise HTTPException(status_code=401, detail="Enrollment token is invalid or expired")
-    family, verification = classify_os(payload.inventory)
+    family, _ = classify_os(payload.inventory)
     if record.expected_os_family and record.expected_os_family != family:
         raise HTTPException(status_code=400, detail="Agent OS does not match enrollment policy")
     response = issue_agent_identity(

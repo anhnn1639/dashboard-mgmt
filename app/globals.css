@@ -2859,6 +2859,39 @@ textarea:focus-visible {
   color: #69a9ff;
   font-size: 11px;
 }
+.package-origin > input {
+  min-width: 0;
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid #35516f;
+  border-radius: 6px;
+  color: #dce9f9;
+  background: #0b1521;
+  font: 10px var(--font-geist-mono);
+}
+.package-origin .package-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: #8fa0b4;
+  font-size: 8px;
+  line-height: 1.45;
+}
+.package-origin .package-confirm input {
+  flex: 0 0 auto;
+  width: auto;
+  margin-top: 1px;
+  accent-color: var(--blue);
+}
+.package-origin .button {
+  width: max-content;
+}
+.package-origin > small {
+  color: #6f8299;
+  font-size: 8px;
+  line-height: 1.45;
+}
 .agent-package-intro ul {
   display: grid;
   gap: 10px;

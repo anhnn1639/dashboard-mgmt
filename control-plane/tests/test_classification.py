@@ -224,6 +224,12 @@ class ClassificationTests(unittest.TestCase):
             windows_claim = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": windows_id, "csr_pem": windows_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-prod-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025", "distribution_id": "windows", "agent_version": "0.4.0"}})
             self.assertEqual(windows_claim.status_code, 201, windows_claim.text)
 
+            unsafe_change = client.put("/api/v1/settings/dashboard-url", headers=headers, json={"dashboard_url": "https://ops-new.company.example"})
+            self.assertEqual(unsafe_change.status_code, 409)
+            confirmed_change = client.put("/api/v1/settings/dashboard-url", headers=headers, json={"dashboard_url": "https://ops-new.company.example", "confirm_existing_agents": True})
+            self.assertEqual(confirmed_change.status_code, 200, confirmed_change.text)
+            self.assertTrue(confirmed_change.json()["existingAgentsNeedMigration"])
+
     def test_clean_file_is_encrypted_and_queued_for_four_eyes_approval(self):
         with TestClient(app) as client:
             headers = {"Authorization": f"Bearer {self.login_admin(client)}"}

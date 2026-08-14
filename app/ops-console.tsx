@@ -2300,6 +2300,34 @@ function AgentPackagesView({ token }: { token: string }) {
       );
   }, [token]);
 
+  async function saveDashboardUrl(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setMessage("");
+    const response = await fetch("/api/v1/settings/dashboard-url", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        dashboard_url: form.get("dashboard_url"),
+        confirm_existing_agents: form.get("confirm_existing_agents") === "on",
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      setMessage(data.detail ?? "Không thể cập nhật URL control plane");
+      return;
+    }
+    setStatus((current) => current ? { ...current, dashboardUrl: data.dashboardUrl } : current);
+    setMessage(
+      data.existingAgentsNeedMigration
+        ? "Đã đổi URL. Bộ cài mới dùng domain mới; agent cũ cần kế hoạch migrate endpoint/CA."
+        : "Đã khóa URL HTTPS dùng để sinh bộ cài Agent.",
+    );
+  }
+
   async function downloadPackage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
@@ -2357,10 +2385,22 @@ function AgentPackagesView({ token }: { token: string }) {
           Domain, CA pin và claim một lần được lấy từ cấu hình HTTPS của hệ thống.
           Private key mTLS chỉ được sinh trên máy đích, không nằm trong file tải về.
         </p>
-        <div className="package-origin">
-          <span>Control plane đã khóa</span>
-          <code>{status?.dashboardUrl ?? "Đang kiểm tra…"}</code>
-        </div>
+        <form className="package-origin" key={status?.dashboardUrl} onSubmit={saveDashboardUrl}>
+          <span>URL control plane dùng để sinh Agent</span>
+          <input
+            name="dashboard_url"
+            type="url"
+            required
+            defaultValue={status?.dashboardUrl ?? ""}
+            placeholder={typeof window === "undefined" ? "https://ops.company.com" : window.location.origin}
+          />
+          <label className="package-confirm">
+            <input name="confirm_existing_agents" type="checkbox" />
+            Tôi hiểu agent cũ vẫn giữ endpoint cũ nếu đổi domain
+          </label>
+          <button className="button ghost" type="submit">Lưu URL HTTPS</button>
+          <small>Hãy mở dashboard bằng chính domain mới, hoàn tất DNS/TLS/Caddy rồi mới lưu.</small>
+        </form>
         <ul>
           <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>

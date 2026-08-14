@@ -1,157 +1,148 @@
 # Bàn giao Codex — 14/08/2026
 
-## Repository và quy ước
+## Repository và trạng thái
 
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
-- Nhánh làm việc/triển khai: `main`
-- Commit tính năng mới nhất: `3941392 Route remote access through secure agent tunnels`
-- Agent mới nhất: `0.3.0`
-- Người dùng đã cho phép commit và push trực tiếp từng thay đổi hoàn chỉnh lên `main`; không tạo PR nếu chưa được yêu cầu.
-- Luôn đọc `AGENTS.md`, xem `git status` và diff trước khi sửa. Không dùng `git reset --hard` hoặc xóa thay đổi chưa xác định.
+- Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
+- Commit zero-touch installer đã push: `5f82cb2 Generate zero-touch agent installers`.
+- Agent mới nhất: `0.4.0`.
+- Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
-## Thay đổi bảo mật đã hoàn thành
+## Zero-touch Agent đã triển khai
 
-### SSH/RDP qua reverse tunnel của agent
+- Admin có trang **Bộ cài Agent** để xem/sửa origin HTTPS của control plane và tải Linux `.run` hoặc Windows `.msi`.
+- API lấy URL từ PostgreSQL `system_settings.dashboard_url`; không hard-code `ops.example.com`. URL chỉ nhận origin HTTPS, admin phải mở dashboard qua chính hostname muốn lưu.
+- Khi đổi domain mà đã có agent, UI/API bắt buộc xác nhận vì agent cũ vẫn giữ endpoint và CA cũ.
+- Mỗi bộ cài có claim ngẫu nhiên 256-bit, hết hạn 5–60 phút, dùng một lần và khóa theo `windows|linux`. Replay, claim hết hạn hoặc nhầm OS đều fail-closed/audit.
+- Private key P-256 và CSR được sinh tại endpoint. Bộ cài chỉ mang locator, SHA-256 pin của CA và claim ngắn hạn; không chứa client private key/certificate dài hạn.
+- Linux `.run` tự giải nén, cài dependency/ClamAV/systemd, enroll, xóa bootstrap secret và start service.
+- Windows dùng MSI generic; API không sửa bytes MSI mà chỉ phát nó dưới tên chứa locator/claim/CA pin, nên có thể giữ chữ ký Authenticode. Không được đổi tên file trước khi cài.
+- MSI cài executable PyInstaller độc lập; Windows Server không cần Python. Service `TramVanHanhAgent` chạy `LocalSystem`, `Automatic`, phụ thuộc TCP/IP, start lúc cài và restart sau 30 giây nếu lỗi.
+- `agent/install-windows.ps1` thủ công cũng đã chuyển từ Scheduled Task sang Windows Service.
+- Windows/Linux vẫn tự vào đúng mục dựa trên inventory thực tế; server từ MSI Linux không thể dùng claim Windows và ngược lại.
 
-- Agent duy trì WebSocket outbound qua `wss://OPS_DOMAIN:9443`, được bảo vệ bằng mTLS và chữ ký ECDSA theo request/handshake.
-- Khi người vận hành mở SSH/RDP, API tạo một TCP listener dùng một lần trên Docker network `session`; `guacd` không kết nối trực tiếp tới IP máy đích.
-- Agent chỉ có thể relay tới `127.0.0.1:22` cho SSH hoặc `127.0.0.1:3389` cho RDP. Agent từ chối host/port tùy ý và giới hạn 4 tunnel đồng thời.
-- Không có fallback trực tiếp tới `server.address:22/3389`. Nếu agent tunnel offline, giao diện khóa nút kết nối và API fail-closed.
-- SSH pin host key. RDP pin certificate fingerprint do agent thu thập, dùng NLA và không bật `ignore-cert`.
-- Clipboard hai chiều, Guacamole SFTP, RDP drive, upload/download và printing đều bị tắt. Recording vẫn được giữ.
+## MSI artifact
 
-### Truyền file một chiều có kiểm soát
+- File: `agent/windows/TramVanHanhAgent.msi`
+- Kích thước: `13,582,336` bytes.
+- SHA-256: `AC5237DB26DE00A352FA63211D340556DBC813FF757FA6718DD087EE8A318982`.
+- Build PyInstaller + WiX thành công trên GitHub Actions run `31769407861`.
+- Workflow: `.github/workflows/build-agent-msi.yml`.
+- Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
+  - `WINDOWS_SIGNING_PFX_BASE64`
+  - `WINDOWS_SIGNING_PASSWORD`
+- Artifact hiện tại **chưa ký Authenticode** vì chưa có code-signing certificate. Trước production phải ký lại, thay MSI trong repo, kiểm tra `Get-AuthenticodeSignature`, rồi rebuild API. Không đặt PFX/private signing key trên dashboard.
+- Administrative extraction `msiexec /a` trên laptop phát triển bị Windows Installer/sandbox treo; đúng process thử nghiệm đã được dừng và không cài service lên laptop. Phải cài/reboot/uninstall MSI trên Windows Server staging.
 
-- Dashboard cho phép operator/admin upload tối đa 50 MiB vào đúng máy đang chọn và bắt buộc nhập lý do/ticket.
-- Caddy chặn request body lớn hơn 55 MB trước API; API tự kiểm tra giới hạn 50 MiB và filename an toàn.
-- ClamAV trung tâm quét bằng `INSTREAM` trên Docker network riêng; TCP `3310` không được publish. Scanner lỗi thì fail-closed.
-- File sạch được mã hóa AES-GCM trong PostgreSQL; AAD ràng buộc transfer ID, server ID và SHA-256.
-- Job `file.deliver` là critical và bắt buộc quy tắc bốn mắt; người upload không tự duyệt.
-- Chỉ đúng agent tải file qua mTLS `9443`, kiểm tra size/SHA-256 và quét lại bằng Microsoft Defender hoặc ClamAV endpoint.
-- File được đưa vào inbox không ghi đè, không tự chạy:
-  - Linux: `/var/lib/tram-agent/inbox`, directory `0700`, file `0600`.
-  - Windows: `%ProgramData%\TramVanHanh\Inbox`, ACL chỉ SYSTEM/Administrators và gắn Mark-of-the-Web.
-- Ciphertext bị xóa ngay khi agent báo thành công/thất bại; payload chưa xử lý hết hạn sau 24 giờ. Chỉ giữ metadata/hash/audit.
-- Không có chiều tải từ server về dashboard và không có server-to-server transfer.
+## Reverse tunnel và truyền file vẫn giữ nguyên
 
-### TLS và mạng
+- Agent outbound WebSocket mTLS `9443`; API/Guacamole không kết nối trực tiếp IP máy đích.
+- Agent chỉ relay `127.0.0.1:22` cho SSH hoặc `127.0.0.1:3389` cho RDP, tối đa 4 tunnel; không fallback trực tiếp.
+- Pin SSH host key/RDP certificate, tắt clipboard/SFTP/RDP drive/printing, giữ recording.
+- File một chiều: giới hạn 50 MiB, ClamAV trung tâm, AES-GCM PostgreSQL, duyệt bốn mắt, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server.
+- Payload file xóa sau kết quả hoặc hết hạn 24 giờ; scanner lỗi thì fail-closed.
 
-- `80/tcp`: chỉ redirect sang HTTPS.
-- `443/tcp`: dashboard, API, Guacamole và enrollment qua HTTPS.
-- `9443/tcp`: agent mTLS cho check-in, job, reverse tunnel và file download.
-- Không public `3310`, `4822`, `5432` hoặc port relay tạm.
-- `guacd` và relay ở network `session` internal. API bind relay bằng alias `tunnel-relay`, không bind lên mọi interface container.
-- Caddy dùng CA nội bộ; máy quản trị và agent phải tin cậy `deploy/pki/server-ca.crt` qua kênh bootstrap an toàn.
+## TLS và firewall
 
-## Triển khai bắt buộc tiếp theo trên Ubuntu control plane
+- `80/tcp`: redirect HTTPS.
+- `443/tcp`: dashboard/API/Guacamole/enrollment/bootstrap claim.
+- `9443/tcp`: agent mTLS check-in/job/tunnel/file.
+- Không public `3310`, `4822`, `5432` hoặc relay tạm.
+- Agent chỉ cần outbound `443` khi bootstrap và `9443` khi vận hành; không cần inbound agent.
+- Chỉ đóng `22/3389` thông thường sau khi tunnel staging đã chạy; break-glass chỉ từ bastion MFA.
+- API hiện giữ TunnelHub in-memory: chỉ chạy một API replica/Uvicorn worker.
 
-Máy test đang dùng PostgreSQL trong Docker:
+## Xử lý lỗi `git pull` trong ảnh người dùng
+
+Máy `/home/system/dashboard-mgmt` có local change ở `agent/install-linux.sh`, nên pull bị chặn. Không reset cả repository. Kiểm tra và backup đúng file:
 
 ```bash
-cd /home/ubuntu/dashboard-mgmt
+cd /home/system/dashboard-mgmt
+git diff -- agent/install-linux.sh
+cp -a agent/install-linux.sh /root/install-linux.sh.before-zero-touch
+git restore -- agent/install-linux.sh
+git pull --ff-only origin main
+```
+
+Nếu diff có nội dung cần giữ, trước khi restore lưu patch:
+
+```bash
+git diff -- agent/install-linux.sh > /root/install-linux.local.patch
+```
+
+Sau pull, không áp patch cũ nguyên xi vì installer Linux mới có bootstrap zero-touch; chỉ đối chiếu phần local thực sự cần giữ.
+
+## Triển khai control plane tiếp theo
+
+Bản test PostgreSQL trong Docker:
+
+```bash
+cd /home/system/dashboard-mgmt
 git pull --ff-only origin main
 git log -3 --oneline
 
 docker compose -f compose.yaml -f compose.test.yaml pull
 docker compose -f compose.yaml -f compose.test.yaml up -d --build
 docker compose -f compose.yaml -f compose.test.yaml ps
-docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api clamav guacamole guacd
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api dashboard clamav guacamole guacd
 ```
 
-Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.test.yaml` và phải có `EXTERNAL_DATABASE_URL` hợp lệ.
+`compose.yaml` đã đổi API build context sang repository root để copy agent source và MSI vào `/opt/tram-agent-assets`; bắt buộc rebuild container `api`, không chỉ restart.
 
 Kết quả mong đợi:
 
-- `caddy`, `api`, `dashboard`, `guacamole`, `guacd`, `clamav` và PostgreSQL test healthy/running.
-- `https://OPS_DOMAIN` mở được sau khi import CA nội bộ vào Root CA máy quản trị.
-- `https://OPS_DOMAIN:9443` không chấp nhận client không có certificate agent.
-- Không có port host `3310`, `4822`, `5432` hoặc relay ngẫu nhiên.
+- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.0`, Linux available và Windows MSI available.
+- Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
+- Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
+- Không public port nội bộ.
 
-Không chạy nhiều API replica/Uvicorn worker. `TunnelHub` hiện giữ WebSocket trong bộ nhớ; phải giữ một API process cho tới khi có distributed tunnel broker và session affinity.
+Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.test.yaml`.
 
-## Nâng cấp agent hiện có
+## Smoke test bắt buộc
 
-### Ubuntu 24.04
+1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.0`, tự vào Linux và `tunnelOnline=true`.
+3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
+4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
+5. Kiểm tra:
 
-```bash
-sudo apt-get update
-sudo apt-get install -y clamav clamav-freshclam
-sudo cp /home/ubuntu/dashboard-mgmt/agent/tram_agent.py /opt/tram-agent/tram_agent.py
-sudo /opt/tram-agent/venv/bin/pip install --no-cache-dir -r /home/ubuntu/dashboard-mgmt/agent/requirements.txt
-sudo systemctl restart tram-agent
-sudo systemctl status tram-agent --no-pager
-sudo journalctl -u tram-agent -n 100 --no-pager
-```
+   ```powershell
+   Get-Service TramVanHanhAgent
+   Get-CimInstance Win32_Service -Filter "Name='TramVanHanhAgent'" | Select Name,State,StartMode,PathName
+   Get-Content "$env:ProgramData\TramVanHanh\agent.log" -Tail 100
+   ```
 
-Agent đã enroll trước đó không cần token mới nếu certificate/key và `server-ca.crt` còn hợp lệ. Log phải có `agent reverse tunnel is online`, agent version trên dashboard là `0.3.0`.
+6. Reboot Windows, xác nhận service và tunnel tự online lại.
+7. Đổi tên một MSI mới trước khi cài: bootstrap phải fail, không enroll nhầm control plane.
+8. Xác nhận claim Windows không dùng được trên Linux và replay bị từ chối.
+9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline.
+10. Test uninstall/upgrade MSI và xác nhận không để lộ claim/private key trong log.
 
-Oracle Linux 8 phải cài ClamAV từ repository EPEL đã được tổ chức phê duyệt và cập nhật signature. Oracle Linux 7 là legacy; nếu không có endpoint scanner còn được hỗ trợ thì file delivery phải tiếp tục fail-closed.
+## Kiểm thử local đã đạt
 
-### Windows Server 2025
+- Control plane `14/14`, gồm configured domain, bundle generation, CA pin, OS binding và replay rejection.
+- Agent security `5/5`, gồm parser locator MSI.
+- ESLint pass.
+- Vinext production build pass.
+- Python `py_compile` pass.
+- XML/YAML/PowerShell syntax pass.
+- MSI WiX build và artifact upload pass; workflow cũ chỉ đỏ ở post-step cache pip sau khi artifact đã upload. Cache đã được bỏ ở thay đổi tiếp theo.
 
-Với agent đã enroll, cập nhật script/requirements rồi restart Scheduled Task:
+## Ưu tiên sau smoke test
 
-```powershell
-Copy-Item -Force .\agent\tram_agent.py "$env:ProgramFiles\TramVanHanhAgent\tram_agent.py"
-& "$env:ProgramFiles\TramVanHanhAgent\venv\Scripts\python.exe" -m pip install --no-cache-dir -r .\agent\requirements.txt
-Stop-ScheduledTask -TaskName TramVanHanhAgent -ErrorAction SilentlyContinue
-Start-ScheduledTask -TaskName TramVanHanhAgent
-Get-Content "$env:ProgramData\TramVanHanh\agent.log" -Tail 100
-```
+1. Cấu hình enterprise/EV code-signing certificate cho workflow và thay artifact unsigned.
+2. Lập luồng migrate domain/CA có dual-endpoint overlap cho agent cũ; không tắt domain cũ đột ngột.
+3. Tích hợp Vault/LAPS cho credential SSH/RDP.
+4. Immutable/WORM storage cho recording/audit.
+5. Distributed tunnel broker trước khi scale API.
+6. CRL/OCSP và certificate rotation tự động.
+7. EDR/WDAC/AppLocker/SELinux, micro-segmentation và pentest độc lập.
 
-Microsoft Defender phải running. RDP phải được bật cục bộ và gắn certificate để agent thu thập `SSLCertificateSHA1Hash`; không cần mở firewall `3389` cho control plane.
+## Nguyên tắc không phá vỡ
 
-## Thứ tự kiểm thử end-to-end
-
-1. Xác nhận một agent Ubuntu `0.3.0` online và `tunnelOnline=true`.
-2. Mở SSH từ dashboard, kiểm tra thao tác và recording; nếu lỗi lấy cùng lúc log `api`, `caddy`, `guacamole`, `guacd` và journal agent.
-3. Xác nhận `guacd` không còn cần route trực tiếp tới IP máy Ubuntu trên port 22.
-4. Xác nhận một Windows agent gửi RDP certificate fingerprint, sau đó mở RDP và kiểm tra recording.
-5. Upload một file văn bản sạch, dùng admin khác duyệt job, xác nhận file vào inbox và ciphertext bị xóa.
-6. Test EICAR trong staging: ClamAV trung tâm phải block, không tạo payload/job giao file.
-7. Tắt ClamAV/Defender trong staging: file transfer phải fail-closed.
-8. Test file trùng tên, traversal, Windows device name và file quá 50 MiB: đều phải bị từ chối.
-9. Chỉ sau khi SSH/RDP tunnel đã chạy ổn mới đóng inbound `22/3389` từ mạng thông thường; nếu cần break-glass, chỉ mở từ bastion riêng có MFA.
-
-## Bộ kiểm thử đã chạy tại commit `3941392`
-
-- Control plane: `13/13` pass.
-- Agent security: `4/4` pass.
-- Rendered HTML: `2/2` pass.
-- ESLint: pass.
-- Vinext production build: pass.
-- Python `py_compile`: pass.
-- Ba file Compose parse YAML: pass.
-- `git diff --check`: pass.
-
-Docker/Caddy chưa được chạy end-to-end trên máy Windows phát triển vì máy này không có Docker/Caddy. Bắt buộc validate Compose và Caddy trên Ubuntu bằng lệnh triển khai ở trên trước khi đóng firewall trực tiếp.
-
-## Ưu tiên sau khi smoke test tunnel/file
-
-1. Tích hợp vault/LAPS cho credential SSH/RDP; hiện credential chỉ tồn tại trong token Guacamole ngắn hạn nhưng vẫn do người vận hành nhập.
-2. Đưa recording và audit ra immutable/WORM storage, có quota, retention và legal hold.
-3. Thay in-memory `TunnelHub` bằng broker phân tán trước khi scale API.
-4. Bổ sung certificate lifecycle: revoke/CRL/OCSP và rotate tự động trước hạn.
-5. Tích hợp EDR/WDAC/AppLocker/SELinux và network micro-segmentation. Antivirus không thể bảo đảm tuyệt đối trước zero-day hoặc khi control plane đã bị chiếm toàn quyền.
-6. Pentest độc lập các luồng enrollment, WebSocket tunnel, Guacamole token, file approval và endpoint inbox trước production.
-
-## Nguyên tắc không được phá vỡ
-
-- Không thêm `command.run`, shell/PowerShell tùy ý hoặc destination tunnel tùy ý.
-- Không bỏ mTLS, chữ ký request, TLS hostname verification, host-key/certificate pinning, RBAC, bốn mắt hoặc audit để sửa lỗi tạm.
-- Không log/commit `.env`, password, token, private key, DB URL có password hoặc recording.
-- Không cho file tự chạy và không bật lại clipboard/SFTP/RDP drive như đường truyền file phụ.
-- Không public ClamAV, guacd, PostgreSQL hoặc relay port.
-- Không xóa PostgreSQL/recording/volume để khắc phục sự cố nếu chưa có xác nhận rõ ràng.
-
-Khi hoàn thành thay đổi tiếp theo:
-
-```bash
-git status -sb
-git diff --check
-# chạy test liên quan
-git add -- <đúng file liên quan>
-git commit -m "Mô tả ngắn"
-git push origin main
-git ls-remote origin refs/heads/main
-```
+- Không thêm shell/PowerShell tùy ý hoặc destination tunnel tùy ý.
+- Không bỏ mTLS, request signature, TLS pin/hostname verification, RBAC, bốn mắt hoặc audit.
+- Không log/commit `.env`, password, raw claim, token, private key, DB URL có password, PFX hoặc recording.
+- Không cho file tự chạy và không bật lại clipboard/SFTP/RDP drive.
+- Không public ClamAV, guacd, PostgreSQL hoặc relay.
+- Không sửa bytes MSI riêng theo từng server vì sẽ phá chữ ký; locator dùng một lần phải nằm trong tên file.

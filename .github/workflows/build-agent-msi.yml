@@ -22,13 +22,44 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Build standalone agent executable
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir -r agent/requirements.txt pyinstaller==6.16.0
           pyinstaller --noconfirm --clean --onefile --name tram-agent agent/tram_agent.py
+
+      - name: Detect optional code-signing certificate
+        id: signing
+        shell: pwsh
+        env:
+          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_PFX)) {
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } elseif ([string]::IsNullOrWhiteSpace($env:SIGNING_PASSWORD)) {
+            throw "WINDOWS_SIGNING_PASSWORD is required when WINDOWS_SIGNING_PFX_BASE64 is configured"
+          } else {
+            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Sign agent executable
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'tram-agent-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:SIGNING_PASSWORD dist/tram-agent.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for the agent executable" }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Install WiX Toolset
         shell: pwsh
@@ -41,6 +72,23 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force agent/windows/out | Out-Null
           wix build agent/windows/Product.wxs -arch x64 -ext WixToolset.Util.wixext -d AgentExe="$pwd/dist/tram-agent.exe" -o agent/windows/out/TramVanHanhAgent.msi
+
+      - name: Sign MSI
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'tram-agent-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:SIGNING_PASSWORD agent/windows/out/TramVanHanhAgent.msi
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for the MSI" }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload generic MSI
         uses: actions/upload-artifact@v4

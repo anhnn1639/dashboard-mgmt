@@ -8,6 +8,7 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Inventory: hostname, OS/version, kiến trúc, IP, kernel, CPU, RAM, disk, uptime, số dịch vụ và bản vá chờ.
 - Agent outbound cho Windows Server 2025, Ubuntu 24.04 và Oracle Linux 7/8.
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
+- Giao diện **Bộ cài Agent** tự sinh Linux `.run` hoặc Windows `.msi` theo đúng domain HTTPS/CA của control plane; không sửa domain bằng tay trên máy đích.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
 - Dashboard/API ở TCP `443` qua TLS của Caddy; TCP `80` chỉ chuyển hướng sang HTTPS.
 - RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT ngắn hạn và Argon2 password hashing.
@@ -113,7 +114,28 @@ API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và au
 
 ## Cài agent
 
-### 1. Tạo enrollment token
+### 1. Tạo bộ cài zero-touch trên dashboard
+
+Đăng nhập bằng `admin`, mở **Bộ cài Agent** và kiểm tra URL control plane. URL phải là origin HTTPS thật đang mở trong trình duyệt, ví dụ `https://ops.company.com`; DNS, `OPS_DOMAIN` và TLS/Caddy phải hoạt động trước khi lưu.
+
+Nhập tên máy/ticket, chọn thời hạn 15–60 phút rồi tải đúng định dạng:
+
+- Linux: `TramAgent-Linux-<label>.run`. Chép qua kênh quản trị tin cậy và chạy:
+
+  ```bash
+  chmod +x TramAgent-Linux-*.run
+  sudo ./TramAgent-Linux-*.run
+  ```
+
+- Windows: một file `TramAgent--...msi`. **Không đổi tên file**; chạy bằng Administrator. MSI chứa executable độc lập, cài service `TramVanHanhAgent` dưới `LocalSystem`, đặt `StartType=Automatic`, khởi động ngay và tự restart khi lỗi. Windows Server không cần cài Python.
+
+Bộ cài không chứa private key/certificate agent dài hạn. Nó chỉ mang locator, SHA-256 pin của CA và claim ngẫu nhiên dùng một lần; private key P-256 được sinh trên máy đích, CSR được gửi qua HTTPS đã pin CA, sau đó mọi kết nối dùng mTLS `9443`. Claim sai hệ điều hành, hết hạn, đã dùng hoặc replay đều bị từ chối và ghi audit. Windows/Linux tự vào đúng mục dựa trên inventory thực tế.
+
+Nếu thay domain sau khi đã có agent, bộ cài mới dùng domain mới nhưng agent cũ vẫn giữ endpoint/CA cũ. Phải lập kế hoạch migrate agent cũ; không xóa domain cũ trước khi chúng đã kết nối qua domain mới.
+
+MSI trong repository là artifact generic, không chứa domain/token. Trước production cần cấu hình GitHub secrets `WINDOWS_SIGNING_PFX_BASE64` và `WINDOWS_SIGNING_PASSWORD`, chạy workflow **Build Windows agent MSI**, thay artifact trong `agent/windows/TramVanHanhAgent.msi`, rồi rebuild API. Không lưu PFX/code-signing password trên control plane.
+
+### 2. Enrollment token thủ công (đường nâng cao/break-glass)
 
 Đăng nhập lấy access token:
 
@@ -134,7 +156,7 @@ curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.com/api/v1/enrol
 
 Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token chỉ dùng được đúng loại máy.
 
-### 2. Ubuntu 24.04 / Oracle Linux 7, 8
+### 3. Ubuntu 24.04 / Oracle Linux 7, 8 — cài thủ công
 
 Trên Ubuntu, bộ cài tự cài Python 3, `venv`, OpenSSH Server và ClamAV. Trên Oracle Linux 8, chỉ bật repository EPEL đã được tổ chức phê duyệt rồi cài ClamAV/cập nhật signature. Oracle Linux 7 có ClamAV cũ trong developer EPEL; không dùng bản EOL cho production — cần endpoint scanner còn được nhà cung cấp hỗ trợ, nếu không truyền file sẽ fail-closed.
 
@@ -149,9 +171,9 @@ sudo systemctl status tram-agent
 
 Máy sẽ tự xuất hiện trong **Máy chủ Linux**. Ubuntu được nhận diện từ `ID=ubuntu`; Oracle Linux từ `ID=ol`.
 
-### 3. Windows Server 2025
+### 4. Windows Server 2025 — cài thủ công
 
-Chạy PowerShell 64-bit bằng quyền Administrator. MVP hiện cần Python 3.11+ cài trên máy; script tạo Scheduled Task chạy dưới `SYSTEM`.
+Chạy PowerShell 64-bit bằng quyền Administrator. Đường thủ công cần Python 3.11+; script đăng ký Windows Service `TramVanHanhAgent` chạy dưới `LocalSystem`, `Automatic` và tự restart khi lỗi. Không còn dùng Scheduled Task.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass

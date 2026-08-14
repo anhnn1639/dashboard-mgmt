@@ -154,10 +154,25 @@ Nhấn: Kiểm tra kết nối & hoàn tất
 Đăng nhập bằng tài khoản admin vừa tạo
 ```
 
+## 13A. Kiểm tra bộ cài Agent theo domain thật
+
+1. Mở dashboard bằng chính URL HTTPS production, không dùng IP hoặc alias tạm.
+2. Vào **Bộ cài Agent** và xác nhận URL hiển thị khớp `OPS_DOMAIN`.
+3. Tải thử một Linux `.run` và một Windows `.msi`; không đổi tên MSI.
+4. Claim chỉ sống 15–60 phút và dùng một lần. Xóa file tải về sau khi máy đã enroll.
+5. Windows MSI cài service `TramVanHanhAgent` kiểu `Automatic`; kiểm tra bằng:
+
+   ```powershell
+   Get-Service TramVanHanhAgent
+   Get-Content "$env:ProgramData\TramVanHanh\agent.log" -Tail 100
+   ```
+
+6. MSI mặc định trong repository chưa có chữ ký publisher. Trước production, cấu hình code-signing certificate trong GitHub Actions, build lại artifact, kiểm tra `Get-AuthenticodeSignature`, thay `agent/windows/TramVanHanhAgent.msi` và rebuild container API. Không đặt private key ký mã trên dashboard.
+
 ## 14. Firewall máy được quản lý
 
-- Agent chỉ cần outbound TCP `9443` tới `ops.example.com`; cho outbound `443`
-  trong lúc enrollment.
+- Agent chỉ cần outbound TCP `9443` tới hostname trong **Bộ cài Agent**; cho outbound
+  `443` trong lúc bootstrap/enrollment.
 - Không mở inbound cho agent.
 - Đóng inbound `22/3389` từ mạng thông thường. Nếu cần break-glass, chỉ cho
   phép một bastion riêng có MFA.
