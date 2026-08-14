@@ -1,0 +1,66 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Tram Van Hanh Agent"
+           Manufacturer="Tram Van Hanh"
+           Version="0.4.0"
+           UpgradeCode="74D43D78-1E81-4D19-B1F4-4BF35670FD36"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Tram Van Hanh Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="TramVanHanhAgent">
+        <Component Id="AgentServiceComponent" Guid="8D57A94B-8461-49D4-B3A4-6D0E076767CD" Bitness="always64">
+          <File Id="AgentExecutable" Source="$(var.AgentExe)" Name="tram-agent.exe" KeyPath="yes" />
+          <ServiceInstall Id="AgentServiceInstall"
+                          Name="TramVanHanhAgent"
+                          DisplayName="Tram Van Hanh Server Agent"
+                          Description="Secure outbound management agent for Tram Van Hanh."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="--config &quot;[CommonAppDataFolder]TramVanHanh\agent.json&quot; --log-file &quot;[CommonAppDataFolder]TramVanHanh\agent.log&quot; service">
+            <ServiceDependency Id="Tcpip" />
+            <util:ServiceConfig FirstFailureActionType="restart"
+                                SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart"
+                                RestartServiceDelayInSeconds="30"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <ServiceControl Id="AgentServiceControl"
+                          Name="TramVanHanhAgent"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="AgentDataFolder" Name="TramVanHanh">
+        <Directory Id="AgentInboxFolder" Name="Inbox" />
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="AgentBootstrapComponent" Directory="AgentDataFolder" Guid="D8F4D36E-BE65-4ED3-BE73-85EDE34BB062" Bitness="always64">
+      <CreateFolder />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\TramVanHanh\Agent">
+        <RegistryValue Name="BootstrapSource" Type="string" Value="[OriginalDatabase]" KeyPath="yes" />
+      </RegistryKey>
+    </Component>
+
+    <Component Id="AgentInboxComponent" Directory="AgentInboxFolder" Guid="C35C8272-5373-4850-BF03-D2E83D64D2F1" Bitness="always64">
+      <CreateFolder />
+    </Component>
+
+    <Feature Id="AgentFeature" Title="Tram Van Hanh Agent" Level="1">
+      <ComponentRef Id="AgentServiceComponent" />
+      <ComponentRef Id="AgentBootstrapComponent" />
+      <ComponentRef Id="AgentInboxComponent" />
+    </Feature>
+  </Package>
+</Wix>

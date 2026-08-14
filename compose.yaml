@@ -39,7 +39,9 @@ services:
     networks: [control]
 
   api:
-    build: ./control-plane
+    build:
+      context: .
+      dockerfile: control-plane/Dockerfile
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:-}

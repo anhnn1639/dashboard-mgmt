@@ -1,0 +1,50 @@
+name: Build Windows agent MSI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - agent/tram_agent.py
+      - agent/requirements.txt
+      - agent/windows/**
+      - .github/workflows/build-agent-msi.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build standalone agent executable
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir -r agent/requirements.txt pyinstaller==6.16.0
+          pyinstaller --noconfirm --clean --onefile --name tram-agent agent/tram_agent.py
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          wix extension add WixToolset.Util.wixext/6.0.2
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force agent/windows/out | Out-Null
+          wix build agent/windows/Product.wxs -arch x64 -ext WixToolset.Util.wixext -d AgentExe="$pwd/dist/tram-agent.exe" -o agent/windows/out/TramVanHanhAgent.msi
+
+      - name: Upload generic MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: TramVanHanhAgent-msi
+          path: agent/windows/out/TramVanHanhAgent.msi
+          if-no-files-found: error

@@ -49,6 +49,7 @@ const navItems = [
   { id: "jobs", icon: "▶", label: "Công việc" },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán" },
   { id: "access", icon: "◎", label: "Người dùng & vai trò" },
+  { id: "agents", icon: "↓", label: "Bộ cài Agent" },
 ];
 
 const healthLabel: Record<Health, string> = {
@@ -326,6 +327,8 @@ export function OpsConsole() {
               ? "Nhật ký kiểm toán"
               : active === "access"
                 ? "Người dùng & vai trò"
+                : active === "agents"
+                  ? "Tạo bộ cài Agent"
                 : "Trung tâm vận hành";
 
   if (setupStatusError) return <SystemUnavailable message={setupStatusError} />;
@@ -678,6 +681,8 @@ export function OpsConsole() {
             <AuditView token={token} />
           ) : active === "access" ? (
             <AccessView token={token} />
+          ) : active === "agents" ? (
+            <AgentPackagesView token={token} />
           ) : (
             <section className="panel fleet-panel">
               <div className="panel-head fleet-head">
@@ -2266,6 +2271,158 @@ function AuditView({ token }: { token: string }) {
         />
       )}
     </>
+  );
+}
+
+function AgentPackagesView({ token }: { token: string }) {
+  const [status, setStatus] = useState<{
+    dashboardUrl: string;
+    agentVersion: string;
+    linuxAvailable: boolean;
+    windowsMsiAvailable: boolean;
+    claimTtlMinutes: number;
+  } | null>(null);
+  const [busy, setBusy] = useState<OSFamily | null>(null);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    fetch("/api/v1/agent-packages/status", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail ?? "Không thể đọc cấu hình bộ cài");
+        return data;
+      })
+      .then(setStatus)
+      .catch((reason) =>
+        setMessage(reason instanceof Error ? reason.message : "Không thể đọc cấu hình bộ cài"),
+      );
+  }, [token]);
+
+  async function downloadPackage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const osFamily = submitter?.dataset.os as OSFamily | undefined;
+    if (!osFamily || !["linux", "windows"].includes(osFamily)) return;
+    const form = new FormData(event.currentTarget);
+    setBusy(osFamily);
+    setMessage("");
+    try {
+      const response = await fetch("/api/v1/agent-packages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          label: form.get("label"),
+          os_family: osFamily,
+          expires_minutes: Number(form.get("expires_minutes")),
+        }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail ?? "Không thể tạo bộ cài Agent");
+      }
+      const disposition = response.headers.get("Content-Disposition") ?? "";
+      const filename = disposition.match(/filename="([^"]+)"/)?.[1] ??
+        (osFamily === "windows" ? "TramAgent.msi" : "TramAgent-Linux.run");
+      const url = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setMessage(
+        osFamily === "windows"
+          ? "Đã tạo MSI dùng một lần. Giữ nguyên tên file, chép sang đúng Windows Server và chạy bằng Administrator."
+          : "Đã tạo gói Linux dùng một lần. Chạy: chmod +x <file>.run && sudo ./<file>.run",
+      );
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "Không thể tạo bộ cài Agent");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="agent-package-layout">
+      <article className="panel agent-package-intro">
+        <p className="eyebrow">ZERO-TOUCH ENROLLMENT</p>
+        <h2>Bộ cài tự nhận đúng control plane</h2>
+        <p>
+          Domain, CA pin và claim một lần được lấy từ cấu hình HTTPS của hệ thống.
+          Private key mTLS chỉ được sinh trên máy đích, không nằm trong file tải về.
+        </p>
+        <div className="package-origin">
+          <span>Control plane đã khóa</span>
+          <code>{status?.dashboardUrl ?? "Đang kiểm tra…"}</code>
+        </div>
+        <ul>
+          <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>
+          <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
+          <li>Linux cài systemd service, tự enroll và khởi động ngay sau khi cài.</li>
+          <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
+        </ul>
+      </article>
+
+      <form
+        className="panel agent-package-form"
+        onSubmit={downloadPackage}
+      >
+        <div className="panel-head">
+          <div>
+            <h2>Tạo bộ cài riêng cho máy chủ</h2>
+            <p>Agent {status?.agentVersion ?? "…"} · chỉ admin được tạo claim enrollment.</p>
+          </div>
+        </div>
+        <label>
+          Tên gợi nhớ / ticket
+          <input name="label" required minLength={3} maxLength={120} placeholder="SRV-PROD-01 hoặc CHG-1234" />
+        </label>
+        <label>
+          Thời hạn cài đặt
+          <select name="expires_minutes" defaultValue="30">
+            <option value="15">15 phút</option>
+            <option value="30">30 phút</option>
+            <option value="60">60 phút</option>
+          </select>
+        </label>
+        <div className="agent-package-options">
+          <button
+            className="package-option linux"
+            type="submit"
+            data-os="linux"
+            disabled={busy !== null || status?.linuxAvailable === false}
+          >
+            <span>L</span>
+            <b>Tải Linux .run</b>
+            <small>Ubuntu 24.04 · Oracle Linux 7/8</small>
+          </button>
+          <button
+            className="package-option windows"
+            type="submit"
+            data-os="windows"
+            disabled={busy !== null || status?.windowsMsiAvailable === false}
+          >
+            <span>W</span>
+            <b>Tải Windows .msi</b>
+            <small>Windows Server 2025 · auto-start service</small>
+          </button>
+        </div>
+        {busy && <p className="package-progress">Đang sinh claim và đóng gói {busy}…</p>}
+        {status && !status.windowsMsiAvailable && (
+          <p className="package-warning">MSI chung chưa có trong API image. Build workflow Windows rồi rebuild container API.</p>
+        )}
+        {message && <p className="settings-message">{message}</p>}
+        <div className="package-security-note">
+          Không đổi tên MSI Windows: tên file chứa locator đã pin CA. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
+        </div>
+      </form>
+    </section>
   );
 }
 

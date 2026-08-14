@@ -29,12 +29,25 @@ if (-not $Defender -or $Defender.Status -ne "Running") {
     Write-Warning "Microsoft Defender is not running. Secure file delivery will fail closed until an endpoint scanner is active."
 }
 
-$TaskName = "TramVanHanhAgent"
-$Arguments = '"{0}" --config "{1}" --log-file "{2}" run' -f (Join-Path $InstallDir "tram_agent.py"), (Join-Path $DataDir "agent.json"), (Join-Path $DataDir "agent.log")
-$Action = New-ScheduledTaskAction -Execute $AgentPython -Argument $Arguments
-$Trigger = New-ScheduledTaskTrigger -AtStartup
-$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
-Start-ScheduledTask -TaskName $TaskName
-Write-Host "Agent installed and started. It will appear automatically under Windows in the dashboard." -ForegroundColor Green
+$ServiceName = "TramVanHanhAgent"
+if (Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false
+}
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+    & sc.exe stop $ServiceName | Out-Null
+    Start-Sleep -Seconds 2
+    & sc.exe delete $ServiceName | Out-Null
+}
+$AgentScript = Join-Path $InstallDir "tram_agent.py"
+$ConfigPath = Join-Path $DataDir "agent.json"
+$LogPath = Join-Path $DataDir "agent.log"
+$ServiceCommand = ('"{0}" "{1}" --config "{2}" --log-file "{3}" service' -f $AgentPython, $AgentScript, $ConfigPath, $LogPath)
+& sc.exe create $ServiceName binPath= $ServiceCommand start= auto depend= Tcpip DisplayName= "Tram Van Hanh Server Agent" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Cannot create Windows service" }
+& sc.exe description $ServiceName "Secure outbound management agent for Tram Van Hanh." | Out-Null
+& sc.exe failure $ServiceName reset= 86400 actions= restart/30000/restart/30000/restart/30000 | Out-Null
+& sc.exe failureflag $ServiceName 1 | Out-Null
+& sc.exe start $ServiceName | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Cannot start Windows service" }
+Write-Host "Windows service installed, set to Automatic, and started. The server will appear automatically under Windows." -ForegroundColor Green

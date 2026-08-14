@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,19 @@ class AgentSecurityTests(unittest.TestCase):
             )
             self.assertEqual(result, 2)
             self.assertIn("Unsafe", message)
+
+    def test_windows_msi_filename_carries_origin_and_ca_pin(self):
+        netloc = base64.urlsafe_b64encode(b"ops.company.example").decode().rstrip("=")
+        package_id = "89d17447-bbd7-4f3c-a9a8-6796c9348b1a"
+        package_secret = "a" * 43
+        ca_fingerprint = "b" * 64
+        source = f"C:/Downloads/TramAgent--{netloc}--{package_id}--{package_secret}--{ca_fingerprint}.msi"
+        self.assertEqual(
+            tram_agent.parse_windows_installer_source(source),
+            ("https://ops.company.example", package_id, package_secret, ca_fingerprint),
+        )
+        with self.assertRaisesRegex(RuntimeError, "bootstrap"):
+            tram_agent.parse_windows_installer_source("C:/Downloads/renamed.msi")
 
 
 if __name__ == "__main__":

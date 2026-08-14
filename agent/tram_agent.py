@@ -6,6 +6,7 @@ import contextlib
 import getpass
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
@@ -32,7 +33,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.4.0"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -709,8 +710,7 @@ def enroll(config: Config, token: str) -> None:
         raise RuntimeError("server_url is required")
     if urlsplit(config.server_url).scheme != "https":
         raise RuntimeError("Enrollment must use HTTPS")
-    key = ec.generate_private_key(ec.SECP256R1())
-    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, config.agent_id), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Tram Van Hanh Agents")])).sign(key, hashes.SHA256())
+    key, csr = create_agent_identity(config.agent_id)
     enrollment_payload = {"token": token, "agent_id": config.agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": collect_inventory()}
     for attempt in range(30):
         response = requests.post(config.server_url + "/api/v1/enroll", json=enrollment_payload, verify=config.tls_verify(), timeout=60)
@@ -719,8 +719,31 @@ def enroll(config: Config, token: str) -> None:
             break
         LOG.warning("control-plane CA is not ready; enrollment retry %s/30", attempt + 1)
         time.sleep(2)
-    data = response.json()
+    persist_enrollment(config, key, response.json())
+
+
+def create_agent_identity(agent_id: str) -> tuple[ec.EllipticCurvePrivateKey, x509.CertificateSigningRequest]:
+    key = ec.generate_private_key(ec.SECP256R1())
+    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Tram Van Hanh Agents")])).sign(key, hashes.SHA256())
+    return key, csr
+
+
+def harden_agent_directory(config: Config) -> None:
     config.key_file.parent.mkdir(parents=True, exist_ok=True)
+    if platform.system().lower() == "windows":
+        completed = subprocess.run(
+            ["icacls.exe", str(config.key_file.parent), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError("Cannot protect the Windows agent data directory")
+
+
+def persist_enrollment(config: Config, key: ec.EllipticCurvePrivateKey, data: dict[str, Any]) -> None:
+    harden_agent_directory(config)
     config.key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     config.cert_file.write_text(data["certificate"], encoding="utf-8")
     config.ca_file.write_text(data["ca_certificate"], encoding="utf-8")
@@ -734,6 +757,117 @@ def enroll(config: Config, token: str) -> None:
     except OSError:
         pass
     LOG.info("enrolled %s as %s; category=%s", config.agent_id, data["os_family"], data["category"])
+
+
+def valid_server_origin(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise RuntimeError("Bootstrap server must be an origin-only HTTPS URL")
+    return normalized
+
+
+def install_pinned_server_ca(config: Config, certificate_pem: str, expected_sha256: str) -> None:
+    try:
+        certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise RuntimeError("Bootstrap package contains an invalid server CA") from exc
+    actual = certificate.fingerprint(hashes.SHA256()).hex()
+    if not hmac.compare_digest(actual, expected_sha256.lower()):
+        raise RuntimeError("Bootstrap server CA fingerprint mismatch")
+    harden_agent_directory(config)
+    config.server_ca_file = config.path.parent / "server-ca.crt"
+    config.server_ca_file.write_text(certificate_pem, encoding="utf-8")
+    config.save()
+
+
+def bootstrap_enroll(config: Config, package_id: str, package_secret: str) -> None:
+    try:
+        uuid.UUID(package_id)
+    except ValueError as exc:
+        raise RuntimeError("Invalid bootstrap package id") from exc
+    if len(package_secret) < 32:
+        raise RuntimeError("Invalid bootstrap package secret")
+    key, csr = create_agent_identity(config.agent_id)
+    payload = {
+        "package_id": package_id,
+        "package_secret": package_secret,
+        "agent_id": config.agent_id,
+        "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(),
+        "inventory": collect_inventory(),
+    }
+    response = requests.post(config.server_url + "/api/v1/agent-bootstrap/claim", json=payload, verify=config.tls_verify(), timeout=90)
+    response.raise_for_status()
+    persist_enrollment(config, key, response.json())
+
+
+def bootstrap_from_file(config: Config, source: Path) -> None:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Cannot read the bootstrap package") from exc
+    if payload.get("version") != 1:
+        raise RuntimeError("Unsupported bootstrap package version")
+    config.server_url = valid_server_origin(str(payload.get("server_url", "")))
+    install_pinned_server_ca(config, str(payload.get("server_ca_certificate", "")), str(payload.get("server_ca_sha256", "")))
+    bootstrap_enroll(config, str(payload.get("package_id", "")), str(payload.get("package_secret", "")))
+
+
+def parse_windows_installer_source(source: str) -> tuple[str, str, str, str]:
+    filename = Path(source).name
+    if not filename.lower().endswith(".msi"):
+        raise RuntimeError("Windows bootstrap source is not an MSI")
+    parts = filename[:-4].split("--")
+    if len(parts) != 5 or parts[0] != "TramAgent":
+        raise RuntimeError("This MSI does not contain a Tram Agent bootstrap claim")
+    try:
+        encoded_netloc, package_id, package_secret, ca_fingerprint = parts[1:]
+        netloc = base64.urlsafe_b64decode(encoded_netloc + "=" * (-len(encoded_netloc) % 4)).decode("utf-8")
+        uuid.UUID(package_id)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Windows bootstrap claim is malformed") from exc
+    server_url = valid_server_origin(f"https://{netloc}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", package_secret) or not re.fullmatch(r"[0-9a-f]{64}", ca_fingerprint):
+        raise RuntimeError("Windows bootstrap claim is malformed")
+    return server_url, package_id, package_secret, ca_fingerprint
+
+
+def retrieve_server_ca_by_fingerprint(server_url: str, expected_sha256: str) -> str:
+    parsed = urlsplit(server_url)
+    # This first request intentionally has no PKI trust yet. Its only accepted
+    # output is a CA certificate matching the SHA-256 pin carried by the MSI
+    # filename. Every request after this one uses normal TLS verification.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=30, context=context)
+    try:
+        connection.request("GET", "/api/v1/agent-server-ca", headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        body = response.read(256 * 1024)
+        if response.status != 200:
+            raise RuntimeError(f"Cannot retrieve the pinned dashboard CA (HTTP {response.status})")
+        certificate_pem = str(json.loads(body).get("certificate", ""))
+    except (OSError, ValueError, TypeError, http.client.HTTPException) as exc:
+        raise RuntimeError("Cannot retrieve the pinned dashboard CA") from exc
+    finally:
+        connection.close()
+    try:
+        certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise RuntimeError("Dashboard returned an invalid bootstrap CA") from exc
+    actual = certificate.fingerprint(hashes.SHA256()).hex()
+    if not hmac.compare_digest(actual, expected_sha256):
+        raise RuntimeError("Downloaded dashboard CA does not match the MSI pin")
+    return certificate_pem
+
+
+def bootstrap_from_windows_installer(config: Config, source: str) -> None:
+    server_url, package_id, package_secret, ca_fingerprint = parse_windows_installer_source(source)
+    config.server_url = server_url
+    certificate_pem = retrieve_server_ca_by_fingerprint(server_url, ca_fingerprint)
+    install_pinned_server_ca(config, certificate_pem, ca_fingerprint)
+    bootstrap_enroll(config, package_id, package_secret)
 
 
 def ensure_server_ca(config: Config) -> None:
@@ -826,6 +960,142 @@ def default_config_path() -> str:
     return "/etc/tram-agent/agent.json"
 
 
+def read_windows_bootstrap_source() -> str:
+    if platform.system().lower() != "windows":
+        raise RuntimeError("Windows bootstrap registry is unavailable on this platform")
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TramVanHanh\Agent", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            value, _ = winreg.QueryValueEx(key, "BootstrapSource")
+    except OSError as exc:
+        raise RuntimeError("MSI bootstrap source is missing") from exc
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("MSI bootstrap source is invalid")
+    return value
+
+
+def delete_windows_bootstrap_source() -> None:
+    if platform.system().lower() != "windows":
+        return
+    import winreg
+
+    with contextlib.suppress(OSError):
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TramVanHanh\Agent", 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+            winreg.DeleteValue(key, "BootstrapSource")
+
+
+def child_agent_command(config: Config, log_file: str | None) -> list[str]:
+    executable = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve())]
+    command = [*executable, "--config", str(config.path)]
+    if log_file:
+        command.extend(["--log-file", log_file])
+    command.append("run")
+    return command
+
+
+def run_windows_service(config: Config, log_file: str | None) -> None:
+    if platform.system().lower() != "windows":
+        raise RuntimeError("The service command is available only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    service_name = "TramVanHanhAgent"
+    service_stop = threading.Event()
+    service_child: subprocess.Popen[str] | None = None
+    status_handle = wintypes.HANDLE()
+
+    SERVICE_WIN32_OWN_PROCESS = 0x00000010
+    SERVICE_STOPPED = 0x00000001
+    SERVICE_START_PENDING = 0x00000002
+    SERVICE_STOP_PENDING = 0x00000003
+    SERVICE_RUNNING = 0x00000004
+    SERVICE_ACCEPT_STOP = 0x00000001
+    SERVICE_ACCEPT_SHUTDOWN = 0x00000004
+    SERVICE_CONTROL_STOP = 0x00000001
+    SERVICE_CONTROL_SHUTDOWN = 0x00000005
+
+    class ServiceStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwServiceType", wintypes.DWORD),
+            ("dwCurrentState", wintypes.DWORD),
+            ("dwControlsAccepted", wintypes.DWORD),
+            ("dwWin32ExitCode", wintypes.DWORD),
+            ("dwServiceSpecificExitCode", wintypes.DWORD),
+            ("dwCheckPoint", wintypes.DWORD),
+            ("dwWaitHint", wintypes.DWORD),
+        ]
+
+    handler_type = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID)
+    service_main_type = ctypes.WINFUNCTYPE(None, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR))
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.RegisterServiceCtrlHandlerExW.argtypes = [wintypes.LPCWSTR, handler_type, wintypes.LPVOID]
+    advapi32.RegisterServiceCtrlHandlerExW.restype = wintypes.HANDLE
+    advapi32.SetServiceStatus.argtypes = [wintypes.HANDLE, ctypes.POINTER(ServiceStatus)]
+    advapi32.SetServiceStatus.restype = wintypes.BOOL
+
+    def set_status(state: int, *, exit_code: int = 0, wait_hint: int = 0) -> None:
+        accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN if state == SERVICE_RUNNING else 0
+        status = ServiceStatus(SERVICE_WIN32_OWN_PROCESS, state, accepted, exit_code, 0, 0, wait_hint)
+        if status_handle and not advapi32.SetServiceStatus(status_handle, ctypes.byref(status)):
+            LOG.error("cannot update Windows service status: %s", ctypes.get_last_error())
+
+    @handler_type
+    def control_handler(control: int, _event_type: int, _event_data: int, _context: int) -> int:
+        nonlocal service_child
+        if control in {SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN}:
+            set_status(SERVICE_STOP_PENDING, wait_hint=20_000)
+            service_stop.set()
+            if service_child and service_child.poll() is None:
+                with contextlib.suppress(OSError):
+                    service_child.terminate()
+        return 0
+
+    @service_main_type
+    def service_main(_argc: int, _argv: ctypes.POINTER(wintypes.LPWSTR)) -> None:
+        nonlocal status_handle, service_child
+        status_handle = advapi32.RegisterServiceCtrlHandlerExW(service_name, control_handler, None)
+        if not status_handle:
+            return
+        set_status(SERVICE_START_PENDING, wait_hint=120_000)
+        exit_code = 0
+        try:
+            enrolled = all(path.exists() for path in (config.cert_file, config.key_file, config.ca_file))
+            if not enrolled:
+                bootstrap_from_windows_installer(config, read_windows_bootstrap_source())
+            delete_windows_bootstrap_source()
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            service_child = subprocess.Popen(child_agent_command(config, log_file), creationflags=creation_flags, text=True)
+            set_status(SERVICE_RUNNING)
+            while not service_stop.wait(1):
+                result = service_child.poll()
+                if result is not None:
+                    exit_code = result or 1
+                    break
+        except Exception:
+            exit_code = 1
+            LOG.exception("Windows service failed")
+        finally:
+            if service_child and service_child.poll() is None:
+                with contextlib.suppress(OSError):
+                    service_child.terminate()
+                try:
+                    service_child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        service_child.kill()
+            set_status(SERVICE_STOPPED, exit_code=exit_code)
+
+    class ServiceTableEntry(ctypes.Structure):
+        _fields_ = [("lpServiceName", wintypes.LPWSTR), ("lpServiceProc", service_main_type)]
+
+    table = (ServiceTableEntry * 2)(ServiceTableEntry(service_name, service_main), ServiceTableEntry(None, service_main_type()))
+    advapi32.StartServiceCtrlDispatcherW.argtypes = [ctypes.POINTER(ServiceTableEntry)]
+    advapi32.StartServiceCtrlDispatcherW.restype = wintypes.BOOL
+    if not advapi32.StartServiceCtrlDispatcherW(table):
+        raise RuntimeError(f"Cannot connect to Windows Service Control Manager ({ctypes.get_last_error()})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trạm Vận Hành agent")
     parser.add_argument("--config", default=default_config_path())
@@ -835,8 +1105,11 @@ def main() -> int:
     enrollment.add_argument("--server", required=True)
     enrollment.add_argument("--token")
     enrollment.add_argument("--server-ca", help="PEM CA used to verify a private/internal dashboard certificate")
+    bootstrap_parser = sub.add_parser("bootstrap")
+    bootstrap_parser.add_argument("--file", required=True, help="One-time bootstrap JSON generated by the dashboard")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--once", action="store_true")
+    sub.add_parser("service")
     args = parser.parse_args()
     configure_logging(args.log_file)
     config = Config(args.config)
@@ -852,6 +1125,12 @@ def main() -> int:
             config.save()
         token = args.token or getpass.getpass("Enrollment token: ")
         enroll(config, token)
+        return 0
+    if args.command == "bootstrap":
+        bootstrap_from_file(config, Path(args.file))
+        return 0
+    if args.command == "service":
+        run_windows_service(config, args.log_file)
         return 0
     loop(config, args.once)
     return 0

@@ -1,8 +1,10 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import tempfile
+import tarfile
 import time
 import unittest
 import uuid
@@ -34,8 +36,9 @@ ca_key_path.write_bytes(ca_key.private_bytes(serialization.Encoding.PEM, seriali
 os.environ["AGENT_CA_CERT"] = str(ca_cert_path)
 os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
+os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import Inventory, classify_os, guacamole_ssh_host_key  # noqa: E402
+from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_ssh_host_key, settings  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -150,6 +153,76 @@ class ClassificationTests(unittest.TestCase):
 
             windows = client.get("/api/v1/servers?os_family=windows", headers=headers)
             self.assertTrue(any(item["id"] == agent_id and item["osFamily"] == "windows" for item in windows.json()["items"]))
+
+    def test_zero_touch_packages_pin_the_configured_domain_and_are_single_use(self):
+        assert SessionLocal is not None
+        with SessionLocal() as db:
+            db.merge(SystemSetting(key="dashboard_url", value="https://ops.company.example"))
+            db.commit()
+        fake_msi = Path(tmp.name) / "TramVanHanhAgent.msi"
+        fake_msi.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 8192)
+        settings.windows_agent_msi = str(fake_msi)
+
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            status = client.get("/api/v1/agent-packages/status", headers=headers)
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json()["dashboardUrl"], "https://ops.company.example")
+            self.assertTrue(status.json()["windowsMsiAvailable"])
+
+            linux_package = client.post(
+                "/api/v1/agent-packages",
+                headers=headers,
+                json={"label": "ubuntu-prod-01", "os_family": "linux", "expires_minutes": 15},
+            )
+            self.assertEqual(linux_package.status_code, 200, linux_package.text)
+            self.assertIn("TramAgent-Linux-ubuntu-prod-01.run", linux_package.headers["content-disposition"])
+            marker = b"__TRAM_AGENT_ARCHIVE__\n"
+            archive_bytes = linux_package.content.split(marker, 1)[1]
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+                bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
+                self.assertEqual(bootstrap["server_url"], "https://ops.company.example")
+                self.assertIn("BEGIN CERTIFICATE", bootstrap["server_ca_certificate"])
+
+            linux_id = str(uuid.uuid4())
+            linux_key = ec.generate_private_key(ec.SECP256R1())
+            linux_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, linux_id)])).sign(linux_key, hashes.SHA256())
+            linux_claim = {
+                "package_id": bootstrap["package_id"],
+                "package_secret": bootstrap["package_secret"],
+                "agent_id": linux_id,
+                "csr_pem": linux_csr.public_bytes(serialization.Encoding.PEM).decode(),
+                "inventory": {"hostname": "ubuntu-prod-01", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.4.0", "addresses": ["10.40.1.10"]},
+            }
+            claimed = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
+            self.assertEqual(claimed.status_code, 201, claimed.text)
+            self.assertEqual(claimed.json()["agent_endpoint"], "https://ops.company.example:9443/api/v1/agent")
+            replay = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
+            self.assertEqual(replay.status_code, 401)
+
+            windows_package = client.post(
+                "/api/v1/agent-packages",
+                headers=headers,
+                json={"label": "win-prod-01", "os_family": "windows", "expires_minutes": 15},
+            )
+            self.assertEqual(windows_package.status_code, 200, windows_package.text)
+            self.assertEqual(windows_package.content, fake_msi.read_bytes())
+            filename = windows_package.headers["content-disposition"].split('filename="', 1)[1].rstrip('"')
+            parts = filename[:-4].split("--")
+            self.assertEqual(len(parts), 5)
+            package_id, package_secret = parts[2], parts[3]
+
+            mismatch_id = str(uuid.uuid4())
+            mismatch_key = ec.generate_private_key(ec.SECP256R1())
+            mismatch_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, mismatch_id)])).sign(mismatch_key, hashes.SHA256())
+            mismatch = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": mismatch_id, "csr_pem": mismatch_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "wrong-linux", "os_family": "linux", "os_name": "Ubuntu 24.04", "distribution_id": "ubuntu", "agent_version": "0.4.0"}})
+            self.assertEqual(mismatch.status_code, 400)
+
+            windows_id = str(uuid.uuid4())
+            windows_key = ec.generate_private_key(ec.SECP256R1())
+            windows_csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, windows_id)])).sign(windows_key, hashes.SHA256())
+            windows_claim = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": windows_id, "csr_pem": windows_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-prod-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025", "distribution_id": "windows", "agent_version": "0.4.0"}})
+            self.assertEqual(windows_claim.status_code, 201, windows_claim.text)
 
     def test_clean_file_is_encrypted_and_queued_for_four_eyes_approval(self):
         with TestClient(app) as client:

@@ -43,6 +43,7 @@ from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, encrypt_file, normalize_upload_name, scan_with_clamav
+from .agent_packages import certificate_sha256, linux_run_bundle, safe_package_label, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 
 
@@ -76,6 +77,8 @@ class Settings(BaseSettings):
     clamav_host: str = "clamav"
     clamav_port: int = 3310
     clamav_timeout_seconds: int = 60
+    agent_assets_root: str = "/opt/tram-agent-assets"
+    windows_agent_msi: str = "/opt/tram-agent-assets/windows/TramVanHanhAgent.msi"
 
 
 settings = Settings()
@@ -168,6 +171,18 @@ class EnrollmentToken(Base):
     uses: Mapped[int] = mapped_column(Integer, default=0)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[str] = mapped_column(String(36))
+
+
+class AgentBootstrapPackage(Base):
+    __tablename__ = "agent_bootstrap_packages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    secret_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(120), default="")
+    expected_os_family: Mapped[str] = mapped_column(String(20), index=True)
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
@@ -283,6 +298,12 @@ class EnrollmentTokenRequest(BaseModel):
     max_uses: int = Field(default=1, ge=1, le=1000)
 
 
+class AgentPackageRequest(BaseModel):
+    label: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@ -]+$")
+    os_family: Literal["windows", "linux"]
+    expires_minutes: int = Field(default=30, ge=5, le=60)
+
+
 class Inventory(BaseModel):
     hostname: str = Field(min_length=1, max_length=255)
     os_family: Literal["windows", "linux"]
@@ -304,6 +325,14 @@ class Inventory(BaseModel):
 
 class EnrollmentRequest(BaseModel):
     token: str = Field(min_length=20)
+    agent_id: str
+    csr_pem: str
+    inventory: Inventory
+
+
+class AgentBootstrapClaimRequest(BaseModel):
+    package_id: str
+    package_secret: str = Field(min_length=32, max_length=256)
     agent_id: str
     csr_pem: str
     inventory: Inventory
@@ -375,8 +404,8 @@ class SetupCompleteRequest(BaseModel):
     def valid_dashboard_url(cls, value: str) -> str:
         normalized = value.strip().rstrip("/")
         parsed = urlsplit(normalized)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Dashboard URL must be an absolute HTTPS URL")
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Dashboard URL must be an origin-only absolute HTTPS URL")
         return normalized
 
 
@@ -433,7 +462,7 @@ tunnel_hub = TunnelHub(
 )
 
 
-app = FastAPI(title="Trạm Vận Hành API", version="0.3.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Trạm Vận Hành API", version="0.4.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -1159,50 +1188,206 @@ def create_enrollment_token(payload: EnrollmentTokenRequest, request: Request, u
     return {"id": record.id, "token": raw, "expiresAt": record.expires_at.isoformat(), "note": "Token is shown once"}
 
 
-@app.post("/api/v1/enroll", status_code=201)
-def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(db_session)):
+def canonical_dashboard_url(db: Session) -> str:
+    canonical = db.get(SystemSetting, "dashboard_url")
+    if not canonical:
+        raise HTTPException(status_code=409, detail="Complete setup with the real HTTPS dashboard URL before generating an agent")
+    normalized = canonical.value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise HTTPException(status_code=409, detail="The configured dashboard URL must be an origin-only HTTPS URL")
+    return normalized
+
+
+def agent_endpoint_for_dashboard(dashboard_url: str) -> str:
+    hostname = urlsplit(dashboard_url).hostname
+    if not hostname:
+        raise HTTPException(status_code=409, detail="Dashboard hostname is unavailable")
+    formatted_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"https://{formatted_host}:9443/api/v1/agent"
+
+
+def issue_agent_identity(
+    *,
+    agent_id: str,
+    csr_pem: str,
+    inventory: Inventory,
+    request: Request,
+    db: Session,
+    actor: str,
+    allow_rotation: bool,
+) -> dict[str, Any]:
     try:
-        uuid.UUID(payload.agent_id)
+        uuid.UUID(agent_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="agent_id must be a UUID") from exc
+    family, verification = classify_os(inventory)
+    existing = db.get(Server, agent_id)
+    if existing and not allow_rotation:
+        raise HTTPException(status_code=409, detail="Bootstrap packages cannot replace an existing agent identity")
+    cert_pem, fingerprint, cert_expires = sign_agent_csr(csr_pem, agent_id)
+    try:
+        server_ca_certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
+        agent_ca_certificate = Path(settings.agent_ca_cert).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Control-plane PKI is unavailable; restart Caddy/API and retry enrollment") from exc
+    replacing_certificate = bool(existing and existing.cert_fingerprint)
+    remote_protocol = "rdp" if family == "windows" else "ssh"
+    server = existing or Server(id=agent_id, name=inventory.hostname, os_family=family, os_name=inventory.os_name)
+    server.name = inventory.hostname
+    server.os_family = family
+    server.os_name = inventory.os_name
+    server.os_version = inventory.os_version
+    server.distribution_id = inventory.distribution_id
+    server.architecture = inventory.architecture
+    server.address = next((address for address in inventory.addresses if not address.startswith("127.") and address != "::1"), "")
+    server.agent_version = inventory.agent_version
+    server.cert_fingerprint = fingerprint
+    server.cert_expires_at = cert_expires
+    server.last_seen = now()
+    server.status = "online"
+    server.inventory = inventory.model_dump()
+    server.ssh_host_key = inventory.ssh_host_key
+    server.remote_protocol = remote_protocol
+    server.verified_os = verification == "verified"
+    db.add(server)
+    action = "agent.certificate.rotate" if replacing_certificate else "agent.enroll"
+    audit(db, actor, action, agent_id, request, detail={"os_family": family, "distribution": inventory.distribution_id, "verified": server.verified_os})
+    try:
+        dashboard_url = canonical_dashboard_url(db)
+    except HTTPException:
+        request_host = request.url.hostname
+        if not request_host:
+            raise
+        dashboard_url = f"https://{request_host}"
+    return {
+        "agent_id": agent_id,
+        "certificate": cert_pem,
+        "ca_certificate": agent_ca_certificate,
+        "server_ca_certificate": server_ca_certificate,
+        "expires_at": cert_expires.isoformat(),
+        "os_family": family,
+        "category": "Windows" if family == "windows" else "Linux",
+        "agent_endpoint": agent_endpoint_for_dashboard(dashboard_url),
+    }
+
+
+@app.get("/api/v1/agent-packages/status")
+def agent_package_status(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    dashboard_url = canonical_dashboard_url(db)
+    return {
+        "dashboardUrl": dashboard_url,
+        "agentVersion": "0.4.0",
+        "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
+        "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
+        "claimTtlMinutes": 30,
+    }
+
+
+@app.post("/api/v1/agent-packages")
+def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    dashboard_url = canonical_dashboard_url(db)
+    try:
+        ca_certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
+        ca_fingerprint = certificate_sha256(ca_certificate)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="The dashboard CA is not available for package pinning") from exc
+    package_id = str(uuid.uuid4())
+    package_secret = secrets.token_urlsafe(32)
+    safe_label = safe_package_label(payload.label)
+    expires_at = now() + timedelta(minutes=payload.expires_minutes)
+    try:
+        if payload.os_family == "linux":
+            content = linux_run_bundle(
+                Path(settings.agent_assets_root),
+                dashboard_url=dashboard_url,
+                package_id=package_id,
+                package_secret=package_secret,
+                ca_certificate=ca_certificate,
+                ca_fingerprint=ca_fingerprint,
+            )
+            filename = f"TramAgent-Linux-{safe_label}.run"
+            media_type = "application/octet-stream"
+        else:
+            content = validate_windows_msi(Path(settings.windows_agent_msi))
+            filename = windows_msi_filename(dashboard_url, package_id, package_secret, ca_fingerprint)
+            media_type = "application/x-msi"
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    record = AgentBootstrapPackage(
+        id=package_id,
+        secret_hash=token_digest(package_secret),
+        label=payload.label,
+        expected_os_family=payload.os_family,
+        created_by=user.id,
+        expires_at=expires_at,
+    )
+    db.add(record)
+    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url})
+    db.commit()
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Tram-Package-Expires": expires_at.isoformat(),
+        },
+    )
+
+
+@app.post("/api/v1/agent-bootstrap/claim", status_code=201)
+def claim_agent_package(payload: AgentBootstrapClaimRequest, request: Request, db: Session = Depends(db_session)):
+    try:
+        uuid.UUID(payload.package_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Bootstrap claim is invalid or expired") from exc
+    record = db.execute(select(AgentBootstrapPackage).where(AgentBootstrapPackage.id == payload.package_id).with_for_update()).scalar_one_or_none()
+    supplied_hash = token_digest(payload.package_secret)
+    if not record or not hmac.compare_digest(record.secret_hash, supplied_hash) or record.used_at is not None or aware(record.expires_at) < now():
+        raise HTTPException(status_code=401, detail="Bootstrap claim is invalid or expired")
+    family, _ = classify_os(payload.inventory)
+    if family != record.expected_os_family:
+        audit(db, f"bootstrap:{record.id}", "agent.package.os_mismatch", record.id, request, "blocked", {"expected": record.expected_os_family, "reported": family})
+        db.commit()
+        raise HTTPException(status_code=400, detail="This installer was generated for a different operating system")
+    response = issue_agent_identity(
+        agent_id=payload.agent_id,
+        csr_pem=payload.csr_pem,
+        inventory=payload.inventory,
+        request=request,
+        db=db,
+        actor=f"bootstrap:{record.id}",
+        allow_rotation=False,
+    )
+    record.used_at = now()
+    audit(db, f"bootstrap:{record.id}", "agent.package.claim", payload.agent_id, request, detail={"label": record.label, "os_family": family})
+    db.commit()
+    return response
+
+
+@app.post("/api/v1/enroll", status_code=201)
+def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(db_session)):
     record = db.execute(select(EnrollmentToken).where(EnrollmentToken.token_hash == token_digest(payload.token))).scalar_one_or_none()
     if not record or record.uses >= record.max_uses or aware(record.expires_at) < now():
         raise HTTPException(status_code=401, detail="Enrollment token is invalid or expired")
     family, verification = classify_os(payload.inventory)
     if record.expected_os_family and record.expected_os_family != family:
         raise HTTPException(status_code=400, detail="Agent OS does not match enrollment policy")
-    cert_pem, fingerprint, cert_expires = sign_agent_csr(payload.csr_pem, payload.agent_id)
-    try:
-        server_ca_certificate = Path(settings.caddy_root_ca).read_text()
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail="Caddy server CA is unavailable; restart Caddy and retry enrollment") from exc
-    server = db.get(Server, payload.agent_id)
-    replacing_certificate = bool(server and server.cert_fingerprint)
-    remote_protocol = "rdp" if family == "windows" else "ssh"
-    server = server or Server(id=payload.agent_id, name=payload.inventory.hostname, os_family=family, os_name=payload.inventory.os_name)
-    server.name = payload.inventory.hostname
-    server.os_family = family
-    server.os_name = payload.inventory.os_name
-    server.os_version = payload.inventory.os_version
-    server.distribution_id = payload.inventory.distribution_id
-    server.architecture = payload.inventory.architecture
-    server.address = next((address for address in payload.inventory.addresses if not address.startswith("127.") and address != "::1"), "")
-    server.agent_version = payload.inventory.agent_version
-    server.cert_fingerprint = fingerprint
-    server.cert_expires_at = cert_expires
-    server.last_seen = now()
-    server.status = "online"
-    server.inventory = payload.inventory.model_dump()
-    server.ssh_host_key = payload.inventory.ssh_host_key
-    server.remote_protocol = remote_protocol
-    server.verified_os = verification == "verified"
-    db.add(server)
+    response = issue_agent_identity(
+        agent_id=payload.agent_id,
+        csr_pem=payload.csr_pem,
+        inventory=payload.inventory,
+        request=request,
+        db=db,
+        actor=f"agent:{payload.agent_id}",
+        allow_rotation=True,
+    )
     record.uses += 1
-    audit(db, f"agent:{payload.agent_id}", "agent.certificate.rotate" if replacing_certificate else "agent.enroll", payload.agent_id, request, detail={"os_family": family, "distribution": payload.inventory.distribution_id, "verified": server.verified_os})
     db.commit()
-    canonical = db.get(SystemSetting, "dashboard_url")
-    dashboard_host = urlsplit(canonical.value).hostname if canonical else request.url.hostname
-    return {"agent_id": payload.agent_id, "certificate": cert_pem, "ca_certificate": Path(settings.agent_ca_cert).read_text(), "server_ca_certificate": server_ca_certificate, "expires_at": cert_expires.isoformat(), "os_family": family, "category": "Windows" if family == "windows" else "Linux", "agent_endpoint": "https://" + str(dashboard_host) + ":9443/api/v1/agent"}
+    return response
 
 
 @app.get("/api/v1/agent-server-ca")

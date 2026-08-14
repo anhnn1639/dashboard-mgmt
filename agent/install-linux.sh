@@ -7,6 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+bootstrap_source=${1:-}
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
@@ -26,6 +27,7 @@ done
 
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 install -d -m 0700 /var/lib/tram-agent/inbox
+systemctl stop tram-agent.service >/dev/null 2>&1 || true
 python3 -m venv /opt/tram-agent/venv
 /opt/tram-agent/venv/bin/pip install --no-cache-dir --upgrade pip
 /opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$script_dir/requirements.txt"
@@ -38,13 +40,28 @@ if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
 elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
   systemctl enable --now sshd
 fi
-systemctl try-restart tram-agent.service
-
 if ! command -v clamscan >/dev/null 2>&1; then
   echo "WARNING: endpoint ClamAV is missing. Secure file delivery will fail closed until a supported scanner is installed." >&2
   echo "Oracle Linux 8: enable the approved ol8_developer_EPEL repository, then install clamav and update signatures." >&2
 fi
 
-echo "Installed. Enroll with:"
-echo "  sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py enroll --server https://ops.example.com --server-ca /path/server-ca.crt --token 'ONE_TIME_TOKEN'"
-echo "Then start: sudo systemctl enable --now tram-agent"
+if [ -n "$bootstrap_source" ]; then
+  if [ ! -f "$bootstrap_source" ]; then
+    echo "Bootstrap file does not exist" >&2
+    exit 1
+  fi
+  install -m 0600 "$bootstrap_source" /etc/tram-agent/bootstrap.json
+  cleanup_bootstrap() { rm -f /etc/tram-agent/bootstrap.json; }
+  trap cleanup_bootstrap EXIT HUP INT TERM
+  /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
+    --config /etc/tram-agent/agent.json \
+    --log-file /var/log/tram-agent/agent.log \
+    bootstrap --file /etc/tram-agent/bootstrap.json
+  cleanup_bootstrap
+  trap - EXIT HUP INT TERM
+  systemctl enable --now tram-agent.service
+  echo "Agent enrolled and started. It will appear automatically under Linux in the dashboard."
+else
+  systemctl try-restart tram-agent.service
+  echo "Installed. Enroll with the HTTPS URL and CA of this control plane, then enable tram-agent.service."
+fi
