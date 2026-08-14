@@ -4,7 +4,7 @@
 
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
-- Release zero-touch installer đã push: `a636e48 Ship domain-aware agent installers`.
+- Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`.
 - Agent mới nhất: `0.4.1`.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -26,8 +26,8 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `13,582,336` bytes.
-- SHA-256: `AC5237DB26DE00A352FA63211D340556DBC813FF757FA6718DD087EE8A318982`.
-- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31770292504`.
+- SHA-256: `AF75F260FB3CB714193D2D8E7F3AC286F525893E4F0584520FF6BED3BFF1DC20`.
+- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31772798824`.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -125,12 +125,12 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `14/14`, gồm configured domain, bundle generation, CA pin, OS binding và replay rejection.
-- Agent security `5/5`, gồm parser locator MSI.
+- Agent security `6/6`, gồm parser locator MSI và bootstrap qua TLS public của Nginx.
 - ESLint pass.
 - Vinext production build pass.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
-- GitHub Actions run `31770292504` pass toàn bộ; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions run `31772798824` pass toàn bộ; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
