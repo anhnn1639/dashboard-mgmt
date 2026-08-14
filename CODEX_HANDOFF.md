@@ -4,7 +4,7 @@
 
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
-- Commit zero-touch installer đã push: `5f82cb2 Generate zero-touch agent installers`.
+- Release zero-touch installer đã push: `a636e48 Ship domain-aware agent installers`.
 - Agent mới nhất: `0.4.0`.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -26,7 +26,7 @@
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `13,582,336` bytes.
 - SHA-256: `AC5237DB26DE00A352FA63211D340556DBC813FF757FA6718DD087EE8A318982`.
-- Build PyInstaller + WiX thành công trên GitHub Actions run `31769407861`.
+- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31770292504`.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -126,7 +126,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Vinext production build pass.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
-- MSI WiX build và artifact upload pass; workflow cũ chỉ đỏ ở post-step cache pip sau khi artifact đã upload. Cache đã được bỏ ở thay đổi tiếp theo.
+- GitHub Actions run `31770292504` pass toàn bộ; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
