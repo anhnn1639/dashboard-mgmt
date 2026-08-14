@@ -5,6 +5,7 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 ## Những gì đã có
 
 - Dashboard tách tự động **Windows** và **Linux**, không yêu cầu chọn thủ công khi cài agent.
+- Mỗi máy chủ có URL riêng dạng `#/linux/<hostname>` hoặc `#/windows/<hostname>`, breadcrumb quay lại danh sách và workspace toàn màn hình với các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký.
 - Inventory: hostname, OS/version, kiến trúc, IP, kernel, CPU, RAM, disk, uptime, số dịch vụ và bản vá chờ.
 - Agent outbound cho Windows Server 2025, Ubuntu 24.04 và Oracle Linux 7/8.
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
@@ -194,11 +195,13 @@ Máy sẽ tự xuất hiện trong **Máy chủ Windows**. RDP phải được b
 1. Chọn server trong dashboard.
 2. Linux hiển thị **Mở SSH**; Windows hiển thị **Remote Desktop**.
 3. Nhập credential dùng cho đúng phiên. Password được đưa vào JSON Guacamole có chữ ký HMAC-SHA256, mã hóa AES-CBC và hết hạn sau 2 phút; API không lưu password và không ghi password vào audit.
-4. API tạo listener TCP dùng một lần trên mạng Docker internal. `guacd` kết nối listener này, agent nhận yêu cầu qua WebSocket mTLS rồi relay tới đúng dịch vụ local. Agent từ chối mọi host/port tùy ý.
+4. API tạo listener TCP dùng một lần trên mạng Docker internal, yêu cầu agent mở stream mTLS tới đúng dịch vụ local và chỉ trả địa chỉ relay cho Guacamole sau khi stream đã sẵn sàng. Nhờ vậy lỗi `sshd`/RDP local hoặc Agent không mở được stream sẽ được báo ngay trên dashboard thay vì chỉ hiện lỗi nội bộ của Guacamole. Agent từ chối mọi host/port tùy ý.
 5. `guacd` ghi native graphical recording vào `RECORDING_DIR`; SSH ghi thêm typescript.
 6. Vào **Nhật ký kiểm toán → Video ghi session → Xem lại** để phát trực tiếp recording gốc trong trình duyệt.
 
 Recording gốc của Guacamole không cần re-encode, giữ nguyên dữ liệu hiển thị ở độ phân giải trình duyệt yêu cầu và thường nhỏ hơn video truyền thống. Object storage retention và legal hold vẫn là hạng mục production tiếp theo. Không bật `ignore-cert` cho RDP; fingerprint certificate RDP do agent thu thập được pin trong Guacamole. SSH host key cũng được pin. Clipboard hai chiều, SFTP và RDP drive/printing đều bị tắt; file chỉ đi qua pipeline đã quét.
+
+Nếu SSH không mở được, không mở inbound `22`. Trên máy Linux đích kiểm tra `systemctl status ssh` (Ubuntu) hoặc `systemctl status sshd` (Oracle Linux), listener `127.0.0.1:22` và log `journalctl -u tram-agent`. Trên control plane kiểm tra `docker compose ... logs api guacamole guacd`; API sẽ phân biệt lỗi Agent/sshd trước khi chuyển trình duyệt sang Guacamole.
 
 ## Truyền file an toàn
 

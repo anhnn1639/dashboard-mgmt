@@ -239,6 +239,29 @@ Nhấn: Kiểm tra kết nối & hoàn tất
 - Không public `3310` (ClamAV), `4822` (guacd), `5432` (PostgreSQL) hoặc các
   cổng relay tạm thời của container API.
 
+## 14A. Kiểm tra SSH qua reverse tunnel
+
+Không mở inbound `22` từ dashboard hoặc các máy chủ khác. Agent chỉ relay tới
+`127.0.0.1:22` trên chính máy Linux đích. Sau khi cập nhật control plane, rebuild
+hai service có thay đổi:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api guacamole guacd
+```
+
+Nếu dashboard báo Agent không chuẩn bị được `127.0.0.1:22`, kiểm tra trên máy đích:
+
+```bash
+sudo systemctl status ssh --no-pager      # Ubuntu 24.04
+sudo systemctl status sshd --no-pager     # Oracle Linux 7/8
+sudo ss -lntp | grep ':22'
+sudo journalctl -u tram-agent -n 150 --no-pager
+```
+
+Luồng mới chờ stream Agent mTLS sẵn sàng rồi mới mở Guacamole, nên lỗi dịch vụ
+SSH local sẽ trả về dashboard trước khi trình duyệt chuyển sang màn hình Guacamole.
+
 ## 15A. Cập nhật bản test
 
 ```bash

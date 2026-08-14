@@ -30,7 +30,7 @@ class TunnelHubTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             await hub.create_listener("session-1", "agent-1", "ssh")
 
-    async def test_tcp_is_bridged_only_after_agent_stream_attaches(self):
+    async def test_agent_stream_is_prepared_before_tcp_relay_is_returned(self):
         closed: list[tuple[str, str]] = []
 
         async def on_closed(session_id: str, reason: str) -> None:
@@ -40,12 +40,13 @@ class TunnelHubTests(unittest.IsolatedAsyncioTestCase):
         control = FakeWebSocket()
         stream = FakeWebSocket()
         await hub.register_control("agent-1", control)
-        port = await hub.create_listener("session-1", "agent-1", "ssh")
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-
+        listener_task = asyncio.create_task(hub.create_listener("session-1", "agent-1", "ssh"))
         instruction = await asyncio.wait_for(control.control_messages.get(), timeout=2)
         self.assertEqual(instruction, {"type": "open", "session_id": "session-1", "protocol": "ssh", "port": 22})
+        self.assertFalse(listener_task.done())
         attached = asyncio.create_task(hub.attach_stream("session-1", "agent-1", stream))
+        port = await asyncio.wait_for(listener_task, timeout=2)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
 
         writer.write(b"client-to-agent")
         await writer.drain()
@@ -59,6 +60,19 @@ class TunnelHubTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         self.assertTrue(stream.closed)
         self.assertEqual(closed[-1], ("session-1", "closed"))
+
+    async def test_listener_fails_before_guacamole_when_agent_stream_times_out(self):
+        closed: list[tuple[str, str]] = []
+
+        async def on_closed(session_id: str, reason: str) -> None:
+            closed.append((session_id, reason))
+
+        hub = TunnelHub(bind_host="127.0.0.1", connect_timeout_seconds=0.01, closed_callback=on_closed)
+        control = FakeWebSocket()
+        await hub.register_control("agent-1", control)
+        with self.assertRaisesRegex(ConnectionError, "did not prepare"):
+            await hub.create_listener("session-timeout", "agent-1", "ssh")
+        self.assertEqual(closed[-1], ("session-timeout", "agent-stream-timeout"))
 
 
 if __name__ == "__main__":

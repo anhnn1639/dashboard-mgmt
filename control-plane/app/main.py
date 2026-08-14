@@ -1140,6 +1140,37 @@ def get_server(server_id: str, _: User = Depends(current_user), db: Session = De
     return {**server_json(server), "inventory": server.inventory}
 
 
+def job_json(job: Job, *, include_output: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": job.id,
+        "serverId": job.server_id,
+        "action": job.action,
+        "status": job.status,
+        "risk": job.risk,
+        "reason": job.reason,
+        "createdAt": aware(job.created_at).isoformat(),
+        "startedAt": aware(job.started_at).isoformat() if job.started_at else None,
+        "finishedAt": aware(job.finished_at).isoformat() if job.finished_at else None,
+        "exitCode": job.exit_code,
+    }
+    if include_output:
+        payload["output"] = job.output
+    return payload
+
+
+@app.get("/api/v1/servers/{server_id}/jobs")
+def list_server_jobs(server_id: str, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if not db.get(Server, server_id):
+        raise HTTPException(status_code=404, detail="Server not found")
+    jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
+    return {
+        "items": [
+            job_json(job, include_output=user.role in SAFE_ACTIONS.get(job.action, {}).get("roles", set()))
+            for job in jobs
+        ]
+    }
+
+
 def file_transfer_json(transfer: FileTransfer) -> dict[str, Any]:
     return {
         "id": transfer.id,
@@ -1610,6 +1641,24 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     job.exit_code = payload.exit_code
     job.output = payload.output
     job.finished_at = now()
+    if job.action == "inventory.collect" and payload.status == "succeeded":
+        try:
+            inventory = Inventory.model_validate_json(payload.output)
+            family, verification = classify_os(inventory)
+            if family == server.os_family:
+                server.name = inventory.hostname
+                server.os_name = inventory.os_name
+                server.os_version = inventory.os_version
+                server.distribution_id = inventory.distribution_id
+                server.architecture = inventory.architecture
+                server.inventory = inventory.model_dump()
+                server.ssh_host_key = inventory.ssh_host_key
+                server.verified_os = verification == "verified"
+        except (ValueError, TypeError):
+            # Preserve the last known-good inventory when a signed endpoint
+            # returns malformed refresh output. The job output remains visible
+            # to operators for diagnosis.
+            pass
     if job.action == "file.deliver":
         parameters = reveal_parameters(job.parameters)
         transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
@@ -1670,7 +1719,7 @@ def approve_job(job_id: str, request: Request, user: User = Depends(require_role
 @app.get("/api/v1/jobs")
 def list_jobs(_: User = Depends(current_user), db: Session = Depends(db_session)):
     jobs = db.execute(select(Job).order_by(Job.created_at.desc()).limit(200)).scalars().all()
-    return {"items": [{"id": job.id, "serverId": job.server_id, "action": job.action, "status": job.status, "risk": job.risk, "reason": job.reason, "createdAt": aware(job.created_at).isoformat()} for job in jobs]}
+    return {"items": [job_json(job) for job in jobs]}
 
 
 @app.get("/api/v1/audit")
@@ -1737,7 +1786,11 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     try:
         relay_port = await tunnel_hub.create_listener(session_id, server.id, payload.protocol)
     except (ConnectionError, OSError) as exc:
-        raise HTTPException(status_code=409, detail="Không thể tạo tunnel bảo mật tới agent") from exc
+        target = "127.0.0.1:22 (sshd)" if payload.protocol == "ssh" else "127.0.0.1:3389 (Remote Desktop)"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent không thể chuẩn bị kết nối tới {target}. Kiểm tra dịch vụ local và log Agent; không mở trực tiếp cổng quản trị ra mạng.",
+        ) from exc
     common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "true"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript", "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true"})

@@ -193,6 +193,18 @@ class ClassificationTests(unittest.TestCase):
             windows = client.get("/api/v1/servers?os_family=windows", headers=headers)
             self.assertTrue(any(item["id"] == agent_id and item["osFamily"] == "windows" for item in windows.json()["items"]))
 
+            service_job = client.post(
+                "/api/v1/jobs",
+                headers=headers,
+                json={"server_id": agent_id, "action": "service.list", "parameters": {}, "reason": "Refresh service inventory", "require_approval": False},
+            )
+            self.assertEqual(service_job.status_code, 201, service_job.text)
+            server_jobs = client.get(f"/api/v1/servers/{agent_id}/jobs", headers=headers)
+            self.assertEqual(server_jobs.status_code, 200, server_jobs.text)
+            listed_job = next(item for item in server_jobs.json()["items"] if item["id"] == service_job.json()["id"])
+            self.assertEqual(listed_job["action"], "service.list")
+            self.assertIn("output", listed_job)
+
     def test_zero_touch_packages_pin_the_configured_domain_and_are_single_use(self):
         assert SessionLocal is not None
         with SessionLocal() as db:

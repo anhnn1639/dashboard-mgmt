@@ -27,6 +27,11 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(source, /\/api\/v1\/servers/);
   assert.match(source, /Phiên truy cập/);
   assert.match(source, /Nhật ký kiểm toán/);
+  assert.match(source, /serverRoute\(server\)/);
+  assert.match(source, /Truyền file/);
+  assert.match(source, /service\.restart/);
+  assert.match(source, /firewall\.list/);
+  assert.match(source, /parseServiceOutput/);
   assert.match(source, /\/api\/v1\/setup\/status/);
   assert.match(source, /Kết nối PostgreSQL/);
   assert.match(source, /Admin local đầu tiên/);

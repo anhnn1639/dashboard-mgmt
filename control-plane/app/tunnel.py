@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Awaitable, Callable
@@ -10,6 +11,7 @@ from fastapi import WebSocket
 
 
 TunnelClosedCallback = Callable[[str, str], Awaitable[None]]
+LOG = logging.getLogger("tram_ops.tunnel")
 
 
 @dataclass
@@ -110,7 +112,39 @@ class TunnelHub:
         if not sockets:
             await self.cancel(session_id, "listener-failed")
             raise OSError("Tunnel listener has no socket")
-        return int(sockets[0].getsockname()[1])
+        relay_port = int(sockets[0].getsockname()[1])
+        channel = self._agents.get(agent_id)
+        if not channel:
+            await self.cancel(session_id, "agent-offline")
+            raise ConnectionError("Agent tunnel is offline")
+        try:
+            # Prepare the endpoint stream before Guacamole is given the relay
+            # address. This avoids guacd timing out while it waits for the
+            # agent to connect to the local SSH/RDP listener and then complete
+            # a second mTLS WebSocket handshake.
+            async with channel.send_lock:
+                await channel.websocket.send_json(
+                    {
+                        "type": "open",
+                        "session_id": pending.session_id,
+                        "protocol": pending.protocol,
+                        "port": pending.target_port,
+                    }
+                )
+            await asyncio.wait_for(
+                asyncio.shield(pending.agent_websocket),
+                timeout=self.connect_timeout_seconds,
+            )
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            LOG.warning("agent stream preparation timed out session=%s protocol=%s", session_id, protocol)
+            await self.cancel(session_id, "agent-stream-timeout")
+            raise ConnectionError("Agent did not prepare the local tunnel stream") from exc
+        except Exception as exc:
+            LOG.warning("agent stream preparation failed session=%s error=%s", session_id, type(exc).__name__)
+            await self.cancel(session_id, "agent-stream-failed")
+            raise ConnectionError("Agent could not prepare the local tunnel stream") from exc
+        LOG.info("agent stream prepared session=%s protocol=%s relay_port=%s", session_id, protocol, relay_port)
+        return relay_port
 
     async def attach_stream(self, session_id: str, agent_id: str, websocket: WebSocket) -> None:
         pending = self._pending.get(session_id)
@@ -155,34 +189,20 @@ class TunnelHub:
         if pending.expiry_task:
             pending.expiry_task.cancel()
 
-        channel = self._agents.get(pending.agent_id)
-        if not channel:
+        if not pending.agent_websocket.done() or pending.agent_websocket.cancelled():
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            await self.cancel(session_id, "agent-offline")
+            await self.cancel(session_id, "agent-stream-missing")
             return
 
         try:
-            async with channel.send_lock:
-                await channel.websocket.send_json(
-                    {
-                        "type": "open",
-                        "session_id": pending.session_id,
-                        "protocol": pending.protocol,
-                        "port": pending.target_port,
-                    }
-                )
-            agent_websocket = await asyncio.wait_for(
-                asyncio.shield(pending.agent_websocket),
-                timeout=self.connect_timeout_seconds,
-            )
+            agent_websocket = pending.agent_websocket.result()
             await self._bridge(reader, writer, agent_websocket)
             reason = "closed"
-        except (TimeoutError, asyncio.TimeoutError):
-            reason = "agent-stream-timeout"
-        except Exception:
-            reason = "bridge-error"
+        except Exception as exc:
+            reason = f"bridge-error:{type(exc).__name__}"
+            LOG.warning("tunnel bridge failed session=%s error=%s", session_id, type(exc).__name__)
         finally:
             writer.close()
             with contextlib.suppress(Exception):

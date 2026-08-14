@@ -8,6 +8,8 @@
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
 - Agent mới nhất: `0.4.1`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
+- Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
+- API có lịch sử job theo từng máy chủ và chỉ trả output cho role được phép xem action đó; kết quả `inventory.collect` hợp lệ cập nhật inventory bền vững trong PostgreSQL.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -42,6 +44,7 @@
 
 - Agent outbound WebSocket mTLS `9443`; API/Guacamole không kết nối trực tiếp IP máy đích.
 - Agent chỉ relay `127.0.0.1:22` cho SSH hoặc `127.0.0.1:3389` cho RDP, tối đa 4 tunnel; không fallback trực tiếp.
+- API gửi lệnh mở tunnel và chờ Agent gắn stream mTLS thành công trước khi trả relay port cho Guacamole. Điều này loại bỏ race khiến `guacd` kết nối trước Agent và biến lỗi sshd/RDP local thành HTTP 409 có hướng dẫn; Agent 0.4.1 hiện tại tương thích, không cần cài lại.
 - Pin SSH host key/RDP certificate, tắt clipboard/SFTP/RDP drive/printing, giữ recording.
 - File một chiều: giới hạn 50 MiB, ClamAV trung tâm, AES-GCM PostgreSQL, duyệt bốn mắt, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server.
 - Payload file xóa sau kết quả hoặc hết hạn 24 giờ; scanner lỗi thì fail-closed.
@@ -94,6 +97,13 @@ docker compose -f compose.yaml -f compose.test.yaml ps
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api dashboard clamav guacamole guacd
 ```
 
+Riêng bản workspace/tunnel hiện tại chỉ cần recreate `api` và `dashboard`:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api guacamole guacd
+```
+
 Máy nâng cấp từ bản cũ bị lỗi `The agent TLS CA is not available for package generation` phải recreate API và CA exporter để tạo named volume/mount mới:
 
 ```bash
@@ -137,17 +147,18 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 6. Reboot Windows, xác nhận service và tunnel tự online lại.
 7. Đổi tên một MSI mới trước khi cài: bootstrap phải fail, không enroll nhầm control plane.
 8. Xác nhận claim Windows không dùng được trên Linux và replay bị từ chối.
-9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline.
+9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline. Khi mở SSH, xác nhận API có log `agent stream prepared`; nếu còn lỗi Guacamole, lấy đồng thời log `api guacamole guacd` để tách lỗi credential/host-key/recording.
 10. Test uninstall/upgrade MSI và xác nhận không để lộ claim/private key trong log.
 
 ## Kiểm thử local đã đạt
 
-- Control plane `15/15`, gồm configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding và replay rejection.
+- Control plane `16/16`, gồm configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
 - Agent security `7/7`, gồm parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
+- Render trực quan workspace máy chủ pass: bố cục toàn vùng nội dung, breadcrumb, action SSH, tab ngang lớn, bảng dịch vụ và form thao tác hiển thị đúng.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
