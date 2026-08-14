@@ -5,7 +5,7 @@
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Release zero-touch installer đã push: `a636e48 Ship domain-aware agent installers`.
-- Agent mới nhất: `0.4.0`.
+- Agent mới nhất: `0.4.1`.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
 ## Zero-touch Agent đã triển khai
@@ -20,6 +20,7 @@
 - MSI cài executable PyInstaller độc lập; Windows Server không cần Python. Service `TramVanHanhAgent` chạy `LocalSystem`, `Automatic`, phụ thuộc TCP/IP, start lúc cài và restart sau 30 giây nếu lỗi.
 - `agent/install-windows.ps1` thủ công cũng đã chuyển từ Scheduled Task sang Windows Service.
 - Windows/Linux vẫn tự vào đúng mục dựa trên inventory thực tế; server từ MSI Linux không thể dùng claim Windows và ngược lại.
+- Khi đặt `WEB_TLS_TRUST=system`, bộ cài bootstrap qua certificate public của Nginx trên `443`; response enrollment vẫn cấp CA riêng để mọi lưu lượng Agent sau đó dùng mTLS trực tiếp trên `9443`.
 
 ## MSI artifact
 
@@ -42,11 +43,12 @@
 - File một chiều: giới hạn 50 MiB, ClamAV trung tâm, AES-GCM PostgreSQL, duyệt bốn mắt, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server.
 - Payload file xóa sau kết quả hoặc hết hạn 24 giờ; scanner lỗi thì fail-closed.
 
-## TLS và firewall
+## Nginx, TLS và firewall
 
-- `80/tcp`: redirect HTTPS.
-- `443/tcp`: dashboard/API/Guacamole/enrollment/bootstrap claim.
+- Nginx host giữ public `80/tcp` (redirect) và `443/tcp` (dashboard/API/Guacamole/enrollment/bootstrap claim).
+- Compose map Caddy HTTPS `443` thành `127.0.0.1:${WEB_BIND_PORT:-3000}`; không publish port Caddy `80/443` trực tiếp.
 - `9443/tcp`: agent mTLS check-in/job/tunnel/file.
+- Nginx reverse proxy tới `https://127.0.0.1:3000`, bật SNI và xác minh bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
 - Không public `3310`, `4822`, `5432` hoặc relay tạm.
 - Agent chỉ cần outbound `443` khi bootstrap và `9443` khi vận hành; không cần inbound agent.
 - Chỉ đóng `22/3389` thông thường sau khi tunnel staging đã chạy; break-glass chỉ từ bastion MFA.
@@ -89,9 +91,11 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api da
 
 `compose.yaml` đã đổi API build context sang repository root để copy agent source và MSI vào `/opt/tram-agent-assets`; bắt buộc rebuild container `api`, không chỉ restart.
 
+`compose.yaml` cũng không còn tranh host port `80/443` với Nginx: web Caddy bind loopback `3000`, còn `9443` vẫn public cho agent mTLS. Mẫu virtual host nằm ở `deploy/nginx-dashboard.conf.example`; certificate public của Nginx phải được endpoint tin cậy mặc định.
+
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.0`, Linux available và Windows MSI available.
+- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.1`, Linux available và Windows MSI available.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
 - Không public port nội bộ.
@@ -101,7 +105,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.0`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.1`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:

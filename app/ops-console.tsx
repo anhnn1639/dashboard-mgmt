@@ -2281,6 +2281,7 @@ function AgentPackagesView({ token }: { token: string }) {
     linuxAvailable: boolean;
     windowsMsiAvailable: boolean;
     claimTtlMinutes: number;
+    webTlsTrust: "internal-ca" | "system";
   } | null>(null);
   const [busy, setBusy] = useState<OSFamily | null>(null);
   const [message, setMessage] = useState("");
@@ -2382,7 +2383,7 @@ function AgentPackagesView({ token }: { token: string }) {
         <p className="eyebrow">ZERO-TOUCH ENROLLMENT</p>
         <h2>Bộ cài tự nhận đúng control plane</h2>
         <p>
-          Domain, CA pin và claim một lần được lấy từ cấu hình HTTPS của hệ thống.
+          Domain, chế độ xác minh TLS và claim một lần được lấy từ cấu hình HTTPS của hệ thống.
           Private key mTLS chỉ được sinh trên máy đích, không nằm trong file tải về.
         </p>
         <form className="package-origin" key={status?.dashboardUrl} onSubmit={saveDashboardUrl}>
@@ -2399,10 +2400,14 @@ function AgentPackagesView({ token }: { token: string }) {
             Tôi hiểu agent cũ vẫn giữ endpoint cũ nếu đổi domain
           </label>
           <button className="button ghost" type="submit">Lưu URL HTTPS</button>
-          <small>Hãy mở dashboard bằng chính domain mới, hoàn tất DNS/TLS/Caddy rồi mới lưu.</small>
+          <small>Hãy mở dashboard bằng chính domain mới, hoàn tất DNS/TLS/Nginx/Caddy rồi mới lưu.</small>
         </form>
         <ul>
           <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>
+          <li>
+            Bootstrap web: {status?.webTlsTrust === "system" ? "CA công khai của Nginx" : "CA nội bộ đã pin"};
+            agent mTLS trên 9443 vẫn dùng CA riêng.
+          </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
           <li>Linux cài systemd service, tự enroll và khởi động ngay sau khi cài.</li>
           <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
@@ -2459,7 +2464,7 @@ function AgentPackagesView({ token }: { token: string }) {
         )}
         {message && <p className="settings-message">{message}</p>}
         <div className="package-security-note">
-          Không đổi tên MSI Windows: tên file chứa locator đã pin CA. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
+          Không đổi tên MSI Windows: tên file chứa locator và chế độ xác minh TLS. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
         </div>
       </form>
     </section>

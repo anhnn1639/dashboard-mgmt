@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     clamav_timeout_seconds: int = 60
     agent_assets_root: str = "/opt/tram-agent-assets"
     windows_agent_msi: str = "/opt/tram-agent-assets/windows/TramVanHanhAgent.msi"
+    web_tls_trust: Literal["internal-ca", "system"] = "internal-ca"
 
 
 settings = Settings()
@@ -476,7 +477,7 @@ tunnel_hub = TunnelHub(
 )
 
 
-app = FastAPI(title="Trạm Vận Hành API", version="0.4.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Trạm Vận Hành API", version="0.4.1", docs_url="/api/docs", openapi_url="/api/openapi.json")
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -1291,10 +1292,11 @@ def agent_package_status(_: User = Depends(require_role("admin")), db: Session =
     dashboard_url = canonical_dashboard_url(db)
     return {
         "dashboardUrl": dashboard_url,
-        "agentVersion": "0.4.0",
+        "agentVersion": "0.4.1",
         "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
         "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
         "claimTtlMinutes": 30,
+        "webTlsTrust": settings.web_tls_trust,
     }
 
 
@@ -1322,7 +1324,9 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
         ca_certificate = Path(settings.caddy_root_ca).read_text(encoding="utf-8")
         ca_fingerprint = certificate_sha256(ca_certificate)
     except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="The dashboard CA is not available for package pinning") from exc
+        raise HTTPException(status_code=503, detail="The agent TLS CA is not available for package generation") from exc
+    bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
+    bootstrap_tls_pin = ca_fingerprint if settings.web_tls_trust == "internal-ca" else "system"
     package_id = str(uuid.uuid4())
     package_secret = secrets.token_urlsafe(32)
     safe_label = safe_package_label(payload.label)
@@ -1334,14 +1338,14 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
                 dashboard_url=dashboard_url,
                 package_id=package_id,
                 package_secret=package_secret,
-                ca_certificate=ca_certificate,
-                ca_fingerprint=ca_fingerprint,
+                ca_certificate=bootstrap_ca_certificate,
+                ca_fingerprint=bootstrap_tls_pin,
             )
             filename = f"TramAgent-Linux-{safe_label}.run"
             media_type = "application/octet-stream"
         else:
             content = validate_windows_msi(Path(settings.windows_agent_msi))
-            filename = windows_msi_filename(dashboard_url, package_id, package_secret, ca_fingerprint)
+            filename = windows_msi_filename(dashboard_url, package_id, package_secret, bootstrap_tls_pin)
             media_type = "application/x-msi"
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1354,7 +1358,7 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
         expires_at=expires_at,
     )
     db.add(record)
-    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url})
+    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url, "web_tls_trust": settings.web_tls_trust})
     db.commit()
     return Response(
         content=content,

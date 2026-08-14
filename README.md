@@ -10,7 +10,7 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
 - Giao diện **Bộ cài Agent** tự sinh Linux `.run` hoặc Windows `.msi` theo đúng domain HTTPS/CA của control plane; không sửa domain bằng tay trên máy đích.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
-- Dashboard/API ở TCP `443` qua TLS của Caddy; TCP `80` chỉ chuyển hướng sang HTTPS.
+- Nginx trên host giữ public TCP `80/443`; Caddy chỉ xuất HTTPS web trên `127.0.0.1:3000`. Port `80` của Nginx chỉ chuyển hướng sang HTTPS.
 - RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT ngắn hạn và Argon2 password hashing.
 - Công việc có cấu trúc và allowlist; không có endpoint chạy shell tùy ý.
 - Quy tắc “4 mắt”: người tạo không thể tự duyệt tác vụ nguy hiểm.
@@ -33,7 +33,7 @@ Control plane tự gán `os_family=windows|linux`; API và giao diện lọc the
 ## Kiến trúc
 
 ```text
-Trình duyệt ── TLS/443 ── Caddy ─┬─ Dashboard
+Trình duyệt ── TLS/443 ── Nginx ── HTTPS/127.0.0.1:3000 ── Caddy ─┬─ Dashboard
                                  ├─ Control Plane API ── PostgreSQL
                                  └─ Guacamole ── guacd ── relay TCP dùng một lần
                                                                │
@@ -50,7 +50,7 @@ Agent chỉ cần kết nối outbound tới control plane. Không cần mở c�
 
 `TunnelHub` hiện giữ trạng thái WebSocket trong bộ nhớ của tiến trình API. Vì vậy bản này phải chạy **một replica API và một Uvicorn worker**; không tăng replica/worker trước khi thay bằng tunnel broker có điều phối phân tán và session affinity.
 
-Compose tự xuất public root CA của HTTPS/mTLS `9443` từ volume Caddy sang `deploy/pki/server-ca.crt`. API chỉ đọc bản public này; private key CA của Caddy không được chia sẻ sang container API. Agent sẽ tự retry nếu CA chưa sẵn sàng trong vài giây đầu sau khi recreate stack.
+Compose tự xuất public root CA của HTTPS nội bộ và mTLS `9443` từ volume Caddy sang `deploy/pki/server-ca.crt`. Nginx dùng file này để xác minh kết nối ngược tới Caddy trên loopback `3000`; API chỉ đọc bản public, private key CA không được chia sẻ. Agent sẽ tự retry nếu CA chưa sẵn sàng trong vài giây đầu sau khi recreate stack.
 
 ## Cài control plane trên Ubuntu 24.04
 
@@ -59,12 +59,12 @@ Compose tự xuất public root CA của HTTPS/mTLS `9443` từ volume Caddy san
 - Ubuntu Server 24.04 LTS x86_64/arm64.
 - Tối thiểu 4 vCPU, 8 GB RAM, 80 GB disk cho lab; production cần tính riêng dung lượng recording.
 - DNS `ops.example.com` trỏ tới máy control plane.
-- Mở inbound TCP `80` (redirect), `443` (operator/enrollment) và `9443` (agent mTLS). Giới hạn `443/9443` theo VPN/subnet quản trị nếu có thể.
+- Nginx giữ inbound TCP `80` (redirect) và `443` (operator/enrollment); Caddy giữ `9443` (agent mTLS). `3000` chỉ bind `127.0.0.1`, không mở firewall. Giới hạn `443/9443` theo VPN/subnet quản trị nếu có thể.
 - Trên máy được quản lý chỉ cho outbound TCP `9443` tới control plane. Có thể cho outbound `443` trong lúc enroll.
 - Chặn inbound `22/3389` từ mạng thông thường. Nếu cần đường cứu hộ, chỉ cho phép từ một bastion riêng có MFA; không cho máy được quản lý truy cập ngang sang `22/3389/445` của máy khác.
 - Docker Engine và Docker Compose plugin theo tài liệu chính thức: <https://docs.docker.com/engine/install/ubuntu/>.
 
-Docker có thể tạo rule iptables vượt qua một số rule UFW. Chỉ publish ba port trong `compose.yaml`, kiểm soát thêm bằng firewall upstream và `DOCKER-USER` chain.
+Docker có thể tạo rule iptables vượt qua một số rule UFW. Compose chỉ publish `127.0.0.1:3000` và `9443`; kiểm soát `9443` thêm bằng firewall upstream và `DOCKER-USER` chain.
 
 ### 2. Tạo cấu hình và PKI
 
@@ -86,6 +86,8 @@ openssl rand -hex 16        # GUACAMOLE_JSON_SECRET: đúng 32 ký tự hex
 
 Production đặt `RECORDING_DIR=/srv/tram-ops/recordings` (hoặc mount riêng có quota). Compose tạo quyền host path cho UID/GID của Guacamole; không dùng Docker named volume nên có thể theo dõi và giới hạn dung lượng trực tiếp từ host.
 
+Giữ `WEB_BIND_PORT=3000` và `WEB_TLS_TRUST=system` khi Nginx dùng certificate công khai (ví dụ Let's Encrypt). Certificate public phải được Windows/Linux tin cậy mặc định để bộ cài zero-touch bootstrap qua `443`; agent sau đó nhận CA riêng và vận hành bằng mTLS trực tiếp trên `9443`.
+
 Không commit `.env`, private key CA hoặc recording. Sao lưu `agent-ca.key` ngoại tuyến; mất key sẽ không cấp/renew agent certificate, lộ key phải rotate toàn bộ agent. Wizard lần đầu tự sinh `JWT_SECRET` và `JOB_SECRET_KEY`, sau đó lưu chuỗi kết nối cùng hai khóa này trong volume `api_config` có quyền hạn chế. Cần sao lưu volume này cùng PostgreSQL; mất `JOB_SECRET_KEY` sẽ làm các job đang chờ không thể giải mã.
 
 ### 3. Khởi động
@@ -104,7 +106,9 @@ docker compose -f compose.yaml -f compose.external.yaml up -d
 docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
-Mở `https://ops.example.com`. Caddy dùng CA nội bộ nên phải import `deploy/pki/server-ca.crt` vào kho Root CA của máy quản trị trước. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
+Sao chép `deploy/nginx-dashboard.conf.example` vào virtual host Nginx, thay domain và đường dẫn certificate public, kiểm tra `nginx -t` rồi reload. Nginx phải xác minh upstream Caddy bằng `deploy/pki/server-ca.crt`; không dùng `proxy_ssl_verify off`.
+
+Mở `https://ops.example.com` qua Nginx. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
 
 1. Nhập máy chủ PostgreSQL, port, database, tài khoản, mật khẩu và chế độ SSL. Với PostgreSQL trong Compose dùng host `postgres`, port `5432` và các giá trị `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` trong `.env`.
 2. Tạo tài khoản admin local đầu tiên với mật khẩu tối thiểu 14 ký tự.
@@ -116,7 +120,7 @@ API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và au
 
 ### 1. Tạo bộ cài zero-touch trên dashboard
 
-Đăng nhập bằng `admin`, mở **Bộ cài Agent** và kiểm tra URL control plane. URL phải là origin HTTPS thật đang mở trong trình duyệt, ví dụ `https://ops.company.com`; DNS, `OPS_DOMAIN` và TLS/Caddy phải hoạt động trước khi lưu.
+Đăng nhập bằng `admin`, mở **Bộ cài Agent** và kiểm tra URL control plane. URL phải là origin HTTPS thật đang mở trong trình duyệt, ví dụ `https://ops.company.com`; DNS, `OPS_DOMAIN`, TLS/Nginx và Caddy phải hoạt động trước khi lưu.
 
 Nhập tên máy/ticket, chọn thời hạn 15–60 phút rồi tải đúng định dạng:
 
@@ -129,7 +133,7 @@ Nhập tên máy/ticket, chọn thời hạn 15–60 phút rồi tải đúng đ
 
 - Windows: một file `TramAgent--...msi`. **Không đổi tên file**; chạy bằng Administrator. MSI chứa executable độc lập, cài service `TramVanHanhAgent` dưới `LocalSystem`, đặt `StartType=Automatic`, khởi động ngay và tự restart khi lỗi. Windows Server không cần cài Python.
 
-Bộ cài không chứa private key/certificate agent dài hạn. Nó chỉ mang locator, SHA-256 pin của CA và claim ngẫu nhiên dùng một lần; private key P-256 được sinh trên máy đích, CSR được gửi qua HTTPS đã pin CA, sau đó mọi kết nối dùng mTLS `9443`. Claim sai hệ điều hành, hết hạn, đã dùng hoặc replay đều bị từ chối và ghi audit. Windows/Linux tự vào đúng mục dựa trên inventory thực tế.
+Bộ cài không chứa private key/certificate agent dài hạn. Nó chỉ mang locator, chế độ xác minh TLS và claim ngẫu nhiên dùng một lần; private key P-256 được sinh trên máy đích. Với `WEB_TLS_TRUST=system`, bootstrap `443` dùng chuỗi tin cậy công khai của Nginx; sau khi claim, mọi kết nối Agent dùng CA riêng và mTLS `9443`. Claim sai hệ điều hành, hết hạn, đã dùng hoặc replay đều bị từ chối và ghi audit. Windows/Linux tự vào đúng mục dựa trên inventory thực tế.
 
 Nếu thay domain sau khi đã có agent, bộ cài mới dùng domain mới nhưng agent cũ vẫn giữ endpoint/CA cũ. Phải lập kế hoạch migrate agent cũ; không xóa domain cũ trước khi chúng đã kết nối qua domain mới.
 

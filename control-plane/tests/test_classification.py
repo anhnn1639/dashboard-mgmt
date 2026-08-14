@@ -224,6 +224,24 @@ class ClassificationTests(unittest.TestCase):
             windows_claim = client.post("/api/v1/agent-bootstrap/claim", json={"package_id": package_id, "package_secret": package_secret, "agent_id": windows_id, "csr_pem": windows_csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-prod-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025", "distribution_id": "windows", "agent_version": "0.4.0"}})
             self.assertEqual(windows_claim.status_code, 201, windows_claim.text)
 
+            settings.web_tls_trust = "system"
+            try:
+                nginx_status = client.get("/api/v1/agent-packages/status", headers=headers)
+                self.assertEqual(nginx_status.status_code, 200, nginx_status.text)
+                self.assertEqual(nginx_status.json()["webTlsTrust"], "system")
+                nginx_linux = client.post("/api/v1/agent-packages", headers=headers, json={"label": "nginx-linux", "os_family": "linux", "expires_minutes": 15})
+                self.assertEqual(nginx_linux.status_code, 200, nginx_linux.text)
+                nginx_archive = nginx_linux.content.split(marker, 1)[1]
+                with tarfile.open(fileobj=io.BytesIO(nginx_archive), mode="r:gz") as archive:
+                    nginx_bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
+                    self.assertEqual(nginx_bootstrap["server_ca_sha256"], "system")
+                    self.assertEqual(nginx_bootstrap["server_ca_certificate"], "")
+                nginx_windows = client.post("/api/v1/agent-packages", headers=headers, json={"label": "nginx-windows", "os_family": "windows", "expires_minutes": 15})
+                self.assertEqual(nginx_windows.status_code, 200, nginx_windows.text)
+                self.assertIn("--system.msi", nginx_windows.headers["content-disposition"])
+            finally:
+                settings.web_tls_trust = "internal-ca"
+
             unsafe_change = client.put("/api/v1/settings/dashboard-url", headers=headers, json={"dashboard_url": "https://ops-new.company.example"})
             self.assertEqual(unsafe_change.status_code, 409)
             confirmed_change = client.put("/api/v1/settings/dashboard-url", headers=headers, json={"dashboard_url": "https://ops-new.company.example", "confirm_existing_agents": True})

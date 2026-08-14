@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.4.1"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
@@ -809,7 +809,11 @@ def bootstrap_from_file(config: Config, source: Path) -> None:
     if payload.get("version") != 1:
         raise RuntimeError("Unsupported bootstrap package version")
     config.server_url = valid_server_origin(str(payload.get("server_url", "")))
-    install_pinned_server_ca(config, str(payload.get("server_ca_certificate", "")), str(payload.get("server_ca_sha256", "")))
+    bootstrap_tls_trust = str(payload.get("server_ca_sha256", ""))
+    if bootstrap_tls_trust == "system":
+        config.server_ca_file = None
+    else:
+        install_pinned_server_ca(config, str(payload.get("server_ca_certificate", "")), bootstrap_tls_trust)
     bootstrap_enroll(config, str(payload.get("package_id", "")), str(payload.get("package_secret", "")))
 
 
@@ -827,7 +831,8 @@ def parse_windows_installer_source(source: str) -> tuple[str, str, str, str]:
     except (ValueError, UnicodeDecodeError) as exc:
         raise RuntimeError("Windows bootstrap claim is malformed") from exc
     server_url = valid_server_origin(f"https://{netloc}")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", package_secret) or not re.fullmatch(r"[0-9a-f]{64}", ca_fingerprint):
+    valid_tls_trust = ca_fingerprint == "system" or re.fullmatch(r"[0-9a-f]{64}", ca_fingerprint)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", package_secret) or not valid_tls_trust:
         raise RuntimeError("Windows bootstrap claim is malformed")
     return server_url, package_id, package_secret, ca_fingerprint
 
@@ -865,8 +870,11 @@ def retrieve_server_ca_by_fingerprint(server_url: str, expected_sha256: str) -> 
 def bootstrap_from_windows_installer(config: Config, source: str) -> None:
     server_url, package_id, package_secret, ca_fingerprint = parse_windows_installer_source(source)
     config.server_url = server_url
-    certificate_pem = retrieve_server_ca_by_fingerprint(server_url, ca_fingerprint)
-    install_pinned_server_ca(config, certificate_pem, ca_fingerprint)
+    if ca_fingerprint == "system":
+        config.server_ca_file = None
+    else:
+        certificate_pem = retrieve_server_ca_by_fingerprint(server_url, ca_fingerprint)
+        install_pinned_server_ca(config, certificate_pem, ca_fingerprint)
     bootstrap_enroll(config, package_id, package_secret)
 
 

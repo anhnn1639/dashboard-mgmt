@@ -46,6 +46,8 @@ POSTGRES_PASSWORD=$(openssl rand -hex 32)
 SETUP_TOKEN=$(openssl rand -hex 32)
 GUACAMOLE_JSON_SECRET=$(openssl rand -hex 16)
 sed -i "s|^OPS_DOMAIN=.*|OPS_DOMAIN=ops.example.com|" .env
+sed -i "s|^WEB_BIND_PORT=.*|WEB_BIND_PORT=3000|" .env
+sed -i "s|^WEB_TLS_TRUST=.*|WEB_TLS_TRUST=system|" .env
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" .env
 sed -i "s|^SETUP_TOKEN=.*|SETUP_TOKEN=$SETUP_TOKEN|" .env
 sed -i "s|^GUACAMOLE_JSON_SECRET=.*|GUACAMOLE_JSON_SECRET=$GUACAMOLE_JSON_SECRET|" .env
@@ -98,15 +100,44 @@ sudo docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 caddy a
 sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 caddy api clamav dashboard
 ```
 
+## 8C. Kết nối Nginx với Caddy trên port 3000
+
+Compose không còn chiếm host port `80/443`. Web Caddy chỉ được publish tại
+`127.0.0.1:3000`; agent mTLS vẫn dùng public `9443`.
+
+Chờ Caddy xuất CA dùng để Nginx xác minh upstream:
+
+```bash
+test -s deploy/pki/server-ca.crt
+curl --cacert deploy/pki/server-ca.crt \
+  --resolve ops.example.com:3000:127.0.0.1 \
+  https://ops.example.com:3000/
+```
+
+Sao chép `deploy/nginx-dashboard.conf.example` vào virtual host Nginx hiện có,
+thay `ops.example.com`, đường dẫn certificate public và đường dẫn repository nếu
+khác `/home/system/dashboard-mgmt`. Nếu đã có server block cho domain này thì chỉ
+gộp các `location`/`proxy_*`, không bật hai server block trùng nhau.
+
+```bash
+sudo cp deploy/nginx-dashboard.conf.example /etc/nginx/sites-available/tram-ops
+sudo ln -s /etc/nginx/sites-available/tram-ops /etc/nginx/sites-enabled/tram-ops
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Không dùng `proxy_ssl_verify off`. Nginx phải có certificate public được Windows
+và Linux tin cậy mặc định vì `.env` đặt `WEB_TLS_TRUST=system`. Port `3000` không
+được mở bằng UFW hoặc NAT ra ngoài.
+
 ## 9. Mở wizard
 
 ```text
 https://ops.example.com
 ```
 
-Caddy dùng CA nội bộ. Trước khi mở wizard, copy `deploy/pki/server-ca.crt`
-qua kênh quản trị tin cậy và import vào Root CA của máy quản trị. Không tải CA
-qua HTTP rồi tin cậy trực tiếp.
+Public TLS kết thúc tại Nginx. Hop Nginx tới Caddy vẫn là HTTPS và được xác minh
+bằng `deploy/pki/server-ca.crt`; không cần import CA Caddy vào trình duyệt.
 
 ## 10. Nhập kết nối PostgreSQL
 

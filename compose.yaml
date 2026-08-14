@@ -14,8 +14,9 @@ services:
     environment:
       OPS_DOMAIN: ${OPS_DOMAIN:?Set OPS_DOMAIN in .env}
     ports:
-      - "80:80"
-      - "443:443"
+      # Nginx on the same host owns public 80/443 and proxies HTTPS to this
+      # loopback-only listener. Agent mTLS remains end-to-end on 9443.
+      - "127.0.0.1:${WEB_BIND_PORT:-3000}:443"
       - "9443:9443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -51,6 +52,7 @@ services:
       AGENT_CA_CERT: /run/secrets/agent-ca.crt
       AGENT_CA_KEY: /run/secrets/agent-ca.key
       CADDY_ROOT_CA: /run/ca-src/server-ca.crt
+      WEB_TLS_TRUST: ${WEB_TLS_TRUST:-system}
       GUACAMOLE_URL: /guacamole
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
