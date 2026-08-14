@@ -9,6 +9,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
 
 import pyotp
 from cryptography import x509
@@ -149,6 +150,33 @@ class ClassificationTests(unittest.TestCase):
 
             windows = client.get("/api/v1/servers?os_family=windows", headers=headers)
             self.assertTrue(any(item["id"] == agent_id and item["osFamily"] == "windows" for item in windows.json()["items"]))
+
+    def test_clean_file_is_encrypted_and_queued_for_four_eyes_approval(self):
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            token_response = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "file-test", "expected_os_family": "linux"})
+            agent_id = str(uuid.uuid4())
+            agent_key = ec.generate_private_key(ec.SECP256R1())
+            csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id)])).sign(agent_key, hashes.SHA256())
+            enroll = client.post("/api/v1/enroll", json={"token": token_response.json()["token"], "agent_id": agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "ubuntu-file-test", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.3.0", "addresses": ["10.30.1.60"]}})
+            self.assertEqual(enroll.status_code, 201, enroll.text)
+
+            with patch("app.main.scan_with_clamav", return_value="stream: OK"):
+                uploaded = client.post(
+                    f"/api/v1/servers/{agent_id}/files",
+                    headers=headers,
+                    files={"file": ("approved-config.yaml", b"setting: approved\n", "application/yaml")},
+                    data={"reason": "CHG-1234 approved configuration"},
+                )
+            self.assertEqual(uploaded.status_code, 201, uploaded.text)
+            self.assertEqual(uploaded.json()["status"], "pending_approval")
+            self.assertEqual(uploaded.json()["sha256"], hashlib.sha256(b"setting: approved\n").hexdigest())
+
+            listed = client.get(f"/api/v1/servers/{agent_id}/files", headers=headers)
+            self.assertEqual(listed.status_code, 200)
+            self.assertTrue(any(item["id"] == uploaded.json()["id"] for item in listed.json()["items"]))
+            jobs = client.get("/api/v1/jobs", headers=headers).json()["items"]
+            self.assertTrue(any(item["id"] == uploaded.json()["jobId"] and item["action"] == "file.deliver" for item in jobs))
 
 
 if __name__ == "__main__":

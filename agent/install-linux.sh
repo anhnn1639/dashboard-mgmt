@@ -10,7 +10,11 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates openssh-server
+  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates openssh-server clamav clamav-freshclam
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y python3 python3-pip ca-certificates openssh-server
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y python3 python3-pip ca-certificates openssh-server
 fi
 
 for required_command in python3 install systemctl; do
@@ -21,6 +25,7 @@ for required_command in python3 install systemctl; do
 done
 
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
+install -d -m 0700 /var/lib/tram-agent/inbox
 python3 -m venv /opt/tram-agent/venv
 /opt/tram-agent/venv/bin/pip install --no-cache-dir --upgrade pip
 /opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$script_dir/requirements.txt"
@@ -30,9 +35,16 @@ systemctl daemon-reload
 
 if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
   systemctl enable --now ssh
+elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+  systemctl enable --now sshd
 fi
 systemctl try-restart tram-agent.service
 
+if ! command -v clamscan >/dev/null 2>&1; then
+  echo "WARNING: endpoint ClamAV is missing. Secure file delivery will fail closed until a supported scanner is installed." >&2
+  echo "Oracle Linux 8: enable the approved ol8_developer_EPEL repository, then install clamav and update signatures." >&2
+fi
+
 echo "Installed. Enroll with:"
-echo "  sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py enroll --server http://ops.example.com --token 'ONE_TIME_TOKEN'"
+echo "  sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py enroll --server https://ops.example.com --server-ca /path/server-ca.crt --token 'ONE_TIME_TOKEN'"
 echo "Then start: sudo systemctl enable --now tram-agent"

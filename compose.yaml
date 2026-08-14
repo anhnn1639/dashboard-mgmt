@@ -15,6 +15,7 @@ services:
       OPS_DOMAIN: ${OPS_DOMAIN:?Set OPS_DOMAIN in .env}
     ports:
       - "80:80"
+      - "443:443"
       - "9443:9443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -52,17 +53,39 @@ services:
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
       RECORDING_ROOT: /recordings
+      TUNNEL_BIND_HOST: tunnel-relay
+      TUNNEL_RELAY_HOST: tunnel-relay
+      TUNNEL_MAX_SESSIONS_PER_AGENT: 4
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      FILE_MAX_BYTES: 52428800
+      FILE_TRANSFER_TTL_HOURS: 24
     volumes:
       - ./deploy/pki:/run/ca-src:ro
       - ${RECORDING_DIR:-./recordings}:/recordings:ro
       - api_config:/var/lib/tram-ops
     expose: ["8000"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
       interval: 15s
       timeout: 5s
       retries: 8
-    networks: [control, session, identity_egress]
+    networks:
+      control:
+      session:
+        aliases: [tunnel-relay]
+      identity_egress:
+      malware_scan:
+
+  clamav:
+    image: clamav/clamav:1.4
+    restart: unless-stopped
+    expose: ["3310"]
+    volumes:
+      - clamav_database:/var/lib/clamav
+    networks: [malware_scan, signature_egress]
 
   caddy-ca-export:
     image: caddy:2.11.4-alpine
@@ -127,9 +150,14 @@ networks:
   control:
     internal: true
   session:
+    internal: true
   identity_egress:
+  malware_scan:
+    internal: true
+  signature_egress:
 
 volumes:
   caddy_data:
   caddy_config:
   api_config:
+  clamav_database:

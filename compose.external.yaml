@@ -2,7 +2,13 @@ services:
   api:
     environment:
       DATABASE_URL: ${EXTERNAL_DATABASE_URL:?Set EXTERNAL_DATABASE_URL in .env}
-    networks: [control, session, identity_egress, database_egress]
+    networks:
+      control:
+      session:
+        aliases: [tunnel-relay]
+      identity_egress:
+      malware_scan:
+      database_egress:
 
 networks:
   database_egress:

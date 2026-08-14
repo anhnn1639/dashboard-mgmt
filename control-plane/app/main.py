@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -9,10 +10,10 @@ import json
 import os
 import re
 import secrets
-import socket
 import ssl
 import threading
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -30,16 +31,19 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from ldap3 import ALL, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, select, text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, select, text
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, encrypt_file, normalize_upload_name, scan_with_clamav
+from .tunnel import TunnelHub
 
 
 class Settings(BaseSettings):
@@ -62,6 +66,16 @@ class Settings(BaseSettings):
     bootstrap_config_path: str = "/var/lib/tram-ops/bootstrap.json"
     setup_token: str = ""
     dashboard_url: str = ""
+    tunnel_bind_host: str = "0.0.0.0"
+    tunnel_relay_host: str = "api"
+    tunnel_listener_ttl_seconds: int = 120
+    tunnel_connect_timeout_seconds: int = 20
+    tunnel_max_sessions_per_agent: int = 4
+    file_max_bytes: int = 50 * 1024 * 1024
+    file_transfer_ttl_hours: int = 24
+    clamav_host: str = "clamav"
+    clamav_port: int = 3310
+    clamav_timeout_seconds: int = 60
 
 
 settings = Settings()
@@ -210,6 +224,25 @@ class RemoteSession(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class FileTransfer(Base):
+    __tablename__ = "file_transfers"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    original_name: Mapped[str] = mapped_column(String(180))
+    content_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="scanning", index=True)
+    scan_result: Mapped[str] = mapped_column(String(255), default="")
+    reason: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    content_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    nonce: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=1024)
@@ -342,8 +375,8 @@ class SetupCompleteRequest(BaseModel):
     def valid_dashboard_url(cls, value: str) -> str:
         normalized = value.strip().rstrip("/")
         parsed = urlsplit(normalized)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Dashboard URL must be an absolute HTTP(S) URL")
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Dashboard URL must be an absolute HTTPS URL")
         return normalized
 
 
@@ -378,7 +411,29 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
 }
 
 
-app = FastAPI(title="Trạm Vận Hành API", version="0.2.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
+async def mark_tunnel_closed(session_id: str, reason: str) -> None:
+    factory = SessionLocal
+    if factory is None:
+        return
+    with factory() as db:
+        session = db.get(RemoteSession, session_id)
+        if session and session.status not in {"closed", "failed"}:
+            session.status = "closed" if reason == "closed" else "failed"
+            session.finished_at = now()
+            audit(db, "system:tunnel", "session.tunnel.closed", session_id, result=session.status, detail={"reason": reason})
+            db.commit()
+
+
+tunnel_hub = TunnelHub(
+    bind_host=settings.tunnel_bind_host,
+    listener_ttl_seconds=settings.tunnel_listener_ttl_seconds,
+    connect_timeout_seconds=settings.tunnel_connect_timeout_seconds,
+    max_sessions_per_agent=settings.tunnel_max_sessions_per_agent,
+    closed_callback=mark_tunnel_closed,
+)
+
+
+app = FastAPI(title="Trạm Vận Hành API", version="0.3.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -641,11 +696,11 @@ def require_role(*roles: str):
     return dependency
 
 
-def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> Server:
+def verify_agent_identity(headers: Mapping[str, str], method: str, path: str, db: Session, agent_id: str, body: bytes) -> Server:
     try:
-        certificate = x509.load_der_x509_certificate(base64.b64decode(request.headers.get("x-tram-agent-certificate", ""), validate=True))
-        timestamp = int(request.headers.get("x-tram-agent-timestamp", ""))
-        signature = base64.b64decode(request.headers.get("x-tram-agent-signature", ""), validate=True)
+        certificate = x509.load_der_x509_certificate(base64.b64decode(headers.get("x-tram-agent-certificate", ""), validate=True))
+        timestamp = int(headers.get("x-tram-agent-timestamp", ""))
+        signature = base64.b64decode(headers.get("x-tram-agent-signature", ""), validate=True)
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Signed agent identity is required") from None
     if abs(int(now().timestamp()) - timestamp) > 300:
@@ -657,7 +712,11 @@ def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> S
     common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     if len(common_names) != 1 or common_names[0].value != agent_id:
         raise HTTPException(status_code=401, detail="Certificate subject mismatch")
-    message = f"{timestamp}\n{request.method.upper()}\n{request.url.path}\n{hashlib.sha256(body).hexdigest()}".encode()
+    if aware(certificate.not_valid_after_utc) < now() or aware(certificate.not_valid_before_utc) > now():
+        raise HTTPException(status_code=401, detail="Agent certificate is not currently valid")
+    if server.status == "quarantined":
+        raise HTTPException(status_code=403, detail="Agent is quarantined")
+    message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
     public_key = certificate.public_key()
     if not isinstance(public_key, ec.EllipticCurvePublicKey):
         raise HTTPException(status_code=401, detail="Unsupported agent certificate key")
@@ -666,6 +725,10 @@ def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> S
     except InvalidSignature:
         raise HTTPException(status_code=401, detail="Invalid agent request signature") from None
     return server
+
+
+def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> Server:
+    return verify_agent_identity(request.headers, request.method, request.url.path, db, agent_id, body)
 
 
 def classify_os(inv: Inventory) -> tuple[str, str]:
@@ -687,7 +750,7 @@ def server_json(server: Server) -> dict[str, Any]:
     relative = "Chưa kết nối" if not last_seen else f"{int(age)} giây trước" if age < 60 else f"{int(age // 60)} phút trước"
     days, remainder = divmod(server.uptime_seconds, 86400)
     hours = remainder // 3600
-    return {"id": server.id, "name": server.name, "osFamily": server.os_family, "os": server.os_name, "version": server.os_version, "address": server.address, "environment": server.environment, "health": health, "agentVersion": server.agent_version, "lastSeen": relative, "cpu": round(server.cpu_percent), "memory": round(server.memory_percent), "disk": round(server.disk_percent), "uptime": f"{days} ngày {hours} giờ", "updates": server.pending_updates, "alerts": server.alerts, "services": server.services_running, "owner": server.owner, "tags": server.tags or [], "verifiedOS": server.verified_os}
+    return {"id": server.id, "name": server.name, "osFamily": server.os_family, "os": server.os_name, "version": server.os_version, "address": server.address, "environment": server.environment, "health": health, "agentVersion": server.agent_version, "lastSeen": relative, "cpu": round(server.cpu_percent), "memory": round(server.memory_percent), "disk": round(server.disk_percent), "uptime": f"{days} ngày {hours} giờ", "updates": server.pending_updates, "alerts": server.alerts, "services": server.services_running, "owner": server.owner, "tags": server.tags or [], "verifiedOS": server.verified_os, "tunnelOnline": tunnel_hub.is_online(server.id)}
 
 
 def sign_agent_csr(csr_pem: str, agent_id: str) -> tuple[str, str, datetime]:
@@ -760,6 +823,28 @@ def guacamole_ssh_host_key(address: str, public_key: str | None) -> str | None:
     return f"{address} {key_type} {encoded_key}"
 
 
+def expire_file_payloads(db: Session) -> int:
+    cutoff = now() - timedelta(hours=settings.file_transfer_ttl_hours)
+    transfers = db.execute(
+        select(FileTransfer).where(
+            FileTransfer.created_at < cutoff,
+            FileTransfer.content_encrypted.is_not(None),
+            FileTransfer.status.in_({"pending_approval", "queued", "transferring"}),
+        )
+    ).scalars().all()
+    for transfer in transfers:
+        transfer.status = "expired"
+        transfer.content_encrypted = None
+        transfer.nonce = ""
+        if transfer.job_id:
+            job = db.get(Job, transfer.job_id)
+            if job and job.status in {"pending_approval", "queued", "dispatched"}:
+                job.status = "expired"
+                job.finished_at = now()
+        audit(db, "system:file-retention", "file.payload.expired", transfer.id, result="expired", detail={"server_id": transfer.server_id, "sha256": transfer.sha256})
+    return len(transfers)
+
+
 @app.on_event("startup")
 def startup() -> None:
     if not settings.database_url:
@@ -770,6 +855,7 @@ def startup() -> None:
         if factory is None:
             return
         with factory() as db:
+            expire_file_payloads(db)
             exists = db.execute(select(User).limit(1)).scalar_one_or_none()
             if not exists and settings.bootstrap_admin_password:
                 if len(settings.bootstrap_admin_password) < 14:
@@ -970,6 +1056,99 @@ def get_server(server_id: str, _: User = Depends(current_user), db: Session = De
     return {**server_json(server), "inventory": server.inventory}
 
 
+def file_transfer_json(transfer: FileTransfer) -> dict[str, Any]:
+    return {
+        "id": transfer.id,
+        "serverId": transfer.server_id,
+        "jobId": transfer.job_id,
+        "filename": transfer.original_name,
+        "contentType": transfer.content_type,
+        "sizeBytes": transfer.size_bytes,
+        "sha256": transfer.sha256,
+        "status": transfer.status,
+        "scanResult": transfer.scan_result,
+        "reason": transfer.reason,
+        "createdAt": aware(transfer.created_at).isoformat(),
+        "deliveredAt": aware(transfer.delivered_at).isoformat() if transfer.delivered_at else None,
+    }
+
+
+@app.get("/api/v1/servers/{server_id}/files")
+def list_server_files(server_id: str, _: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+    if not db.get(Server, server_id):
+        raise HTTPException(status_code=404, detail="Server not found")
+    if expire_file_payloads(db):
+        db.commit()
+    transfers = db.execute(select(FileTransfer).where(FileTransfer.server_id == server_id).order_by(FileTransfer.created_at.desc()).limit(100)).scalars().all()
+    return {"items": [file_transfer_json(item) for item in transfers]}
+
+
+@app.post("/api/v1/servers/{server_id}/files", status_code=201)
+async def upload_server_file(
+    server_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    reason: str = Form(..., min_length=5, max_length=2000),
+    user: User = Depends(require_role("admin", "operator")),
+    db: Session = Depends(db_session),
+):
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    try:
+        filename = normalize_upload_name(file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    content = bytearray()
+    digest = hashlib.sha256()
+    while chunk := await file.read(64 * 1024):
+        if len(content) + len(chunk) > settings.file_max_bytes:
+            audit(db, user.username, "file.upload.blocked", server_id, request, "blocked", {"filename": filename, "reason": "size-limit"})
+            db.commit()
+            await file.close()
+            raise HTTPException(status_code=413, detail=f"File exceeds the {settings.file_max_bytes // (1024 * 1024)} MiB limit")
+        content.extend(chunk)
+        digest.update(chunk)
+    await file.close()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty files are not accepted")
+
+    transfer_id = str(uuid.uuid4())
+    sha256 = digest.hexdigest()
+    content_type = (file.content_type or "application/octet-stream")[:255]
+    try:
+        scan_result = await asyncio.to_thread(
+            scan_with_clamav,
+            bytes(content),
+            settings.clamav_host,
+            settings.clamav_port,
+            settings.clamav_timeout_seconds,
+        )
+    except MalwareDetected as exc:
+        transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="blocked", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
+        db.add(transfer)
+        audit(db, user.username, "file.upload.blocked", transfer.id, request, "blocked", {"server": server.name, "filename": filename, "sha256": sha256, "scanner": "clamav", "signature": exc.signature})
+        db.commit()
+        raise HTTPException(status_code=422, detail="Malware scanner blocked this file") from exc
+    except ScannerUnavailable as exc:
+        transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="scan_failed", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
+        db.add(transfer)
+        audit(db, user.username, "file.upload.scan_failed", transfer.id, request, "failed", {"server": server.name, "filename": filename, "sha256": sha256})
+        db.commit()
+        raise HTTPException(status_code=503, detail="Malware scanner is unavailable; file was not stored") from exc
+
+    encrypted, nonce = encrypt_file(bytes(content), transfer_id, server.id, sha256, settings.job_secret_key)
+    transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="pending_approval", scan_result=scan_result[:255], reason=reason, created_by=user.id, content_encrypted=encrypted, nonce=nonce)
+    job = Job(server_id=server.id, action="file.deliver", parameters={"transfer_id": transfer.id, "filename": filename, "sha256": sha256, "size_bytes": len(content)}, reason=reason, status="pending_approval", risk="critical", created_by=user.id)
+    db.add_all([transfer, job])
+    db.flush()
+    transfer.job_id = job.id
+    audit(db, user.username, "file.upload.clean", transfer.id, request, detail={"server": server.name, "filename": filename, "size": len(content), "sha256": sha256, "scanner": "clamav", "approval": True})
+    db.commit()
+    return {**file_transfer_json(transfer), "note": "A different administrator must approve the delivery job"}
+
+
 @app.post("/api/v1/enrollment-tokens", status_code=201)
 def create_enrollment_token(payload: EnrollmentTokenRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
     raw = "tvo_" + secrets.token_urlsafe(32)
@@ -1034,9 +1213,97 @@ def agent_server_ca():
         raise HTTPException(status_code=503, detail="Caddy server CA is unavailable") from exc
 
 
+def authenticate_agent_websocket(websocket: WebSocket, agent_id: str) -> Server:
+    factory = SessionLocal
+    if factory is None:
+        raise HTTPException(status_code=503, detail="Database setup is required")
+    with factory() as db:
+        return verify_agent_identity(websocket.headers, "GET", websocket.url.path, db, agent_id, b"")
+
+
+@app.websocket("/api/v1/agent/tunnel/control")
+async def agent_tunnel_control(websocket: WebSocket, agent_id: str):
+    try:
+        authenticate_agent_websocket(websocket, agent_id)
+    except HTTPException as exc:
+        await websocket.close(code=4403 if exc.status_code == 403 else 4401, reason=str(exc.detail)[:120])
+        return
+    await websocket.accept()
+    await tunnel_hub.register_control(agent_id, websocket)
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message.get("text"):
+                try:
+                    payload = json.loads(message["text"])
+                except (TypeError, ValueError):
+                    await websocket.close(code=4400, reason="Invalid control message")
+                    break
+                if payload.get("type") != "ready":
+                    await websocket.close(code=4400, reason="Unsupported control message")
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await tunnel_hub.unregister_control(agent_id, websocket)
+
+
+@app.websocket("/api/v1/agent/tunnel/stream/{session_id}")
+async def agent_tunnel_stream(websocket: WebSocket, session_id: str, agent_id: str):
+    try:
+        authenticate_agent_websocket(websocket, agent_id)
+    except HTTPException as exc:
+        await websocket.close(code=4403 if exc.status_code == 403 else 4401, reason=str(exc.detail)[:120])
+        return
+    await websocket.accept()
+    await tunnel_hub.attach_stream(session_id, agent_id, websocket)
+
+
+@app.get("/api/v1/agent/files/{transfer_id}")
+async def agent_download_file(transfer_id: str, agent_id: str, request: Request, db: Session = Depends(db_session)):
+    server = verify_agent(request, db, agent_id, b"")
+    transfer = db.get(FileTransfer, transfer_id)
+    if not transfer or transfer.server_id != server.id:
+        raise HTTPException(status_code=404, detail="File transfer not found")
+    if transfer.status not in {"queued", "transferring"} or not transfer.content_encrypted or not transfer.nonce:
+        raise HTTPException(status_code=409, detail="File transfer is not available for delivery")
+    if now() - aware(transfer.created_at) > timedelta(hours=settings.file_transfer_ttl_hours):
+        transfer.status = "expired"
+        transfer.content_encrypted = None
+        transfer.nonce = ""
+        audit(db, f"agent:{server.id}", "file.download.expired", transfer.id, request, "blocked")
+        db.commit()
+        raise HTTPException(status_code=410, detail="File transfer expired")
+    try:
+        content = decrypt_file(transfer.content_encrypted, transfer.nonce, transfer.id, transfer.server_id, transfer.sha256, settings.job_secret_key)
+    except Exception as exc:
+        audit(db, f"agent:{server.id}", "file.download.decrypt_failed", transfer.id, request, "failed")
+        db.commit()
+        raise HTTPException(status_code=500, detail="File transfer integrity validation failed") from exc
+    if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), transfer.sha256):
+        raise HTTPException(status_code=500, detail="File transfer hash mismatch")
+    transfer.status = "transferring"
+    audit(db, f"agent:{server.id}", "file.download", transfer.id, request, detail={"filename": transfer.original_name, "size": transfer.size_bytes, "sha256": transfer.sha256})
+    db.commit()
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Tram-Filename": transfer.original_name,
+            "X-Tram-SHA256": transfer.sha256,
+            "X-Tram-Size": str(transfer.size_bytes),
+        },
+    )
+
+
 @app.post("/api/v1/agent/checkin")
 async def agent_checkin(payload: CheckinRequest, request: Request, db: Session = Depends(db_session)):
     server = verify_agent(request, db, payload.agent_id, await request.body())
+    expire_file_payloads(db)
     if payload.inventory:
         family, verification = classify_os(payload.inventory)
         if family != server.os_family:
@@ -1069,6 +1336,11 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
     for job in jobs:
         job.status = "dispatched"
         job.started_at = now()
+        if job.action == "file.deliver":
+            parameters = reveal_parameters(job.parameters)
+            transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
+            if transfer and transfer.server_id == server.id:
+                transfer.status = "transferring"
     db.commit()
     return {"server_time": now().isoformat(), "inventory_interval_seconds": 1800, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
 
@@ -1083,6 +1355,14 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     job.exit_code = payload.exit_code
     job.output = payload.output
     job.finished_at = now()
+    if job.action == "file.deliver":
+        parameters = reveal_parameters(job.parameters)
+        transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
+        if transfer and transfer.server_id == server.id:
+            transfer.status = "delivered" if payload.status == "succeeded" else "failed"
+            transfer.delivered_at = now() if payload.status == "succeeded" else None
+            transfer.content_encrypted = None
+            transfer.nonce = ""
     audit(db, f"agent:{server.id}", f"job.{payload.status}", job.id, request, payload.status, {"action": job.action, "exit_code": payload.exit_code})
     db.commit()
     return {"accepted": True}
@@ -1109,6 +1389,8 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
 
 @app.post("/api/v1/jobs/{job_id}/approve")
 def approve_job(job_id: str, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    if expire_file_payloads(db):
+        db.commit()
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1119,6 +1401,12 @@ def approve_job(job_id: str, request: Request, user: User = Depends(require_role
     job.status = "queued"
     job.approved_by = user.id
     job.approved_at = now()
+    if job.action == "file.deliver":
+        parameters = reveal_parameters(job.parameters)
+        transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
+        if not transfer or transfer.status != "pending_approval" or not transfer.content_encrypted:
+            raise HTTPException(status_code=409, detail="File transfer is no longer available")
+        transfer.status = "queued"
     audit(db, user.username, "job.approve", job.id, request)
     db.commit()
     return {"id": job.id, "status": job.status}
@@ -1180,7 +1468,7 @@ def read_recording(session_id: str, request: Request, user: User = Depends(requi
 
 
 @app.post("/api/v1/sessions/launch")
-def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
+async def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
     server = db.get(Server, payload.server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -1188,27 +1476,36 @@ def launch_session(payload: SessionLaunchRequest, request: Request, user: User =
         raise HTTPException(status_code=400, detail="RDP is reserved for Windows servers")
     if payload.protocol == "ssh" and server.os_family != "linux":
         raise HTTPException(status_code=400, detail="SSH is reserved for Linux servers")
-    if not server.address:
-        raise HTTPException(status_code=409, detail="Máy chủ chưa cung cấp địa chỉ quản trị")
-    port = 3389 if payload.protocol == "rdp" else 22
-    try:
-        with socket.create_connection((server.address, port), timeout=4):
-            pass
-    except OSError as exc:
-        protocol_name = "RDP" if payload.protocol == "rdp" else "SSH"
-        raise HTTPException(status_code=409, detail=f"Không thể kết nối {protocol_name} tới {server.address}:{port}. Kiểm tra dịch vụ và firewall trên máy đích.") from exc
+    if not tunnel_hub.is_online(server.id):
+        raise HTTPException(status_code=409, detail="Kênh tunnel mTLS của agent đang offline; hệ thống không fallback sang 22/3389 trực tiếp")
     session_id = str(uuid.uuid4())
-    common = {"hostname": server.address, "port": str(port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false"}
+    try:
+        relay_port = await tunnel_hub.create_listener(session_id, server.id, payload.protocol)
+    except (ConnectionError, OSError) as exc:
+        raise HTTPException(status_code=409, detail="Không thể tạo tunnel bảo mật tới agent") from exc
+    common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "true"}
     if payload.protocol == "ssh":
-        common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript"})
-        known_host = guacamole_ssh_host_key(server.address, server.ssh_host_key)
+        common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript", "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true"})
+        known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, server.ssh_host_key)
         if known_host:
             common["host-key"] = known_host
     else:
-        common.update({"security": "nla", "ignore-cert": "false", "width": str(payload.width), "height": str(payload.height), "resize-method": "display-update"})
-    guac_payload = {"username": user.username, "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000), "connections": {server.name: {"protocol": payload.protocol, "parameters": common}}}
-    encrypted = encrypt_guacamole_json(guac_payload)
-    db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=payload.username, created_by=user.username, status="launched", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
-    audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "recording": True})
-    db.commit()
+        fingerprint = str((server.inventory or {}).get("extra", {}).get("rdp_certificate_fingerprint", "")).lower().replace(":", "")
+        if fingerprint.startswith("sha1"):
+            fingerprint = "sha1:" + fingerprint.removeprefix("sha1")
+        elif fingerprint.startswith("sha256"):
+            fingerprint = "sha256:" + fingerprint.removeprefix("sha256")
+        if not re.fullmatch(r"(?:sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})", fingerprint):
+            await tunnel_hub.cancel(session_id, "rdp-certificate-missing")
+            raise HTTPException(status_code=409, detail="Agent chưa cung cấp fingerprint certificate RDP; cấu hình certificate RDP rồi đồng bộ inventory")
+        common.update({"security": "nla", "ignore-cert": "false", "cert-fingerprints": fingerprint, "enable-drive": "false", "disable-upload": "true", "disable-download": "true", "enable-printing": "false", "width": str(payload.width), "height": str(payload.height), "resize-method": "display-update"})
+    try:
+        guac_payload = {"username": user.username, "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000), "connections": {server.name: {"protocol": payload.protocol, "parameters": common}}}
+        encrypted = encrypt_guacamole_json(guac_payload)
+        db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=payload.username, created_by=user.username, status="waiting", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
+        audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "transport": "agent-mtls-tunnel", "target_port": 22 if payload.protocol == "ssh" else 3389, "recording": True, "clipboard": "disabled", "native_file_transfer": "disabled"})
+        db.commit()
+    except Exception:
+        await tunnel_hub.cancel(session_id, "launch-failed")
+        raise
     return {"sessionId": session_id, "url": f"{settings.guacamole_url}/?data={quote(encrypted)}", "expiresIn": 120, "recording": True}

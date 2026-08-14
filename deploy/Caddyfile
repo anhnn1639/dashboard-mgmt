@@ -5,10 +5,24 @@
 }
 
 http://{$OPS_DOMAIN} {
+    redir https://{host}{uri} permanent
+}
+
+https://{$OPS_DOMAIN} {
+    tls internal
     encode zstd gzip
 
     @agentEnroll path /api/v1/enroll
     handle @agentEnroll {
+        reverse_proxy api:8000
+    }
+
+    @fileUpload path_regexp fileUpload ^/api/v1/servers/[^/]+/files/?$
+    handle @fileUpload {
+        request_body {
+            # Includes multipart framing in addition to the 50 MiB file limit.
+            max_size 55MB
+        }
         reverse_proxy api:8000
     }
 
@@ -28,6 +42,7 @@ http://{$OPS_DOMAIN} {
         X-Content-Type-Options "nosniff"
         Referrer-Policy "same-origin"
         Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        Strict-Transport-Security "max-age=31536000"
         -Server
     }
 }
@@ -44,6 +59,7 @@ https://{$OPS_DOMAIN}:9443 {
     handle @agent {
         reverse_proxy api:8000 {
             header_up -Authorization
+            stream_close_delay 5m
         }
     }
 

@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
 import os
 import platform
 import re
+import shutil
 import socket
+import ssl
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,23 +26,34 @@ from urllib.parse import urlsplit
 
 import psutil
 import requests
+import websocket
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-AGENT_VERSION = "0.2.4"
+AGENT_VERSION = "0.3.0"
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
+TRANSFER_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,179}$")
+WINDOWS_RESERVED_FILENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+MAX_CONCURRENT_TUNNELS = 4
+ACTIVE_TUNNELS: set[str] = set()
+ACTIVE_TUNNELS_LOCK = threading.Lock()
 ALLOWED_ACTIONS = {
     "inventory.collect", "service.list", "service.restart", "service.start", "service.stop",
     "user.create", "user.disable", "user.enable", "user.delete", "user.password.reset",
     "group.create", "group.delete", "user.add_group", "patch.scan",
     "patch.install_security", "logs.read", "process.list", "firewall.list", "system.reboot",
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
-    "firewall.rule.add", "firewall.rule.remove", "network.list",
+    "firewall.rule.add", "firewall.rule.remove", "network.list", "file.deliver",
 }
 
 
@@ -71,8 +87,7 @@ class Config:
         return str(self.server_ca_file) if self.server_ca_file else True
 
 
-def signed_request(config: Config, method: str, url: str, payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+def signed_headers(config: Config, method: str, url: str, body: bytes = b"") -> dict[str, str]:
     timestamp = str(int(time.time()))
     path = urlsplit(url).path
     message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
@@ -81,12 +96,16 @@ def signed_request(config: Config, method: str, url: str, payload: dict[str, Any
     if not isinstance(private_key, ec.EllipticCurvePrivateKey):
         raise RuntimeError("Agent private key must be an EC key")
     signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
-    return body, {
-        "Content-Type": "application/json",
+    return {
         "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
         "X-Tram-Agent-Timestamp": timestamp,
         "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
     }
+
+
+def signed_request(config: Config, method: str, url: str, payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return body, {"Content-Type": "application/json", **signed_headers(config, method, url, body)}
 
 
 def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False) -> tuple[int, str]:
@@ -173,6 +192,14 @@ def ssh_host_key() -> str | None:
     return None
 
 
+def rdp_certificate_fingerprint() -> str | None:
+    if platform.system().lower() != "windows":
+        return None
+    code, output = powershell("$s=Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TSGeneralSetting -Filter \"TerminalName='RDP-tcp'\" -ErrorAction Stop;$s.SSLCertificateSHA1Hash")
+    fingerprint = re.sub(r"[^0-9A-Fa-f]", "", output)
+    return f"sha1:{fingerprint.lower()}" if code == 0 and len(fingerprint) == 40 else None
+
+
 def management_facts(os_family: str) -> dict[str, Any]:
     if os_family == "windows":
         code, output = powershell("[pscustomobject]@{Users=@(Get-LocalUser|Select Name,Enabled,LastLogon);Groups=@(Get-LocalGroup|ForEach-Object{$g=$_;[pscustomobject]@{name=$g.Name;members=@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue|ForEach-Object Name)}});Storage=@(Get-Volume|Where-Object DriveLetter|Select DriveLetter,FileSystemLabel,FileSystem,Size,SizeRemaining);Services=@(Get-Service|Select Name,DisplayName,Status,StartType)}|ConvertTo-Json -Depth 5 -Compress")
@@ -224,7 +251,10 @@ def collect_inventory() -> dict[str, Any]:
     if boot_path.exists():
         boot_id = boot_path.read_text().strip()
     os_family = "windows" if system == "windows" else "linux"
-    return {"hostname": socket.gethostname(), "os_family": os_family, "os_name": os_name, "os_version": os_version, "distribution_id": distribution_id, "architecture": platform.machine(), "agent_version": AGENT_VERSION, "addresses": network_addresses(), "boot_id": boot_id, "ssh_host_key": ssh_host_key(), "extra": {"kernel": platform.release(), "python": platform.python_version(), **management_facts(os_family)}}
+    extra = {"kernel": platform.release(), "python": platform.python_version(), **management_facts(os_family)}
+    if os_family == "windows":
+        extra["rdp_certificate_fingerprint"] = rdp_certificate_fingerprint()
+    return {"hostname": socket.gethostname(), "os_family": os_family, "os_name": os_name, "os_version": os_version, "distribution_id": distribution_id, "architecture": platform.machine(), "agent_version": AGENT_VERSION, "addresses": network_addresses(), "boot_id": boot_id, "ssh_host_key": ssh_host_key(), "extra": extra}
 
 
 def pending_updates(inventory: dict[str, Any]) -> int:
@@ -297,9 +327,231 @@ def firewall_parameters(parameters: dict[str, Any]) -> tuple[str, int, str, str,
     return name, port, protocol, action, source
 
 
+def tunnel_url(config: Config, suffix: str) -> str:
+    parsed = urlsplit(config.agent_endpoint)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RuntimeError("Agent endpoint must use HTTPS before a tunnel can be opened")
+    return f"wss://{parsed.netloc}{parsed.path}/tunnel/{suffix}"
+
+
+def open_agent_websocket(config: Config, url: str, timeout: int = 30) -> websocket.WebSocket:
+    if not config.server_ca_file:
+        raise RuntimeError("Control-plane CA is not installed")
+    headers = signed_headers(config, "GET", url)
+    return websocket.create_connection(
+        url,
+        header=[f"{key}: {value}" for key, value in headers.items()],
+        sslopt={
+            "certfile": str(config.cert_file),
+            "keyfile": str(config.key_file),
+            "ca_certs": str(config.server_ca_file),
+            "cert_reqs": ssl.CERT_REQUIRED,
+            "check_hostname": True,
+        },
+        timeout=timeout,
+        enable_multithread=True,
+        suppress_origin=True,
+    )
+
+
+def tunnel_stream_worker(config: Config, instruction: dict[str, Any]) -> None:
+    session_id = str(instruction.get("session_id", ""))
+    protocol = str(instruction.get("protocol", ""))
+    try:
+        port = int(instruction.get("port", 0))
+    except (TypeError, ValueError):
+        LOG.warning("rejected tunnel instruction with an invalid port")
+        return
+    expected_port = {"ssh": 22, "rdp": 3389}.get(protocol)
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        LOG.warning("rejected tunnel instruction with invalid session id")
+        return
+    if expected_port is None or port != expected_port:
+        LOG.warning("rejected tunnel instruction protocol=%s port=%s", protocol, port)
+        return
+
+    stream_url = tunnel_url(config, f"stream/{session_id}?agent_id={config.agent_id}")
+    with ACTIVE_TUNNELS_LOCK:
+        if session_id in ACTIVE_TUNNELS or len(ACTIVE_TUNNELS) >= MAX_CONCURRENT_TUNNELS:
+            LOG.warning("rejected tunnel %s because the local session limit was reached", session_id)
+            return
+        ACTIVE_TUNNELS.add(session_id)
+    local_socket: socket.socket | None = None
+    stream: websocket.WebSocket | None = None
+    try:
+        # The control plane never supplies a destination. The agent can connect
+        # only to the SSH/RDP listener on the machine on which it is installed.
+        local_socket = socket.create_connection(("127.0.0.1", expected_port), timeout=10)
+        local_socket.settimeout(None)
+        stream = open_agent_websocket(config, stream_url)
+        stream.settimeout(None)
+        stopped = threading.Event()
+
+        def local_to_stream() -> None:
+            try:
+                while not stopped.is_set():
+                    data = local_socket.recv(64 * 1024)
+                    if not data:
+                        break
+                    stream.send_binary(data)
+            except (OSError, websocket.WebSocketException):
+                pass
+            finally:
+                stopped.set()
+                with contextlib.suppress(Exception):
+                    stream.close()
+
+        sender = threading.Thread(target=local_to_stream, name=f"tram-tunnel-{session_id[:8]}", daemon=True)
+        sender.start()
+        while not stopped.is_set():
+            opcode, data = stream.recv_data()
+            if opcode == websocket.ABNF.OPCODE_CLOSE:
+                break
+            if opcode != websocket.ABNF.OPCODE_BINARY:
+                raise RuntimeError("Tunnel stream received a non-binary frame")
+            local_socket.sendall(data)
+        stopped.set()
+    except (OSError, RuntimeError, websocket.WebSocketException) as exc:
+        LOG.warning("tunnel %s failed: %s", session_id, exc)
+    finally:
+        if stream:
+            with contextlib.suppress(Exception):
+                stream.close()
+        if local_socket:
+            with contextlib.suppress(Exception):
+                local_socket.shutdown(socket.SHUT_RDWR)
+            local_socket.close()
+        with ACTIVE_TUNNELS_LOCK:
+            ACTIVE_TUNNELS.discard(session_id)
+
+
+def tunnel_control_loop(config: Config) -> None:
+    backoff = 5
+    while True:
+        control: websocket.WebSocket | None = None
+        try:
+            ensure_server_ca(config)
+            url = tunnel_url(config, f"control?agent_id={config.agent_id}")
+            control = open_agent_websocket(config, url, timeout=60)
+            control.send(json.dumps({"type": "ready", "agent_version": AGENT_VERSION}, separators=(",", ":")))
+            LOG.info("agent reverse tunnel is online")
+            backoff = 5
+            while True:
+                try:
+                    message = control.recv()
+                except websocket.WebSocketTimeoutException:
+                    control.ping()
+                    continue
+                if not message:
+                    raise websocket.WebSocketConnectionClosedException("Tunnel control channel closed")
+                instruction = json.loads(message)
+                if instruction.get("type") != "open":
+                    raise RuntimeError("Unsupported tunnel instruction")
+                threading.Thread(target=tunnel_stream_worker, args=(config, instruction), daemon=True).start()
+        except (OSError, RuntimeError, ValueError, requests.RequestException, websocket.WebSocketException) as exc:
+            LOG.warning("tunnel control unavailable: %s; retry in %ss", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(60, backoff * 2)
+        finally:
+            if control:
+                with contextlib.suppress(Exception):
+                    control.close()
+
+
+def local_malware_scan(path: Path, windows: bool) -> tuple[bool, str]:
+    if windows:
+        candidates: list[Path] = []
+        platform_root = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Microsoft/Windows Defender/Platform"
+        if platform_root.is_dir():
+            candidates.extend(sorted((item / "MpCmdRun.exe" for item in platform_root.iterdir()), reverse=True))
+        candidates.append(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Windows Defender/MpCmdRun.exe")
+        scanner = next((item for item in candidates if item.is_file()), None)
+        if not scanner:
+            return False, "Microsoft Defender scanner is unavailable"
+        code, output = run([str(scanner), "-Scan", "-ScanType", "3", "-File", str(path), "-DisableRemediation"], timeout=900)
+        return code == 0, "Microsoft Defender: clean" if code == 0 else f"Microsoft Defender blocked the file (code {code}): {output[-1000:]}"
+    scanner = shutil.which("clamscan")
+    if not scanner:
+        return False, "ClamAV clamscan is unavailable on this Linux server"
+    code, output = run([scanner, "--no-summary", "--infected", str(path)], timeout=900)
+    return code == 0, "ClamAV endpoint scan: clean" if code == 0 else f"ClamAV endpoint scan blocked the file (code {code}): {output[-1000:]}"
+
+
+def deliver_file(config: Config, parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    transfer_id = str(parameters.get("transfer_id", ""))
+    filename = str(parameters.get("filename", ""))
+    expected_sha256 = str(parameters.get("sha256", "")).lower()
+    try:
+        expected_size = int(parameters.get("size_bytes", 0))
+    except (TypeError, ValueError):
+        return 2, "Invalid file size metadata"
+    try:
+        uuid.UUID(transfer_id)
+    except ValueError:
+        return 2, "Invalid file transfer id"
+    reserved_stem = filename.split(".", 1)[0].upper()
+    if not TRANSFER_FILENAME_RE.fullmatch(filename) or filename.endswith((".", " ")) or reserved_stem in WINDOWS_RESERVED_FILENAMES:
+        return 2, "Unsafe file name"
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256) or not 1 <= expected_size <= MAX_TRANSFER_BYTES:
+        return 2, "Invalid file integrity metadata"
+
+    windows = inventory["os_family"] == "windows"
+    inbox = (Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "TramVanHanh/Inbox") if windows else Path("/var/lib/tram-agent/inbox")
+    inbox.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(inbox, 0o700)
+    destination = inbox / filename
+    if destination.exists():
+        return 3, "Destination file already exists; overwrite is forbidden"
+    temporary = inbox / f".{transfer_id}.part"
+    url = f"{config.agent_endpoint}/files/{transfer_id}?agent_id={config.agent_id}"
+    headers = signed_headers(config, "GET", url)
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with requests.get(url, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=300, stream=True) as response:
+            response.raise_for_status()
+            if response.headers.get("X-Tram-SHA256", "").lower() != expected_sha256:
+                raise RuntimeError("Control-plane hash header mismatch")
+            with temporary.open("xb") as output:
+                for chunk in response.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > expected_size or written > MAX_TRANSFER_BYTES:
+                        raise RuntimeError("Downloaded file exceeds approved size")
+                    output.write(chunk)
+                    digest.update(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        if written != expected_size or not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+            raise RuntimeError("Downloaded file failed size or SHA-256 validation")
+        with contextlib.suppress(OSError):
+            os.chmod(temporary, 0o600)
+        clean, scan_result = local_malware_scan(temporary, windows)
+        if not clean:
+            raise RuntimeError(scan_result)
+        # Hard-link publication is atomic and refuses to overwrite an existing
+        # destination. The temporary name is removed only after publication.
+        os.link(temporary, destination)
+        temporary.unlink()
+        if windows:
+            with contextlib.suppress(OSError):
+                Path(str(destination) + ":Zone.Identifier").write_text("[ZoneTransfer]\r\nZoneId=3\r\n", encoding="ascii")
+        return 0, json.dumps({"delivered": str(destination), "sha256": expected_sha256, "size": written, "endpoint_scan": scan_result}, ensure_ascii=False)
+    except (OSError, RuntimeError, requests.RequestException) as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return 4, f"Secure file delivery failed: {exc}"
+
+
 def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
     if action not in ALLOWED_ACTIONS:
         return 126, "Action is not allowlisted by this agent"
+    if action == "file.deliver":
+        return 126, "File delivery requires the signed agent download channel"
     windows = inventory["os_family"] == "windows"
     if action == "inventory.collect":
         return 0, json.dumps(collect_inventory(), ensure_ascii=False, indent=2)
@@ -455,11 +707,13 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
 def enroll(config: Config, token: str) -> None:
     if not config.server_url:
         raise RuntimeError("server_url is required")
+    if urlsplit(config.server_url).scheme != "https":
+        raise RuntimeError("Enrollment must use HTTPS")
     key = ec.generate_private_key(ec.SECP256R1())
     csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, config.agent_id), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Tram Van Hanh Agents")])).sign(key, hashes.SHA256())
     enrollment_payload = {"token": token, "agent_id": config.agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": collect_inventory()}
     for attempt in range(30):
-        response = requests.post(config.server_url + "/api/v1/enroll", json=enrollment_payload, timeout=60)
+        response = requests.post(config.server_url + "/api/v1/enroll", json=enrollment_payload, verify=config.tls_verify(), timeout=60)
         if response.status_code != 503 or attempt == 29:
             response.raise_for_status()
             break
@@ -487,6 +741,8 @@ def ensure_server_ca(config: Config) -> None:
         return
     if not config.server_url:
         raise RuntimeError("server_url is required to retrieve the server CA")
+    if urlsplit(config.server_url).scheme != "https":
+        raise RuntimeError("Control-plane CA bootstrap requires HTTPS")
     response = requests.get(config.server_url + "/api/v1/agent-server-ca", timeout=30)
     response.raise_for_status()
     certificate = response.json().get("certificate", "")
@@ -513,6 +769,8 @@ def loop(config: Config, once: bool = False) -> None:
     inventory = collect_inventory()
     expensive_metrics_pending = False
     backoff = config.interval
+    if not once:
+        threading.Thread(target=tunnel_control_loop, args=(config,), name="tram-tunnel-control", daemon=True).start()
     while True:
         try:
             ensure_server_ca(config)
@@ -535,7 +793,10 @@ def loop(config: Config, once: bool = False) -> None:
             for job in data.get("jobs", []):
                 LOG.info("job %s action=%s", job["id"], job["action"])
                 try:
-                    exit_code, output = execute_job(job["action"], job.get("parameters", {}), inventory)
+                    if job["action"] == "file.deliver":
+                        exit_code, output = deliver_file(config, job.get("parameters", {}), inventory)
+                    else:
+                        exit_code, output = execute_job(job["action"], job.get("parameters", {}), inventory)
                 except Exception as exc:
                     LOG.exception("job failed")
                     exit_code, output = 1, f"{type(exc).__name__}: {exc}"
@@ -573,6 +834,7 @@ def main() -> int:
     enrollment = sub.add_parser("enroll")
     enrollment.add_argument("--server", required=True)
     enrollment.add_argument("--token")
+    enrollment.add_argument("--server-ca", help="PEM CA used to verify a private/internal dashboard certificate")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
@@ -580,6 +842,14 @@ def main() -> int:
     config = Config(args.config)
     if args.command == "enroll":
         config.server_url = args.server.rstrip("/")
+        if args.server_ca:
+            certificate = Path(args.server_ca).read_text(encoding="utf-8")
+            if "BEGIN CERTIFICATE" not in certificate:
+                raise RuntimeError("--server-ca is not a PEM certificate")
+            config.server_ca_file = config.path.parent / "server-ca.crt"
+            config.server_ca_file.parent.mkdir(parents=True, exist_ok=True)
+            config.server_ca_file.write_text(certificate, encoding="utf-8")
+            config.save()
         token = args.token or getpass.getpass("Enrollment token: ")
         enroll(config, token)
         return 0

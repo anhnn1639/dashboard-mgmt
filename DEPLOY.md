@@ -11,6 +11,7 @@ ops.example.com -> PUBLIC_IP_CUA_SERVER
 ```bash
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
 sudo ufw allow 9443/tcp
 sudo ufw enable
 ```
@@ -88,20 +89,24 @@ sudo docker compose -f compose.yaml -f compose.external.yaml ps
 ## 8A. Kiểm tra log bản test
 
 ```bash
-sudo docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 caddy api postgres dashboard
+sudo docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 caddy api clamav postgres dashboard
 ```
 
 ## 8B. Kiểm tra log bản PostgreSQL bên ngoài
 
 ```bash
-sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 caddy api dashboard
+sudo docker compose -f compose.yaml -f compose.external.yaml logs --tail=100 caddy api clamav dashboard
 ```
 
 ## 9. Mở wizard
 
 ```text
-http://ops.example.com
+https://ops.example.com
 ```
+
+Caddy dùng CA nội bộ. Trước khi mở wizard, copy `deploy/pki/server-ca.crt`
+qua kênh quản trị tin cậy và import vào Root CA của máy quản trị. Không tải CA
+qua HTTP rồi tin cậy trực tiếp.
 
 ## 10. Nhập kết nối PostgreSQL
 
@@ -138,7 +143,7 @@ Mật khẩu: tối thiểu 14 ký tự
 ## 12. Nhập URL dashboard
 
 ```text
-Dashboard URL: http://ops.example.com
+Dashboard URL: https://ops.example.com
 Mã thiết lập: giá trị SETUP_TOKEN ở bước 5
 ```
 
@@ -149,7 +154,18 @@ Nhấn: Kiểm tra kết nối & hoàn tất
 Đăng nhập bằng tài khoản admin vừa tạo
 ```
 
-## 14A. Cập nhật bản test
+## 14. Firewall máy được quản lý
+
+- Agent chỉ cần outbound TCP `9443` tới `ops.example.com`; cho outbound `443`
+  trong lúc enrollment.
+- Không mở inbound cho agent.
+- Đóng inbound `22/3389` từ mạng thông thường. Nếu cần break-glass, chỉ cho
+  phép một bastion riêng có MFA.
+- Chặn server-to-server tới `22`, `3389`, `445` và các mạng control/database.
+- Không public `3310` (ClamAV), `4822` (guacd), `5432` (PostgreSQL) hoặc các
+  cổng relay tạm thời của container API.
+
+## 15A. Cập nhật bản test
 
 ```bash
 cd dashboard-mgmt
@@ -159,7 +175,7 @@ sudo docker compose -f compose.yaml -f compose.test.yaml up -d
 sudo docker compose -f compose.yaml -f compose.test.yaml ps
 ```
 
-## 14B. Cập nhật bản PostgreSQL bên ngoài
+## 15B. Cập nhật bản PostgreSQL bên ngoài
 
 ```bash
 cd dashboard-mgmt

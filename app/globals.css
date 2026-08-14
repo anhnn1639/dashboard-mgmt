@@ -972,6 +972,10 @@ textarea:focus-visible {
     rgba(17, 31, 51, 0.5)
   );
 }
+.drawer-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .drawer-actions button span {
   grid-row: span 2;
   width: 28px;
@@ -2638,6 +2642,45 @@ textarea:focus-visible {
 .server-action-form .button {
   width: 100%;
   margin-top: 8px;
+}
+.secure-file-form {
+  border-color: #315145;
+  background: rgba(28, 68, 55, 0.12);
+}
+.transfer-list {
+  margin-top: 9px;
+  border: 1px solid #253143;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.transfer-list > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid #202b3a;
+}
+.transfer-list > div:last-child {
+  border-bottom: 0;
+}
+.transfer-list b,
+.transfer-list small {
+  display: block;
+}
+.transfer-list b {
+  font-size: 9px;
+}
+.transfer-list small {
+  margin-top: 3px;
+  color: #64748a;
+  font: 8px var(--font-geist-mono);
+}
+.transfer-list em {
+  color: #7bc9ad;
+  font-size: 8px;
+  font-style: normal;
+  white-space: nowrap;
 }
 .recording-pending {
   color: #9b7b4a;

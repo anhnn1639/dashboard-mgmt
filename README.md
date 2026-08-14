@@ -9,13 +9,14 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Agent outbound cho Windows Server 2025, Ubuntu 24.04 và Oracle Linux 7/8.
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
-- Dashboard/API ở TCP `443` qua TLS tự động của Caddy.
+- Dashboard/API ở TCP `443` qua TLS của Caddy; TCP `80` chỉ chuyển hướng sang HTTPS.
 - RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT ngắn hạn và Argon2 password hashing.
 - Công việc có cấu trúc và allowlist; không có endpoint chạy shell tùy ý.
 - Quy tắc “4 mắt”: người tạo không thể tự duyệt tác vụ nguy hiểm.
 - Quản lý local user/group theo máy đang chọn: tạo/khóa/mở khóa/xóa/reset mật khẩu, tạo/xóa group và thêm/xóa thành viên.
 - Scan/cài security updates, start/stop/restart service, xem process, firewall, journal/Event Log và reboot.
-- SSH/RDP trong trình duyệt qua Apache Guacamole 1.6; native recording giữ độ phân giải nguồn, có trình phát tại tab Nhật ký kiểm toán và SSH typescript.
+- SSH/RDP trong trình duyệt qua Apache Guacamole 1.6 và reverse tunnel của agent; không cần mở `22/3389` từ control plane tới máy đích.
+- Truyền file một chiều qua mTLS `9443`: ClamAV trung tâm, mã hóa AES-GCM trong PostgreSQL, duyệt bốn mắt, kiểm tra SHA-256 và quét lại bằng Defender/ClamAV tại endpoint trước khi đưa vào inbox.
 - Audit log liên kết hash để phát hiện chỉnh sửa/xóa/chèn sự kiện ngoài luồng.
 - Docker Compose cho Ubuntu 24.04 với Postgres, API, dashboard, Caddy, Guacamole và guacd.
 
@@ -33,14 +34,20 @@ Control plane tự gán `os_family=windows|linux`; API và giao diện lọc the
 ```text
 Trình duyệt ── TLS/443 ── Caddy ─┬─ Dashboard
                                  ├─ Control Plane API ── PostgreSQL
-                                 └─ Guacamole ── guacd ── SSH/22 hoặc RDP/3389 ── Máy đích
+                                 └─ Guacamole ── guacd ── relay TCP dùng một lần
+                                                               │
+Windows/Linux Agent ── WebSocket mTLS/9443 ── Caddy/API ───────┘
+        │
+        ├─ chỉ relay tới localhost:22 (Linux) hoặc localhost:3389 (Windows)
+        └─ private key không rời máy; không có listener inbound của agent
 
-Windows/Linux Agent ── mTLS/9443 ── Caddy ── Control Plane API
-        │                                 │
-        └─ private key không rời máy      └─ allowlist job + RBAC + audit
+Upload ── TLS/443 ── ClamAV cách ly ── AES-GCM/PostgreSQL ── duyệt 4 mắt
+        ── mTLS/9443 ── SHA-256 ── Defender/ClamAV endpoint ── inbox 0600/ACL
 ```
 
-Agent chỉ cần kết nối outbound tới control plane. Không cần mở thêm cổng inbound cho agent. `guacd` không được publish ra host; chỉ container Guacamole truy cập được.
+Agent chỉ cần kết nối outbound tới control plane. Không cần mở cổng inbound cho agent. `guacd`, relay TCP, ClamAV `3310` và PostgreSQL không được publish ra host. Mạng Docker `session` là internal nên `guacd` không thể đi thẳng tới subnet máy chủ. Nếu tunnel lỗi, API fail-closed và không fallback về IP quản trị.
+
+`TunnelHub` hiện giữ trạng thái WebSocket trong bộ nhớ của tiến trình API. Vì vậy bản này phải chạy **một replica API và một Uvicorn worker**; không tăng replica/worker trước khi thay bằng tunnel broker có điều phối phân tán và session affinity.
 
 Compose tự xuất public root CA của HTTPS/mTLS `9443` từ volume Caddy sang `deploy/pki/server-ca.crt`. API chỉ đọc bản public này; private key CA của Caddy không được chia sẻ sang container API. Agent sẽ tự retry nếu CA chưa sẵn sàng trong vài giây đầu sau khi recreate stack.
 
@@ -51,8 +58,9 @@ Compose tự xuất public root CA của HTTPS/mTLS `9443` từ volume Caddy san
 - Ubuntu Server 24.04 LTS x86_64/arm64.
 - Tối thiểu 4 vCPU, 8 GB RAM, 80 GB disk cho lab; production cần tính riêng dung lượng recording.
 - DNS `ops.example.com` trỏ tới máy control plane.
-- Mở inbound TCP `80`, `443`, `9443`. Giới hạn `9443` theo IP/VPN nếu có thể.
-- Control plane/`guacd` phải route được tới IP quản trị của máy đích trên TCP `22` hoặc `3389`.
+- Mở inbound TCP `80` (redirect), `443` (operator/enrollment) và `9443` (agent mTLS). Giới hạn `443/9443` theo VPN/subnet quản trị nếu có thể.
+- Trên máy được quản lý chỉ cho outbound TCP `9443` tới control plane. Có thể cho outbound `443` trong lúc enroll.
+- Chặn inbound `22/3389` từ mạng thông thường. Nếu cần đường cứu hộ, chỉ cho phép từ một bastion riêng có MFA; không cho máy được quản lý truy cập ngang sang `22/3389/445` của máy khác.
 - Docker Engine và Docker Compose plugin theo tài liệu chính thức: <https://docs.docker.com/engine/install/ubuntu/>.
 
 Docker có thể tạo rule iptables vượt qua một số rule UFW. Chỉ publish ba port trong `compose.yaml`, kiểm soát thêm bằng firewall upstream và `DOCKER-USER` chain.
@@ -95,7 +103,7 @@ docker compose -f compose.yaml -f compose.external.yaml up -d
 docker compose -f compose.yaml -f compose.external.yaml ps
 ```
 
-Mở `http://ops.example.com`. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
+Mở `https://ops.example.com`. Caddy dùng CA nội bộ nên phải import `deploy/pki/server-ca.crt` vào kho Root CA của máy quản trị trước. Khi database chưa được cấu hình, chưa kết nối được, chưa có admin hoặc chưa có URL chuẩn, dashboard tự mở màn hình **Thiết lập lần đầu**:
 
 1. Nhập máy chủ PostgreSQL, port, database, tài khoản, mật khẩu và chế độ SSL. Với PostgreSQL trong Compose dùng host `postgres`, port `5432` và các giá trị `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` trong `.env`.
 2. Tạo tài khoản admin local đầu tiên với mật khẩu tối thiểu 14 ký tự.
@@ -110,7 +118,7 @@ API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và au
 Đăng nhập lấy access token:
 
 ```bash
-ACCESS_TOKEN=$(curl -fsS http://ops.example.com/api/v1/auth/login \
+ACCESS_TOKEN=$(curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.com/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_ADMIN_PASSWORD"}' | jq -r .access_token)
 ```
@@ -118,7 +126,7 @@ ACCESS_TOKEN=$(curl -fsS http://ops.example.com/api/v1/auth/login \
 Token dùng một lần, hết hạn sau 24 giờ:
 
 ```bash
-curl -fsS http://ops.example.com/api/v1/enrollment-tokens \
+curl --cacert deploy/pki/server-ca.crt -fsS https://ops.example.com/api/v1/enrollment-tokens \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"label":"server-batch-01","expires_hours":24,"max_uses":1}'
@@ -128,12 +136,13 @@ Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token ch
 
 ### 2. Ubuntu 24.04 / Oracle Linux 7, 8
 
-Trên Ubuntu, bộ cài tự cài Python 3, `venv` và OpenSSH Server. Trên Oracle Linux 7, Python hệ thống có thể quá cũ; cài Python 3.9+ và OpenSSH Server từ repository được tổ chức phê duyệt trước khi chạy.
+Trên Ubuntu, bộ cài tự cài Python 3, `venv`, OpenSSH Server và ClamAV. Trên Oracle Linux 8, chỉ bật repository EPEL đã được tổ chức phê duyệt rồi cài ClamAV/cập nhật signature. Oracle Linux 7 có ClamAV cũ trong developer EPEL; không dùng bản EOL cho production — cần endpoint scanner còn được nhà cung cấp hỗ trợ, nếu không truyền file sẽ fail-closed.
 
 ```bash
 sudo sh agent/install-linux.sh
 sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
-  enroll --server http://ops.example.com --token 'tvo_ONE_TIME_TOKEN'
+  enroll --server https://ops.example.com \
+  --server-ca /path/server-ca.crt --token 'tvo_ONE_TIME_TOKEN'
 sudo systemctl enable --now tram-agent
 sudo systemctl status tram-agent
 ```
@@ -147,21 +156,34 @@ Chạy PowerShell 64-bit bằng quyền Administrator. MVP hiện cần Python 3
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\agent\install-windows.ps1 `
-  -Server "http://ops.example.com" `
+  -Server "https://ops.example.com" `
+  -ServerCA "C:\SecureBootstrap\server-ca.crt" `
   -EnrollmentToken "tvo_ONE_TIME_TOKEN"
 ```
 
-Máy sẽ tự xuất hiện trong **Máy chủ Windows**. Windows Server 2025 có OpenSSH Server được cài sẵn nhưng mặc định chưa bật; RDP cũng phải được bật và firewall cho phép từ IP control plane/Guacamole.
+Máy sẽ tự xuất hiện trong **Máy chủ Windows**. RDP phải được bật và gắn certificate; firewall không cần cho phép `3389` từ control plane vì agent chỉ nối tới listener cục bộ. Microsoft Defender phải hoạt động để nhận file.
 
 ## SSH/RDP và recording
 
 1. Chọn server trong dashboard.
 2. Linux hiển thị **Mở SSH**; Windows hiển thị **Remote Desktop**.
 3. Nhập credential dùng cho đúng phiên. Password được đưa vào JSON Guacamole có chữ ký HMAC-SHA256, mã hóa AES-CBC và hết hạn sau 2 phút; API không lưu password và không ghi password vào audit.
-4. `guacd` ghi native graphical recording vào `RECORDING_DIR`; SSH ghi thêm typescript.
-5. Vào **Nhật ký kiểm toán → Video ghi session → Xem lại** để phát trực tiếp recording gốc trong trình duyệt.
+4. API tạo listener TCP dùng một lần trên mạng Docker internal. `guacd` kết nối listener này, agent nhận yêu cầu qua WebSocket mTLS rồi relay tới đúng dịch vụ local. Agent từ chối mọi host/port tùy ý.
+5. `guacd` ghi native graphical recording vào `RECORDING_DIR`; SSH ghi thêm typescript.
+6. Vào **Nhật ký kiểm toán → Video ghi session → Xem lại** để phát trực tiếp recording gốc trong trình duyệt.
 
-Recording gốc của Guacamole không cần re-encode, giữ nguyên dữ liệu hiển thị ở độ phân giải trình duyệt yêu cầu và thường nhỏ hơn video truyền thống. Object storage retention và legal hold vẫn là hạng mục production tiếp theo. Không bật `ignore-cert` cho RDP; triển khai certificate hợp lệ cho RDP. SSH host key được agent thu thập và pin khi có Ed25519 host key.
+Recording gốc của Guacamole không cần re-encode, giữ nguyên dữ liệu hiển thị ở độ phân giải trình duyệt yêu cầu và thường nhỏ hơn video truyền thống. Object storage retention và legal hold vẫn là hạng mục production tiếp theo. Không bật `ignore-cert` cho RDP; fingerprint certificate RDP do agent thu thập được pin trong Guacamole. SSH host key cũng được pin. Clipboard hai chiều, SFTP và RDP drive/printing đều bị tắt; file chỉ đi qua pipeline đã quét.
+
+## Truyền file an toàn
+
+1. Chọn máy chủ, tải file tối đa 50 MiB và nhập ticket/lý do.
+2. API giữ upload trong `/tmp` container gắn `noexec,nosuid,nodev`, gửi bytes qua `INSTREAM` tới ClamAV trên mạng Docker riêng. Socket `3310` không được public.
+3. File sạch được mã hóa AES-GCM có AAD gắn với transfer/server/SHA-256 rồi lưu trong PostgreSQL. File nhiễm hoặc scanner lỗi không được lưu nội dung.
+4. Một admin khác phải duyệt job `file.deliver`; người upload không tự duyệt được.
+5. Đúng agent tải file qua API mTLS `9443`, kiểm tra kích thước/SHA-256, quét lại bằng Microsoft Defender hoặc ClamAV endpoint, sau đó publish không ghi đè vào `%ProgramData%\TramVanHanh\Inbox` hoặc `/var/lib/tram-agent/inbox`.
+6. Sau khi agent báo thành công/thất bại, ciphertext bị xóa khỏi PostgreSQL; metadata, hash và audit được giữ lại. Không có luồng tải file từ server về dashboard hoặc server-sang-server.
+
+Không hệ thống antivirus nào đảm bảo chặn tuyệt đối zero-day. Các lớp trên giảm mạnh khả năng lây nhiễm chéo; production vẫn cần EDR, application allowlisting (WDAC/AppLocker/SELinux), phân đoạn mạng và kiểm thử pentest.
 
 ## LDAP Domain Login và MFA
 
@@ -170,7 +192,7 @@ Recording gốc của Guacamole không cần re-encode, giữ nguyên dữ liệ
 3. Bật **Domain Login**, lưu cấu hình, sau đó dùng tab **Domain Login** ở màn hình đăng nhập.
 4. Lần đầu mỗi tài khoản Local hoặc Domain đăng nhập thành công, hệ thống bắt buộc quét QR TOTP và xác minh mã 6 số trước khi cấp JWT.
 
-Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` trước khi lưu PostgreSQL. Nên dùng LDAPS có certificate được API container tin cậy và HTTPS ở production; chạy HTTP sẽ làm lộ credential trên đường truyền.
+Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` trước khi lưu PostgreSQL. Bắt buộc dùng LDAPS có certificate được API container tin cậy ở production.
 
 ## User/group theo hệ điều hành
 
@@ -219,7 +241,8 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r control-plane/requirements.txt -r agent/requirements.txt
 PYTHONPATH=control-plane python -m unittest discover -s control-plane/tests
-python -m py_compile control-plane/app/main.py agent/tram_agent.py
+python -m unittest discover -s agent/tests
+python -m py_compile control-plane/app/main.py control-plane/app/tunnel.py control-plane/app/file_security.py agent/tram_agent.py
 ```
 
 ## Làm việc trên hai máy qua GitHub
@@ -248,3 +271,7 @@ Không đồng bộ `.env`, `deploy/pki`, certificate agent hoặc recording qua
 - Guacamole recording: <https://guacamole.apache.org/doc/gug/recording-playback.html>
 - Guacamole JSON authentication: <https://guacamole.apache.org/doc/gug/json-auth.html>
 - Caddy mTLS: <https://caddyserver.com/docs/caddyfile/directives/tls>
+- Caddy WebSocket reverse proxy: <https://caddyserver.com/docs/caddyfile/directives/reverse_proxy>
+- ClamAV `INSTREAM`: <https://docs.clamav.net/manual/Usage/ClamdProtocol.html>
+- Microsoft Defender `MpCmdRun`: <https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus>
+- OWASP File Upload Cheat Sheet: <https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html>

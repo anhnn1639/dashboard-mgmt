@@ -1,7 +1,7 @@
 "use client";
 
 import Guacamole from "guacamole-common-js";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -38,6 +38,7 @@ type Server = {
   services: number;
   owner: string;
   tags: string[];
+  tunnelOnline: boolean;
 };
 
 const navItems = [
@@ -1064,7 +1065,7 @@ function SetupScreen({
               <span>03</span>
               <div>
                 <b>Địa chỉ dashboard</b>
-                <small>URL HTTP mà người dùng có thể truy cập.</small>
+                <small>URL HTTPS chính thức mà người dùng có thể truy cập.</small>
               </div>
             </legend>
             <label>
@@ -1075,10 +1076,10 @@ function SetupScreen({
                 defaultValue={
                   typeof window !== "undefined"
                     ? window.location.origin
-                    : "http://ops.example.com"
+                    : "https://ops.example.com"
                 }
                 required
-                placeholder="http://ops.example.com"
+                placeholder="https://ops.example.com"
               />
             </label>
             {status.setupTokenRequired && (
@@ -1350,6 +1351,26 @@ function ServerDrawer({
   const [detail, setDetail] = useState<Detail | null>(null);
   const [action, setAction] = useState("user.create");
   const [busy, setBusy] = useState(false);
+  const [fileBusy, setFileBusy] = useState(false);
+  const [transfers, setTransfers] = useState<
+    Array<{
+      id: string;
+      filename: string;
+      sizeBytes: number;
+      sha256: string;
+      status: string;
+    }>
+  >([]);
+  const loadTransfers = useCallback(
+    () =>
+      fetch(`/api/v1/servers/${server.id}/files`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((response) => (response.ok ? response.json() : Promise.reject()))
+        .then((data) => setTransfers(Array.isArray(data.items) ? data.items : []))
+        .catch(() => setTransfers([])),
+    [server.id, token],
+  );
   useEffect(() => {
     fetch(`/api/v1/servers/${server.id}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -1357,7 +1378,8 @@ function ServerDrawer({
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then(setDetail)
       .catch(() => setDetail(null));
-  }, [server.id, token]);
+    void loadTransfers();
+  }, [server.id, token, loadTransfers]);
   const facts = detail?.inventory?.extra;
   const groups = (facts?.Groups ?? [])
     .map((item) => item.name ?? item.Name ?? "")
@@ -1418,6 +1440,28 @@ function ServerDrawer({
       setBusy(false);
     }
   }
+  async function uploadFile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFileBusy(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      const response = await fetch(`/api/v1/servers/${server.id}/files`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await response.json();
+      if (!response.ok)
+        throw new Error(data.detail ?? "Không thể tải file vào vùng cách ly");
+      notify("File sạch đã vào vùng cách ly và đang chờ quản trị viên khác phê duyệt.");
+      event.currentTarget.reset();
+      await loadTransfers();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Không thể tải file");
+    } finally {
+      setFileBusy(false);
+    }
+  }
   return (
     <>
       <button
@@ -1443,10 +1487,12 @@ function ServerDrawer({
           </div>
         </div>
         <div className="drawer-actions">
-          <button className="connect" onClick={openSession}>
+          <button className="connect" onClick={openSession} disabled={!server.tunnelOnline}>
             <span>↗</span>
             <b>{server.osFamily === "windows" ? "Remote Desktop" : "Mở SSH"}</b>
-            <small>Qua gateway bảo mật</small>
+            <small>
+              {server.tunnelOnline ? "Tunnel mTLS 9443 sẵn sàng" : "Tunnel agent đang offline"}
+            </small>
           </button>
           <button
             onClick={() =>
@@ -1514,9 +1560,46 @@ function ServerDrawer({
             </div>
             <div>
               <dt>Agent</dt>
-              <dd>v{server.agentVersion} · mTLS</dd>
+              <dd>
+                v{server.agentVersion} · mTLS · {server.tunnelOnline ? "tunnel online" : "tunnel offline"}
+              </dd>
             </div>
           </dl>
+          <h3>Truyền file một chiều an toàn</h3>
+          <form className="server-action-form secure-file-form" onSubmit={uploadFile}>
+            <label>
+              File đưa vào inbox cách ly
+              <input name="file" type="file" required />
+            </label>
+            <label>
+              Lý do / ticket
+              <textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Mục đích sử dụng file" />
+            </label>
+            <div className="warning-box">
+              <b>Không đi qua SFTP, RDP drive hoặc clipboard</b>
+              <p>
+                File tối đa 50 MiB, được quét ClamAV trước khi mã hóa lưu trong PostgreSQL,
+                cần phê duyệt bốn mắt và được Defender/ClamAV quét lại tại máy đích. Agent
+                không tự chạy file và không ghi đè file đã có.
+              </p>
+            </div>
+            <button className="button primary" disabled={fileBusy || !server.tunnelOnline}>
+              {fileBusy ? "Đang quét…" : "Quét & gửi vào vùng cách ly"}
+            </button>
+          </form>
+          {transfers.length > 0 && (
+            <div className="transfer-list">
+              {transfers.slice(0, 5).map((transfer) => (
+                <div key={transfer.id}>
+                  <span>
+                    <b>{transfer.filename}</b>
+                    <small>{Math.ceil(transfer.sizeBytes / 1024)} KiB · SHA-256 {transfer.sha256.slice(0, 12)}…</small>
+                  </span>
+                  <em>{transfer.status}</em>
+                </div>
+              ))}
+            </div>
+          )}
           <h3>Thao tác trên {server.name}</h3>
           <form className="server-action-form" onSubmit={submitAction}>
             <label>
