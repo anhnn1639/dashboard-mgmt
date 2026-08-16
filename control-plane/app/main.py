@@ -869,6 +869,17 @@ def encrypt_guacamole_json(payload: dict[str, Any]) -> str:
     return base64.b64encode(encryptor.update(padded) + encryptor.finalize()).decode()
 
 
+def guacamole_launch_url(base_url: str, connection_identifier: str, encrypted_data: str) -> str:
+    """Return a Guacamole client route authenticated by encrypted JSON data."""
+    client_identifier = base64.urlsafe_b64encode(
+        f"{connection_identifier}\0c\0json".encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return (
+        f"{base_url.rstrip('/')}/#/client/{client_identifier}"
+        f"?data={quote(encrypted_data, safe='')}"
+    )
+
+
 SSH_HOST_KEY_TYPES = {
     "ssh-ed25519",
     "ssh-rsa",
@@ -1821,4 +1832,9 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     except Exception:
         await tunnel_hub.cancel(session_id, "launch-failed")
         raise
-    return {"sessionId": session_id, "url": f"{settings.guacamole_url}/?data={quote(encrypted)}", "expiresIn": 120, "recording": True}
+    return {
+        "sessionId": session_id,
+        "url": guacamole_launch_url(settings.guacamole_url, server.name, encrypted),
+        "expiresIn": 120,
+        "recording": True,
+    }

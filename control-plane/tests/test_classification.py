@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_ssh_host_key, settings  # noqa: E402
+from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -99,6 +99,23 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(
             guacamole_ssh_host_key("tunnel-relay", 49152, f"old-host ssh-ed25519 {encoded_key} comment"),
             f"[tunnel-relay]:49152 ssh-ed25519 {encoded_key}",
+        )
+
+    def test_guacamole_launch_url_opens_the_json_connection_directly(self):
+        url = guacamole_launch_url(
+            "/guacamole/",
+            "dashboard-mgmt",
+            "encrypted+/=data",
+        )
+        encoded_identifier = url.split("/client/", 1)[1].split("?", 1)[0]
+        padding = "=" * ((4 - len(encoded_identifier) % 4) % 4)
+        self.assertEqual(
+            base64.urlsafe_b64decode(encoded_identifier + padding).decode(),
+            "dashboard-mgmt\0c\0json",
+        )
+        self.assertEqual(
+            url,
+            f"/guacamole/#/client/{encoded_identifier}?data=encrypted%2B%2F%3Ddata",
         )
 
     def test_guacamole_rejects_invalid_host_key(self):
