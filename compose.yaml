@@ -147,12 +147,18 @@ services:
     volumes:
       - ${RECORDING_DIR:-./recordings}:/recordings
     expose: ["4822"]
-    networks: [session]
+    networks:
+      session:
+        # Keep the service name stable even when existing Docker endpoints
+        # were created without Compose's implicit service-name alias.
+        aliases: [guacd]
 
   guacamole:
     image: guacamole/guacamole:1.6.0
     restart: unless-stopped
-    depends_on: [guacd]
+    depends_on:
+      guacd:
+        condition: service_healthy
     environment:
       GUACD_HOSTNAME: guacd
       GUACD_PORT: 4822
@@ -165,7 +171,11 @@ services:
     expose: ["8080"]
     volumes:
       - ${RECORDING_DIR:-./recordings}:/var/lib/guacamole/recordings:ro
-    networks: [session, edge]
+    networks:
+      session:
+        aliases: [guacamole]
+      edge:
+        aliases: [guacamole]
 
 networks:
   edge:
