@@ -21,6 +21,11 @@ class AgentSecurityTests(unittest.TestCase):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Version="$(var.AgentVersion)"', wix_source)
 
+    def test_linux_service_allows_netlink_for_inventory_and_firewall(self):
+        service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
+        address_families = next(line for line in service.splitlines() if line.startswith("RestrictAddressFamilies="))
+        self.assertIn("AF_NETLINK", address_families.split("=", 1)[1].split())
+
     def test_system_command_falls_back_to_standard_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             command = Path(directory) / "iptables"
