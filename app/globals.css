@@ -1358,6 +1358,11 @@ textarea:focus-visible {
   display: block;
   margin-bottom: 7px;
 }
+.firewall-scan-error small {
+  display: block;
+  margin-bottom: 8px;
+  color: #b7858a;
+}
 .firewall-scan-error pre {
   margin: 0;
   overflow: auto;

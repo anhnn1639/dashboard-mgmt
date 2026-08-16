@@ -1653,6 +1653,7 @@ function ServerDrawer({
   const latestReadJob = currentReadAction
     ? jobs.find((job) => job.action === currentReadAction)
     : undefined;
+  const latestFirewallJob = jobs.find((job) => job.action === "firewall.list");
   const firewallScan = parseFirewallOutput(
     jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded")?.output,
   );
@@ -1719,7 +1720,7 @@ function ServerDrawer({
     setActiveTab(tab);
     const options = actionOptions[tab] ?? [];
     if (options.length) setAction(options[0].value);
-    if (tab === "firewall" && !jobs.some((job) => job.action === "firewall.list"))
+    if (tab === "firewall" && (!latestFirewallJob || latestFirewallJob.status === "failed"))
       void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`, false).catch((reason) =>
         notify(reason instanceof Error ? reason.message : "Không thể quét firewall"),
       );
@@ -2136,7 +2137,7 @@ function ServerDrawer({
                     </table>
                     {!latestReadJob && <div className="empty-state">Chưa có dữ liệu; nhấn “Quét lại”.</div>}
                     {latestReadJob && ["queued", "approved", "running"].includes(latestReadJob.status) && <div className="empty-state">Agent đang xử lý: {latestReadJob.status}</div>}
-                    {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
+                    {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><small>Kết quả lúc {new Date(latestReadJob.createdAt).toLocaleString("vi-VN")}. Mở lại tab hoặc bấm “Quét lại” để tạo lần quét mới.</small><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
                     {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning">{firewallScan.warning}</div>}
                   </div>
