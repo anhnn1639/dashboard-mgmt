@@ -74,6 +74,9 @@ services:
     expose: ["8000"]
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
+    group_add:
+      # Read-only access to recordings created by guacd (UID/GID 1000).
+      - "${RECORDING_GID:-1000}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
       interval: 15s
@@ -134,7 +137,13 @@ services:
     user: "0:0"
     network_mode: none
     restart: "no"
-    command: ["sh", "-c", "chown 1001:1000 /recordings && chmod 2750 /recordings"]
+    command:
+      - sh
+      - -c
+      - >-
+        chown -R 1000:${RECORDING_GID:-1000} /recordings &&
+        find /recordings -type d -exec chmod 2750 {} + &&
+        find /recordings -type f -exec chmod 0640 {} +
     volumes:
       - ${RECORDING_DIR:-./recordings}:/recordings
 
@@ -171,6 +180,9 @@ services:
     expose: ["8080"]
     volumes:
       - ${RECORDING_DIR:-./recordings}:/var/lib/guacamole/recordings:ro
+    group_add:
+      # The web application only reads recordings created by guacd.
+      - "${RECORDING_GID:-1000}"
     networks:
       session:
         aliases: [guacamole]

@@ -10,6 +10,7 @@
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
+- Sau khi DNS chạy, log `guacd` xác nhận hai lỗi kế tiếp: host key bị pin cho `tunnel-relay` nhưng thiếu cổng relay động (`Host key does not match known hosts entry`) và recording/typescript bị `Permission denied`. API hiện sinh known_hosts dạng `[tunnel-relay]:PORT KEY_TYPE KEY`; recording-init dùng đúng owner guacd `1000`, shared GID cấu hình bằng `RECORDING_GID`, còn API/Guacamole chỉ được thêm nhóm để đọc.
 - API có lịch sử job theo từng máy chủ và chỉ trả output cho role được phép xem action đó; kết quả `inventory.collect` hợp lệ cập nhật inventory bền vững trong PostgreSQL.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
@@ -114,6 +115,17 @@ docker compose -f compose.yaml -f compose.test.yaml exec guacamole getent hosts 
 ```
 
 Lệnh cuối phải trả về IP nội bộ và tên `guacd`. Nếu rỗng, kiểm tra `docker inspect` của hai container; cả hai phải cùng network `*_session`, trong đó `guacd` có alias/DNS name `guacd`.
+
+Sau bản sửa host-key/recording, phải rebuild API và recreate các container dùng quyền volume:
+
+```bash
+git pull --ff-only origin main
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate recording-init api guacd guacamole
+docker compose -f compose.yaml -f compose.test.yaml exec guacd id
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-init api guacd guacamole
+```
+
+`guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
 Máy nâng cấp từ bản cũ bị lỗi `The agent TLS CA is not available for package generation` phải recreate API và CA exporter để tạo named volume/mount mới:
 

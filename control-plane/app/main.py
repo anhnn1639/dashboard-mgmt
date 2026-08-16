@@ -882,12 +882,14 @@ SSH_HOST_KEY_TYPES = {
 }
 
 
-def guacamole_ssh_host_key(address: str, public_key: str | None) -> str | None:
+def guacamole_ssh_host_key(address: str, port: int, public_key: str | None) -> str | None:
     """Return the host key as the single known_hosts entry Guacamole requires."""
     if not public_key:
         return None
     if not address or any(character.isspace() for character in address):
         raise HTTPException(status_code=409, detail="Địa chỉ SSH trong inventory không hợp lệ")
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=409, detail="Cổng SSH relay không hợp lệ")
 
     parts = public_key.strip().split()
     key_index = 0 if len(parts) >= 2 and parts[0] in SSH_HOST_KEY_TYPES else 1 if len(parts) >= 3 and parts[1] in SSH_HOST_KEY_TYPES else -1
@@ -903,8 +905,11 @@ def guacamole_ssh_host_key(address: str, public_key: str | None) -> str | None:
         raise HTTPException(status_code=409, detail="SSH host key trong inventory quá ngắn")
 
     # The agent reads an OpenSSH .pub file, which contains only KEY_TYPE KEY.
-    # Guacamole's host-key parameter instead requires HOST KEY_TYPE KEY.
-    return f"{address} {key_type} {encoded_key}"
+    # Guacamole's host-key parameter instead requires a complete known_hosts
+    # entry. OpenSSH scopes non-default ports as [HOST]:PORT, and every reverse
+    # tunnel listener uses a dynamic non-default port.
+    known_hosts_address = address if port == 22 else f"[{address}]:{port}"
+    return f"{known_hosts_address} {key_type} {encoded_key}"
 
 
 def expire_file_payloads(db: Session) -> int:
@@ -1794,7 +1799,7 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "true"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript", "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true"})
-        known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, server.ssh_host_key)
+        known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, relay_port, server.ssh_host_key)
         if known_host:
             common["host-key"] = known_host
     else:

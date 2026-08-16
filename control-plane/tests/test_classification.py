@@ -93,17 +93,22 @@ class ClassificationTests(unittest.TestCase):
     def test_guacamole_host_key_is_a_known_hosts_entry(self):
         encoded_key = base64.b64encode(b"test-ed25519-host-key-material").decode()
         self.assertEqual(
-            guacamole_ssh_host_key("10.20.1.11", f"ssh-ed25519 {encoded_key}"),
+            guacamole_ssh_host_key("10.20.1.11", 22, f"ssh-ed25519 {encoded_key}"),
             f"10.20.1.11 ssh-ed25519 {encoded_key}",
         )
         self.assertEqual(
-            guacamole_ssh_host_key("10.20.1.12", f"old-host ssh-ed25519 {encoded_key} comment"),
-            f"10.20.1.12 ssh-ed25519 {encoded_key}",
+            guacamole_ssh_host_key("tunnel-relay", 49152, f"old-host ssh-ed25519 {encoded_key} comment"),
+            f"[tunnel-relay]:49152 ssh-ed25519 {encoded_key}",
         )
 
     def test_guacamole_rejects_invalid_host_key(self):
         with self.assertRaisesRegex(HTTPException, "SSH host key"):
-            guacamole_ssh_host_key("10.20.1.11", "ssh-ed25519 not-base64!!!")
+            guacamole_ssh_host_key("10.20.1.11", 22, "ssh-ed25519 not-base64!!!")
+
+    def test_guacamole_rejects_invalid_relay_port(self):
+        encoded_key = base64.b64encode(b"test-ed25519-host-key-material").decode()
+        with self.assertRaisesRegex(HTTPException, "Cổng SSH relay"):
+            guacamole_ssh_host_key("tunnel-relay", 0, f"ssh-ed25519 {encoded_key}")
 
     def test_agent_package_generation_fails_closed_when_server_ca_is_missing(self):
         assert SessionLocal is not None
