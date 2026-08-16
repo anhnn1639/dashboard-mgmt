@@ -33,8 +33,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `13,582,336` bytes.
-- SHA-256: `080BF23ADEA876F1801916350D50E8A001097BDC8C1D6895301EABDB7F6B40DC`.
-- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31779167705`.
+- Phiên bản MSI: `0.4.2`.
+- SHA-256: `6797B2EB77CF7B86F8F413E59EF333B50A233B1E080A92AC01D9F88FC00DB7D3`.
+- Build PyInstaller + WiX và upload artifact thành công trên GitHub Actions run `31941564706`.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -157,7 +158,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.1`, Linux available và Windows MSI available.
+- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.2`, Linux available và Windows MSI available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -188,7 +189,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `16/16`, gồm configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
-- Agent security `7/7`, gồm parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
+- Agent security `9/9`, gồm thứ tự SSH host key tương thích guacd/libssh2, parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
@@ -197,7 +198,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions run cuối trên `main` là `31779341117`, pass toàn bộ; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions build MSI 0.4.2 run `31941564706` pass; bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
