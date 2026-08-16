@@ -13,6 +13,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -50,6 +51,7 @@ LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
+FIREWALL_OBJECT_RE = re.compile(r"^[A-Za-z0-9_.@:+/-]{1,160}$")
 TRANSFER_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,179}$")
 WINDOWS_RESERVED_FILENAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -121,7 +123,7 @@ def signed_request(config: Config, method: str, url: str, payload: dict[str, Any
     return body, {"Content-Type": "application/json", **signed_headers(config, method, url, body)}
 
 
-def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False) -> tuple[int, str]:
+def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False, output_limit: int = 100_000) -> tuple[int, str]:
     if not sensitive:
         LOG.info("exec action: %s", command[0])
     completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
@@ -130,7 +132,7 @@ def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: 
     output = stdout if completed.returncode == 0 else "\n".join(part for part in (stdout, stderr) if part)
     if check and completed.returncode:
         raise RuntimeError(output or f"Command failed: {completed.returncode}")
-    return completed.returncode, output[-100_000:]
+    return completed.returncode, output[-output_limit:]
 
 
 def run_with_input(command: list[str], input_value: str, timeout: int = 120) -> tuple[int, str]:
@@ -139,9 +141,9 @@ def run_with_input(command: list[str], input_value: str, timeout: int = 120) -> 
     return completed.returncode, output[-100_000:]
 
 
-def powershell(script: str, timeout: int = 120) -> tuple[int, str]:
+def powershell(script: str, timeout: int = 120, output_limit: int = 100_000) -> tuple[int, str]:
     encoded = base64.b64encode(script.encode("utf-16le")).decode()
-    return run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], timeout=timeout, sensitive=True)
+    return run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], timeout=timeout, sensitive=True, output_limit=output_limit)
 
 
 def parse_os_release() -> dict[str, str]:
@@ -343,17 +345,369 @@ def require_group(parameters: dict[str, Any]) -> str:
     return value
 
 
-def firewall_parameters(parameters: dict[str, Any]) -> tuple[str, int, str, str, str]:
-    name = require_name(parameters, "name")
-    port = int(parameters.get("port", 0))
+def firewall_address(value: Any) -> str:
+    normalized = str(value or "any").strip().lower()
+    return "any" if normalized in {"", "any"} else str(ipaddress.ip_network(normalized, strict=False))
+
+
+def firewall_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    name = str(parameters.get("name", "")).strip()
+    if not 1 <= len(name) <= 128 or any(ord(character) < 32 for character in name):
+        raise ValueError("Invalid firewall rule name")
+    local_port = int(parameters.get("local_port", parameters.get("port", 0)))
+    remote_port_value = parameters.get("remote_port", "any")
+    remote_port = "any" if str(remote_port_value).strip().lower() in {"", "any"} else int(remote_port_value)
     protocol = str(parameters.get("protocol", "tcp")).lower()
-    action = str(parameters.get("action", "allow")).lower()
-    source = str(parameters.get("source", "any")).strip().lower()
-    if not 1 <= port <= 65535 or protocol not in {"tcp", "udp"} or action not in {"allow", "deny"}:
+    rule_action = str(parameters.get("action", "allow")).lower()
+    direction = str(parameters.get("direction", "in")).lower()
+    if not 1 <= local_port <= 65535 or (remote_port != "any" and not 1 <= remote_port <= 65535):
+        raise ValueError("Invalid firewall port")
+    if protocol not in {"tcp", "udp"} or rule_action not in {"allow", "deny", "reject"} or direction not in {"in", "out"}:
         raise ValueError("Invalid firewall rule")
-    if source != "any":
-        source = str(ipaddress.ip_network(source, strict=False))
-    return name, port, protocol, action, source
+    return {
+        "name": name,
+        "local_port": local_port,
+        "remote_port": remote_port,
+        "protocol": protocol,
+        "action": rule_action,
+        "direction": direction,
+        "source": firewall_address(parameters.get("source", "any")),
+        "destination": firewall_address(parameters.get("destination", "any")),
+    }
+
+
+def parse_ufw_rules(output: str) -> list[dict[str, Any]]:
+    rules: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        match = re.match(r"^\s*\[\s*(\d+)\]\s+(.+?)\s{2,}(ALLOW|DENY|REJECT|LIMIT)(?:\s+(IN|OUT|FWD))?\s{2,}(.+?)\s*$", line, re.IGNORECASE)
+        if not match:
+            continue
+        number, destination, action, direction, source = match.groups()
+        port_match = re.search(r"\b(\d{1,5})(?:/(tcp|udp))?\b", destination, re.IGNORECASE)
+        rules.append({
+            "id": number,
+            "backend": "ufw",
+            "name": f"UFW #{number}",
+            "direction": (direction or "IN").lower(),
+            "action": action.lower(),
+            "enabled": True,
+            "protocol": (port_match.group(2) if port_match and port_match.group(2) else "any").lower(),
+            "localPort": port_match.group(1) if port_match else destination,
+            "remotePort": "any",
+            "source": source,
+            "destination": destination,
+            "profile": "active",
+            "raw": line.strip(),
+            "removable": True,
+            "spec": {"number": int(number)},
+        })
+    return rules
+
+
+def parse_firewalld_rules(output: str) -> list[dict[str, Any]]:
+    rules: list[dict[str, Any]] = []
+    zone = ""
+    field = ""
+    counters: dict[tuple[str, str], int] = {}
+    supported = {"services", "ports", "protocols", "source-ports", "forward-ports", "icmp-blocks", "rich rules"}
+    for raw_line in output.splitlines():
+        if raw_line and not raw_line.startswith((" ", "\t")):
+            zone = raw_line.split()[0]
+            field = ""
+            continue
+        stripped = raw_line.strip()
+        if not zone or not stripped:
+            continue
+        if field in {"rich rules", "forward-ports"} and (stripped.startswith("rule ") or stripped.startswith("port=")):
+            values = [stripped]
+        elif ":" in stripped:
+            candidate, value = stripped.split(":", 1)
+            candidate = candidate.strip()
+            if candidate in supported:
+                field = candidate
+                values = [value.strip()] if candidate in {"rich rules", "forward-ports"} and value.strip() else value.split()
+            else:
+                field = ""
+                continue
+        elif field in {"rich rules", "forward-ports"}:
+            values = [stripped]
+        else:
+            continue
+        for value in values:
+            if not value:
+                continue
+            key = (zone, field)
+            counters[key] = counters.get(key, 0) + 1
+            action_match = re.search(r"\b(accept|drop|reject)\b", value)
+            protocol_match = re.search(r'(?:protocol=\"?|/)(tcp|udp)\b', value, re.IGNORECASE)
+            port_match = re.search(r'(?:port port=\"?|^)(\d+(?:-\d+)?)', value)
+            source_match = re.search(r'source address=\"([^\"]+)\"', value)
+            rules.append({
+                "id": f"{zone}:{field}:{counters[key]}",
+                "backend": "firewalld",
+                "name": f"{zone} · {field.rstrip('s')} · {value}",
+                "direction": "in",
+                "action": (action_match.group(1) if action_match else "allow").lower(),
+                "enabled": True,
+                "protocol": (protocol_match.group(1) if protocol_match else "any").lower(),
+                "localPort": port_match.group(1) if port_match else (f"service:{value}" if field == "services" else "any"),
+                "remotePort": "any",
+                "source": source_match.group(1) if source_match else "any",
+                "destination": "any",
+                "profile": zone,
+                "raw": value,
+                "removable": True,
+                "spec": {"zone": zone, "type": field, "value": value},
+            })
+    return rules
+
+
+def parse_nft_rules(output: str) -> list[dict[str, Any]]:
+    try:
+        documents = json.loads(output).get("nftables", [])
+    except (AttributeError, ValueError):
+        return []
+    rules: list[dict[str, Any]] = []
+    for document in documents:
+        rule = document.get("rule") if isinstance(document, dict) else None
+        if not isinstance(rule, dict) or not isinstance(rule.get("handle"), int):
+            continue
+        expression = rule.get("expr", [])
+        raw = json.dumps(expression, ensure_ascii=False, separators=(",", ":"))
+        verdict = next((name for name in ("accept", "drop", "reject") if f'"{name}"' in raw), "unknown")
+        family, table, chain, handle = (str(rule.get(key, "")) for key in ("family", "table", "chain", "handle"))
+        rules.append({
+            "id": f"{family}:{table}:{chain}:{handle}",
+            "backend": "nftables",
+            "name": str(rule.get("comment") or f"{table}/{chain} #{handle}"),
+            "direction": chain.lower() if chain.lower() in {"input", "output", "forward"} else "chain",
+            "action": verdict,
+            "enabled": True,
+            "protocol": "any",
+            "localPort": "expression",
+            "remotePort": "any",
+            "source": "see expression",
+            "destination": "see expression",
+            "profile": family,
+            "raw": raw,
+            "removable": True,
+            "spec": {"family": family, "table": table, "chain": chain, "handle": int(handle)},
+        })
+    return rules
+
+
+def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
+    table = "filter"
+    indexes: dict[tuple[str, str], int] = {}
+    rules: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if line.startswith("*"):
+            table = line[1:].strip()
+            continue
+        if not line.startswith("-A "):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        chain = tokens[1]
+        key = (table, chain)
+        indexes[key] = indexes.get(key, 0) + 1
+        def option(name: str, fallback: str = "any") -> str:
+            try:
+                return tokens[tokens.index(name) + 1]
+            except (ValueError, IndexError):
+                return fallback
+        index = indexes[key]
+        target = option("-j", "unknown")
+        comment = option("--comment", "")
+        rules.append({
+            "id": f"{family}:{table}:{chain}:{index}",
+            "backend": "iptables",
+            "name": comment or f"{family} {table}/{chain} #{index}",
+            "direction": chain.lower(),
+            "action": target.lower(),
+            "enabled": True,
+            "protocol": option("-p"),
+            "localPort": option("--dport"),
+            "remotePort": option("--sport"),
+            "source": option("-s"),
+            "destination": option("-d"),
+            "profile": family,
+            "raw": line,
+            "removable": True,
+            "spec": {"family": family, "table": table, "chain": chain, "index": index},
+        })
+    return rules
+
+
+def windows_firewall_rules() -> tuple[int, str]:
+    script = "$rows=@(Get-NetFirewallRule -PolicyStore ActiveStore|ForEach-Object{$r=$_;$p=$r|Get-NetFirewallPortFilter;$a=$r|Get-NetFirewallAddressFilter;[pscustomobject]@{id=$r.Name;backend='windows';name=$r.DisplayName;direction=([string]$r.Direction).ToLower();action=([string]$r.Action).ToLower();enabled=([bool]($r.Enabled -eq 'True'));protocol=([string]$p.Protocol).ToLower();localPort=([string]($p.LocalPort -join ','));remotePort=([string]($p.RemotePort -join ','));source=([string]($a.RemoteAddress -join ','));destination=([string]($a.LocalAddress -join ','));profile=([string]$r.Profile);raw=([string]$r.Description);removable=([bool]($r.PolicyStoreSourceType -eq 'Local'));spec=@{name=$r.Name;policyStoreSourceType=([string]$r.PolicyStoreSourceType)}}});[pscustomobject]@{backend='windows';backends=@('windows');rules=$rows}|ConvertTo-Json -Depth 6 -Compress"
+    return powershell(script, timeout=300, output_limit=5_000_000)
+
+
+def linux_firewall_rules() -> tuple[int, str]:
+    firewall_cmd = shutil.which("firewall-cmd")
+    if firewall_cmd:
+        state_code, _ = run([firewall_cmd, "--state"])
+        if state_code == 0:
+            code, output = run([firewall_cmd, "--list-all-zones"], output_limit=5_000_000)
+            if code == 0:
+                rules = parse_firewalld_rules(output)
+                return 0, json.dumps({"backend": "firewalld", "backends": ["firewalld"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+    ufw = shutil.which("ufw")
+    if ufw:
+        code, output = run([ufw, "status", "numbered"], output_limit=5_000_000)
+        if code == 0:
+            rules = parse_ufw_rules(output)
+            return 0, json.dumps({"backend": "ufw", "backends": ["ufw"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+    nft = shutil.which("nft")
+    if nft:
+        code, output = run([nft, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
+        if code == 0:
+            rules = parse_nft_rules(output)
+            if rules:
+                return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+    rules: list[dict[str, Any]] = []
+    families: list[str] = []
+    for binary, family in ((shutil.which("iptables-save"), "ipv4"), (shutil.which("ip6tables-save"), "ipv6")):
+        if binary:
+            code, output = run([binary], output_limit=5_000_000)
+            if code == 0:
+                rules.extend(parse_iptables_rules(output, family))
+                families.append(family)
+    if families:
+        return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+    return 1, "No supported firewall backend found (firewalld, UFW, nftables, iptables)"
+
+
+def ps_literal(value: str) -> str:
+    if not value or len(value) > 512 or any(ord(character) < 32 for character in value):
+        raise ValueError("Invalid Windows firewall identifier")
+    return "'" + value.replace("'", "''") + "'"
+
+
+def run_many(commands: list[list[str]], ignored_errors: tuple[str, ...] = ()) -> tuple[int, str]:
+    results: list[str] = []
+    for command in commands:
+        code, output = run(command)
+        results.append(output or f"{Path(command[0]).name}: OK")
+        if code and not any(marker in output for marker in ignored_errors):
+            return code, "\n".join(results)
+    return 0, "\n".join(results)
+
+
+def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    values = firewall_parameters(parameters)
+    backend = str(parameters.get("backend", "windows" if inventory["os_family"] == "windows" else "")).lower()
+    if inventory["os_family"] == "windows":
+        if backend != "windows":
+            raise ValueError("Firewall backend does not match Windows")
+        profile = str(parameters.get("profile", "Any"))
+        if profile not in {"Any", "Domain", "Private", "Public"}:
+            raise ValueError("Invalid Windows firewall profile")
+        direction = "Inbound" if values["direction"] == "in" else "Outbound"
+        rule_action = "Allow" if values["action"] == "allow" else "Block"
+        remote_port = "Any" if values["remote_port"] == "any" else str(values["remote_port"])
+        script = f"New-NetFirewallRule -DisplayName {ps_literal('TramOps - ' + values['name'])} -Direction {direction} -Action {rule_action} -Enabled True -Profile {profile} -Protocol {values['protocol'].upper()} -LocalPort {values['local_port']} -RemotePort {remote_port} -RemoteAddress {ps_literal('Any' if values['source'] == 'any' else values['source'])} -LocalAddress {ps_literal('Any' if values['destination'] == 'any' else values['destination'])} -ErrorAction Stop|Select Name,DisplayName,Enabled,Direction,Action|ConvertTo-Json -Compress"
+        return powershell(script)
+    if backend == "ufw":
+        binary = shutil.which("ufw")
+        if not binary:
+            return 1, "UFW is not installed"
+        command = [binary, "--force", "allow" if values["action"] == "allow" else values["action"], values["direction"], "proto", values["protocol"], "from", values["source"]]
+        if values["remote_port"] != "any": command += ["port", str(values["remote_port"])]
+        command += ["to", values["destination"], "port", str(values["local_port"]), "comment", values["name"]]
+        return run(command)
+    if backend == "firewalld":
+        binary = shutil.which("firewall-cmd")
+        zone = str(parameters.get("zone", "public"))
+        if not binary or not FIREWALL_OBJECT_RE.fullmatch(zone):
+            raise ValueError("Invalid firewalld zone")
+        if values["direction"] != "in":
+            raise ValueError("firewalld zone rules support inbound traffic only")
+        family = str(parameters.get("family", "ipv6" if ":" in values["source"] or ":" in values["destination"] else "ipv4"))
+        if family not in {"ipv4", "ipv6"}:
+            raise ValueError("Invalid firewalld address family")
+        parts = [f'rule family="{family}"']
+        if values["source"] != "any": parts.append(f'source address="{values["source"]}"')
+        if values["destination"] != "any": parts.append(f'destination address="{values["destination"]}"')
+        if values["remote_port"] != "any": parts.append(f'source-port port="{values["remote_port"]}" protocol="{values["protocol"]}"')
+        parts.append(f'port port="{values["local_port"]}" protocol="{values["protocol"]}"')
+        parts.append("accept" if values["action"] == "allow" else values["action"])
+        rich_rule = " ".join(parts)
+        return run_many([[binary, f"--zone={zone}", f"--add-rich-rule={rich_rule}"], [binary, "--permanent", f"--zone={zone}", f"--add-rich-rule={rich_rule}"]])
+    if backend == "nftables":
+        binary = shutil.which("nft")
+        family = str(parameters.get("family", "inet")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "input"))
+        if not binary or family not in {"ip", "ip6", "inet"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
+            raise ValueError("Invalid nftables target")
+        command = [binary, "add", "rule", family, table, chain]
+        address_family = "ip6" if ":" in values["source"] or ":" in values["destination"] else "ip"
+        if values["source"] != "any": command += [address_family, "saddr", values["source"]]
+        if values["destination"] != "any": command += [address_family, "daddr", values["destination"]]
+        if values["remote_port"] != "any": command += [values["protocol"], "sport", str(values["remote_port"])]
+        command += [values["protocol"], "dport", str(values["local_port"]), "accept" if values["action"] == "allow" else values["action"], "comment", f"TramOps - {values['name']}"]
+        return run(command)
+    if backend == "iptables":
+        family = str(parameters.get("family", "ipv4")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "INPUT" if values["direction"] == "in" else "OUTPUT"))
+        binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+        if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
+            raise ValueError("Invalid iptables target")
+        command = [binary, "-t", table, "-A", chain, "-p", values["protocol"], "--dport", str(values["local_port"])]
+        if values["source"] != "any": command += ["-s", values["source"]]
+        if values["destination"] != "any": command += ["-d", values["destination"]]
+        if values["remote_port"] != "any": command += ["--sport", str(values["remote_port"])]
+        target = "ACCEPT" if values["action"] == "allow" else "REJECT" if values["action"] == "reject" else "DROP"
+        command += ["-m", "comment", "--comment", f"TramOps - {values['name']}", "-j", target]
+        return run(command)
+    raise ValueError("Unsupported firewall backend")
+
+
+def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    rules = parameters.get("rules")
+    if not isinstance(rules, list) or not 1 <= len(rules) <= 200 or any(not isinstance(rule, dict) for rule in rules):
+        raise ValueError("Select between 1 and 200 firewall rules")
+    backends = {str(rule.get("backend", "")).lower() for rule in rules}
+    if len(backends) != 1:
+        raise ValueError("Firewall rules must use the same backend")
+    backend = next(iter(backends))
+    if inventory["os_family"] == "windows":
+        if backend != "windows": raise ValueError("Firewall backend does not match Windows")
+        names = [ps_literal(str(rule.get("spec", {}).get("name", rule.get("id", "")))) for rule in rules]
+        return powershell(f"@({','.join(names)})|ForEach-Object{{Remove-NetFirewallRule -Name $_ -ErrorAction Stop -Confirm:$false}}")
+    commands: list[list[str]] = []
+    if backend == "ufw":
+        binary = shutil.which("ufw")
+        if not binary: return 1, "UFW is not installed"
+        numbers = sorted({int(rule.get("spec", {}).get("number", 0)) for rule in rules}, reverse=True)
+        if not numbers or numbers[-1] < 1: raise ValueError("Invalid UFW rule number")
+        commands = [[binary, "--force", "delete", str(number)] for number in numbers]
+    elif backend == "firewalld":
+        binary = shutil.which("firewall-cmd")
+        if not binary: return 1, "firewalld is not installed"
+        option_map = {"services": "service", "ports": "port", "protocols": "protocol", "source-ports": "source-port", "forward-ports": "forward-port", "icmp-blocks": "icmp-block", "rich rules": "rich-rule"}
+        for rule in rules:
+            spec = rule.get("spec", {}); zone = str(spec.get("zone", "")); kind = option_map.get(str(spec.get("type", ""))); value = str(spec.get("value", ""))
+            if not kind or not FIREWALL_OBJECT_RE.fullmatch(zone) or not value or len(value) > 2048 or any(ord(c) < 32 for c in value): raise ValueError("Invalid firewalld rule")
+            commands.append([binary, f"--zone={zone}", f"--remove-{kind}={value}"])
+            commands.append([binary, "--permanent", f"--zone={zone}", f"--remove-{kind}={value}"])
+    elif backend == "nftables":
+        binary = shutil.which("nft")
+        if not binary: return 1, "nftables is not installed"
+        for rule in rules:
+            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); handle = int(spec.get("handle", 0))
+            if family not in {"ip", "ip6", "inet", "arp", "bridge", "netdev"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or handle < 1: raise ValueError("Invalid nftables rule")
+            commands.append([binary, "delete", "rule", family, table, chain, "handle", str(handle)])
+    elif backend == "iptables":
+        ordered = sorted(rules, key=lambda rule: (str(rule.get("spec", {}).get("family", "")), str(rule.get("spec", {}).get("table", "")), str(rule.get("spec", {}).get("chain", "")), -int(rule.get("spec", {}).get("index", 0))))
+        for rule in ordered:
+            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); index = int(spec.get("index", 0)); binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+            if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or index < 1: raise ValueError("Invalid iptables rule")
+            commands.append([binary, "-t", table, "-D", chain, str(index)])
+    else:
+        raise ValueError("Unsupported firewall backend")
+    return run_many(commands, ("NOT_ENABLED",)) if backend == "firewalld" else run_many(commands)
 
 
 def tunnel_url(config: Config, suffix: str) -> str:
@@ -684,29 +1038,11 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         rows = [{"pid": p.info["pid"], "name": p.info["name"], "username": p.info.get("username"), "cpu": p.info.get("cpu_percent"), "memory": p.info.get("memory_percent")} for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent"])]
         return 0, json.dumps(rows[:2000], ensure_ascii=False)
     if action == "firewall.list":
-        if windows:
-            return powershell("Get-NetFirewallRule -Enabled True|Select -First 1000 DisplayName,Direction,Action,Profile|ConvertTo-Json -Depth 2")
-        if inventory["distribution_id"] == "ubuntu" and Path("/usr/sbin/ufw").exists():
-            return run(["/usr/sbin/ufw", "status", "verbose"])
-        return run(["/usr/bin/firewall-cmd", "--list-all"])
-    if action in {"firewall.rule.add", "firewall.rule.remove"}:
-        name, port, protocol, rule_action, source = firewall_parameters(parameters)
-        if windows:
-            escaped_name = name.replace("'", "''")
-            remote = "Any" if source == "any" else source
-            if action.endswith("add"):
-                windows_action = "Allow" if rule_action == "allow" else "Block"
-                return powershell(f"New-NetFirewallRule -DisplayName 'TramOps-{escaped_name}' -Direction Inbound -Action {windows_action} -Protocol {protocol.upper()} -LocalPort {port} -RemoteAddress '{remote}' -ErrorAction Stop|Select Name,DisplayName,Enabled,Direction,Action|ConvertTo-Json -Compress")
-            return powershell(f"Get-NetFirewallRule -DisplayName 'TramOps-{escaped_name}' -ErrorAction Stop|Remove-NetFirewallRule -ErrorAction Stop")
-        if inventory["distribution_id"] != "ubuntu" or not Path("/usr/sbin/ufw").exists():
-            return 1, "Structured firewall changes currently require Ubuntu UFW"
-        rule = [rule_action]
-        if source != "any":
-            rule += ["from", source, "to", "any"]
-        rule += ["port", str(port), "proto", protocol]
-        if action.endswith("remove"):
-            rule.insert(0, "delete")
-        return run(["/usr/sbin/ufw", "--force", *rule])
+        return windows_firewall_rules() if windows else linux_firewall_rules()
+    if action == "firewall.rule.add":
+        return add_firewall_rule(parameters, inventory)
+    if action == "firewall.rule.remove":
+        return remove_firewall_rules(parameters, inventory)
     if action == "storage.list":
         facts = management_facts("windows" if windows else "linux")
         return 0, json.dumps(facts.get("Storage", []), ensure_ascii=False)

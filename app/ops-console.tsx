@@ -95,6 +95,57 @@ function parseServiceOutput(output: string | undefined) {
   }
 }
 
+type FirewallRule = {
+  id: string;
+  backend: "windows" | "ufw" | "firewalld" | "nftables" | "iptables";
+  name: string;
+  direction: string;
+  action: string;
+  enabled: boolean;
+  protocol: string;
+  localPort: string;
+  remotePort: string;
+  source: string;
+  destination: string;
+  profile: string;
+  raw: string;
+  removable: boolean;
+  spec: Record<string, unknown>;
+};
+
+type FirewallScan = {
+  backend: FirewallRule["backend"] | "";
+  backends: string[];
+  rules: FirewallRule[];
+};
+
+function parseFirewallOutput(output: string | undefined): FirewallScan {
+  if (!output) return { backend: "", backends: [], rules: [] };
+  try {
+    const parsed = JSON.parse(output) as Partial<FirewallScan>;
+    const rules = Array.isArray(parsed.rules)
+      ? parsed.rules.filter(
+          (rule): rule is FirewallRule =>
+            Boolean(rule) &&
+            typeof rule === "object" &&
+            typeof rule.id === "string" &&
+            typeof rule.backend === "string",
+        )
+      : [];
+    return {
+      backend: typeof parsed.backend === "string" ? parsed.backend as FirewallScan["backend"] : "",
+      backends: Array.isArray(parsed.backends) ? parsed.backends.map(String) : [],
+      rules,
+    };
+  } catch {
+    return { backend: "", backends: [], rules: [] };
+  }
+}
+
+function firewallRuleKey(rule: FirewallRule) {
+  return `${rule.backend}:${rule.id}`;
+}
+
 function MiniBar({
   value,
   dangerAt = 85,
@@ -1452,10 +1503,6 @@ const actionOptions: Partial<Record<ServerTab, Array<{ value: string; label: str
     { value: "service.start", label: "Bật service" },
     { value: "service.stop", label: "Dừng service" },
   ],
-  firewall: [
-    { value: "firewall.rule.add", label: "Thêm rule firewall" },
-    { value: "firewall.rule.remove", label: "Xóa rule firewall" },
-  ],
   storage: [{ value: "storage.extend", label: "Mở rộng ổ/Logical Volume" }],
   updates: [
     { value: "patch.install_security", label: "Cài bản vá bảo mật" },
@@ -1534,6 +1581,9 @@ function ServerDrawer({
   const [activeTab, setActiveTab] = useState<ServerTab>("overview");
   const [action, setAction] = useState("user.create");
   const [busy, setBusy] = useState(false);
+  const [firewallModal, setFirewallModal] = useState<"add" | "delete" | null>(null);
+  const [selectedFirewallRules, setSelectedFirewallRules] = useState<string[]>([]);
+  const [firewallConfirmation, setFirewallConfirmation] = useState("");
   const [fileBusy, setFileBusy] = useState(false);
   const [transfers, setTransfers] = useState<
     Array<{
@@ -1597,6 +1647,14 @@ function ServerDrawer({
   const latestReadJob = currentReadAction
     ? jobs.find((job) => job.action === currentReadAction)
     : undefined;
+  const firewallScan = parseFirewallOutput(
+    jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded")?.output,
+  );
+  const firewallRules = firewallScan.rules;
+  const selectedRules = firewallRules.filter((rule) =>
+    selectedFirewallRules.includes(firewallRuleKey(rule)),
+  );
+  const removableRules = firewallRules.filter((rule) => rule.removable !== false);
   const refreshedServices =
     activeTab === "services" && latestReadJob?.status === "succeeded"
       ? parseServiceOutput(latestReadJob.output)
@@ -1655,6 +1713,10 @@ function ServerDrawer({
     setActiveTab(tab);
     const options = actionOptions[tab] ?? [];
     if (options.length) setAction(options[0].value);
+    if (tab === "firewall" && !jobs.some((job) => job.action === "firewall.list"))
+      void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`, false).catch((reason) =>
+        notify(reason instanceof Error ? reason.message : "Không thể quét firewall"),
+      );
   }
   async function submitAction(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1676,6 +1738,74 @@ function ServerDrawer({
       event.currentTarget.reset();
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể tạo tác vụ");
+    } finally {
+      setBusy(false);
+    }
+  }
+  function closeFirewallModal() {
+    setFirewallModal(null);
+    setFirewallConfirmation("");
+  }
+  function toggleFirewallRule(rule: FirewallRule) {
+    if (rule.removable === false) return;
+    const key = firewallRuleKey(rule);
+    setSelectedFirewallRules((current) => {
+      if (current.includes(key)) return current.filter((item) => item !== key);
+      if (current.length >= 200) {
+        notify("Mỗi tác vụ được chọn tối đa 200 firewall rule.");
+        return current;
+      }
+      return [...current, key];
+    });
+  }
+  function toggleAllFirewallRules() {
+    const keys = removableRules.slice(0, 200).map(firewallRuleKey);
+    setSelectedFirewallRules((current) =>
+      keys.length > 0 && keys.every((key) => current.includes(key)) ? [] : keys,
+    );
+  }
+  async function submitFirewallRule(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    const form = new FormData(event.currentTarget);
+    const parameters: Record<string, unknown> = {};
+    for (const [key, value] of form.entries())
+      if (key !== "reason" && value !== "") parameters[key] = value;
+    parameters.local_port = Number(parameters.local_port);
+    if (parameters.remote_port && String(parameters.remote_port).toLowerCase() !== "any")
+      parameters.remote_port = Number(parameters.remote_port);
+    try {
+      await queueJob(
+        "firewall.rule.add",
+        parameters,
+        String(form.get("reason") ?? "Thêm firewall rule từ máy chủ đã chọn"),
+      );
+      closeFirewallModal();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Không thể tạo firewall rule");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function deleteFirewallRules() {
+    if (firewallConfirmation !== "CONFIRM" || selectedRules.length === 0) return;
+    setBusy(true);
+    try {
+      await queueJob(
+        "firewall.rule.remove",
+        {
+          rules: selectedRules.map((rule) => ({
+            id: rule.id,
+            backend: rule.backend,
+            spec: rule.spec,
+          })),
+        },
+        `Xóa ${selectedRules.length} firewall rule đã xác nhận trên ${server.name}`,
+      );
+      setSelectedFirewallRules([]);
+      closeFirewallModal();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Không thể xóa firewall rule");
     } finally {
       setBusy(false);
     }
@@ -1703,6 +1833,7 @@ function ServerDrawer({
     }
   }
   return (
+    <>
       <section className="server-workspace">
         <nav className="server-breadcrumb" aria-label="Đường dẫn máy chủ">
           <a href={sectionRoute(server.osFamily)} onClick={(event) => { event.preventDefault(); close(); }}>
@@ -1830,10 +1961,19 @@ function ServerDrawer({
                   <h2>{serverTabs.find((tab) => tab.id === activeTab)?.label}</h2>
                   <p>Dữ liệu thật từ Agent và lịch sử tác vụ trong PostgreSQL.</p>
                 </div>
-                {currentReadAction && (
+                {currentReadAction && activeTab !== "firewall" && (
                   <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
                     {busy ? "Đang yêu cầu…" : "↻ Lấy dữ liệu mới"}
                   </button>
+                )}
+                {activeTab === "firewall" && (
+                  <div className="firewall-toolbar-actions">
+                    <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
+                      {busy ? "Đang quét…" : "↻ Quét lại"}
+                    </button>
+                    <button className="firewall-icon-button add" type="button" aria-label="Thêm firewall rule" title="Thêm firewall rule" onClick={() => setFirewallModal("add")}>+</button>
+                    <button className="firewall-icon-button remove" type="button" aria-label="Xóa firewall rule đã chọn" title="Xóa firewall rule đã chọn" disabled={selectedRules.length === 0} onClick={() => { setFirewallConfirmation(""); setFirewallModal("delete"); }}>−</button>
+                  </div>
                 )}
               </div>
 
@@ -1885,6 +2025,54 @@ function ServerDrawer({
                 </div>
               )}
 
+              {activeTab === "firewall" && (
+                <section className="firewall-rule-panel">
+                  <div className="firewall-rule-summary">
+                    <span><b>{firewallRules.length}</b> rule · backend <strong>{firewallScan.backend || "chưa xác định"}</strong></span>
+                    <span>{selectedRules.length} rule đang chọn</span>
+                  </div>
+                  <div className="firewall-table-scroll">
+                    <table className="firewall-table">
+                      <thead>
+                        <tr>
+                          <th className="firewall-check-cell">
+                            <input
+                              type="checkbox"
+                              aria-label="Chọn tất cả firewall rule có thể xóa"
+                              checked={removableRules.length > 0 && removableRules.slice(0, 200).every((rule) => selectedFirewallRules.includes(firewallRuleKey(rule)))}
+                              onChange={toggleAllFirewallRules}
+                            />
+                          </th>
+                          <th>Rule</th><th>Hướng</th><th>Action</th><th>Protocol / cổng</th><th>Nguồn → Đích</th><th>Profile / Zone</th><th>Trạng thái</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {firewallRules.map((rule) => {
+                          const key = firewallRuleKey(rule);
+                          return (
+                            <tr key={key} className={selectedFirewallRules.includes(key) ? "selected" : ""}>
+                              <td className="firewall-check-cell">
+                                <input type="checkbox" checked={selectedFirewallRules.includes(key)} disabled={rule.removable === false} aria-label={`Chọn ${rule.name}`} title={rule.removable === false ? "Rule do Group Policy quản lý, không thể xóa tại máy local" : ""} onChange={() => toggleFirewallRule(rule)} />
+                              </td>
+                              <td><b>{rule.name}</b><small>{rule.backend} · {rule.id}</small></td>
+                              <td>{rule.direction || "—"}</td>
+                              <td><span className={`firewall-action ${rule.action}`}>{rule.action || "—"}</span></td>
+                              <td>{rule.protocol || "any"} · {rule.localPort || "any"}{rule.remotePort && rule.remotePort !== "any" ? ` / remote ${rule.remotePort}` : ""}</td>
+                              <td><span className="firewall-address">{rule.source || "any"} → {rule.destination || "any"}</span></td>
+                              <td>{rule.profile || "—"}</td>
+                              <td><span className={rule.enabled ? "firewall-enabled" : "firewall-disabled"}>{rule.enabled ? "Enabled" : "Disabled"}</span></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {latestReadJob?.status !== "succeeded" && <div className="empty-state">{latestReadJob ? `Agent đang xử lý: ${latestReadJob.status}` : "Chưa có dữ liệu; nhấn “Quét lại”."}</div>}
+                    {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
+                  </div>
+                  <p className="firewall-note">Rule chỉ được thay đổi sau khi một quản trị viên khác phê duyệt; mỗi tác vụ xóa tối đa 200 rule. Rule Windows do Domain GPO quản lý vẫn hiển thị nhưng không cho xóa tại máy local.</p>
+                </section>
+              )}
+
               {activeTab === "updates" && (
                 <div className="update-summary-card">
                   <strong>{server.updates}</strong>
@@ -1893,7 +2081,7 @@ function ServerDrawer({
                 </div>
               )}
 
-              {latestReadJob && (
+              {latestReadJob && activeTab !== "firewall" && (
                 <section className="operation-result">
                   <header>
                     <b>{latestReadJob.action}</b>
@@ -2068,50 +2256,6 @@ function ServerDrawer({
                 </select>
               </label>
             )}
-            {action.startsWith("firewall.rule") && (
-              <>
-                <label>
-                  Tên rule
-                  <input name="name" required pattern="[A-Za-z0-9._-]+" />
-                </label>
-                <div className="form-grid">
-                  <label>
-                    Cổng
-                    <input
-                      name="port"
-                      type="number"
-                      min="1"
-                      max="65535"
-                      required
-                    />
-                  </label>
-                  <label>
-                    Protocol
-                    <select name="protocol">
-                      <option value="tcp">TCP</option>
-                      <option value="udp">UDP</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="form-grid">
-                  <label>
-                    Hành động
-                    <select name="action">
-                      <option value="allow">Allow</option>
-                      <option value="deny">Deny/Block</option>
-                    </select>
-                  </label>
-                  <label>
-                    Nguồn
-                    <input
-                      name="source"
-                      defaultValue="any"
-                      placeholder="any hoặc CIDR"
-                    />
-                  </label>
-                </div>
-              </>
-            )}
             {action === "storage.extend" &&
               (server.osFamily === "windows" ? (
                 <label>
@@ -2173,6 +2317,51 @@ function ServerDrawer({
           )}
         </div>
       </section>
+      {firewallModal === "add" && (
+        <div className="modal-backdrop">
+          <button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại thêm firewall rule" onClick={closeFirewallModal} />
+          <form className="modal firewall-modal" onSubmit={submitFirewallRule}>
+            <div className="modal-head">
+              <div><span className="modal-icon">+</span><div><h2>Thêm firewall rule</h2><p>{server.name} · {firewallScan.backend || (server.osFamily === "windows" ? "windows" : "đang chờ quét backend")}</p></div></div>
+              <button type="button" aria-label="Đóng" onClick={closeFirewallModal}>×</button>
+            </div>
+            <input type="hidden" name="backend" value={firewallScan.backend || (server.osFamily === "windows" ? "windows" : "")} />
+            <label>Tên rule<input name="name" required minLength={1} maxLength={128} placeholder="VD: Web nội bộ" /></label>
+            <div className="form-grid">
+              <label>Hướng<select name="direction" defaultValue="in"><option value="in">Inbound</option>{firewallScan.backend !== "firewalld" && <option value="out">Outbound</option>}</select></label>
+              <label>Hành động<select name="action" defaultValue="allow"><option value="allow">Allow</option><option value="deny">Deny / Block</option>{firewallScan.backend !== "windows" && <option value="reject">Reject</option>}</select></label>
+            </div>
+            <div className="form-grid">
+              <label>Protocol<select name="protocol" defaultValue="tcp"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label>
+              <label>Local port<input name="local_port" type="number" min="1" max="65535" required placeholder="443" /></label>
+            </div>
+            <div className="form-grid">
+              <label>Remote port<input name="remote_port" defaultValue="any" pattern="any|[0-9]{1,5}" /></label>
+              <label>Nguồn<input name="source" defaultValue="any" placeholder="any hoặc CIDR" /></label>
+            </div>
+            <label>Đích<input name="destination" defaultValue="any" placeholder="any hoặc CIDR" /></label>
+            {firewallScan.backend === "windows" && <label>Windows profile<select name="profile" defaultValue="Any"><option>Any</option><option>Domain</option><option>Private</option><option>Public</option></select></label>}
+            {firewallScan.backend === "firewalld" && <div className="form-grid"><label>Firewalld zone<select name="zone" defaultValue={firewallRules[0]?.profile || "public"}>{Array.from(new Set(firewallRules.map((rule) => rule.profile).filter(Boolean))).map((zone) => <option key={zone}>{zone}</option>)}{firewallRules.length === 0 && <option>public</option>}</select></label><label>IP family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label></div>}
+            {firewallScan.backend === "nftables" && <div className="form-grid"><label>Family<select name="family" defaultValue="inet">{Array.from(new Set(firewallRules.map((rule) => rule.profile).filter(Boolean))).map((family) => <option key={family}>{family}</option>)}<option value="inet">inet</option></select></label><label>Table<input name="table" required defaultValue={String(firewallRules[0]?.spec.table ?? "filter")} /></label><label>Chain<input name="chain" required defaultValue={String(firewallRules[0]?.spec.chain ?? "input")} /></label></div>}
+            {firewallScan.backend === "iptables" && <div className="form-grid"><label>Family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label><label>Table<input name="table" required defaultValue="filter" /></label><label>Chain<input name="chain" required defaultValue="INPUT" /></label></div>}
+            <label>Lý do / ticket<textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Mô tả thay đổi" /></label>
+            <div className="warning-box"><b>Thay đổi có kiểm soát</b><p>Tác vụ chỉ được chạy sau khi một quản trị viên khác phê duyệt và toàn bộ tham số được ghi vào nhật ký kiểm toán.</p></div>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy || !firewallScan.backend}>{busy ? "Đang gửi…" : "Gửi chờ phê duyệt"}</button></div>
+          </form>
+        </div>
+      )}
+      {firewallModal === "delete" && (
+        <div className="modal-backdrop">
+          <button className="modal-dismiss" type="button" aria-label="Đóng xác nhận xóa firewall rule" onClick={closeFirewallModal} />
+          <section className="modal firewall-modal delete-firewall-modal" role="dialog" aria-modal="true" aria-labelledby="delete-firewall-title">
+            <div className="modal-head"><div><span className="modal-icon danger">−</span><div><h2 id="delete-firewall-title">Xác nhận xóa {selectedRules.length} rule</h2><p>{server.name} · hành động rủi ro cao</p></div></div><button type="button" aria-label="Đóng" onClick={closeFirewallModal}>×</button></div>
+            <div className="firewall-delete-list">{selectedRules.map((rule) => <div key={firewallRuleKey(rule)}><b>{rule.name}</b><span>{rule.backend} · {rule.direction} · {rule.action} · {rule.protocol}/{rule.localPort}</span><small>{rule.source} → {rule.destination}</small></div>)}</div>
+            <label>Gõ <b>CONFIRM</b> để mở nút Delete<input value={firewallConfirmation} onChange={(event) => setFirewallConfirmation(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button>{firewallConfirmation === "CONFIRM" && <button type="button" className="button firewall-delete-button" disabled={busy} onClick={() => void deleteFirewallRules()}>{busy ? "Đang gửi…" : `Delete ${selectedRules.length} rule`}</button>}</div>
+          </section>
+        </div>
+      )}
+    </>
   );
 }
 

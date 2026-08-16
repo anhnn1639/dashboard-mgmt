@@ -1186,6 +1186,133 @@ textarea:focus-visible {
   color: #71839a;
   font-size: 11px;
 }
+.firewall-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.firewall-icon-button {
+  width: 38px;
+  height: 38px;
+  border: 1px solid #31517c;
+  border-radius: 8px;
+  color: #dceaff;
+  background: #17335d;
+  font-size: 23px;
+  line-height: 1;
+  cursor: pointer;
+}
+.firewall-icon-button.remove {
+  border-color: #693841;
+  color: #ffc2c7;
+  background: #3d1c25;
+}
+.firewall-icon-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.firewall-rule-panel {
+  min-width: 0;
+}
+.firewall-rule-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+  color: #73849a;
+  font-size: 10px;
+}
+.firewall-rule-summary b,
+.firewall-rule-summary strong {
+  color: #a9c8fa;
+}
+.firewall-table-scroll {
+  overflow: auto;
+  max-height: 580px;
+  border: 1px solid #273548;
+  border-radius: 9px;
+  background: #0c151f;
+}
+.firewall-table {
+  width: 100%;
+  min-width: 1180px;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+.firewall-table th {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  padding: 11px 12px;
+  color: #687b95;
+  background: #111c29;
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 8px;
+}
+.firewall-table td {
+  padding: 11px 12px;
+  border-top: 1px solid #202c3b;
+  color: #a1b0c4;
+  vertical-align: middle;
+}
+.firewall-table tr.selected td {
+  background: rgba(70, 132, 227, 0.08);
+}
+.firewall-table td b,
+.firewall-table td small {
+  display: block;
+  max-width: 280px;
+}
+.firewall-table td b {
+  overflow-wrap: anywhere;
+  color: #d8e4f5;
+}
+.firewall-table td small {
+  overflow: hidden;
+  margin-top: 3px;
+  color: #60738d;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.firewall-check-cell {
+  width: 42px;
+  text-align: center !important;
+}
+.firewall-check-cell input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--blue);
+}
+.firewall-action,
+.firewall-enabled,
+.firewall-disabled {
+  display: inline-flex;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(83, 211, 165, 0.09);
+  color: #62d9ae;
+  text-transform: capitalize;
+}
+.firewall-action.deny,
+.firewall-action.drop,
+.firewall-action.block,
+.firewall-action.reject,
+.firewall-disabled {
+  color: #ff929b;
+  background: rgba(255, 105, 116, 0.09);
+}
+.firewall-address {
+  display: block;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+.firewall-note {
+  margin: 10px 0 0;
+  color: #6f8096;
+  font-size: 9px;
+}
 .inventory-table {
   overflow: hidden;
   border: 1px solid #273548;
@@ -1851,6 +1978,53 @@ textarea:focus-visible {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 18px;
+}
+.firewall-modal {
+  width: min(720px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+}
+.modal-icon.danger {
+  color: #ff8c96;
+  background: rgba(255, 100, 112, 0.12);
+}
+.firewall-delete-list {
+  max-height: 310px;
+  overflow: auto;
+  border: 1px solid #3b3038;
+  border-radius: 7px;
+  background: #0c131c;
+}
+.firewall-delete-list > div {
+  padding: 10px 12px;
+  border-bottom: 1px solid #2a2831;
+}
+.firewall-delete-list > div:last-child {
+  border-bottom: 0;
+}
+.firewall-delete-list b,
+.firewall-delete-list span,
+.firewall-delete-list small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.firewall-delete-list b {
+  color: #e5d8db;
+  font-size: 10px;
+}
+.firewall-delete-list span,
+.firewall-delete-list small {
+  margin-top: 3px;
+  color: #8a737b;
+  font-size: 8px;
+}
+.firewall-delete-button {
+  border-color: #9a3945;
+  color: #fff;
+  background: #b83242;
+}
+.firewall-delete-button:hover {
+  background: #ca3c4d;
 }
 .command-backdrop {
   place-items: start center;

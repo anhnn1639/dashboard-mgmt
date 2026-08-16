@@ -1,4 +1,4 @@
-# Bàn giao Codex — 14/08/2026
+# Bàn giao Codex — 16/08/2026
 
 ## Repository và trạng thái
 
@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent mới nhất: `0.4.2`.
+- Agent source mới nhất: `0.5.0`; endpoint phải nâng cấp agent để dùng quản trị firewall đa backend. MSI bundle trong repo vẫn là `0.4.2` cho tới khi tải artifact từ workflow của commit này và thay file.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
@@ -14,6 +14,8 @@
 - Sau Agent 0.4.2, API đã mở được relay nhưng trình duyệt rơi về trang danh sách Guacamole và `guacd` không nhận connection. Nguyên nhân là URL launch chỉ trỏ `/guacamole/?data=...` thay vì route client. API hiện trả thẳng `/guacamole/#/client/BASE64URL?data=...`, trong đó identifier là `CONNECTION_NAME\0c\0json` và encrypted JSON được percent-encode toàn bộ.
 - Route client đúng nhưng Guacamole vẫn có thể báo `The requested connection does not exist` nếu cùng origin còn `GUAC_AUTH_TOKEN` từ lần đăng nhập Guacamole trước/manual. Token cũ được gửi cùng encrypted JSON và được ưu tiên, nên data source `json` không có trong session hiện tại. Dashboard hiện xóa riêng `GUAC_AUTH_TOKEN` trong localStorage sau khi API tạo relay và trước khi điều hướng; token dashboard dùng `sessionStorage.tram_ops_token` nên không bị ảnh hưởng.
 - API có lịch sử job theo từng máy chủ và chỉ trả output cho role được phép xem action đó; kết quả `inventory.collect` hợp lệ cập nhật inventory bền vững trong PostgreSQL.
+- Tab **Firewall** đã bỏ form tác vụ chung, thay bằng bảng tất cả rule của backend đang quản lý firewall, checkbox chọn một/nhiều dòng, nút `+` mở form theo Windows/Linux và nút `−` mở danh sách xác nhận từng dòng. Nút Delete chỉ xuất hiện sau khi gõ đúng `CONFIRM`; add/remove vẫn là job rủi ro cao, bắt buộc phê duyệt bốn mắt và audit trong PostgreSQL.
+- Agent 0.5.0 chuẩn hóa Windows Defender Firewall, firewalld (Red Hat/CentOS), UFW (Ubuntu), nftables và iptables/ip6tables. Xóa dùng định danh gốc an toàn: Windows `Name`, UFW number theo thứ tự giảm dần, firewalld zone/type/value, nft handle và iptables chain index; không nhận command/script tùy ý.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -130,7 +132,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.4.2 như sau, không enroll lại và không thay certificate/config hiện có:
+Endpoint Linux đang cài agent thủ công cập nhật 0.5.0 như sau, không enroll lại và không thay certificate/config hiện có:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -180,7 +182,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.4.2`, Linux available và Windows MSI available.
+- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.5.0`, Linux available và Windows MSI available sau khi MSI 0.5.0 được bundle.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -191,7 +193,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.2`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.5.0`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -210,8 +212,8 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `18/18`, gồm direct Guacamole client route, configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
-- Agent security `9/9`, gồm thứ tự SSH host key tương thích guacd/libssh2, parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
+- Control plane `18/18`, gồm kiểm tra chặn parameter firewall lạ/rỗng, direct Guacamole client route, configured domain, bundle generation, CA pin, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
+- Agent security `15/15`, gồm parser firewalld/UFW/nftables/iptables, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.

@@ -227,6 +227,20 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(listed_job["action"], "service.list")
             self.assertIn("output", listed_job)
 
+            invalid_firewall_job = client.post(
+                "/api/v1/jobs",
+                headers=headers,
+                json={"server_id": agent_id, "action": "firewall.rule.add", "parameters": {"backend": "windows", "name": "SSH", "unexpected": "powershell"}, "reason": "Reject unknown firewall parameters"},
+            )
+            self.assertEqual(invalid_firewall_job.status_code, 422, invalid_firewall_job.text)
+
+            empty_delete = client.post(
+                "/api/v1/jobs",
+                headers=headers,
+                json={"server_id": agent_id, "action": "firewall.rule.remove", "parameters": {"rules": []}, "reason": "Reject empty firewall deletion"},
+            )
+            self.assertEqual(empty_delete.status_code, 422, empty_delete.text)
+
     def test_zero_touch_packages_pin_the_configured_domain_and_are_single_use(self):
         assert SessionLocal is not None
         with SessionLocal() as db:

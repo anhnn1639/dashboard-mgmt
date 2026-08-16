@@ -3,6 +3,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tram_agent.py"
@@ -129,6 +130,68 @@ class AgentSecurityTests(unittest.TestCase):
             tram_agent.parse_windows_installer_source(source),
             ("https://ops.company.example", package_id, package_secret, "system"),
         )
+
+    def test_ufw_numbered_rules_are_normalized_for_exact_deletion(self):
+        rules = tram_agent.parse_ufw_rules(
+            "Status: active\n\n[ 1] 22/tcp                     ALLOW IN    10.0.0.0/8\n"
+            "[ 2] 53/udp                     DENY OUT    Anywhere"
+        )
+        self.assertEqual([rule["id"] for rule in rules], ["1", "2"])
+        self.assertEqual(rules[0]["localPort"], "22")
+        self.assertEqual(rules[1]["direction"], "out")
+
+    def test_nftables_rules_use_kernel_handles(self):
+        output = '{"nftables":[{"rule":{"family":"inet","table":"filter","chain":"input","handle":17,"comment":"SSH","expr":[{"accept":null}]}}]}'
+        rules = tram_agent.parse_nft_rules(output)
+        self.assertEqual(rules[0]["id"], "inet:filter:input:17")
+        self.assertEqual(rules[0]["spec"]["handle"], 17)
+        self.assertEqual(rules[0]["action"], "accept")
+
+    def test_firewalld_scans_services_ports_and_ipv6_rich_rules(self):
+        output = """public (active)
+  services: cockpit ssh
+  ports: 8443/tcp
+  rich rules:
+    rule family=\"ipv6\" source address=\"2001:db8::/64\" port port=\"443\" protocol=\"tcp\" accept
+"""
+        rules = tram_agent.parse_firewalld_rules(output)
+        self.assertEqual(len(rules), 4)
+        self.assertEqual(rules[-1]["source"], "2001:db8::/64")
+        self.assertEqual(rules[-1]["localPort"], "443")
+        self.assertEqual(rules[-1]["spec"]["zone"], "public")
+
+    def test_iptables_rules_keep_per_chain_line_numbers(self):
+        output = "*filter\n-A INPUT -p tcp -s 10.0.0.0/8 --dport 22 -m comment --comment SSH -j ACCEPT\n-A INPUT -p udp --dport 53 -j DROP\nCOMMIT"
+        rules = tram_agent.parse_iptables_rules(output, "ipv4")
+        self.assertEqual([rule["spec"]["index"] for rule in rules], [1, 2])
+        self.assertEqual(rules[0]["source"], "10.0.0.0/8")
+        self.assertEqual(rules[1]["action"], "drop")
+
+    def test_ufw_bulk_delete_runs_descending_to_avoid_renumbering(self):
+        commands = []
+
+        def fake_run(command, *args, **kwargs):
+            commands.append(command)
+            return 0, "ok"
+
+        with patch.object(tram_agent.shutil, "which", return_value="/usr/sbin/ufw"), patch.object(tram_agent, "run", side_effect=fake_run):
+            code, _ = tram_agent.remove_firewall_rules(
+                {"rules": [
+                    {"backend": "ufw", "id": "2", "spec": {"number": 2}},
+                    {"backend": "ufw", "id": "7", "spec": {"number": 7}},
+                ]},
+                {"os_family": "linux"},
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual([command[-1] for command in commands], ["7", "2"])
+
+    def test_firewall_object_names_cannot_inject_commands(self):
+        with patch.object(tram_agent.shutil, "which", return_value="/usr/sbin/nft"):
+            with self.assertRaisesRegex(ValueError, "nftables target"):
+                tram_agent.add_firewall_rule(
+                    {"backend": "nftables", "name": "Web nội bộ", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 443, "source": "any", "destination": "any", "family": "inet", "table": "filter;reboot", "chain": "input"},
+                    {"os_family": "linux"},
+                )
 
 
 if __name__ == "__main__":

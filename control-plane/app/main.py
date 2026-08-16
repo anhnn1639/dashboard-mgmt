@@ -421,7 +421,7 @@ class JobCreateRequest(BaseModel):
 class JobResultRequest(BaseModel):
     status: Literal["succeeded", "failed"]
     exit_code: int
-    output: str = Field(default="", max_length=100_000)
+    output: str = Field(default="", max_length=5_000_000)
 
 
 class SessionLaunchRequest(BaseModel):
@@ -493,6 +493,31 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
 }
+
+
+def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) -> None:
+    if action == "firewall.list":
+        if parameters:
+            raise HTTPException(status_code=422, detail="firewall.list does not accept parameters")
+        return
+    if action == "firewall.rule.add":
+        allowed = {"backend", "name", "direction", "action", "protocol", "local_port", "remote_port", "source", "destination", "profile", "zone", "family", "table", "chain"}
+        if set(parameters) - allowed:
+            raise HTTPException(status_code=422, detail="Unknown firewall rule parameter")
+        required = {"backend", "name", "direction", "action", "protocol", "local_port"}
+        if not required.issubset(parameters):
+            raise HTTPException(status_code=422, detail="Firewall rule parameters are incomplete")
+        if len(json.dumps(parameters, ensure_ascii=False)) > 10_000:
+            raise HTTPException(status_code=422, detail="Firewall rule parameters are too large")
+        return
+    if action == "firewall.rule.remove":
+        if set(parameters) != {"rules"} or not isinstance(parameters.get("rules"), list):
+            raise HTTPException(status_code=422, detail="Firewall deletion requires a rules list")
+        rules = parameters["rules"]
+        if not 1 <= len(rules) <= 200 or any(not isinstance(rule, dict) for rule in rules):
+            raise HTTPException(status_code=422, detail="Select between 1 and 200 firewall rules")
+        if len(json.dumps(parameters, ensure_ascii=False)) > 200_000:
+            raise HTTPException(status_code=422, detail="Selected firewall rules are too large")
 
 
 async def mark_tunnel_closed(session_id: str, reason: str) -> None:
@@ -1695,6 +1720,8 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
         raise HTTPException(status_code=400, detail="Action is not allowlisted")
     if user.role not in policy["roles"]:
         raise HTTPException(status_code=403, detail="Role cannot execute this action")
+    if payload.action.startswith("firewall."):
+        validate_firewall_job_parameters(payload.action, payload.parameters)
     server = db.get(Server, payload.server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
