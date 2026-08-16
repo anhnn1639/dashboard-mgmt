@@ -241,6 +241,13 @@ class ClassificationTests(unittest.TestCase):
             )
             self.assertEqual(empty_delete.status_code, 422, empty_delete.text)
 
+            invalid_reorder = client.post(
+                "/api/v1/jobs",
+                headers=headers,
+                json={"server_id": agent_id, "action": "firewall.rule.reorder", "parameters": {"rule": {"backend": "windows", "id": "rule-1", "raw": "block"}, "before": None}, "reason": "Reject unordered firewall backend"},
+            )
+            self.assertEqual(invalid_reorder.status_code, 422, invalid_reorder.text)
+
     def test_zero_touch_packages_pin_the_configured_domain_and_are_single_use(self):
         assert SessionLocal is not None
         with SessionLocal() as db:

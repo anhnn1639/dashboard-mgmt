@@ -488,6 +488,7 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
     "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
+    "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
     "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
     "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
@@ -518,6 +519,18 @@ def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) ->
             raise HTTPException(status_code=422, detail="Select between 1 and 200 firewall rules")
         if len(json.dumps(parameters, ensure_ascii=False)) > 200_000:
             raise HTTPException(status_code=422, detail="Selected firewall rules are too large")
+        return
+    if action == "firewall.rule.reorder":
+        if set(parameters) - {"rule", "before"} or "rule" not in parameters:
+            raise HTTPException(status_code=422, detail="Firewall reorder requires rule and optional before target")
+        if not isinstance(parameters.get("rule"), dict) or (parameters.get("before") is not None and not isinstance(parameters.get("before"), dict)):
+            raise HTTPException(status_code=422, detail="Firewall reorder rules are invalid")
+        source = parameters["rule"]
+        target = parameters.get("before")
+        if source.get("backend") not in {"ufw", "nftables", "iptables"} or (target and target.get("backend") != source.get("backend")):
+            raise HTTPException(status_code=422, detail="Firewall backend does not support ordered rules")
+        if len(json.dumps(parameters, ensure_ascii=False)) > 50_000:
+            raise HTTPException(status_code=422, detail="Firewall reorder parameters are too large")
 
 
 async def mark_tunnel_closed(session_id: str, reason: str) -> None:

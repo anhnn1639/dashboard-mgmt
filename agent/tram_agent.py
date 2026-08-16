@@ -68,7 +68,7 @@ ALLOWED_ACTIONS = {
     "group.create", "group.delete", "user.add_group", "patch.scan",
     "patch.install_security", "logs.read", "process.list", "firewall.list", "system.reboot",
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
-    "firewall.rule.add", "firewall.rule.remove", "network.list", "file.deliver",
+    "firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
 
 
@@ -376,6 +376,78 @@ def firewall_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ufw_endpoint(value: str, family: str) -> tuple[str, str, str, str] | None:
+    normalized = re.sub(r"\s+\(v6\)\s*$", "", value.strip(), flags=re.IGNORECASE)
+    interface = ""
+    interface_match = re.match(r"^(.*?)\s+on\s+([A-Za-z0-9_.:@+-]+)$", normalized)
+    if interface_match:
+        normalized, interface = interface_match.groups()
+    port = ""
+    protocol = ""
+    port_match = re.search(r"(?:^|\s)(\d{1,5}(?:-\d{1,5})?)/(tcp|udp)$", normalized, re.IGNORECASE)
+    if port_match:
+        port, protocol = port_match.groups()
+        normalized = normalized[:port_match.start()].strip()
+        for part in port.split("-"):
+            if not 1 <= int(part) <= 65535:
+                return None
+    if normalized.lower() == "anywhere" or not normalized:
+        address = "::/0" if family == "ipv6" else "0.0.0.0/0"
+    else:
+        try:
+            network = ipaddress.ip_network(normalized, strict=False)
+        except ValueError:
+            return None
+        if network.version != (6 if family == "ipv6" else 4):
+            return None
+        address = str(network)
+    return address, port, protocol.lower(), interface
+
+
+def ufw_insert_arguments(destination: str, action: str, direction: str, source: str, comment: str, family: str) -> list[str] | None:
+    destination_endpoint = ufw_endpoint(destination, family)
+    source_endpoint = ufw_endpoint(source, family)
+    if not destination_endpoint or not source_endpoint:
+        return None
+    destination_address, destination_port, destination_protocol, destination_interface = destination_endpoint
+    source_address, source_port, source_protocol, source_interface = source_endpoint
+    if source_port or (source_protocol and destination_protocol and source_protocol != destination_protocol):
+        return None
+    protocol = destination_protocol or source_protocol
+    command = [action.lower()]
+    normalized_direction = (direction or "IN").upper()
+    if normalized_direction == "FWD":
+        command.insert(0, "route")
+        if source_interface:
+            command += ["in", "on", source_interface]
+        if destination_interface:
+            command += ["out", "on", destination_interface]
+    elif normalized_direction == "OUT":
+        command += ["out"]
+        if source_interface:
+            command += ["on", source_interface]
+        if destination_interface:
+            return None
+    elif normalized_direction == "IN":
+        command += ["in"]
+        if destination_interface:
+            command += ["on", destination_interface]
+        if source_interface:
+            return None
+    else:
+        return None
+    if protocol:
+        command += ["proto", protocol]
+    command += ["from", source_address, "to", destination_address]
+    if destination_port:
+        command += ["port", destination_port]
+    if comment:
+        if len(comment) > 255 or any(ord(character) < 32 for character in comment):
+            return None
+        command += ["comment", comment]
+    return command
+
+
 def parse_ufw_rules(output: str) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -383,6 +455,11 @@ def parse_ufw_rules(output: str) -> list[dict[str, Any]]:
         if not match:
             continue
         number, destination, action, direction, source = match.groups()
+        comment = ""
+        if " # " in source:
+            source, comment = source.split(" # ", 1)
+        family = "ipv6" if "(v6)" in destination.lower() or "(v6)" in source.lower() else "ipv4"
+        insert_arguments = ufw_insert_arguments(destination, action, direction or "IN", source, comment, family)
         port_match = re.search(r"\b(\d{1,5})(?:/(tcp|udp))?\b", destination, re.IGNORECASE)
         rules.append({
             "id": number,
@@ -399,7 +476,9 @@ def parse_ufw_rules(output: str) -> list[dict[str, Any]]:
             "profile": "active",
             "raw": line.strip(),
             "removable": True,
-            "spec": {"number": int(number)},
+            "reorderable": insert_arguments is not None,
+            "orderGroup": f"ufw:{family}",
+            "spec": {"number": int(number), "family": family, "insertArguments": insert_arguments or []},
         })
     return rules
 
@@ -457,6 +536,7 @@ def parse_firewalld_rules(output: str) -> list[dict[str, Any]]:
                 "profile": zone,
                 "raw": value,
                 "removable": True,
+                "reorderable": False,
                 "spec": {"zone": zone, "type": field, "value": value},
             })
     return rules
@@ -491,7 +571,9 @@ def parse_nft_rules(output: str) -> list[dict[str, Any]]:
             "profile": family,
             "raw": raw,
             "removable": True,
-            "spec": {"family": family, "table": table, "chain": chain, "handle": int(handle)},
+            "reorderable": True,
+            "orderGroup": f"nftables:{family}:{table}:{chain}",
+            "spec": {"family": family, "table": table, "chain": chain, "handle": int(handle), "comment": str(rule.get("comment") or "")},
         })
     return rules
 
@@ -536,13 +618,15 @@ def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
             "profile": family,
             "raw": line,
             "removable": True,
+            "reorderable": True,
+            "orderGroup": f"iptables:{family}:{table}:{chain}",
             "spec": {"family": family, "table": table, "chain": chain, "index": index},
         })
     return rules
 
 
 def windows_firewall_rules() -> tuple[int, str]:
-    script = "$rows=@(Get-NetFirewallRule -PolicyStore ActiveStore|ForEach-Object{$r=$_;$p=$r|Get-NetFirewallPortFilter;$a=$r|Get-NetFirewallAddressFilter;[pscustomobject]@{id=$r.Name;backend='windows';name=$r.DisplayName;direction=([string]$r.Direction).ToLower();action=([string]$r.Action).ToLower();enabled=([bool]($r.Enabled -eq 'True'));protocol=([string]$p.Protocol).ToLower();localPort=([string]($p.LocalPort -join ','));remotePort=([string]($p.RemotePort -join ','));source=([string]($a.RemoteAddress -join ','));destination=([string]($a.LocalAddress -join ','));profile=([string]$r.Profile);raw=([string]$r.Description);removable=([bool]($r.PolicyStoreSourceType -eq 'Local'));spec=@{name=$r.Name;policyStoreSourceType=([string]$r.PolicyStoreSourceType)}}});[pscustomobject]@{backend='windows';backends=@('windows');rules=$rows}|ConvertTo-Json -Depth 6 -Compress"
+    script = "$rows=@(Get-NetFirewallRule -PolicyStore ActiveStore|ForEach-Object{$r=$_;$p=$r|Get-NetFirewallPortFilter;$a=$r|Get-NetFirewallAddressFilter;[pscustomobject]@{id=$r.Name;backend='windows';name=$r.DisplayName;direction=([string]$r.Direction).ToLower();action=([string]$r.Action).ToLower();enabled=([bool]($r.Enabled -eq 'True'));protocol=([string]$p.Protocol).ToLower();localPort=([string]($p.LocalPort -join ','));remotePort=([string]($p.RemotePort -join ','));source=([string]($a.RemoteAddress -join ','));destination=([string]($a.LocalAddress -join ','));profile=([string]$r.Profile);raw=([string]$r.Description);removable=([bool]($r.PolicyStoreSourceType -eq 'Local'));reorderable=$false;spec=@{name=$r.Name;policyStoreSourceType=([string]$r.PolicyStoreSourceType)}}});[pscustomobject]@{backend='windows';backends=@('windows');rules=$rows}|ConvertTo-Json -Depth 6 -Compress"
     return powershell(script, timeout=300, output_limit=5_000_000)
 
 
@@ -566,8 +650,7 @@ def linux_firewall_rules() -> tuple[int, str]:
         code, output = run([nft, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
         if code == 0:
             rules = parse_nft_rules(output)
-            if rules:
-                return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+            return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     rules: list[dict[str, Any]] = []
     families: list[str] = []
     for binary, family in ((shutil.which("iptables-save"), "ipv4"), (shutil.which("ip6tables-save"), "ipv6")):
@@ -578,7 +661,7 @@ def linux_firewall_rules() -> tuple[int, str]:
                 families.append(family)
     if families:
         return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
-    return 1, "No supported firewall backend found (firewalld, UFW, nftables, iptables)"
+    return 0, json.dumps({"backend": "", "backends": [], "rules": [], "warning": "No active or supported firewall backend found (firewalld, UFW, nftables, iptables)"}, separators=(",", ":"))
 
 
 def ps_literal(value: str) -> str:
@@ -708,6 +791,190 @@ def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any])
     else:
         raise ValueError("Unsupported firewall backend")
     return run_many(commands, ("NOT_ENABLED",)) if backend == "firewalld" else run_many(commands)
+
+
+def require_reorder_rule(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid firewall {label} rule")
+    backend = str(value.get("backend", "")).lower()
+    rule_id = str(value.get("id", ""))
+    raw = str(value.get("raw", ""))
+    spec = value.get("spec")
+    if backend not in {"ufw", "nftables", "iptables"} or not rule_id or not raw or not isinstance(spec, dict):
+        raise ValueError(f"Invalid firewall {label} rule")
+    if len(rule_id) > 256 or len(raw) > 16_384 or any(ord(character) < 32 and character not in "\t" for character in raw):
+        raise ValueError(f"Invalid firewall {label} rule")
+    return value
+
+
+def reorder_ufw_rule(parameters: dict[str, Any]) -> tuple[int, str]:
+    binary = shutil.which("ufw")
+    if not binary:
+        return 1, "UFW is not installed"
+    requested = require_reorder_rule(parameters.get("rule"), "source")
+    before_requested = parameters.get("before")
+    before = require_reorder_rule(before_requested, "target") if before_requested is not None else None
+    if requested["backend"] != "ufw" or (before and before["backend"] != "ufw"):
+        raise ValueError("Firewall reorder backend mismatch")
+    code, output = run([binary, "status", "numbered"], output_limit=5_000_000)
+    if code:
+        return code, output
+    current_rules = parse_ufw_rules(output)
+
+    def current_match(candidate: dict[str, Any]) -> dict[str, Any]:
+        match = next((rule for rule in current_rules if rule["id"] == str(candidate.get("id")) and rule["raw"] == str(candidate.get("raw"))), None)
+        if not match:
+            raise ValueError("Firewall rules changed after the scan; scan again before reordering")
+        return match
+
+    source = current_match(requested)
+    target = current_match(before) if before else None
+    if not source.get("reorderable"):
+        raise ValueError("This UFW rule cannot be reconstructed safely")
+    if target and source.get("orderGroup") != target.get("orderGroup"):
+        raise ValueError("UFW rules can only be reordered within the same IP family")
+    source_number = int(source["spec"]["number"])
+    target_number = int(target["spec"]["number"]) if target else max(int(rule["spec"]["number"]) for rule in current_rules if rule.get("orderGroup") == source.get("orderGroup")) + 1
+    if source_number == target_number or target_number == source_number + 1:
+        return 0, "Firewall rule is already in the requested position"
+    insert_arguments = source["spec"].get("insertArguments")
+    if not isinstance(insert_arguments, list) or not insert_arguments or any(not isinstance(argument, str) for argument in insert_arguments):
+        raise ValueError("This UFW rule cannot be reconstructed safely")
+    insert_code, insert_output = run([binary, "--force", "insert", str(target_number), *insert_arguments])
+    if insert_code:
+        return insert_code, insert_output
+    original_number = source_number + 1 if target_number <= source_number else source_number
+    delete_code, delete_output = run([binary, "--force", "delete", str(original_number)])
+    if delete_code:
+        rollback_code, rollback_output = run([binary, "--force", "delete", str(target_number)])
+        rollback = "rollback succeeded" if rollback_code == 0 else f"ROLLBACK FAILED: {rollback_output}"
+        return delete_code, f"Could not remove the original UFW rule; {rollback}. {delete_output}"
+    return 0, f"Moved UFW rule #{source_number} before position {target_number}"
+
+
+def reorder_iptables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
+    requested = require_reorder_rule(parameters.get("rule"), "source")
+    before_requested = parameters.get("before")
+    before = require_reorder_rule(before_requested, "target") if before_requested is not None else None
+    if requested["backend"] != "iptables" or (before and before["backend"] != "iptables"):
+        raise ValueError("Firewall reorder backend mismatch")
+    spec = requested["spec"]
+    family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); source_index = int(spec.get("index", 0))
+    if family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or source_index < 1:
+        raise ValueError("Invalid iptables source rule")
+    if before:
+        target_spec = before["spec"]
+        if (str(target_spec.get("family", "")), str(target_spec.get("table", "")), str(target_spec.get("chain", ""))) != (family, table, chain):
+            raise ValueError("iptables rules can only be reordered within the same table and chain")
+        target_index = int(target_spec.get("index", 0))
+    else:
+        target_index = 0
+    save_binary = shutil.which("ip6tables-save" if family == "ipv6" else "iptables-save")
+    restore_binary = shutil.which("ip6tables-restore" if family == "ipv6" else "iptables-restore")
+    if not save_binary or not restore_binary:
+        return 1, "iptables save/restore tools are not installed"
+    code, output = run([save_binary], output_limit=5_000_000)
+    if code:
+        return code, output
+    lines = output.splitlines()
+    current_table = ""
+    positions: list[int] = []
+    for position, line in enumerate(lines):
+        if line.startswith("*"):
+            current_table = line[1:].strip()
+        elif line == "COMMIT":
+            current_table = ""
+        elif current_table == table and line.startswith(f"-A {chain} "):
+            positions.append(position)
+    if source_index > len(positions) or lines[positions[source_index - 1]] != str(requested["raw"]):
+        raise ValueError("Firewall rules changed after the scan; scan again before reordering")
+    if before:
+        if target_index < 1 or target_index > len(positions) or lines[positions[target_index - 1]] != str(before["raw"]):
+            raise ValueError("Firewall rules changed after the scan; scan again before reordering")
+    else:
+        target_index = len(positions) + 1
+    if source_index == target_index or target_index == source_index + 1:
+        return 0, "Firewall rule is already in the requested position"
+    ordered_lines = [lines[position] for position in positions]
+    moved_line = ordered_lines.pop(source_index - 1)
+    insertion_index = target_index - 1
+    if source_index < target_index:
+        insertion_index -= 1
+    ordered_lines.insert(insertion_index, moved_line)
+    for position, line in zip(positions, ordered_lines):
+        lines[position] = line
+    restore_code, restore_output = run_with_input([restore_binary], "\n".join(lines) + "\n")
+    if restore_code:
+        return restore_code, restore_output
+    return 0, f"Moved {family} {table}/{chain} rule #{source_index} before position {target_index}"
+
+
+def reorder_nftables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
+    binary = shutil.which("nft")
+    if not binary:
+        return 1, "nftables is not installed"
+    requested = require_reorder_rule(parameters.get("rule"), "source")
+    before_requested = parameters.get("before")
+    before = require_reorder_rule(before_requested, "target") if before_requested is not None else None
+    if requested["backend"] != "nftables" or (before and before["backend"] != "nftables"):
+        raise ValueError("Firewall reorder backend mismatch")
+    code, output = run([binary, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
+    if code:
+        return code, output
+    current_rules = parse_nft_rules(output)
+
+    def current_match(candidate: dict[str, Any]) -> dict[str, Any]:
+        match = next((rule for rule in current_rules if rule["id"] == str(candidate.get("id")) and rule["raw"] == str(candidate.get("raw"))), None)
+        if not match:
+            raise ValueError("Firewall rules changed after the scan; scan again before reordering")
+        return match
+
+    source = current_match(requested)
+    target = current_match(before) if before else None
+    if target and source.get("orderGroup") != target.get("orderGroup"):
+        raise ValueError("nftables rules can only be reordered within the same table and chain")
+    if target and source["id"] == target["id"]:
+        return 0, "Firewall rule is already in the requested position"
+    source_spec = source["spec"]
+    rule = {
+        "family": source_spec["family"],
+        "table": source_spec["table"],
+        "chain": source_spec["chain"],
+        "expr": json.loads(source["raw"]),
+    }
+    if source_spec.get("comment"):
+        rule["comment"] = source_spec["comment"]
+    command_name = "add"
+    if target:
+        rule["handle"] = int(target["spec"]["handle"])
+        command_name = "insert"
+    batch = {"nftables": [
+        {command_name: {"rule": rule}},
+        {"delete": {"rule": {
+            "family": source_spec["family"],
+            "table": source_spec["table"],
+            "chain": source_spec["chain"],
+            "handle": int(source_spec["handle"]),
+        }}},
+    ]}
+    restore_code, restore_output = run_with_input([binary, "-j", "-f", "-"], json.dumps(batch, ensure_ascii=False, separators=(",", ":")))
+    if restore_code:
+        return restore_code, restore_output
+    return 0, f"Moved nftables rule {source['id']}"
+
+
+def reorder_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    if inventory["os_family"] == "windows":
+        raise ValueError("Windows Firewall does not support administrator-assigned rule ordering")
+    requested = require_reorder_rule(parameters.get("rule"), "source")
+    backend = str(requested.get("backend", "")).lower()
+    if backend == "ufw":
+        return reorder_ufw_rule(parameters)
+    if backend == "nftables":
+        return reorder_nftables_rule(parameters)
+    if backend == "iptables":
+        return reorder_iptables_rule(parameters)
+    raise ValueError("This firewall backend does not support safe rule reordering")
 
 
 def tunnel_url(config: Config, suffix: str) -> str:
@@ -1043,6 +1310,8 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         return add_firewall_rule(parameters, inventory)
     if action == "firewall.rule.remove":
         return remove_firewall_rules(parameters, inventory)
+    if action == "firewall.rule.reorder":
+        return reorder_firewall_rule(parameters, inventory)
     if action == "storage.list":
         facts = management_facts("windows" if windows else "linux")
         return 0, json.dumps(facts.get("Storage", []), ensure_ascii=False)

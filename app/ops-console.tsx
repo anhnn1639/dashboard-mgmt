@@ -1,7 +1,7 @@
 "use client";
 
 import Guacamole from "guacamole-common-js";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -110,6 +110,8 @@ type FirewallRule = {
   profile: string;
   raw: string;
   removable: boolean;
+  reorderable?: boolean;
+  orderGroup?: string;
   spec: Record<string, unknown>;
 };
 
@@ -117,6 +119,7 @@ type FirewallScan = {
   backend: FirewallRule["backend"] | "";
   backends: string[];
   rules: FirewallRule[];
+  warning?: string;
 };
 
 function parseFirewallOutput(output: string | undefined): FirewallScan {
@@ -136,6 +139,7 @@ function parseFirewallOutput(output: string | undefined): FirewallScan {
       backend: typeof parsed.backend === "string" ? parsed.backend as FirewallScan["backend"] : "",
       backends: Array.isArray(parsed.backends) ? parsed.backends.map(String) : [],
       rules,
+      warning: typeof parsed.warning === "string" ? parsed.warning : undefined,
     };
   } catch {
     return { backend: "", backends: [], rules: [] };
@@ -1581,9 +1585,11 @@ function ServerDrawer({
   const [activeTab, setActiveTab] = useState<ServerTab>("overview");
   const [action, setAction] = useState("user.create");
   const [busy, setBusy] = useState(false);
-  const [firewallModal, setFirewallModal] = useState<"add" | "delete" | null>(null);
+  const [firewallModal, setFirewallModal] = useState<"add" | "delete" | "reorder" | null>(null);
   const [selectedFirewallRules, setSelectedFirewallRules] = useState<string[]>([]);
   const [firewallConfirmation, setFirewallConfirmation] = useState("");
+  const [draggedFirewallRule, setDraggedFirewallRule] = useState<string | null>(null);
+  const [firewallReorder, setFirewallReorder] = useState<{ rule: FirewallRule; before: FirewallRule | null } | null>(null);
   const [fileBusy, setFileBusy] = useState(false);
   const [transfers, setTransfers] = useState<
     Array<{
@@ -1745,6 +1751,7 @@ function ServerDrawer({
   function closeFirewallModal() {
     setFirewallModal(null);
     setFirewallConfirmation("");
+    setFirewallReorder(null);
   }
   function toggleFirewallRule(rule: FirewallRule) {
     if (rule.removable === false) return;
@@ -1806,6 +1813,46 @@ function ServerDrawer({
       closeFirewallModal();
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể xóa firewall rule");
+    } finally {
+      setBusy(false);
+    }
+  }
+  function dropFirewallRule(target: FirewallRule, event: DragEvent<HTMLTableRowElement>) {
+    event.preventDefault();
+    const source = firewallRules.find((rule) => firewallRuleKey(rule) === draggedFirewallRule);
+    setDraggedFirewallRule(null);
+    if (!source || source.reorderable !== true || target.reorderable !== true || source.orderGroup !== target.orderGroup || source.id === target.id) return;
+    const group = firewallRules.filter((rule) => rule.orderGroup === source.orderGroup);
+    const remaining = group.filter((rule) => rule.id !== source.id);
+    const targetIndex = remaining.findIndex((rule) => rule.id === target.id);
+    if (targetIndex < 0) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const afterTarget = event.clientY >= bounds.top + bounds.height / 2;
+    const desired = [...remaining];
+    desired.splice(targetIndex + (afterTarget ? 1 : 0), 0, source);
+    const sourcePosition = desired.findIndex((rule) => rule.id === source.id);
+    const before = desired[sourcePosition + 1] ?? null;
+    const currentPosition = group.findIndex((rule) => rule.id === source.id);
+    const currentBefore = group[currentPosition + 1] ?? null;
+    if ((before?.id ?? null) === (currentBefore?.id ?? null)) return;
+    setFirewallReorder({ rule: source, before });
+    setFirewallModal("reorder");
+  }
+  async function submitFirewallReorder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!firewallReorder) return;
+    setBusy(true);
+    const form = new FormData(event.currentTarget);
+    const compactRule = (rule: FirewallRule) => ({ id: rule.id, backend: rule.backend, raw: rule.raw, spec: rule.spec });
+    try {
+      await queueJob(
+        "firewall.rule.reorder",
+        { rule: compactRule(firewallReorder.rule), before: firewallReorder.before ? compactRule(firewallReorder.before) : null },
+        String(form.get("reason") ?? `Sắp xếp firewall rule trên ${server.name}`),
+      );
+      closeFirewallModal();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Không thể sắp xếp firewall rule");
     } finally {
       setBusy(false);
     }
@@ -2035,6 +2082,7 @@ function ServerDrawer({
                     <table className="firewall-table">
                       <thead>
                         <tr>
+                          <th className="firewall-drag-cell" aria-label="Thứ tự rule">↕</th>
                           <th className="firewall-check-cell">
                             <input
                               type="checkbox"
@@ -2050,7 +2098,27 @@ function ServerDrawer({
                         {firewallRules.map((rule) => {
                           const key = firewallRuleKey(rule);
                           return (
-                            <tr key={key} className={selectedFirewallRules.includes(key) ? "selected" : ""}>
+                            <tr
+                              key={key}
+                              className={`${selectedFirewallRules.includes(key) ? "selected" : ""} ${draggedFirewallRule === key ? "dragging" : ""}`.trim()}
+                              draggable={rule.reorderable === true}
+                              onDragStart={(event) => {
+                                if (rule.reorderable !== true) return;
+                                event.dataTransfer.effectAllowed = "move";
+                                event.dataTransfer.setData("text/plain", key);
+                                setDraggedFirewallRule(key);
+                              }}
+                              onDragEnd={() => setDraggedFirewallRule(null)}
+                              onDragOver={(event) => {
+                                const source = firewallRules.find((item) => firewallRuleKey(item) === draggedFirewallRule);
+                                if (source?.orderGroup === rule.orderGroup && source.id !== rule.id && rule.reorderable === true) {
+                                  event.preventDefault();
+                                  event.dataTransfer.dropEffect = "move";
+                                }
+                              }}
+                              onDrop={(event) => dropFirewallRule(rule, event)}
+                            >
+                              <td className="firewall-drag-cell"><span className={rule.reorderable ? "firewall-drag-handle" : "firewall-drag-disabled"} title={rule.reorderable ? "Kéo lên hoặc xuống trong cùng chain / IP family" : "Backend hoặc rule này không hỗ trợ sắp xếp an toàn"}>⠿</span></td>
                               <td className="firewall-check-cell">
                                 <input type="checkbox" checked={selectedFirewallRules.includes(key)} disabled={rule.removable === false} aria-label={`Chọn ${rule.name}`} title={rule.removable === false ? "Rule do Group Policy quản lý, không thể xóa tại máy local" : ""} onChange={() => toggleFirewallRule(rule)} />
                               </td>
@@ -2066,10 +2134,13 @@ function ServerDrawer({
                         })}
                       </tbody>
                     </table>
-                    {latestReadJob?.status !== "succeeded" && <div className="empty-state">{latestReadJob ? `Agent đang xử lý: ${latestReadJob.status}` : "Chưa có dữ liệu; nhấn “Quét lại”."}</div>}
+                    {!latestReadJob && <div className="empty-state">Chưa có dữ liệu; nhấn “Quét lại”.</div>}
+                    {latestReadJob && ["queued", "approved", "running"].includes(latestReadJob.status) && <div className="empty-state">Agent đang xử lý: {latestReadJob.status}</div>}
+                    {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
+                    {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning">{firewallScan.warning}</div>}
                   </div>
-                  <p className="firewall-note">Rule chỉ được thay đổi sau khi một quản trị viên khác phê duyệt; mỗi tác vụ xóa tối đa 200 rule. Rule Windows do Domain GPO quản lý vẫn hiển thị nhưng không cho xóa tại máy local.</p>
+                  <p className="firewall-note">Kéo biểu tượng ⠿ để đổi thứ tự trong cùng UFW IP family hoặc cùng nftables/iptables table và chain; thay đổi chỉ chạy sau phê duyệt và agent sẽ từ chối nếu snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
                 </section>
               )}
 
@@ -2359,6 +2430,21 @@ function ServerDrawer({
             <label>Gõ <b>CONFIRM</b> để mở nút Delete<input value={firewallConfirmation} onChange={(event) => setFirewallConfirmation(event.target.value)} autoComplete="off" spellCheck={false} /></label>
             <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button>{firewallConfirmation === "CONFIRM" && <button type="button" className="button firewall-delete-button" disabled={busy} onClick={() => void deleteFirewallRules()}>{busy ? "Đang gửi…" : `Delete ${selectedRules.length} rule`}</button>}</div>
           </section>
+        </div>
+      )}
+      {firewallModal === "reorder" && firewallReorder && (
+        <div className="modal-backdrop">
+          <button className="modal-dismiss" type="button" aria-label="Đóng xác nhận sắp xếp firewall rule" onClick={closeFirewallModal} />
+          <form className="modal firewall-modal" onSubmit={submitFirewallReorder}>
+            <div className="modal-head"><div><span className="modal-icon">↕</span><div><h2>Xác nhận đổi thứ tự rule</h2><p>{server.name} · tác vụ critical</p></div></div><button type="button" aria-label="Đóng" onClick={closeFirewallModal}>×</button></div>
+            <div className="firewall-reorder-preview">
+              <span>Di chuyển</span><b>{firewallReorder.rule.name}</b><small>{firewallReorder.rule.action} · {firewallReorder.rule.protocol}/{firewallReorder.rule.localPort} · {firewallReorder.rule.source} → {firewallReorder.rule.destination}</small>
+              <span>{firewallReorder.before ? "Lên ngay trước" : "Xuống cuối nhóm"}</span><b>{firewallReorder.before?.name ?? firewallReorder.rule.orderGroup}</b>
+            </div>
+            <label>Lý do / ticket<textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Đưa Allow SSH lên trước Deny" /></label>
+            <div className="warning-box"><b>Kiểm tra tránh mất kết nối</b><p>Hãy xác nhận rule Allow quản trị cần thiết vẫn nằm trước Deny/Drop. Agent đối chiếu lại nội dung và vị trí rule ngay trước khi áp dụng; snapshot khác sẽ bị từ chối.</p></div>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang gửi…" : "Gửi chờ phê duyệt"}</button></div>
+          </form>
         </div>
       )}
     </>

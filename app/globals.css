@@ -1260,6 +1260,13 @@ textarea:focus-visible {
 .firewall-table tr.selected td {
   background: rgba(70, 132, 227, 0.08);
 }
+.firewall-table tr.dragging td {
+  opacity: 0.45;
+  background: rgba(70, 132, 227, 0.14);
+}
+.firewall-table tr[draggable="true"]:hover td {
+  border-top-color: #3d5f8c;
+}
 .firewall-table td b,
 .firewall-table td small {
   display: block;
@@ -1279,6 +1286,31 @@ textarea:focus-visible {
 .firewall-check-cell {
   width: 42px;
   text-align: center !important;
+}
+.firewall-drag-cell {
+  width: 34px;
+  padding-right: 4px !important;
+  padding-left: 8px !important;
+  text-align: center !important;
+}
+.firewall-drag-handle,
+.firewall-drag-disabled {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 28px;
+  color: #74a8f8;
+  font-size: 16px;
+  cursor: grab;
+  user-select: none;
+}
+.firewall-drag-handle:active {
+  cursor: grabbing;
+}
+.firewall-drag-disabled {
+  color: #405066;
+  cursor: not-allowed;
 }
 .firewall-check-cell input {
   width: 15px;
@@ -1312,6 +1344,32 @@ textarea:focus-visible {
   margin: 10px 0 0;
   color: #6f8096;
   font-size: 9px;
+}
+.firewall-scan-error,
+.firewall-scan-warning {
+  margin: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 105, 116, 0.35);
+  border-radius: 7px;
+  color: #ffadb4;
+  background: rgba(255, 105, 116, 0.07);
+}
+.firewall-scan-error b {
+  display: block;
+  margin-bottom: 7px;
+}
+.firewall-scan-error pre {
+  margin: 0;
+  overflow: auto;
+  color: #d9a7ab;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+.firewall-scan-warning {
+  border-color: rgba(246, 183, 88, 0.35);
+  color: #e9bd78;
+  background: rgba(246, 183, 88, 0.07);
 }
 .inventory-table {
   overflow: hidden;
@@ -2025,6 +2083,29 @@ textarea:focus-visible {
 }
 .firewall-delete-button:hover {
   background: #ca3c4d;
+}
+.firewall-reorder-preview {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #2d4260;
+  border-radius: 7px;
+  background: #0c151f;
+}
+.firewall-reorder-preview span {
+  margin-top: 6px;
+  color: #6f89aa;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.firewall-reorder-preview b {
+  color: #dce9fa;
+  overflow-wrap: anywhere;
+}
+.firewall-reorder-preview small {
+  color: #8295ad;
+  overflow-wrap: anywhere;
 }
 .command-backdrop {
   place-items: start center;
