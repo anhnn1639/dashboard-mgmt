@@ -1376,6 +1376,13 @@ textarea:focus-visible {
   color: #e9bd78;
   background: rgba(246, 183, 88, 0.07);
 }
+.firewall-scan-warning b,
+.firewall-scan-warning span {
+  display: block;
+}
+.firewall-scan-warning b {
+  margin-bottom: 6px;
+}
 .inventory-table {
   overflow: hidden;
   border: 1px solid #273548;

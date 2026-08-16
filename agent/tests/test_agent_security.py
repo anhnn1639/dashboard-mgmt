@@ -21,6 +21,14 @@ class AgentSecurityTests(unittest.TestCase):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Version="$(var.AgentVersion)"', wix_source)
 
+    def test_system_command_falls_back_to_standard_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = Path(directory) / "iptables"
+            command.write_text("test", encoding="ascii")
+            command.chmod(0o755)
+            with patch.object(tram_agent.shutil, "which", return_value=None), patch.object(tram_agent, "SYSTEM_COMMAND_DIRS", (Path(directory),)):
+                self.assertEqual(tram_agent.find_system_command("iptables"), str(command))
+
     def test_tunnel_url_requires_https(self):
         with tempfile.TemporaryDirectory() as directory:
             secure = tram_agent.Config(str(Path(directory) / "agent.json"))
@@ -174,12 +182,13 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(payload["rules"], [])
 
     def test_missing_firewall_backend_is_reported_without_failing_the_job(self):
-        with patch.object(tram_agent.shutil, "which", return_value=None):
+        with patch.object(tram_agent.shutil, "which", return_value=None), patch.object(tram_agent, "SYSTEM_COMMAND_DIRS", ()):
             code, output = tram_agent.linux_firewall_rules()
         payload = json.loads(output)
         self.assertEqual(code, 0)
         self.assertEqual(payload["backend"], "")
         self.assertIn("No active or supported firewall backend", payload["warning"])
+        self.assertIn("ipv4: iptables not found", payload["warning"])
 
     def test_firewalld_scans_services_ports_and_ipv6_rich_rules(self):
         output = """public (active)

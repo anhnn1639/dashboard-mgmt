@@ -53,6 +53,7 @@ GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
 FIREWALL_OBJECT_RE = re.compile(r"^[A-Za-z0-9_.@:+/-]{1,160}$")
 TRANSFER_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,179}$")
+SYSTEM_COMMAND_DIRS = tuple(Path(value) for value in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"))
 WINDOWS_RESERVED_FILENAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{number}" for number in range(1, 10)),
@@ -70,6 +71,17 @@ ALLOWED_ACTIONS = {
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
     "firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
+
+
+def find_system_command(name: str) -> str | None:
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    for directory in SYSTEM_COMMAND_DIRS:
+        candidate = directory / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def configure_logging(log_file: str | None = None) -> None:
@@ -630,26 +642,31 @@ def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
     return rules
 
 
-def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]]]:
+def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]], list[str]]:
     save_name = "ip6tables-save" if family == "ipv6" else "iptables-save"
     command_name = "ip6tables" if family == "ipv6" else "iptables"
-    save_binary = shutil.which(save_name)
+    diagnostics: list[str] = []
+    save_binary = find_system_command(save_name)
     if save_binary:
         code, output = run([save_binary], output_limit=5_000_000)
         if code == 0:
-            return True, parse_iptables_rules(output, family)
-    command_binary = shutil.which(command_name)
+            return True, parse_iptables_rules(output, family), diagnostics
+        diagnostics.append(f"{save_name} exit {code}: {' '.join(output.split())[:300] or 'no output'}")
+    command_binary = find_system_command(command_name)
     if not command_binary:
-        return False, []
+        diagnostics.append(f"{command_name} not found in PATH or standard system directories")
+        return False, [], diagnostics
     rules: list[dict[str, Any]] = []
     scanned = False
     for table in IPTABLES_TABLES:
         code, output = run([command_binary, "-w", "-t", table, "-S"], output_limit=5_000_000)
         if code != 0:
+            if table == "filter":
+                diagnostics.append(f"{command_name} filter scan exit {code}: {' '.join(output.split())[:300] or 'no output'}")
             continue
         scanned = True
         rules.extend(parse_iptables_rules(f"*{table}\n{output}\nCOMMIT", family))
-    return scanned, rules
+    return scanned, rules, diagnostics
 
 
 def windows_firewall_rules() -> tuple[int, str]:
@@ -658,7 +675,8 @@ def windows_firewall_rules() -> tuple[int, str]:
 
 
 def linux_firewall_rules() -> tuple[int, str]:
-    firewall_cmd = shutil.which("firewall-cmd")
+    diagnostics: list[str] = []
+    firewall_cmd = find_system_command("firewall-cmd")
     if firewall_cmd:
         state_code, _ = run([firewall_cmd, "--state"])
         if state_code == 0:
@@ -666,13 +684,13 @@ def linux_firewall_rules() -> tuple[int, str]:
             if code == 0:
                 rules = parse_firewalld_rules(output)
                 return 0, json.dumps({"backend": "firewalld", "backends": ["firewalld"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
-    ufw = shutil.which("ufw")
+    ufw = find_system_command("ufw")
     if ufw:
         code, output = run([ufw, "status", "numbered"], output_limit=5_000_000)
         if code == 0:
             rules = parse_ufw_rules(output)
             return 0, json.dumps({"backend": "ufw", "backends": ["ufw"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
-    nft = shutil.which("nft")
+    nft = find_system_command("nft")
     if nft:
         code, output = run([nft, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
         if code == 0:
@@ -681,13 +699,17 @@ def linux_firewall_rules() -> tuple[int, str]:
     rules: list[dict[str, Any]] = []
     families: list[str] = []
     for family in ("ipv4", "ipv6"):
-        scanned, family_rules = scan_iptables_family(family)
+        scanned, family_rules, family_diagnostics = scan_iptables_family(family)
+        diagnostics.extend(f"{family}: {message}" for message in family_diagnostics)
         if scanned:
             rules.extend(family_rules)
             families.append(family)
     if families:
         return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
-    return 0, json.dumps({"backend": "", "backends": [], "rules": [], "warning": "No active or supported firewall backend found (firewalld, UFW, nftables, iptables)"}, separators=(",", ":"))
+    warning = "No active or supported firewall backend found (firewalld, UFW, nftables, iptables)"
+    if diagnostics:
+        warning += ". Agent diagnostics: " + "; ".join(diagnostics)
+    return 0, json.dumps({"backend": "", "backends": [], "rules": [], "warning": warning}, separators=(",", ":"))
 
 
 def ps_literal(value: str) -> str:
@@ -721,7 +743,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         script = f"New-NetFirewallRule -DisplayName {ps_literal('TramOps - ' + values['name'])} -Direction {direction} -Action {rule_action} -Enabled True -Profile {profile} -Protocol {values['protocol'].upper()} -LocalPort {values['local_port']} -RemotePort {remote_port} -RemoteAddress {ps_literal('Any' if values['source'] == 'any' else values['source'])} -LocalAddress {ps_literal('Any' if values['destination'] == 'any' else values['destination'])} -ErrorAction Stop|Select Name,DisplayName,Enabled,Direction,Action|ConvertTo-Json -Compress"
         return powershell(script)
     if backend == "ufw":
-        binary = shutil.which("ufw")
+        binary = find_system_command("ufw")
         if not binary:
             return 1, "UFW is not installed"
         command = [binary, "--force", "allow" if values["action"] == "allow" else values["action"], values["direction"], "proto", values["protocol"], "from", values["source"]]
@@ -729,7 +751,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         command += ["to", values["destination"], "port", str(values["local_port"]), "comment", values["name"]]
         return run(command)
     if backend == "firewalld":
-        binary = shutil.which("firewall-cmd")
+        binary = find_system_command("firewall-cmd")
         zone = str(parameters.get("zone", "public"))
         if not binary or not FIREWALL_OBJECT_RE.fullmatch(zone):
             raise ValueError("Invalid firewalld zone")
@@ -747,7 +769,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         rich_rule = " ".join(parts)
         return run_many([[binary, f"--zone={zone}", f"--add-rich-rule={rich_rule}"], [binary, "--permanent", f"--zone={zone}", f"--add-rich-rule={rich_rule}"]])
     if backend == "nftables":
-        binary = shutil.which("nft")
+        binary = find_system_command("nft")
         family = str(parameters.get("family", "inet")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "input"))
         if not binary or family not in {"ip", "ip6", "inet"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
             raise ValueError("Invalid nftables target")
@@ -760,7 +782,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         return run(command)
     if backend == "iptables":
         family = str(parameters.get("family", "ipv4")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "INPUT" if values["direction"] == "in" else "OUTPUT"))
-        binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+        binary = find_system_command("ip6tables" if family == "ipv6" else "iptables")
         if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
             raise ValueError("Invalid iptables target")
         command = [binary, "-t", table, "-A", chain, "-p", values["protocol"], "--dport", str(values["local_port"])]
@@ -787,13 +809,13 @@ def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any])
         return powershell(f"@({','.join(names)})|ForEach-Object{{Remove-NetFirewallRule -Name $_ -ErrorAction Stop -Confirm:$false}}")
     commands: list[list[str]] = []
     if backend == "ufw":
-        binary = shutil.which("ufw")
+        binary = find_system_command("ufw")
         if not binary: return 1, "UFW is not installed"
         numbers = sorted({int(rule.get("spec", {}).get("number", 0)) for rule in rules}, reverse=True)
         if not numbers or numbers[-1] < 1: raise ValueError("Invalid UFW rule number")
         commands = [[binary, "--force", "delete", str(number)] for number in numbers]
     elif backend == "firewalld":
-        binary = shutil.which("firewall-cmd")
+        binary = find_system_command("firewall-cmd")
         if not binary: return 1, "firewalld is not installed"
         option_map = {"services": "service", "ports": "port", "protocols": "protocol", "source-ports": "source-port", "forward-ports": "forward-port", "icmp-blocks": "icmp-block", "rich rules": "rich-rule"}
         for rule in rules:
@@ -802,7 +824,7 @@ def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any])
             commands.append([binary, f"--zone={zone}", f"--remove-{kind}={value}"])
             commands.append([binary, "--permanent", f"--zone={zone}", f"--remove-{kind}={value}"])
     elif backend == "nftables":
-        binary = shutil.which("nft")
+        binary = find_system_command("nft")
         if not binary: return 1, "nftables is not installed"
         for rule in rules:
             spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); handle = int(spec.get("handle", 0))
@@ -811,7 +833,7 @@ def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any])
     elif backend == "iptables":
         ordered = sorted(rules, key=lambda rule: (str(rule.get("spec", {}).get("family", "")), str(rule.get("spec", {}).get("table", "")), str(rule.get("spec", {}).get("chain", "")), -int(rule.get("spec", {}).get("index", 0))))
         for rule in ordered:
-            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); index = int(spec.get("index", 0)); raw = str(rule.get("raw", "")); binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); index = int(spec.get("index", 0)); raw = str(rule.get("raw", "")); binary = find_system_command("ip6tables" if family == "ipv6" else "iptables")
             if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or index < 1 or not raw: raise ValueError("Invalid iptables rule")
             code, output = run([binary, "-w", "-t", table, "-S", chain], output_limit=5_000_000)
             if code:
@@ -842,7 +864,7 @@ def require_reorder_rule(value: Any, label: str) -> dict[str, Any]:
 
 
 def reorder_ufw_rule(parameters: dict[str, Any]) -> tuple[int, str]:
-    binary = shutil.which("ufw")
+    binary = find_system_command("ufw")
     if not binary:
         return 1, "UFW is not installed"
     requested = require_reorder_rule(parameters.get("rule"), "source")
@@ -903,10 +925,10 @@ def reorder_iptables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
         target_index = int(target_spec.get("index", 0))
     else:
         target_index = 0
-    save_binary = shutil.which("ip6tables-save" if family == "ipv6" else "iptables-save")
-    restore_binary = shutil.which("ip6tables-restore" if family == "ipv6" else "iptables-restore")
+    save_binary = find_system_command("ip6tables-save" if family == "ipv6" else "iptables-save")
+    restore_binary = find_system_command("ip6tables-restore" if family == "ipv6" else "iptables-restore")
     if not save_binary or not restore_binary:
-        command_binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+        command_binary = find_system_command("ip6tables" if family == "ipv6" else "iptables")
         if not command_binary:
             return 1, "iptables tools are not installed"
         code, output = run([command_binary, "-w", "-t", table, "-S", chain], output_limit=5_000_000)
@@ -980,7 +1002,7 @@ def reorder_iptables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
 
 
 def reorder_nftables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
-    binary = shutil.which("nft")
+    binary = find_system_command("nft")
     if not binary:
         return 1, "nftables is not installed"
     requested = require_reorder_rule(parameters.get("rule"), "source")

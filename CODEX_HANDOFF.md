@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent mới nhất: `0.6.1`; endpoint phải nâng cấp agent để quét/reorder iptables trên máy chỉ có lệnh `iptables` mà thiếu helper `iptables-save`. MSI 0.6.1 đã được bundle từ GitHub Actions vào repository.
+- Agent source mới nhất: `0.6.2`; endpoint phải nâng cấp agent để dò firewall binary trong các thư mục hệ thống dù PATH của systemd không chứa `/usr/sbin`/`/sbin`. MSI đang bundle trong repository vẫn là 0.6.1 cho tới khi workflow 0.6.2 hoàn tất và artifact mới được đưa vào main.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
@@ -19,6 +19,7 @@
 - Agent 0.6.0 và dashboard cho kéo-thả thứ tự UFW, nftables và iptables trong đúng IP family/table/chain. Reorder là job `critical`, bắt buộc phê duyệt bốn mắt; agent đối chiếu lại ID/nội dung snapshot trước khi đổi. UFW dùng insert + delete với rollback, nftables dùng một JSON transaction, iptables dùng save/restore. Windows không bật kéo vì Microsoft không hỗ trợ administrator-assigned ordering và Block xung đột ưu tiên hơn Allow; firewalld chưa bật kéo vì thứ tự thực thi phụ thuộc rich-rule priority và các chain action.
 - Firewall scan không còn fail khi nftables có ruleset rỗng hoặc máy chưa có backend được hỗ trợ; UI hiển thị warning cho trạng thái không có backend và hiển thị nguyên văn output của job nếu agent thực sự trả `failed`, kèm phiên bản agent để chẩn đoán.
 - Agent 0.6.1 fallback sang `iptables -S`/`ip6tables -S` trên các table chuẩn khi thiếu hoặc lỗi `iptables-save`; đây là bản sửa cho host vẫn thấy rule bằng `iptables -L` nhưng dashboard báo không có backend. Reorder cũng fallback sang insert/delete native có stale guard và rollback. Rule hạ tầng Docker vẫn được liệt kê nhưng bị khóa xóa/kéo ở UI và bị agent từ chối nếu cố thao tác trực tiếp.
+- Agent 0.6.2 không còn phụ thuộc PATH của service khi tìm `firewall-cmd`, `ufw`, `nft`, `iptables` và các helper save/restore: sau `shutil.which` sẽ dò allowlist `/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`. Nếu vẫn không có backend, output job chứa chẩn đoán theo IPv4/IPv6 và UI hiển thị kèm chính xác agent version để lần kiểm tra tiếp theo không còn cảnh báo mơ hồ.
 - Modal thêm firewall đổi nút gửi thành **Thêm Rule** và hiển thị **Đang chờ quét firewall…** khi backend chưa sẵn sàng, tránh trường hợp bấm mà không có phản hồi. Chính sách bốn mắt vẫn được thực thi tại API cho `firewall.rule.add`; không được bỏ chỉ bằng cờ từ client.
 - Sau nâng cấp agent, job firewall `failed` cũ vẫn còn bền vững trong PostgreSQL. Dashboard hiện ghi rõ thời điểm của lỗi cũ và tự tạo một lần quét mới khi người dùng mở lại tab Firewall nếu job mới nhất đang `failed`; nút **Quét lại** luôn có thể tạo job thủ công.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
@@ -137,7 +138,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.6.1 như sau, không enroll lại và không thay certificate/config hiện có:
+Endpoint Linux đang cài agent thủ công cập nhật 0.6.2 như sau, không enroll lại và không thay certificate/config hiện có:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -187,7 +188,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.6.1`, Linux available và Windows MSI available sau khi MSI 0.6.1 được bundle.
+- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.6.2`, Linux available và Windows MSI available sau khi MSI 0.6.2 được bundle.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -198,7 +199,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.6.1`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.6.2`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -218,7 +219,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `18/18`, gồm kiểm tra chặn parameter firewall lạ/rỗng/backend không có thứ tự, direct Guacamole client route, configured domain, bundle generation, CA pin, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
-- Agent security `23/23`, gồm parser firewalld/UFW/nftables/iptables, fallback `iptables -S` khi thiếu save helper, khóa rule Docker, ruleset rỗng/không có backend, reorder UFW/nftables/iptables qua save/restore hoặc native fallback, rollback/stale snapshot guard, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
+- Agent security `24/24`, gồm parser firewalld/UFW/nftables/iptables, fallback thư mục hệ thống và `iptables -S` khi thiếu save helper/PATH, chẩn đoán không có backend, khóa rule Docker, ruleset rỗng, reorder UFW/nftables/iptables qua save/restore hoặc native fallback, rollback/stale snapshot guard, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.

@@ -2141,7 +2141,7 @@ function ServerDrawer({
                     {latestReadJob && ["queued", "approved", "running"].includes(latestReadJob.status) && <div className="empty-state">Agent đang xử lý: {latestReadJob.status}</div>}
                     {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><small>Kết quả lúc {new Date(latestReadJob.createdAt).toLocaleString("vi-VN")}. Mở lại tab hoặc bấm “Quét lại” để tạo lần quét mới.</small><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
-                    {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning">{firewallScan.warning}</div>}
+                    {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning"><b>Agent {server.agentVersion || "chưa rõ phiên bản"}</b><span>{firewallScan.warning}</span></div>}
                   </div>
                   <p className="firewall-note">Kéo biểu tượng ⠿ để đổi thứ tự trong cùng UFW IP family hoặc cùng nftables/iptables table và chain; thay đổi chỉ chạy sau phê duyệt và agent sẽ từ chối nếu snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
                 </section>
