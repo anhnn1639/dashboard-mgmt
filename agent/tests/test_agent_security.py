@@ -31,6 +31,36 @@ class AgentSecurityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTPS"):
                 tram_agent.tunnel_url(secure, "control")
 
+    def test_ssh_host_key_follows_guacd_libssh2_preference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ssh_root = Path(directory)
+            ecdsa = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIdGVzdA== host"
+            ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3Q= host"
+            (ssh_root / "ssh_host_ed25519_key.pub").write_text(ed25519, encoding="ascii")
+            (ssh_root / "ssh_host_ecdsa_key.pub").write_text(ecdsa, encoding="ascii")
+
+            self.assertEqual(
+                tram_agent.first_ssh_host_key([
+                    ssh_root / "ssh_host_ecdsa_key.pub",
+                    ssh_root / "ssh_host_ed25519_key.pub",
+                ]),
+                "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIdGVzdA==",
+            )
+
+    def test_ssh_host_key_falls_back_when_ecdsa_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ssh_root = Path(directory)
+            ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3Q= host"
+            (ssh_root / "ssh_host_ed25519_key.pub").write_text(ed25519, encoding="ascii")
+
+            self.assertEqual(
+                tram_agent.first_ssh_host_key([
+                    ssh_root / "ssh_host_ecdsa_key.pub",
+                    ssh_root / "ssh_host_ed25519_key.pub",
+                ]),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3Q=",
+            )
+
     def test_file_delivery_rejects_traversal_before_network_access(self):
         with tempfile.TemporaryDirectory() as directory:
             config = tram_agent.Config(str(Path(directory) / "agent.json"))

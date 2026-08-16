@@ -195,14 +195,30 @@ def network_addresses() -> list[str]:
     return result
 
 
-def ssh_host_key() -> str | None:
-    candidates = [Path("/etc/ssh/ssh_host_ed25519_key.pub"), Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ssh/ssh_host_ed25519_key.pub"]
+def first_ssh_host_key(candidates: list[Path]) -> str | None:
+    """Return the first usable OpenSSH public host key from candidates."""
     for candidate in candidates:
         if candidate.exists():
             parts = candidate.read_text(errors="replace").strip().split()
             if len(parts) >= 2:
                 return f"{parts[0]} {parts[1]}"
     return None
+
+
+def ssh_host_key() -> str | None:
+    # guacd 1.6.0 uses libssh2, whose default host-key preference is ECDSA
+    # P-256 before Ed25519 and RSA. Guacamole verifies the key negotiated by
+    # libssh2 after the handshake, so the inventory key must follow that same
+    # order instead of always pinning Ed25519.
+    if platform.system().lower() == "windows":
+        ssh_root = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ssh"
+    else:
+        ssh_root = Path("/etc/ssh")
+    return first_ssh_host_key([
+        ssh_root / "ssh_host_ecdsa_key.pub",
+        ssh_root / "ssh_host_ed25519_key.pub",
+        ssh_root / "ssh_host_rsa_key.pub",
+    ])
 
 
 def rdp_certificate_fingerprint() -> str | None:
