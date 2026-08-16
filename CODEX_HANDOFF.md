@@ -12,6 +12,7 @@
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
 - Sau khi DNS chạy, log `guacd` xác nhận hai lỗi kế tiếp: host key bị pin cho `tunnel-relay` nhưng thiếu cổng relay động (`Host key does not match known hosts entry`) và recording/typescript bị `Permission denied`. API hiện sinh known_hosts dạng `[tunnel-relay]:PORT KEY_TYPE KEY`; recording-init dùng đúng owner guacd `1000`, shared GID cấu hình bằng `RECORDING_GID`, còn API/Guacamole chỉ được thêm nhóm để đọc. Log phiên mới ngày 16/08 cho thấy recording đã chạy nhưng host key vẫn mismatch: nguyên nhân cuối là agent 0.4.1 luôn gửi ED25519 trong khi libssh2 của guacd ưu tiên/đàm phán ECDSA P-256 trước. Agent 0.4.2 chọn ECDSA, rồi ED25519, rồi RSA theo đúng thứ tự tương thích với guacd.
 - Sau Agent 0.4.2, API đã mở được relay nhưng trình duyệt rơi về trang danh sách Guacamole và `guacd` không nhận connection. Nguyên nhân là URL launch chỉ trỏ `/guacamole/?data=...` thay vì route client. API hiện trả thẳng `/guacamole/#/client/BASE64URL?data=...`, trong đó identifier là `CONNECTION_NAME\0c\0json` và encrypted JSON được percent-encode toàn bộ.
+- Route client đúng nhưng Guacamole vẫn có thể báo `The requested connection does not exist` nếu cùng origin còn `GUAC_AUTH_TOKEN` từ lần đăng nhập Guacamole trước/manual. Token cũ được gửi cùng encrypted JSON và được ưu tiên, nên data source `json` không có trong session hiện tại. Dashboard hiện xóa riêng `GUAC_AUTH_TOKEN` trong localStorage sau khi API tạo relay và trước khi điều hướng; token dashboard dùng `sessionStorage.tram_ops_token` nên không bị ảnh hưởng.
 - API có lịch sử job theo từng máy chủ và chỉ trả output cho role được phép xem action đó; kết quả `inventory.collect` hợp lệ cập nhật inventory bền vững trong PostgreSQL.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
@@ -151,6 +152,16 @@ docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recrea
 
 Sau đó quay lại dashboard và tạo phiên SSH mới. URL đúng phải chứa `/guacamole/#/client/`; log `guacd` phải xuất hiện cho phiên đó.
 
+Nếu route client báo **The requested connection does not exist**, phải rebuild cả dashboard để nhận bản tự xóa token Guacamole cũ:
+
+```bash
+cd /home/system/dashboard-mgmt
+git pull --ff-only origin main
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate dashboard
+```
+
+Hard refresh dashboard rồi tạo phiên mới; không mở/đăng nhập Guacamole thủ công trước khi bấm **Mở SSH**.
+
 Máy nâng cấp từ bản cũ bị lỗi `The agent TLS CA is not available for package generation` phải recreate API và CA exporter để tạo named volume/mount mới:
 
 ```bash
@@ -180,7 +191,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.1`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.4.2`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -199,7 +210,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `16/16`, gồm configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
+- Control plane `18/18`, gồm direct Guacamole client route, configured domain, bundle generation, CA pin, trạng thái/fail-closed khi public CA bị thiếu, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
 - Agent security `9/9`, gồm thứ tự SSH host key tương thích guacd/libssh2, parser locator MSI, bootstrap qua TLS public của Nginx và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.

@@ -3110,6 +3110,12 @@ function SessionModal({
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Không thể tạo phiên");
       close();
+      // Guacamole persists its own token across tabs in origin-wide
+      // localStorage. A stale token from a previous/manual Guacamole login
+      // takes precedence over the encrypted JSON connection in the new URL,
+      // causing the valid temporary connection to appear missing. Dashboard
+      // authentication uses a separate sessionStorage key and is unaffected.
+      window.localStorage.removeItem("GUAC_AUTH_TOKEN");
       if (sessionWindow) sessionWindow.location.href = data.url;
       else window.location.href = data.url;
       notify(
