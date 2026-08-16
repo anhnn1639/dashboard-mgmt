@@ -112,6 +112,7 @@ type FirewallRule = {
   removable: boolean;
   reorderable?: boolean;
   orderGroup?: string;
+  managedBy?: string;
   spec: Record<string, unknown>;
 };
 
@@ -1805,6 +1806,7 @@ function ServerDrawer({
           rules: selectedRules.map((rule) => ({
             id: rule.id,
             backend: rule.backend,
+            raw: rule.raw,
             spec: rule.spec,
           })),
         },
@@ -2121,7 +2123,7 @@ function ServerDrawer({
                             >
                               <td className="firewall-drag-cell"><span className={rule.reorderable ? "firewall-drag-handle" : "firewall-drag-disabled"} title={rule.reorderable ? "Kéo lên hoặc xuống trong cùng chain / IP family" : "Backend hoặc rule này không hỗ trợ sắp xếp an toàn"}>⠿</span></td>
                               <td className="firewall-check-cell">
-                                <input type="checkbox" checked={selectedFirewallRules.includes(key)} disabled={rule.removable === false} aria-label={`Chọn ${rule.name}`} title={rule.removable === false ? "Rule do Group Policy quản lý, không thể xóa tại máy local" : ""} onChange={() => toggleFirewallRule(rule)} />
+                                <input type="checkbox" checked={selectedFirewallRules.includes(key)} disabled={rule.removable === false} aria-label={`Chọn ${rule.name}`} title={rule.removable === false ? (rule.managedBy === "docker" ? "Rule hạ tầng do Docker quản lý; chỉ hiển thị để tránh làm hỏng mạng container" : "Rule do Group Policy quản lý, không thể xóa tại máy local") : ""} onChange={() => toggleFirewallRule(rule)} />
                               </td>
                               <td><b>{rule.name}</b><small>{rule.backend} · {rule.id}</small></td>
                               <td>{rule.direction || "—"}</td>
@@ -2418,7 +2420,7 @@ function ServerDrawer({
             {firewallScan.backend === "iptables" && <div className="form-grid"><label>Family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label><label>Table<input name="table" required defaultValue="filter" /></label><label>Chain<input name="chain" required defaultValue="INPUT" /></label></div>}
             <label>Lý do / ticket<textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Mô tả thay đổi" /></label>
             <div className="warning-box"><b>Thay đổi có kiểm soát</b><p>Tác vụ chỉ được chạy sau khi một quản trị viên khác phê duyệt và toàn bộ tham số được ghi vào nhật ký kiểm toán.</p></div>
-            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy || !firewallScan.backend}>{busy ? "Đang gửi…" : "Gửi chờ phê duyệt"}</button></div>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy || !firewallScan.backend}>{busy ? "Đang thêm…" : firewallScan.backend ? "Thêm Rule" : "Đang chờ quét firewall…"}</button></div>
           </form>
         </div>
       )}

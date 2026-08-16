@@ -201,6 +201,38 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(rules[0]["source"], "10.0.0.0/8")
         self.assertEqual(rules[1]["action"], "drop")
 
+    def test_iptables_command_is_used_when_save_helper_is_missing(self):
+        def fake_which(name):
+            return "/usr/sbin/iptables" if name == "iptables" else None
+
+        def fake_run(command, *args, **kwargs):
+            table = command[command.index("-t") + 1]
+            if table == "filter":
+                return 0, "-P INPUT ACCEPT\n-A INPUT -s 10.64.83.172/32 -p tcp --dport 22 -j ACCEPT\n-A FORWARD -j DOCKER-USER"
+            return 1, f"Table {table} does not exist"
+
+        with patch.object(tram_agent.shutil, "which", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
+            code, output = tram_agent.linux_firewall_rules()
+        payload = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["backend"], "iptables")
+        self.assertEqual(payload["families"], ["ipv4"])
+        self.assertEqual(payload["rules"][0]["source"], "10.64.83.172/32")
+        self.assertTrue(payload["rules"][0]["removable"])
+        self.assertFalse(payload["rules"][1]["removable"])
+        self.assertEqual(payload["rules"][1]["managedBy"], "docker")
+
+    def test_docker_managed_iptables_rule_cannot_be_deleted(self):
+        output = "-A FORWARD -j DOCKER-USER"
+        rule = tram_agent.parse_iptables_rules(f"*filter\n{output}\nCOMMIT", "ipv4")[0]
+
+        def fake_which(name):
+            return "/usr/sbin/iptables" if name == "iptables" else None
+
+        with patch.object(tram_agent.shutil, "which", side_effect=fake_which), patch.object(tram_agent, "run", return_value=(0, output)):
+            with self.assertRaisesRegex(ValueError, "Docker-managed"):
+                tram_agent.remove_firewall_rules({"rules": [rule]}, {"os_family": "linux"})
+
     def test_ufw_bulk_delete_runs_descending_to_avoid_renumbering(self):
         commands = []
 
@@ -252,6 +284,24 @@ class AgentSecurityTests(unittest.TestCase):
             code, _ = tram_agent.reorder_iptables_rule({"rule": rules[1], "before": rules[0]})
         self.assertEqual(code, 0)
         self.assertIn("-A INPUT -p tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT\n-A INPUT -p tcp --dport 22 -j DROP", restored[0])
+
+    def test_iptables_reorder_uses_native_commands_without_save_restore(self):
+        output = "-P INPUT ACCEPT\n-A INPUT -p tcp --dport 22 -j DROP\n-A INPUT -p tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT"
+        rules = tram_agent.parse_iptables_rules(f"*filter\n{output}\nCOMMIT", "ipv4")
+        commands = []
+
+        def fake_which(name):
+            return "/usr/sbin/iptables" if name == "iptables" else None
+
+        def fake_run(command, *args, **kwargs):
+            commands.append(command)
+            return (0, output) if command[-2:] == ["-S", "INPUT"] else (0, "ok")
+
+        with patch.object(tram_agent.shutil, "which", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
+            code, _ = tram_agent.reorder_iptables_rule({"rule": rules[1], "before": rules[0]})
+        self.assertEqual(code, 0)
+        self.assertEqual(commands[1][:8], ["/usr/sbin/iptables", "-w", "-t", "filter", "-I", "INPUT", "1", "-p"])
+        self.assertEqual(commands[2], ["/usr/sbin/iptables", "-w", "-t", "filter", "-D", "INPUT", "3"])
 
     def test_firewall_object_names_cannot_inject_commands(self):
         with patch.object(tram_agent.shutil, "which", return_value="/usr/sbin/nft"):

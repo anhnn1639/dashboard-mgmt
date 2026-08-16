@@ -578,6 +578,9 @@ def parse_nft_rules(output: str) -> list[dict[str, Any]]:
     return rules
 
 
+IPTABLES_TABLES = ("filter", "nat", "mangle", "raw", "security")
+
+
 def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
     table = "filter"
     indexes: dict[tuple[str, str], int] = {}
@@ -603,6 +606,7 @@ def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
         index = indexes[key]
         target = option("-j", "unknown")
         comment = option("--comment", "")
+        docker_managed = (chain.upper().startswith("DOCKER") and chain.upper() != "DOCKER-USER") or target.upper().startswith("DOCKER")
         rules.append({
             "id": f"{family}:{table}:{chain}:{index}",
             "backend": "iptables",
@@ -617,12 +621,35 @@ def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
             "destination": option("-d"),
             "profile": family,
             "raw": line,
-            "removable": True,
-            "reorderable": True,
+            "removable": not docker_managed,
+            "reorderable": not docker_managed,
+            "managedBy": "docker" if docker_managed else "",
             "orderGroup": f"iptables:{family}:{table}:{chain}",
             "spec": {"family": family, "table": table, "chain": chain, "index": index},
         })
     return rules
+
+
+def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]]]:
+    save_name = "ip6tables-save" if family == "ipv6" else "iptables-save"
+    command_name = "ip6tables" if family == "ipv6" else "iptables"
+    save_binary = shutil.which(save_name)
+    if save_binary:
+        code, output = run([save_binary], output_limit=5_000_000)
+        if code == 0:
+            return True, parse_iptables_rules(output, family)
+    command_binary = shutil.which(command_name)
+    if not command_binary:
+        return False, []
+    rules: list[dict[str, Any]] = []
+    scanned = False
+    for table in IPTABLES_TABLES:
+        code, output = run([command_binary, "-w", "-t", table, "-S"], output_limit=5_000_000)
+        if code != 0:
+            continue
+        scanned = True
+        rules.extend(parse_iptables_rules(f"*{table}\n{output}\nCOMMIT", family))
+    return scanned, rules
 
 
 def windows_firewall_rules() -> tuple[int, str]:
@@ -653,12 +680,11 @@ def linux_firewall_rules() -> tuple[int, str]:
             return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     rules: list[dict[str, Any]] = []
     families: list[str] = []
-    for binary, family in ((shutil.which("iptables-save"), "ipv4"), (shutil.which("ip6tables-save"), "ipv6")):
-        if binary:
-            code, output = run([binary], output_limit=5_000_000)
-            if code == 0:
-                rules.extend(parse_iptables_rules(output, family))
-                families.append(family)
+    for family in ("ipv4", "ipv6"):
+        scanned, family_rules = scan_iptables_family(family)
+        if scanned:
+            rules.extend(family_rules)
+            families.append(family)
     if families:
         return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     return 0, json.dumps({"backend": "", "backends": [], "rules": [], "warning": "No active or supported firewall backend found (firewalld, UFW, nftables, iptables)"}, separators=(",", ":"))
@@ -785,8 +811,16 @@ def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any])
     elif backend == "iptables":
         ordered = sorted(rules, key=lambda rule: (str(rule.get("spec", {}).get("family", "")), str(rule.get("spec", {}).get("table", "")), str(rule.get("spec", {}).get("chain", "")), -int(rule.get("spec", {}).get("index", 0))))
         for rule in ordered:
-            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); index = int(spec.get("index", 0)); binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
-            if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or index < 1: raise ValueError("Invalid iptables rule")
+            spec = rule.get("spec", {}); family = str(spec.get("family", "")); table = str(spec.get("table", "")); chain = str(spec.get("chain", "")); index = int(spec.get("index", 0)); raw = str(rule.get("raw", "")); binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+            if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain) or index < 1 or not raw: raise ValueError("Invalid iptables rule")
+            code, output = run([binary, "-w", "-t", table, "-S", chain], output_limit=5_000_000)
+            if code:
+                return code, output
+            current = next((item for item in parse_iptables_rules(f"*{table}\n{output}\nCOMMIT", family) if item["id"] == str(rule.get("id")) and item["raw"] == raw), None)
+            if not current:
+                raise ValueError("Firewall rules changed after the scan; scan again before deleting")
+            if not current.get("removable"):
+                raise ValueError("Docker-managed firewall rules cannot be deleted")
             commands.append([binary, "-t", table, "-D", chain, str(index)])
     else:
         raise ValueError("Unsupported firewall backend")
@@ -872,7 +906,43 @@ def reorder_iptables_rule(parameters: dict[str, Any]) -> tuple[int, str]:
     save_binary = shutil.which("ip6tables-save" if family == "ipv6" else "iptables-save")
     restore_binary = shutil.which("ip6tables-restore" if family == "ipv6" else "iptables-restore")
     if not save_binary or not restore_binary:
-        return 1, "iptables save/restore tools are not installed"
+        command_binary = shutil.which("ip6tables" if family == "ipv6" else "iptables")
+        if not command_binary:
+            return 1, "iptables tools are not installed"
+        code, output = run([command_binary, "-w", "-t", table, "-S", chain], output_limit=5_000_000)
+        if code:
+            return code, output
+        current_rules = parse_iptables_rules(f"*{table}\n{output}\nCOMMIT", family)
+
+        def current_match(candidate: dict[str, Any]) -> dict[str, Any]:
+            match = next((rule for rule in current_rules if rule["id"] == str(candidate.get("id")) and rule["raw"] == str(candidate.get("raw"))), None)
+            if not match:
+                raise ValueError("Firewall rules changed after the scan; scan again before reordering")
+            if not match.get("reorderable"):
+                raise ValueError("Docker-managed firewall rules cannot be reordered")
+            return match
+
+        source = current_match(requested)
+        target = current_match(before) if before else None
+        target_index = int(target["spec"]["index"]) if target else len(current_rules) + 1
+        if source_index == target_index or target_index == source_index + 1:
+            return 0, "Firewall rule is already in the requested position"
+        try:
+            source_tokens = shlex.split(str(source["raw"]))
+        except ValueError as exc:
+            raise ValueError("Invalid iptables source rule") from exc
+        if len(source_tokens) < 3 or source_tokens[:2] != ["-A", chain]:
+            raise ValueError("Invalid iptables source rule")
+        insert_code, insert_output = run([command_binary, "-w", "-t", table, "-I", chain, str(target_index), *source_tokens[2:]])
+        if insert_code:
+            return insert_code, insert_output
+        original_index = source_index + 1 if target_index <= source_index else source_index
+        delete_code, delete_output = run([command_binary, "-w", "-t", table, "-D", chain, str(original_index)])
+        if delete_code:
+            rollback_code, rollback_output = run([command_binary, "-w", "-t", table, "-D", chain, str(target_index)])
+            rollback = "rollback succeeded" if rollback_code == 0 else f"ROLLBACK FAILED: {rollback_output}"
+            return delete_code, f"Could not remove the original iptables rule; {rollback}. {delete_output}"
+        return 0, f"Moved {family} {table}/{chain} rule #{source_index} before position {target_index}"
     code, output = run([save_binary], output_limit=5_000_000)
     if code:
         return code, output
