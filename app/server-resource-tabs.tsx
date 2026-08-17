@@ -145,13 +145,42 @@ function objectArray(value: unknown): Record<string, unknown>[] {
 }
 
 function stringArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(String).filter(Boolean);
-  return value === undefined || value === null || value === "" ? [] : [String(value)];
+  const scalar = (item: unknown) =>
+    typeof item === "string" || typeof item === "number" || typeof item === "boolean"
+      ? String(item)
+      : "";
+  if (Array.isArray(value)) return value.map(scalar).filter(Boolean);
+  const item = scalar(value);
+  return item ? [item] : [];
+}
+
+function storageText(value: unknown): string | undefined {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+    ? String(value)
+    : undefined;
 }
 
 function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
   return {
-    ...value,
+    id: storageText(value.id),
+    name: storageText(value.name),
+    path: storageText(value.path),
+    type: storageText(value.type),
+    filesystem: storageText(value.filesystem),
+    label: storageText(value.label),
+    driveLetter: storageText(value.driveLetter),
+    model: storageText(value.model),
+    serial: storageText(value.serial),
+    partitionTable: storageText(value.partitionTable),
+    sizeBytes: bytes(value.sizeBytes),
+    freeBytes: bytes(value.freeBytes),
+    extendableBytes: bytes(value.extendableBytes),
+    unallocatedBytes: bytes(value.unallocatedBytes),
+    partitionNumber: Number(value.partitionNumber) || undefined,
+    diskNumber: Number(value.diskNumber) || undefined,
+    number: Number(value.number) || 0,
+    protected: value.protected === true,
+    readOnly: value.readOnly === true,
     mountpoints: stringArray(value.mountpoints),
     children: objectArray(value.children).map(normalizeStorageNode),
     partitions: objectArray(value.partitions).map(normalizeStorageNode),
@@ -605,6 +634,7 @@ export type UpdateRow = { id: string; revision?: number; name: string; version?:
 export function UpdatesResourceTab({ output, job, serverName, busy, refresh, queue }: { output?: string; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
   const payload = useMemo(() => parseObject(output), [output]);
   const rows = objectArray(payload.updates) as UpdateRow[];
+  const diagnostics = payload.diagnostics && typeof payload.diagnostics === "object" ? payload.diagnostics as Record<string, unknown> : null;
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   async function install() {
@@ -612,7 +642,7 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  return <section className="resource-tab"><div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div><PendingState job={job} /><div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">Không có update đang chờ hoặc chưa quét dữ liệu.</div>}</div></section>;
+  return <section className="resource-tab"><div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div><PendingState job={job} /><div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">Không có update đang chờ hoặc chưa quét dữ liệu.</div>}</div>{diagnostics && <div className="resource-help">Windows Update API: {String(diagnostics.wuaCount ?? 0)} · Configuration Manager: {String(diagnostics.configMgrCount ?? 0)}{diagnostics.wuaError ? ` · WUA lỗi: ${String(diagnostics.wuaError)}` : ""}{diagnostics.configMgrError ? ` · ConfigMgr: ${String(diagnostics.configMgrError)}` : ""}</div>}</section>;
 }
 
 export type LogRow = { timestamp?: string; source: string; severity?: "error" | "warning" | "info"; message: string; id?: number; provider?: string };

@@ -38,7 +38,7 @@ from ldap3 import ALL, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, select, text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, select, text, update
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -278,6 +278,22 @@ class RemoteSession(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class RecordingDeletionRequest(Base):
+    __tablename__ = "recording_deletion_requests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    requested_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    requested_by_username: Mapped[str] = mapped_column(String(80))
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    approved_by_username: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class FileTransfer(Base):
     __tablename__ = "file_transfers"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -432,6 +448,11 @@ class SessionLaunchRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
     width: int = Field(default=1440, ge=800, le=7680)
     height: int = Field(default=900, ge=600, le=4320)
+
+
+class RecordingDeletionCreateRequest(BaseModel):
+    session_ids: list[str] = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=5, max_length=1000)
 
 
 class DatabaseSetupRequest(BaseModel):
@@ -2036,31 +2057,125 @@ def list_audit(_: User = Depends(require_role("admin", "auditor")), db: Session 
 @app.get("/api/v1/sessions")
 def list_sessions(_: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
     rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
-    available = available_recording_ids()
-    return {"items": [{"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": item.id in available, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None} for item, server_name in rows]}
+    items = []
+    for item, server_name in rows:
+        path = recording_file(item.id)
+        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
+    return {"items": items}
 
 
-def available_recording_ids() -> set[str]:
+def recording_files(session_id: str, include_typescript: bool = False) -> list[Path]:
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", session_id):
+        return []
     root = Path(settings.recording_root).resolve()
+    if not root.is_dir():
+        return []
     try:
-        return {candidate.name[:36] for candidate in root.iterdir() if candidate.is_file() and len(candidate.name) > 37 and candidate.name[36] == "-" and not candidate.name.endswith(".typescript")}
+        candidates = list(root.iterdir())
     except OSError:
-        return set()
+        return []
+    matches: list[Path] = []
+    for candidate in candidates:
+        name = candidate.name
+        if not (name == session_id or (name.startswith(session_id) and len(name) > len(session_id) and name[len(session_id)] in "-._")):
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        if not include_typescript and resolved.name.endswith(".typescript"):
+            continue
+        matches.append(resolved)
+    return sorted(matches, key=lambda item: item.stat().st_mtime, reverse=True)
 
 
 def recording_file(session_id: str) -> Path | None:
-    root = Path(settings.recording_root).resolve()
-    if not root.is_dir():
-        return None
+    candidates = recording_files(session_id)
+    return candidates[0] if candidates else None
+
+
+def recording_deletion_json(item: RecordingDeletionRequest, db: Session) -> dict[str, Any]:
+    sessions = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).where(RemoteSession.id.in_(item.session_ids))).all()
+    labels = {session.id: f"{server_name} · {session.protocol.upper()} · {aware(session.started_at).isoformat()}" for session, server_name in sessions}
+    return {
+        "id": item.id,
+        "sessionIds": item.session_ids,
+        "sessions": [{"id": session_id, "label": labels.get(session_id, session_id)} for session_id in item.session_ids],
+        "reason": item.reason,
+        "status": item.status,
+        "requestedBy": item.requested_by,
+        "requestedByUsername": item.requested_by_username,
+        "approvedBy": item.approved_by,
+        "approvedByUsername": item.approved_by_username,
+        "createdAt": aware(item.created_at).isoformat(),
+        "approvedAt": aware(item.approved_at).isoformat() if item.approved_at else None,
+        "completedAt": aware(item.completed_at).isoformat() if item.completed_at else None,
+        "error": item.error,
+    }
+
+
+@app.get("/api/v1/recording-deletion-requests")
+def list_recording_deletion_requests(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    rows = db.execute(select(RecordingDeletionRequest).order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
+    return {"items": [recording_deletion_json(item, db) for item in rows]}
+
+
+@app.post("/api/v1/recording-deletion-requests", status_code=201)
+def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    session_ids = list(dict.fromkeys(payload.session_ids))
+    if len(session_ids) != len(payload.session_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", item) for item in session_ids):
+        raise HTTPException(status_code=400, detail="Danh sách recording không hợp lệ hoặc bị trùng")
+    sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(session_ids))).scalars().all()
+    if len(sessions) != len(session_ids):
+        raise HTTPException(status_code=404, detail="Có session không còn tồn tại")
+    unavailable = [item.id for item in sessions if recording_file(item.id) is None]
+    if unavailable:
+        raise HTTPException(status_code=409, detail="Có recording chưa sẵn sàng; hãy tải lại danh sách")
+    pending = db.execute(select(RecordingDeletionRequest).where(RecordingDeletionRequest.status.in_(["pending", "deleting"]))).scalars().all()
+    if any(set(item.session_ids).intersection(session_ids) for item in pending):
+        raise HTTPException(status_code=409, detail="Một recording đã nằm trong yêu cầu xóa đang chờ duyệt")
+    deletion = RecordingDeletionRequest(session_ids=session_ids, reason=payload.reason.strip(), requested_by=user.id, requested_by_username=user.username)
+    db.add(deletion)
+    db.flush()
+    audit(db, user.username, "session.recording.delete.request", deletion.id, request, detail={"session_ids": session_ids, "count": len(session_ids)})
+    db.commit()
+    return recording_deletion_json(deletion, db)
+
+
+@app.post("/api/v1/recording-deletion-requests/{deletion_id}/approve")
+def approve_recording_deletion_request(deletion_id: str, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+    deletion = db.get(RecordingDeletionRequest, deletion_id)
+    if not deletion:
+        raise HTTPException(status_code=404, detail="Yêu cầu xóa recording không tồn tại")
+    if deletion.requested_by == user.id:
+        raise HTTPException(status_code=409, detail="Người tạo yêu cầu không được tự duyệt; cần quản trị viên thứ hai")
+    claimed_at = now()
+    result = db.execute(update(RecordingDeletionRequest).where(RecordingDeletionRequest.id == deletion_id, RecordingDeletionRequest.status == "pending").values(status="deleting", approved_by=user.id, approved_by_username=user.username, approved_at=claimed_at))
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Yêu cầu này không còn ở trạng thái chờ duyệt")
+    db.commit()
+    deletion = db.get(RecordingDeletionRequest, deletion_id)
+    deleted_files: list[str] = []
     try:
-        candidates = sorted(root.glob(f"{session_id}-*"), key=lambda item: item.stat().st_mtime, reverse=True)
-    except OSError:
-        return None
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.parent == root and resolved.is_file() and not resolved.name.endswith(".typescript"):
-            return resolved
-    return None
+        for session_id in deletion.session_ids:
+            for path in recording_files(session_id, include_typescript=True):
+                path.unlink()
+                deleted_files.append(path.name)
+        deletion.status = "deleted"
+        deletion.completed_at = now()
+        audit(db, user.username, "session.recording.delete.approve", deletion.id, request, detail={"requested_by": deletion.requested_by_username, "session_ids": deletion.session_ids, "files_deleted": len(deleted_files)})
+        db.commit()
+    except OSError as exc:
+        deletion.status = "failed"
+        deletion.error = str(exc)[:2000]
+        deletion.completed_at = now()
+        audit(db, user.username, "session.recording.delete.approve", deletion.id, request, result="failed", detail={"files_deleted": len(deleted_files), "error": deletion.error})
+        db.commit()
+        raise HTTPException(status_code=500, detail="Không thể xóa toàn bộ recording; xem nhật ký kiểm toán") from exc
+    return recording_deletion_json(deletion, db)
 
 
 @app.get("/api/v1/sessions/{session_id}/recording")

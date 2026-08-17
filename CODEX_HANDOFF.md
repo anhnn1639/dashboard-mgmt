@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn và MSI bundle mới nhất: `0.7.1`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn mới nhất: `0.7.2`; MSI bundle trong repository vẫn là `0.7.1` cho tới khi GitHub Actions build xong artifact 0.7.2. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -33,6 +33,8 @@
 - Ảnh test thực tế xác nhận `firewall.rule.add` đã tới Agent 0.6.5 nhưng nftables báo syntax error tại comment `TramOps - SSH ALLOW`: nft CLI ghép argv thành grammar nên comment có khoảng trắng phải mang dấu nháy literal. Agent 0.6.6 dùng JSON-compatible quoted/escaped string cho nft comment, vẫn gọi subprocess bằng argv và không qua shell; unit test bao phủ khoảng trắng, dấu nháy và backslash. API tiếp tục trả `exitCode`/`output` theo RBAC và UI hiển thị nguyên văn lỗi có vùng cuộn.
 - Agent/dashboard 0.7.0 thay toàn bộ form thao tác chung ở các tab tài nguyên. **Disk** hiển thị cây Disk → partition → filesystem/LVM, dung lượng thực/unallocated/free/extendable; Windows dùng Storage cmdlet, Ubuntu dùng apt/systemd/parted/LVM, Red Hat và Oracle Linux dùng dnf/yum/systemd/parted/LVM. Modal tạo/extend/xóa chỉ nhận target/capacity Agent vừa quét, nằm trong viewport và cuộn nội bộ trên màn hình nhỏ. Boot/system/root bị khóa; layout được đối chiếu lại ngay trước thao tác; volume dữ liệu đang mount chỉ xóa sau khi unmount thành công và dòng UUID tương ứng được dọn khỏi fstab sau khi xóa thành công.
 - Agent/dashboard 0.7.1 sửa hai lỗi Windows thực tế: Windows Update API duyệt `IUpdateCollection` bằng `Item(index)` và dùng tiêu chí `IsInstalled=0`, nên lấy cả update/driver đang chờ giống Windows Settings; tab Disk chuẩn hóa object/array đệ quy trước khi render, nên payload chỉ có một partition/volume không còn làm client crash khi mở cây.
+- Agent/dashboard 0.7.2 xử lý dữ liệu Windows thực tế còn lại: Disk chỉ đưa scalar đã chuẩn hóa vào React nên object CIM/PowerShell không thể làm sập route khi bung partition; Windows Update quét đồng thời WUA và `root\ccm\ClientSDK/CCM_SoftwareUpdate`, hiển thị chẩn đoán từng nguồn và cài update ConfigMgr bằng `CCM_SoftwareUpdatesManager.InstallUpdates`. Firewall có tìm kiếm theo tên/ID/IP/cổng/profile/zone và lọc action, hướng, trạng thái, backend; chọn tất cả chỉ tác động các rule đang hiển thị.
+- Recording được dò theo UUID với hậu tố `-`, `.`, `_` hoặc file UUID trực tiếp, không còn khóa cứng vào một mẫu tên. API mount recording read-write nhưng chỉ xóa qua yêu cầu PostgreSQL: admin tạo yêu cầu không được tự duyệt, admin thứ hai claim yêu cầu rồi mới xóa cả graphical recording và typescript; toàn bộ request/approve/failure được audit. `recording-init` dùng directory mode `2770` để shared GID của API có thể thực thi xóa đã duyệt. File vốn chưa từng được guacd tạo ở phiên cũ không thể khôi phục và UI sẽ ghi rõ `Không tìm thấy file` thay vì chờ vô hạn.
 - Tab **Services** chỉ liệt kê tên, trạng thái, start cùng OS và Start/Stop/Restart; có filter running/stopped/other. **Tài khoản** có Users/Groups, multi-select, tạo/xóa, đổi password/expiry/group/quyền sudo-wheel-Administrators; hiển thị mọi local user/group nhưng khóa built-in theo UID/GID/SID. **Tiến trình** chỉ hiển thị tên và đối chiếu PID/name/create-time trước khi kill. **Cập nhật** chỉ cài đúng các gói/version được chọn, không còn action update-all. **Nhật ký** lấy tối đa 500 dòng, cấu hình nguồn bền vững trong PostgreSQL, chỉ cho file thật dưới `/var/log` hoặc Windows Event Log đang bật và tô cả dòng error/warning.
 - Sau mọi mutation Services/Users/Groups/Disk/Process/Updates, API tự tạo job quét lại tương ứng giống Firewall; dashboard polling hiển thị dữ liệu thật mới nhất. Các thao tác vẫn chạy trực tiếp không qua phê duyệt, nhưng giữ MFA, RBAC, allowlist, live stale-target guard và audit PostgreSQL.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
@@ -151,7 +153,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.7.1 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đang cài agent thủ công cập nhật 0.7.2 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -203,7 +205,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.1`, Linux available và Windows MSI 0.7.1 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.2`, Linux available và Windows MSI 0.7.2 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -214,7 +216,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.1`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.2`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -236,13 +238,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `25/25`, gồm job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, endpoint approve đã gỡ, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `39/39`, gồm storage free-region parser, selected-only apt/dnf version pin, stale update guard, protected process, source log allowlist, account built-in membership, severity word matching; cùng toàn bộ quoted nft comment, firewall capabilities/order/reorder/rollback/stale guard, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
+- Control plane `27/27`, gồm job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, endpoint job approve đã gỡ, recording delete bắt buộc admin thứ hai khác requester, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Agent security `41/41`, gồm WUA + Configuration Manager scan/install, storage free-region parser, selected-only apt/dnf version pin, stale update guard, protected process, source log allowlist, account built-in membership, severity word matching; cùng toàn bộ quoted nft comment, firewall capabilities/order/reorder/rollback/stale guard, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
-- Render test workspace `4/4` pass, gồm shell, Windows/Linux fleet, modal resource nằm trong viewport/cuộn nội bộ và form firewall theo capabilities.
+- Render test workspace `6/6` pass, gồm shell, Windows/Linux fleet, modal resource nằm trong viewport/cuộn nội bộ, form firewall theo capabilities, tìm kiếm/filter rule và UI recording delete hai quản trị viên.
 - Kiểm tra browser local bằng dữ liệu mẫu pass: cây Disk mở đúng cấp; modal hiển thị footer ở desktop và cuộn nội bộ tại `390x700`; Services/Users giữ bố cục; log tô toàn dòng error đỏ và warning vàng. Route dữ liệu mẫu và dev server đã gỡ/dừng trước commit.
 - Render trực quan modal thêm firewall pass trên Windows profile, Ubuntu/UFW, Oracle Linux/firewalld zone và Red Hat/iptables INPUT/OUTPUT. DOM đo ở 1024x600 và 390x700 xác nhận modal nằm trọn viewport, không có tràn ngang, body có thanh cuộn riêng và footer luôn hiển thị.
 - Python `py_compile` pass.

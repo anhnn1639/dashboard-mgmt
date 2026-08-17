@@ -74,3 +74,22 @@ test("firewall add form uses server capabilities and a viewport-safe scroll regi
   assert.match(styles, /\.add-firewall-modal\s*{[^}]*max-height:\s*calc\(100% - 32px\)/s);
   assert.match(styles, /\.firewall-add-scroll\s*{[^}]*overflow-y:\s*auto/s);
 });
+
+test("firewall rules are searchable and filterable", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /aria-label="Tìm firewall rule"/);
+  assert.match(source, /firewallActionFilter/);
+  assert.match(source, /firewallDirectionFilter/);
+  assert.match(source, /firewallStateFilter/);
+  assert.match(source, /firewallBackendFilter/);
+  assert.match(source, /filteredFirewallRules\.map/);
+});
+
+test("recording deletion requires a distinct second administrator", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /recording-deletion-requests/);
+  assert.match(source, /Người tạo yêu cầu không được tự duyệt/);
+  assert.match(source, /Chờ quản trị viên khác/);
+  assert.match(source, /Gửi yêu cầu xóa/);
+  assert.match(source, /selectedRecordingIds/);
+});

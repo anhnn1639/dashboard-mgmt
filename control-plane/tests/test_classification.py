@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, recording_file, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -520,6 +520,43 @@ class ClassificationTests(unittest.TestCase):
             self.assertTrue(any(item["id"] == uploaded.json()["id"] for item in listed.json()["items"]))
             jobs = client.get("/api/v1/jobs", headers=headers).json()["items"]
             self.assertTrue(any(item["id"] == uploaded.json()["jobId"] and item["action"] == "file.deliver" for item in jobs))
+
+    def test_recording_delete_requires_a_distinct_second_admin(self):
+        original_root = settings.recording_root
+        recording_root = Path(tmp.name) / f"recordings-{uuid.uuid4()}"
+        recording_root.mkdir()
+        settings.recording_root = str(recording_root)
+        server_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        with SessionLocal() as db:
+            requester = User(username=f"recording-requester-{uuid.uuid4()}", password_hash="!", display_name="Requester", role="admin")
+            approver = User(username=f"recording-approver-{uuid.uuid4()}", password_hash="!", display_name="Approver", role="admin")
+            db.add_all([requester, approver, Server(id=server_id, name="recording-test", os_family="linux", os_name="Ubuntu"), RemoteSession(id=session_id, server_id=server_id, protocol="ssh", remote_username="root", created_by=requester.username, status="closed", recording_name=f"{session_id}-${{GUAC_USERNAME}}")])
+            db.commit()
+            requester_token = issue_jwt(requester)
+            approver_token = issue_jwt(approver)
+        recording = recording_root / f"{session_id}.guac"
+        typescript = recording_root / f"{session_id}.typescript"
+        recording.write_bytes(b"guacamole-recording")
+        typescript.write_bytes(b"terminal-text")
+        try:
+            self.assertEqual(recording_file(session_id), recording.resolve())
+            with TestClient(app) as client:
+                created = client.post("/api/v1/recording-deletion-requests", headers={"Authorization": f"Bearer {requester_token}"}, json={"session_ids": [session_id], "reason": "CHG-4242 retention cleanup"})
+                self.assertEqual(created.status_code, 201, created.text)
+                deletion_id = created.json()["id"]
+                self_approval = client.post(f"/api/v1/recording-deletion-requests/{deletion_id}/approve", headers={"Authorization": f"Bearer {requester_token}"})
+                self.assertEqual(self_approval.status_code, 409, self_approval.text)
+                self.assertTrue(recording.exists())
+                approved = client.post(f"/api/v1/recording-deletion-requests/{deletion_id}/approve", headers={"Authorization": f"Bearer {approver_token}"})
+                self.assertEqual(approved.status_code, 200, approved.text)
+                self.assertEqual(approved.json()["status"], "deleted")
+                self.assertFalse(recording.exists())
+                self.assertFalse(typescript.exists())
+            with SessionLocal() as db:
+                self.assertEqual(db.get(RecordingDeletionRequest, deletion_id).status, "deleted")
+        finally:
+            settings.recording_root = original_root
 
 
 if __name__ == "__main__":

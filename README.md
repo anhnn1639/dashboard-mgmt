@@ -199,6 +199,8 @@ Máy sẽ tự xuất hiện trong **Máy chủ Windows**. RDP phải được b
 5. `guacd` ghi native graphical recording vào `RECORDING_DIR`; SSH ghi thêm typescript.
 6. Vào **Nhật ký kiểm toán → Video ghi session → Xem lại** để phát trực tiếp recording gốc trong trình duyệt.
 
+Admin có thể chọn một hoặc nhiều recording và tạo yêu cầu xóa. Yêu cầu được lưu trong PostgreSQL; chính admin tạo yêu cầu không được tự duyệt. Chỉ sau khi một admin thứ hai duyệt thì API mới xóa graphical recording và typescript khỏi `RECORDING_DIR`, đồng thời ghi request/approval/kết quả vào audit. Đây là thao tác duy nhất trên dashboard dùng phê duyệt hai quản trị viên; các resource job khác vẫn chạy trực tiếp theo RBAC/MFA/allowlist.
+
 Recording gốc của Guacamole không cần re-encode, giữ nguyên dữ liệu hiển thị ở độ phân giải trình duyệt yêu cầu và thường nhỏ hơn video truyền thống. Object storage retention và legal hold vẫn là hạng mục production tiếp theo. Không bật `ignore-cert` cho RDP; fingerprint certificate RDP do agent thu thập được pin trong Guacamole. SSH host key cũng được pin. Clipboard hai chiều, SFTP và RDP drive/printing đều bị tắt; file chỉ đi qua pipeline đã quét.
 
 Nếu SSH không mở được, không mở inbound `22`. Trên máy Linux đích kiểm tra `systemctl status ssh` (Ubuntu) hoặc `systemctl status sshd` (Oracle Linux), listener `127.0.0.1:22` và log `journalctl -u tram-agent`. Trên control plane kiểm tra `docker compose ... logs api guacamole guacd`; API sẽ phân biệt lỗi Agent/sshd trước khi chuyển trình duyệt sang Guacamole.

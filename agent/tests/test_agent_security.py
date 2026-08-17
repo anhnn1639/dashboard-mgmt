@@ -455,7 +455,21 @@ trusted
         self.assertEqual(code, 0)
         self.assertIn('Search("IsInstalled=0")', scripts[0])
         self.assertIn("$r.Updates.Item($i)", scripts[0])
+        self.assertIn("root\\ccm\\ClientSDK", scripts[0])
+        self.assertIn("CCM_SoftwareUpdate", scripts[0])
         self.assertNotIn("foreach($u in $r.Updates)", scripts[0])
+
+    def test_configmgr_update_install_uses_client_sdk(self):
+        scan = json.dumps({"updates": [
+            {"id": "ccm-update-id", "name": "Managed cumulative update", "version": "KB5012345", "manager": "configmgr"},
+        ]})
+        scripts = []
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"returnValue":0}'))):
+            code, _ = tram_agent.install_updates({"updates": [{"id": "ccm-update-id", "version": "KB5012345"}]}, {"os_family": "windows"})
+        self.assertEqual(code, 0)
+        self.assertIn("CCM_SoftwareUpdatesManager", scripts[0])
+        self.assertIn("InstallUpdates", scripts[0])
+        self.assertIn("ccm-update-id", base64.b64decode(scripts[0].split("FromBase64String('", 1)[1].split("')", 1)[0]).decode())
 
     def test_update_install_rejects_a_stale_package_version(self):
         scan = json.dumps({"updates": [{"id": "openssl", "name": "openssl", "version": "3.0.2-2"}]})

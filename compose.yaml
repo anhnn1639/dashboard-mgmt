@@ -69,13 +69,15 @@ services:
       # The API receives only Caddy's exported public root. It never mounts
       # caddy_data, which also contains the private internal-CA key.
       - agent_server_ca:/run/server-ca:ro
-      - ${RECORDING_DIR:-./recordings}:/recordings:ro
+      # The API reads recordings and removes them only after a second,
+      # distinct administrator approves a PostgreSQL-backed delete request.
+      - ${RECORDING_DIR:-./recordings}:/recordings
       - api_config:/var/lib/tram-ops
     expose: ["8000"]
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
     group_add:
-      # Read-only access to recordings created by guacd (UID/GID 1000).
+      # Shared group access is required for approved recording deletion.
       - "${RECORDING_GID:-1000}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
@@ -142,7 +144,7 @@ services:
       - -c
       - >-
         chown -R 1000:${RECORDING_GID:-1000} /recordings &&
-        find /recordings -type d -exec chmod 2750 {} + &&
+        find /recordings -type d -exec chmod 2770 {} + &&
         find /recordings -type f -exec chmod 0640 {} +
     volumes:
       - ${RECORDING_DIR:-./recordings}:/recordings

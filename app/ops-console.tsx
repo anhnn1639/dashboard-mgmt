@@ -1610,6 +1610,11 @@ function ServerDrawer({
   const [busy, setBusy] = useState(false);
   const [firewallModal, setFirewallModal] = useState<"add" | "delete" | "reorder" | null>(null);
   const [selectedFirewallRules, setSelectedFirewallRules] = useState<string[]>([]);
+  const [firewallSearch, setFirewallSearch] = useState("");
+  const [firewallActionFilter, setFirewallActionFilter] = useState("all");
+  const [firewallDirectionFilter, setFirewallDirectionFilter] = useState("all");
+  const [firewallStateFilter, setFirewallStateFilter] = useState("all");
+  const [firewallBackendFilter, setFirewallBackendFilter] = useState("all");
   const [firewallConfirmation, setFirewallConfirmation] = useState("");
   const [draggedFirewallRule, setDraggedFirewallRule] = useState<string | null>(null);
   const [firewallReorder, setFirewallReorder] = useState<{ rule: FirewallRule; before: FirewallRule | null } | null>(null);
@@ -1712,10 +1717,22 @@ function ServerDrawer({
   );
   const firewallScan = parseFirewallOutput(latestSuccessfulFirewallJob?.output);
   const firewallRules = firewallScan.rules;
+  const filteredFirewallRules = firewallRules.filter((rule) => {
+    const query = firewallSearch.trim().toLocaleLowerCase("vi");
+    const matchesSearch = !query || [
+      rule.name, rule.id, rule.backend, rule.direction, rule.action, rule.protocol,
+      rule.localPort, rule.remotePort, rule.source, rule.destination, rule.profile,
+    ].some((value) => String(value ?? "").toLocaleLowerCase("vi").includes(query));
+    return matchesSearch &&
+      (firewallActionFilter === "all" || String(rule.action ?? "").toLowerCase() === firewallActionFilter) &&
+      (firewallDirectionFilter === "all" || String(rule.direction ?? "").toLowerCase() === firewallDirectionFilter) &&
+      (firewallStateFilter === "all" || (firewallStateFilter === "enabled" ? rule.enabled : !rule.enabled)) &&
+      (firewallBackendFilter === "all" || rule.backend === firewallBackendFilter);
+  });
   const selectedRules = firewallRules.filter((rule) =>
     selectedFirewallRules.includes(firewallRuleKey(rule)),
   );
-  const removableRules = firewallRules.filter((rule) => rule.removable !== false);
+  const removableRules = filteredFirewallRules.filter((rule) => rule.removable !== false);
   async function queueJob(
     nextAction: string,
     parameters: Record<string, unknown>,
@@ -2096,8 +2113,49 @@ function ServerDrawer({
               {activeTab === "firewall" && (
                 <section className="firewall-rule-panel">
                   <div className="firewall-rule-summary">
-                    <span><b>{firewallRules.length}</b> rule · backend <strong>{firewallScan.backend || "chưa xác định"}</strong></span>
+                    <span><b>{filteredFirewallRules.length}</b> / {firewallRules.length} rule · backend <strong>{firewallScan.backend || "chưa xác định"}</strong></span>
                     <span>{selectedRules.length} rule đang chọn</span>
+                  </div>
+                  <div className="firewall-filter-bar" aria-label="Tìm kiếm và lọc firewall rule">
+                    <label className="firewall-search-field">
+                      <span>⌕</span>
+                      <input
+                        type="search"
+                        value={firewallSearch}
+                        onChange={(event) => setFirewallSearch(event.target.value)}
+                        placeholder="Tìm tên, ID, IP, cổng, profile / zone…"
+                        aria-label="Tìm firewall rule"
+                      />
+                    </label>
+                    <select value={firewallActionFilter} onChange={(event) => setFirewallActionFilter(event.target.value)} aria-label="Lọc theo action">
+                      <option value="all">Mọi action</option>
+                      <option value="allow">Allow</option>
+                      <option value="accept">Accept</option>
+                      <option value="block">Block</option>
+                      <option value="deny">Deny</option>
+                      <option value="drop">Drop</option>
+                      <option value="reject">Reject</option>
+                    </select>
+                    <select value={firewallDirectionFilter} onChange={(event) => setFirewallDirectionFilter(event.target.value)} aria-label="Lọc theo hướng">
+                      <option value="all">Mọi hướng</option>
+                      <option value="inbound">Inbound</option>
+                      <option value="outbound">Outbound</option>
+                      <option value="in">In</option>
+                      <option value="out">Out</option>
+                      <option value="forward">Forward</option>
+                    </select>
+                    <select value={firewallStateFilter} onChange={(event) => setFirewallStateFilter(event.target.value)} aria-label="Lọc theo trạng thái">
+                      <option value="all">Mọi trạng thái</option>
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled</option>
+                    </select>
+                    <select value={firewallBackendFilter} onChange={(event) => setFirewallBackendFilter(event.target.value)} aria-label="Lọc theo backend">
+                      <option value="all">Mọi backend</option>
+                      {[...new Set(firewallRules.map((rule) => rule.backend))].map((backend) => <option key={backend} value={backend}>{backend}</option>)}
+                    </select>
+                    {(firewallSearch || firewallActionFilter !== "all" || firewallDirectionFilter !== "all" || firewallStateFilter !== "all" || firewallBackendFilter !== "all") && (
+                      <button type="button" className="button ghost firewall-clear-filter" onClick={() => { setFirewallSearch(""); setFirewallActionFilter("all"); setFirewallDirectionFilter("all"); setFirewallStateFilter("all"); setFirewallBackendFilter("all"); }}>Xóa lọc</button>
+                    )}
                   </div>
                   {mutationNeedsRefresh && latestFirewallMutation && (
                     <div className={`firewall-mutation-status ${latestFirewallMutation.status}`}>
@@ -2131,7 +2189,7 @@ function ServerDrawer({
                         </tr>
                       </thead>
                       <tbody>
-                        {firewallRules.map((rule) => {
+                        {filteredFirewallRules.map((rule) => {
                           const key = firewallRuleKey(rule);
                           return (
                             <tr
@@ -2174,6 +2232,7 @@ function ServerDrawer({
                     {latestReadJob && ["queued", "dispatched"].includes(latestReadJob.status) && <div className="empty-state">Agent đang tải lại danh sách firewall: {latestReadJob.status}</div>}
                     {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><small>Kết quả lúc {new Date(latestReadJob.createdAt).toLocaleString("vi-VN")}. Mở lại tab hoặc bấm “Quét lại” để tạo lần quét mới.</small><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
+                    {latestReadJob?.status === "succeeded" && firewallRules.length > 0 && filteredFirewallRules.length === 0 && <div className="empty-state">Không có rule nào khớp điều kiện tìm kiếm và bộ lọc.</div>}
                     {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning"><b>Agent {server.agentVersion || "chưa rõ phiên bản"}</b><span>{firewallScan.warning}</span></div>}
                   </div>
                   <p className="firewall-note">Rule mới được xếp hàng ngay và chèn đầu chain UFW/nftables/iptables; sau mọi kết quả thêm, xóa hoặc đổi thứ tự, hệ thống tự quét lại danh sách thật từ Agent. Agent vẫn từ chối nếu zone/chain hoặc snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
@@ -2662,7 +2721,23 @@ type SessionRecord = {
   createdBy: string;
   status: string;
   recordingAvailable: boolean;
+  recordingSizeBytes: number;
   startedAt: string;
+  finishedAt?: string | null;
+};
+
+type RecordingDeletionRequest = {
+  id: string;
+  sessionIds: string[];
+  sessions: Array<{ id: string; label: string }>;
+  reason: string;
+  status: "pending" | "deleting" | "deleted" | "failed";
+  requestedBy: string;
+  requestedByUsername: string;
+  approvedBy?: string | null;
+  approvedByUsername?: string;
+  createdAt: string;
+  error?: string;
 };
 
 function RecordingPlayer({
@@ -2792,10 +2867,28 @@ function AuditView({ token }: { token: string }) {
     }>
   >([]);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [deletionRequests, setDeletionRequests] = useState<RecordingDeletionRequest[]>([]);
+  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [tab, setTab] = useState<"events" | "recordings">("events");
   const [selectedRecording, setSelectedRecording] =
     useState<SessionRecord | null>(null);
+  const [selectedRecordingIds, setSelectedRecordingIds] = useState<string[]>([]);
+  const [deleteModal, setDeleteModal] = useState(false);
+  const [deleteReason, setDeleteReason] = useState("");
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [recordingBusy, setRecordingBusy] = useState(false);
+  const [recordingMessage, setRecordingMessage] = useState("");
+  const loadSessions = useCallback(() =>
+    fetch("/api/v1/sessions", { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((data) => setSessions(data.items ?? []))
+      .catch(() => setSessions([])), [token]);
+  const loadDeletionRequests = useCallback(() =>
+    fetch("/api/v1/recording-deletion-requests", { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((data) => setDeletionRequests(data.items ?? []))
+      .catch(() => setDeletionRequests([])), [token]);
   useEffect(() => {
     fetch("/api/v1/audit", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => {
@@ -2804,11 +2897,48 @@ function AuditView({ token }: { token: string }) {
       })
       .then((data) => setRows(data.items ?? []))
       .catch(() => setRows([]));
-    fetch("/api/v1/sessions", { headers: { Authorization: `Bearer ${token}` } })
+    fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
-      .then((data) => setSessions(data.items ?? []))
-      .catch(() => setSessions([]));
-  }, [token]);
+      .then(setCurrentUser)
+      .catch(() => setCurrentUser(null));
+    void loadSessions();
+    void loadDeletionRequests();
+  }, [token, loadSessions, loadDeletionRequests]);
+  const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
+  const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
+  const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
+  function toggleRecording(sessionId: string) {
+    setSelectedRecordingIds((current) => current.includes(sessionId) ? current.filter((item) => item !== sessionId) : [...current, sessionId]);
+  }
+  async function requestRecordingDeletion() {
+    if (deleteConfirmation !== "DELETE" || deleteReason.trim().length < 5 || selectedRecordingIds.length === 0) return;
+    setRecordingBusy(true);
+    setRecordingMessage("");
+    const response = await fetch("/api/v1/recording-deletion-requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ session_ids: selectedRecordingIds, reason: deleteReason }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) {
+      setRecordingMessage("Đã tạo yêu cầu. Video chỉ bị xóa sau khi một quản trị viên khác duyệt.");
+      setSelectedRecordingIds([]);
+      setDeleteModal(false);
+      setDeleteReason("");
+      setDeleteConfirmation("");
+      await loadDeletionRequests();
+    } else setRecordingMessage(data.detail ?? "Không thể tạo yêu cầu xóa recording");
+    setRecordingBusy(false);
+  }
+  async function approveRecordingDeletion(item: RecordingDeletionRequest) {
+    setRecordingBusy(true);
+    setRecordingMessage("");
+    const response = await fetch(`/api/v1/recording-deletion-requests/${item.id}/approve`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+    const data = await response.json().catch(() => ({}));
+    setRecordingMessage(response.ok ? `Đã duyệt và xóa ${item.sessionIds.length} recording.` : data.detail ?? "Không thể duyệt yêu cầu xóa");
+    await Promise.all([loadSessions(), loadDeletionRequests()]);
+    setRecordingBusy(false);
+  }
   return (
     <>
       <section className="panel view-panel">
@@ -2871,10 +3001,31 @@ function AuditView({ token }: { token: string }) {
             )}
           </div>
         ) : (
-          <div className="recording-list audit-recordings">
+          <div className="recording-management">
+            {currentUser?.role === "admin" && (
+              <div className="recording-actions">
+                <label><input type="checkbox" checked={selectableSessions.length > 0 && selectableSessions.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableSessions.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableSessions.map((session) => session.id))} /> Chọn tất cả video khả dụng</label>
+                <span>{selectedRecordingIds.length} video đang chọn</span>
+                <button className="button danger" disabled={selectedRecordingIds.length === 0} onClick={() => setDeleteModal(true)}>Xóa video đã chọn</button>
+              </div>
+            )}
+            {recordingMessage && <div className="recording-message">{recordingMessage}</div>}
+            {currentUser?.role === "admin" && deletionRequests.some((item) => item.status === "pending") && (
+              <div className="recording-approval-list">
+                <h3>Yêu cầu xóa đang chờ quản trị viên thứ hai</h3>
+                {deletionRequests.filter((item) => item.status === "pending").map((item) => (
+                  <div key={item.id}>
+                    <p><b>{item.requestedByUsername}</b><small>{item.sessions.map((session) => session.label).join("\n")}</small><em>{item.reason}</em></p>
+                    <button className="button primary" disabled={recordingBusy || item.requestedBy === currentUser.id} title={item.requestedBy === currentUser.id ? "Người tạo yêu cầu không được tự duyệt" : "Duyệt và xóa video"} onClick={() => void approveRecordingDeletion(item)}>{item.requestedBy === currentUser.id ? "Chờ quản trị viên khác" : "Duyệt & xóa"}</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="recording-list audit-recordings">
             {sessions.length ? (
               sessions.map((session) => (
                 <div key={session.id}>
+                  {currentUser?.role === "admin" ? <input type="checkbox" checked={selectedRecordingIds.includes(session.id)} disabled={!session.recordingAvailable || pendingSessionIds.has(session.id)} aria-label={`Chọn recording ${session.serverName}`} onChange={() => toggleRecording(session.id)} /> : <span />}
                   <span className="play">▶</span>
                   <p>
                     <b>
@@ -2883,6 +3034,7 @@ function AuditView({ token }: { token: string }) {
                     <small>
                       {session.username} · {session.createdBy} ·{" "}
                       {new Date(session.startedAt).toLocaleString("vi-VN")}
+                      {session.recordingAvailable && ` · ${(session.recordingSizeBytes / 1024 / 1024).toFixed(1)} MiB`}
                     </small>
                   </p>
                   <span
@@ -2892,9 +3044,7 @@ function AuditView({ token }: { token: string }) {
                         : "recording-pending"
                     }
                   >
-                    {session.recordingAvailable
-                      ? "● Sẵn sàng"
-                      : "Đang chờ file"}
+                    {pendingSessionIds.has(session.id) ? "Chờ duyệt xóa" : session.recordingAvailable ? "● Sẵn sàng" : session.finishedAt ? "Không tìm thấy file" : "Đang ghi"}
                   </span>
                   <button
                     disabled={!session.recordingAvailable}
@@ -2909,9 +3059,21 @@ function AuditView({ token }: { token: string }) {
                 Chưa có phiên truy cập được ghi lại.
               </div>
             )}
+            </div>
           </div>
         )}
       </section>
+      {deleteModal && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDeleteModal(false); }}>
+          <section className="modal firewall-modal" role="dialog" aria-modal="true" aria-label="Yêu cầu xóa recording">
+            <div className="modal-head"><div><span className="modal-icon danger">−</span><div><h2>Yêu cầu xóa {selectedSessions.length} video</h2><p>Cần một quản trị viên khác duyệt trước khi file bị xóa.</p></div></div><button type="button" onClick={() => setDeleteModal(false)}>×</button></div>
+            <div className="firewall-delete-list">{selectedSessions.map((session) => <div key={session.id}><b>{session.serverName} · {session.protocol.toUpperCase()}</b><span>{session.username} · {new Date(session.startedAt).toLocaleString("vi-VN")}</span></div>)}</div>
+            <label>Lý do / ticket<textarea rows={3} minLength={5} value={deleteReason} onChange={(event) => setDeleteReason(event.target.value)} placeholder="CHG-1234 · Lý do xóa recording" /></label>
+            <label>Gõ DELETE để tạo yêu cầu<input value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoComplete="off" /></label>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setDeleteModal(false)}>Hủy</button><button type="button" className="button danger" disabled={recordingBusy || deleteConfirmation !== "DELETE" || deleteReason.trim().length < 5} onClick={() => void requestRecordingDeletion()}>Gửi yêu cầu xóa</button></div>
+          </section>
+        </div>
+      )}
       {selectedRecording && (
         <RecordingPlayer
           session={selectedRecording}
