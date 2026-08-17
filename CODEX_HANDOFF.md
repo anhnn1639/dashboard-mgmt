@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn mới nhất: `0.7.1`; MSI bundle `0.7.1` sẽ được lấy từ GitHub Actions sau commit nguồn của bản sửa này. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn và MSI bundle mới nhất: `0.7.1`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -55,10 +55,10 @@
 ## MSI artifact
 
 - File: `agent/windows/TramVanHanhAgent.msi`
-- Kích thước: `13,647,872` bytes.
-- Phiên bản MSI: `0.7.0`.
-- SHA-256: `286225870A70586E3C6760869B71300937DC6E97A8A372FAADD40CB0F0C35F4F`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `bb5e88c` trên GitHub Actions run `32012255748`; ProductVersion và SHA-256 đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Kích thước: `13,651,968` bytes.
+- Phiên bản MSI: `0.7.1`.
+- SHA-256: `0C0543CBBF23D046630591633FB1D03C87D8BE4136502615F77DC35EBEBB1DF0`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `c482061` trên GitHub Actions run `32041048044`; ProductVersion `0.7.1` và SHA-256 đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -151,7 +151,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.7.0 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đang cài agent thủ công cập nhật 0.7.1 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -203,7 +203,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.0`, Linux available và Windows MSI 0.7.0 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.1`, Linux available và Windows MSI 0.7.1 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -214,7 +214,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.0`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.1`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -248,7 +248,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions build MSI 0.7.0 run `32012255748` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.0`. Workflow xác nhận trên commit bundle cuối `8196c35` cũng pass ở run `32012560648`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions build MSI 0.7.1 run `32041048044` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.1`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
