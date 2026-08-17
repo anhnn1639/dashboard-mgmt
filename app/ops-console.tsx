@@ -2176,7 +2176,10 @@ function ServerDrawer({
                             ? "Agent đang áp dụng thay đổi"
                             : latestFirewallMutation.status === "succeeded"
                               ? "Đã áp dụng · hệ thống đang tự quét lại danh sách"
-                              : "Thay đổi thất bại · mở Công việc để xem kết quả"}</span>
+                              : "Thay đổi thất bại · chi tiết từ Agent ở bên dưới"}</span>
+                      {latestFirewallMutation.status === "failed" && (
+                        <pre>{latestFirewallMutation.output || "Agent không trả về nội dung lỗi."}</pre>
+                      )}
                     </div>
                   )}
                   <div className="firewall-table-scroll">
@@ -2837,6 +2840,8 @@ function JobsView({ token }: { token: string }) {
       risk: string;
       reason: string;
       createdAt: string;
+      exitCode?: number | null;
+      output?: string;
     }>
   >([]);
   useEffect(() => {
@@ -2889,6 +2894,9 @@ function JobsView({ token }: { token: string }) {
                   {statusLabel(job.status)}
                 </span>
               </div>
+              {job.status === "failed" && (
+                <pre className="job-error-output">Exit code {job.exitCode ?? "?"}{"\n"}{job.output || "Agent không trả về nội dung lỗi."}</pre>
+              )}
             </div>
           ))
         ) : (

@@ -1253,6 +1253,12 @@ def job_json(job: Job, *, include_output: bool = False) -> dict[str, Any]:
     return payload
 
 
+def can_view_job_output(user: User, action: str) -> bool:
+    if action == "file.deliver":
+        return user.role in {"admin", "operator", "auditor"}
+    return user.role in SAFE_ACTIONS.get(action, {}).get("roles", set())
+
+
 @app.get("/api/v1/servers/{server_id}/jobs")
 def list_server_jobs(server_id: str, user: User = Depends(current_user), db: Session = Depends(db_session)):
     if not db.get(Server, server_id):
@@ -1260,7 +1266,7 @@ def list_server_jobs(server_id: str, user: User = Depends(current_user), db: Ses
     jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
     return {
         "items": [
-            job_json(job, include_output=user.role in SAFE_ACTIONS.get(job.action, {}).get("roles", set()))
+            job_json(job, include_output=can_view_job_output(user, job.action))
             for job in jobs
         ]
     }
@@ -1811,9 +1817,9 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
 
 
 @app.get("/api/v1/jobs")
-def list_jobs(_: User = Depends(current_user), db: Session = Depends(db_session)):
+def list_jobs(user: User = Depends(current_user), db: Session = Depends(db_session)):
     jobs = db.execute(select(Job).order_by(Job.created_at.desc()).limit(200)).scalars().all()
-    return {"items": [job_json(job) for job in jobs]}
+    return {"items": [job_json(job, include_output=can_view_job_output(user, job.action)) for job in jobs]}
 
 
 @app.get("/api/v1/audit")

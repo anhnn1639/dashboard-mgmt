@@ -166,6 +166,11 @@ class ClassificationTests(unittest.TestCase):
             failed_result = client.post(failed_path, headers=signed_headers, content=body)
             self.assertEqual(failed_result.status_code, 200, failed_result.text)
             self.assertIsNotNone(failed_result.json()["refresh_job_id"])
+            global_jobs = client.get("/api/v1/jobs", headers=headers)
+            self.assertEqual(global_jobs.status_code, 200, global_jobs.text)
+            listed_failure = next(item for item in global_jobs.json()["items"] if item["id"] == failed_mutation_id)
+            self.assertEqual(listed_failure["exitCode"], 1)
+            self.assertEqual(listed_failure["output"], "not removed")
             with SessionLocal() as db:
                 refreshes = db.query(Job).filter(Job.server_id == agent_id, Job.action == "firewall.list").all()
                 self.assertEqual(len(refreshes), 2)

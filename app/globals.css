@@ -1228,6 +1228,7 @@ textarea:focus-visible {
 }
 .firewall-mutation-status {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -1246,6 +1247,20 @@ textarea:focus-visible {
   border-color: #71343d;
   color: #c98b91;
   background: rgba(211, 70, 82, 0.07);
+}
+.firewall-mutation-status pre {
+  flex-basis: 100%;
+  max-height: 150px;
+  margin: 2px 0 0;
+  padding: 9px 10px;
+  overflow: auto;
+  border: 1px solid rgba(201, 139, 145, 0.22);
+  border-radius: 6px;
+  color: #e3afb4;
+  background: rgba(5, 9, 15, 0.5);
+  font: 9px/1.55 var(--font-mono), monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .firewall-table-scroll {
   overflow: auto;
@@ -1820,6 +1835,20 @@ textarea:focus-visible {
   background: #172841;
   cursor: pointer;
   font-size: 8px;
+}
+.job-error-output {
+  grid-column: 1 / -1;
+  max-height: 180px;
+  margin: -2px 0 2px;
+  padding: 9px 10px;
+  overflow: auto;
+  border: 1px solid rgba(211, 70, 82, 0.22);
+  border-radius: 6px;
+  color: #d99aa0;
+  background: rgba(113, 52, 61, 0.08);
+  font: 9px/1.55 var(--font-mono), monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .audit-integrity {
   font-size: 8px;

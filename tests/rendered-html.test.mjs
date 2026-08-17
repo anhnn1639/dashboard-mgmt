@@ -48,6 +48,9 @@ test("firewall add form uses server capabilities and a viewport-safe scroll regi
   assert.match(source, /hệ thống đang tự quét lại danh sách/);
   assert.match(source, /Thực thi trực tiếp có kiểm soát/);
   assert.match(source, /Đang chờ Agent nhận tác vụ/);
+  assert.match(source, /chi tiết từ Agent ở bên dưới/);
+  assert.match(source, /job-error-output/);
+  assert.match(source, /Exit code/);
   assert.match(source, /autoRefreshForLatestMutation\.status !== "succeeded"/);
   assert.doesNotMatch(source, /\/api\/v1\/jobs\/\$\{jobId\}\/approve/);
   assert.doesNotMatch(source, /Phê duyệt/);
