@@ -164,6 +164,17 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(rules[0]["action"], "accept")
         self.assertTrue(rules[0]["reorderable"])
 
+    def test_nftables_add_targets_only_include_live_filter_input_and_output_hooks(self):
+        output = json.dumps({"nftables": [
+            {"chain": {"family": "inet", "table": "filter", "name": "host_in", "type": "filter", "hook": "input"}},
+            {"chain": {"family": "inet", "table": "filter", "name": "host_out", "type": "filter", "hook": "output"}},
+            {"chain": {"family": "inet", "table": "filter", "name": "forward", "type": "filter", "hook": "forward"}},
+            {"chain": {"family": "ip", "table": "nat", "name": "DOCKER", "type": "nat", "hook": "prerouting"}},
+        ]})
+        targets = tram_agent.parse_nft_filter_targets(output)
+        self.assertEqual([target["chain"] for target in targets], ["host_in", "host_out"])
+        self.assertEqual([target["direction"] for target in targets], ["in", "out"])
+
     def test_nftables_reorder_is_one_json_transaction(self):
         output = '{"nftables":[{"rule":{"family":"inet","table":"filter","chain":"input","handle":17,"expr":[{"drop":null}]}},{"rule":{"family":"inet","table":"filter","chain":"input","handle":21,"comment":"SSH","expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":22}},{"accept":null}]}}]}'
         rules = tram_agent.parse_nft_rules(output)
@@ -208,6 +219,16 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(rules[-1]["localPort"], "443")
         self.assertEqual(rules[-1]["spec"]["zone"], "public")
 
+    def test_firewalld_capabilities_include_empty_zones_from_the_server(self):
+        output = """block
+  services:
+public (active)
+  services: cockpit ssh
+trusted
+  services:
+"""
+        self.assertEqual(tram_agent.parse_firewalld_zones(output), ["block", "public", "trusted"])
+
     def test_iptables_rules_keep_per_chain_line_numbers(self):
         output = "*filter\n-A INPUT -p tcp -s 10.0.0.0/8 --dport 22 -m comment --comment SSH -j ACCEPT\n-A INPUT -p udp --dport 53 -j DROP\nCOMMIT"
         rules = tram_agent.parse_iptables_rules(output, "ipv4")
@@ -235,6 +256,36 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertTrue(payload["rules"][0]["removable"])
         self.assertFalse(payload["rules"][1]["removable"])
         self.assertEqual(payload["rules"][1]["managedBy"], "docker")
+        self.assertEqual(
+            [(target["chain"], target["direction"]) for target in payload["capabilities"]["targets"]],
+            [("INPUT", "in")],
+        )
+
+    def test_iptables_add_rejects_a_chain_that_disappeared_after_scan(self):
+        parameters = {
+            "backend": "iptables", "name": "Web nội bộ", "direction": "in",
+            "action": "allow", "protocol": "tcp", "local_port": 443,
+            "source": "10.0.0.0/8", "destination": "any", "family": "ipv4",
+            "table": "filter", "chain": "MISSING",
+        }
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/iptables"), patch.object(
+            tram_agent, "run", return_value=(0, "-P INPUT ACCEPT\n-P OUTPUT ACCEPT")
+        ):
+            with self.assertRaisesRegex(ValueError, "no longer available"):
+                tram_agent.add_firewall_rule(parameters, {"os_family": "linux"})
+
+    def test_iptables_add_rejects_an_address_from_the_wrong_family(self):
+        parameters = {
+            "backend": "iptables", "name": "Web IPv6", "direction": "in",
+            "action": "allow", "protocol": "tcp", "local_port": 443,
+            "source": "2001:db8::/64", "destination": "any", "family": "ipv4",
+            "table": "filter", "chain": "INPUT",
+        }
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/iptables"), patch.object(
+            tram_agent, "run", return_value=(0, "-P INPUT ACCEPT\n-P OUTPUT ACCEPT")
+        ):
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                tram_agent.add_firewall_rule(parameters, {"os_family": "linux"})
 
     def test_docker_managed_iptables_rule_cannot_be_deleted(self):
         output = "-A FORWARD -j DOCKER-USER"

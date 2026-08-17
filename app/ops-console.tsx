@@ -116,15 +116,34 @@ type FirewallRule = {
   spec: Record<string, unknown>;
 };
 
+type FirewallTarget = {
+  id: string;
+  label: string;
+  family: string;
+  table: string;
+  chain: string;
+  direction: "in" | "out";
+};
+
+type FirewallCapabilities = {
+  profiles: string[];
+  activeProfiles: string[];
+  zones: string[];
+  defaultZone: string;
+  targets: FirewallTarget[];
+};
+
 type FirewallScan = {
   backend: FirewallRule["backend"] | "";
   backends: string[];
+  capabilities: FirewallCapabilities;
   rules: FirewallRule[];
   warning?: string;
 };
 
 function parseFirewallOutput(output: string | undefined): FirewallScan {
-  if (!output) return { backend: "", backends: [], rules: [] };
+  const emptyCapabilities: FirewallCapabilities = { profiles: [], activeProfiles: [], zones: [], defaultZone: "", targets: [] };
+  if (!output) return { backend: "", backends: [], capabilities: emptyCapabilities, rules: [] };
   try {
     const parsed = JSON.parse(output) as Partial<FirewallScan>;
     const rules = Array.isArray(parsed.rules)
@@ -136,19 +155,75 @@ function parseFirewallOutput(output: string | undefined): FirewallScan {
             typeof rule.backend === "string",
         )
       : [];
+    const rawCapabilities = parsed.capabilities && typeof parsed.capabilities === "object"
+      ? parsed.capabilities as Partial<FirewallCapabilities>
+      : {};
+    const targets = Array.isArray(rawCapabilities.targets)
+      ? rawCapabilities.targets.filter(
+          (target): target is FirewallTarget =>
+            Boolean(target) &&
+            typeof target === "object" &&
+            typeof target.id === "string" &&
+            typeof target.label === "string" &&
+            typeof target.family === "string" &&
+            typeof target.table === "string" &&
+            typeof target.chain === "string" &&
+            (target.direction === "in" || target.direction === "out"),
+        )
+      : [];
     return {
       backend: typeof parsed.backend === "string" ? parsed.backend as FirewallScan["backend"] : "",
       backends: Array.isArray(parsed.backends) ? parsed.backends.map(String) : [],
+      capabilities: {
+        profiles: Array.isArray(rawCapabilities.profiles) ? rawCapabilities.profiles.map(String) : [],
+        activeProfiles: Array.isArray(rawCapabilities.activeProfiles) ? rawCapabilities.activeProfiles.map(String) : [],
+        zones: Array.isArray(rawCapabilities.zones) ? rawCapabilities.zones.map(String) : [],
+        defaultZone: typeof rawCapabilities.defaultZone === "string" ? rawCapabilities.defaultZone : "",
+        targets,
+      },
       rules,
       warning: typeof parsed.warning === "string" ? parsed.warning : undefined,
     };
   } catch {
-    return { backend: "", backends: [], rules: [] };
+    return { backend: "", backends: [], capabilities: emptyCapabilities, rules: [] };
   }
 }
 
 function firewallRuleKey(rule: FirewallRule) {
   return `${rule.backend}:${rule.id}`;
+}
+
+function firewallCapabilitiesForForm(scan: FirewallScan): FirewallCapabilities {
+  const profiles = scan.capabilities.profiles.length
+    ? scan.capabilities.profiles
+    : scan.backend === "windows"
+      ? ["Any", "Domain", "Private", "Public"]
+      : [];
+  const zones = scan.capabilities.zones.length
+    ? scan.capabilities.zones
+    : scan.backend === "firewalld"
+      ? Array.from(new Set(scan.rules.map((rule) => rule.profile).filter(Boolean)))
+      : [];
+  const derivedTargets = new Map<string, FirewallTarget>();
+  if (scan.backend === "nftables" || scan.backend === "iptables") {
+    for (const rule of scan.rules) {
+      const family = String(rule.spec.family ?? "");
+      const table = String(rule.spec.table ?? "");
+      const chain = String(rule.spec.chain ?? "");
+      const normalizedChain = chain.toLowerCase();
+      if (!family || table !== "filter" || !["input", "output"].includes(normalizedChain)) continue;
+      const direction = normalizedChain === "input" ? "in" : "out";
+      const id = `${family}:${table}:${chain}`;
+      derivedTargets.set(id, { id, family, table, chain, direction, label: `${family} ${table} → ${chain} (${direction === "in" ? "INPUT" : "OUTPUT"})` });
+    }
+  }
+  return {
+    profiles,
+    activeProfiles: scan.capabilities.activeProfiles,
+    zones,
+    defaultZone: scan.capabilities.defaultZone || zones[0] || "",
+    targets: scan.capabilities.targets.length ? scan.capabilities.targets : Array.from(derivedTargets.values()),
+  };
 }
 
 function MiniBar({
@@ -1780,7 +1855,8 @@ function ServerDrawer({
     const parameters: Record<string, unknown> = {};
     for (const [key, value] of form.entries())
       if (key !== "reason" && value !== "") parameters[key] = value;
-    parameters.local_port = Number(parameters.local_port);
+    if (parameters.local_port && String(parameters.local_port).toLowerCase() !== "any")
+      parameters.local_port = Number(parameters.local_port);
     if (parameters.remote_port && String(parameters.remote_port).toLowerCase() !== "any")
       parameters.remote_port = Number(parameters.remote_port);
     try {
@@ -2392,37 +2468,14 @@ function ServerDrawer({
         </div>
       </section>
       {firewallModal === "add" && (
-        <div className="modal-backdrop">
-          <button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại thêm firewall rule" onClick={closeFirewallModal} />
-          <form className="modal firewall-modal" onSubmit={submitFirewallRule}>
-            <div className="modal-head">
-              <div><span className="modal-icon">+</span><div><h2>Thêm firewall rule</h2><p>{server.name} · {firewallScan.backend || (server.osFamily === "windows" ? "windows" : "đang chờ quét backend")}</p></div></div>
-              <button type="button" aria-label="Đóng" onClick={closeFirewallModal}>×</button>
-            </div>
-            <input type="hidden" name="backend" value={firewallScan.backend || (server.osFamily === "windows" ? "windows" : "")} />
-            <label>Tên rule<input name="name" required minLength={1} maxLength={128} placeholder="VD: Web nội bộ" /></label>
-            <div className="form-grid">
-              <label>Hướng<select name="direction" defaultValue="in"><option value="in">Inbound</option>{firewallScan.backend !== "firewalld" && <option value="out">Outbound</option>}</select></label>
-              <label>Hành động<select name="action" defaultValue="allow"><option value="allow">Allow</option><option value="deny">Deny / Block</option>{firewallScan.backend !== "windows" && <option value="reject">Reject</option>}</select></label>
-            </div>
-            <div className="form-grid">
-              <label>Protocol<select name="protocol" defaultValue="tcp"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label>
-              <label>Local port<input name="local_port" type="number" min="1" max="65535" required placeholder="443" /></label>
-            </div>
-            <div className="form-grid">
-              <label>Remote port<input name="remote_port" defaultValue="any" pattern="any|[0-9]{1,5}" /></label>
-              <label>Nguồn<input name="source" defaultValue="any" placeholder="any hoặc CIDR" /></label>
-            </div>
-            <label>Đích<input name="destination" defaultValue="any" placeholder="any hoặc CIDR" /></label>
-            {firewallScan.backend === "windows" && <label>Windows profile<select name="profile" defaultValue="Any"><option>Any</option><option>Domain</option><option>Private</option><option>Public</option></select></label>}
-            {firewallScan.backend === "firewalld" && <div className="form-grid"><label>Firewalld zone<select name="zone" defaultValue={firewallRules[0]?.profile || "public"}>{Array.from(new Set(firewallRules.map((rule) => rule.profile).filter(Boolean))).map((zone) => <option key={zone}>{zone}</option>)}{firewallRules.length === 0 && <option>public</option>}</select></label><label>IP family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label></div>}
-            {firewallScan.backend === "nftables" && <div className="form-grid"><label>Family<select name="family" defaultValue="inet">{Array.from(new Set(firewallRules.map((rule) => rule.profile).filter(Boolean))).map((family) => <option key={family}>{family}</option>)}<option value="inet">inet</option></select></label><label>Table<input name="table" required defaultValue={String(firewallRules[0]?.spec.table ?? "filter")} /></label><label>Chain<input name="chain" required defaultValue={String(firewallRules[0]?.spec.chain ?? "input")} /></label></div>}
-            {firewallScan.backend === "iptables" && <div className="form-grid"><label>Family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label><label>Table<input name="table" required defaultValue="filter" /></label><label>Chain<input name="chain" required defaultValue="INPUT" /></label></div>}
-            <label>Lý do / ticket<textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Mô tả thay đổi" /></label>
-            <div className="warning-box"><b>Thay đổi có kiểm soát</b><p>Tác vụ chỉ được chạy sau khi một quản trị viên khác phê duyệt và toàn bộ tham số được ghi vào nhật ký kiểm toán.</p></div>
-            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy || !firewallScan.backend}>{busy ? "Đang thêm…" : firewallScan.backend ? "Thêm Rule" : "Đang chờ quét firewall…"}</button></div>
-          </form>
-        </div>
+        <FirewallAddModal
+          key={`${server.id}:${latestFirewallJob?.id ?? "no-scan"}:${latestFirewallJob?.status ?? "pending"}`}
+          server={server}
+          scan={firewallScan}
+          busy={busy}
+          close={closeFirewallModal}
+          submit={submitFirewallRule}
+        />
       )}
       {firewallModal === "delete" && (
         <div className="modal-backdrop">
@@ -2451,6 +2504,242 @@ function ServerDrawer({
         </div>
       )}
     </>
+  );
+}
+
+function FirewallAddModal({
+  server,
+  scan,
+  busy,
+  close,
+  submit,
+}: {
+  server: Server;
+  scan: FirewallScan;
+  busy: boolean;
+  close: () => void;
+  submit: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+}) {
+  const backend = scan.backend || (server.osFamily === "windows" ? "windows" : "");
+  const capabilities = firewallCapabilitiesForForm(scan);
+  const initialTarget = capabilities.targets[0];
+  const [targetId, setTargetId] = useState(initialTarget?.id ?? "");
+  const [direction, setDirection] = useState<"in" | "out">(
+    backend === "firewalld" ? "in" : initialTarget?.direction ?? "in",
+  );
+  const [ruleAction, setRuleAction] = useState("allow");
+  const [protocol, setProtocol] = useState("tcp");
+  const [servicePreset, setServicePreset] = useState("https");
+  const [servicePort, setServicePort] = useState("443");
+  const [remoteMode, setRemoteMode] = useState("any");
+  const [remoteAddress, setRemoteAddress] = useState("");
+  const [family, setFamily] = useState("ipv4");
+  const [profile, setProfile] = useState(
+    capabilities.activeProfiles[0] ?? capabilities.profiles[0] ?? "Any",
+  );
+  const [zone, setZone] = useState(capabilities.defaultZone || capabilities.zones[0] || "");
+  const target = capabilities.targets.find((item) => item.id === targetId) ?? initialTarget;
+  const needsTarget = backend === "nftables" || backend === "iptables";
+  const scopeReady = Boolean(
+    backend &&
+    (backend !== "firewalld" || zone) &&
+    (!needsTarget || target),
+  );
+  const remoteValue = remoteMode === "cidr" ? remoteAddress : "any";
+  const expectedIpVersion = backend === "firewalld"
+    ? family === "ipv6" ? 6 : 4
+    : target?.family === "ip6" || target?.family === "ipv6"
+      ? 6
+      : target?.family === "ip" || target?.family === "ipv4"
+        ? 4
+        : null;
+  const remoteIpVersion = remoteAddress.includes(":") ? 6 : 4;
+  const addressFamilyMismatch = remoteMode === "cidr" && Boolean(remoteAddress) && expectedIpVersion !== null && remoteIpVersion !== expectedIpVersion;
+  const formReady = scopeReady && !addressFamilyMismatch;
+  const windowsOutbound = backend === "windows" && direction === "out";
+  const localPort = windowsOutbound ? "any" : servicePort;
+  const remotePort = windowsOutbound ? servicePort : "any";
+  const source = direction === "in" || backend === "windows" ? remoteValue : "any";
+  const destination = direction === "out" && backend !== "windows" ? remoteValue : "any";
+  const backendDescription = {
+    windows: "Profile được Agent đọc bằng Get-NetFirewallProfile trên đúng Windows Server này.",
+    ufw: "UFW tự ánh xạ Inbound/Outbound sang chain phù hợp; không cần nhập table hoặc chain.",
+    firewalld: "public là zone của firewalld, không phải chain. Danh sách zone bên dưới lấy trực tiếp từ máy chủ.",
+    nftables: "Chỉ base chain loại filter có hook INPUT/OUTPUT lấy từ nftables được phép chọn; chain NAT/DOCKER bị loại.",
+    iptables: "INPUT/OUTPUT là chain. UI chỉ cho chọn chain filter đang tồn tại do Agent báo về.",
+  }[backend] ?? "Đang chờ Agent quét backend firewall và trả metadata từ máy chủ.";
+  const scopeText = !backend
+    ? "Chưa xác định backend"
+    : backend === "windows"
+      ? `Profile ${profile}`
+      : backend === "firewalld"
+        ? `Zone ${zone || "chưa có"} · ${family}`
+        : needsTarget
+          ? target?.label ?? "Chưa có filter chain phù hợp"
+          : "UFW tự chọn chain";
+
+  function selectService(value: string) {
+    setServicePreset(value);
+    const preset: Record<string, [string, string]> = {
+      ssh: ["22", "tcp"],
+      http: ["80", "tcp"],
+      https: ["443", "tcp"],
+      dns: ["53", "udp"],
+      rdp: ["3389", "tcp"],
+    };
+    if (preset[value]) {
+      setServicePort(preset[value][0]);
+      setProtocol(preset[value][1]);
+    }
+  }
+
+  function selectTarget(value: string) {
+    setTargetId(value);
+    const selected = capabilities.targets.find((item) => item.id === value);
+    if (selected) setDirection(selected.direction);
+  }
+
+  return (
+    <div className="modal-backdrop firewall-add-backdrop">
+      <button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại thêm firewall rule" onClick={close} />
+      <form className="modal firewall-modal add-firewall-modal" onSubmit={submit}>
+        <div className="modal-head firewall-add-head">
+          <div><span className="modal-icon">+</span><div><h2>Thêm firewall rule</h2><p>{server.name} · {backend || "đang chờ quét backend"}</p></div></div>
+          <button type="button" aria-label="Đóng" onClick={close}>×</button>
+        </div>
+
+        <div className="firewall-add-scroll">
+          <div className={`firewall-capability-note ${scopeReady ? "ready" : "waiting"}`}>
+            <span>{scopeReady ? "✓ Dữ liệu trực tiếp từ máy chủ" : "! Chưa đủ metadata từ Agent"}</span>
+            <b>{scopeText}</b>
+            <p>{backendDescription}</p>
+          </div>
+
+          <input type="hidden" name="backend" value={backend} />
+          <input type="hidden" name="direction" value={direction} />
+          <input type="hidden" name="action" value={ruleAction} />
+          <input type="hidden" name="protocol" value={protocol} />
+          <input type="hidden" name="local_port" value={localPort} />
+          <input type="hidden" name="remote_port" value={remotePort} />
+          <input type="hidden" name="source" value={source} />
+          <input type="hidden" name="destination" value={destination} />
+          {target && <>
+            <input type="hidden" name="family" value={target.family} />
+            <input type="hidden" name="table" value={target.table} />
+            <input type="hidden" name="chain" value={target.chain} />
+          </>}
+
+          <div className="firewall-add-grid">
+            <label className="wide">
+              Tên dễ nhận biết
+              <input name="name" required minLength={1} maxLength={128} placeholder="VD: HTTPS từ mạng quản trị" />
+              <small>Tên này xuất hiện trong lịch sử tác vụ và comment/display name của firewall.</small>
+            </label>
+
+            {backend === "windows" && <label className="wide">
+              Profile Windows Firewall
+              <select name="profile" value={profile} onChange={(event) => setProfile(event.target.value)} required>
+                {capabilities.profiles.map((item) => <option key={item} value={item}>{item}{capabilities.activeProfiles.includes(item) ? " · đang bật" : ""}</option>)}
+              </select>
+              <small>Danh sách profile do chính Windows Server trả về.</small>
+            </label>}
+
+            {backend === "firewalld" && <>
+              <label>
+                Zone firewalld
+                <select name="zone" value={zone} onChange={(event) => setZone(event.target.value)} required>
+                  {capabilities.zones.map((item) => <option key={item} value={item}>{item}{item === capabilities.defaultZone ? " · mặc định" : ""}</option>)}
+                </select>
+                <small>Ví dụ public là zone; không phải INPUT/chain.</small>
+              </label>
+              <label>
+                IP family
+                <select name="family" value={family} onChange={(event) => setFamily(event.target.value)}>
+                  <option value="ipv4">IPv4</option><option value="ipv6">IPv6</option>
+                </select>
+                <small>CIDR nhập bên dưới phải cùng family.</small>
+              </label>
+            </>}
+
+            {needsTarget && <label className="wide">
+              Filter chain trên máy chủ
+              <select value={targetId} onChange={(event) => selectTarget(event.target.value)} required>
+                {capabilities.targets.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+              </select>
+              <small>Table và chain được lấy từ lần quét hiện tại; không cho nhập tay hoặc chọn NAT/DOCKER.</small>
+            </label>}
+
+            <label>
+              Hướng lưu lượng
+              <select value={direction} onChange={(event) => setDirection(event.target.value as "in" | "out")} disabled={backend === "firewalld" || needsTarget}>
+                <option value="in">Đi vào máy chủ (Inbound)</option>
+                {backend !== "firewalld" && <option value="out">Đi ra ngoài (Outbound)</option>}
+              </select>
+              <small>{needsTarget ? "Hướng được xác định bởi chain đã chọn." : "Chọn chiều kết nối cần kiểm soát."}</small>
+            </label>
+            <label>
+              Hành động
+              <select value={ruleAction} onChange={(event) => setRuleAction(event.target.value)}>
+                <option value="allow">Cho phép (Allow)</option>
+                <option value="deny">Chặn (Deny/Block)</option>
+                {backend !== "windows" && <option value="reject">Từ chối có phản hồi (Reject)</option>}
+              </select>
+              <small>Agent chuyển sang action tương ứng của backend.</small>
+            </label>
+
+            <label>
+              Dịch vụ phổ biến
+              <select value={servicePreset} onChange={(event) => selectService(event.target.value)}>
+                <option value="ssh">SSH · TCP 22</option><option value="http">HTTP · TCP 80</option>
+                <option value="https">HTTPS · TCP 443</option><option value="dns">DNS · UDP 53</option>
+                <option value="rdp">RDP · TCP 3389</option><option value="custom">Tự chọn</option>
+              </select>
+              <small>Preset tự điền cổng và protocol.</small>
+            </label>
+            <div className="firewall-port-grid">
+              <label>
+                {direction === "in" ? "Cổng dịch vụ trên máy chủ" : "Cổng dịch vụ từ xa"}
+                <input type="number" min="1" max="65535" value={servicePort} onChange={(event) => { setServicePort(event.target.value); setServicePreset("custom"); }} required />
+              </label>
+              <label>
+                Protocol
+                <select value={protocol} onChange={(event) => { setProtocol(event.target.value); setServicePreset("custom"); }}><option value="tcp">TCP</option><option value="udp">UDP</option></select>
+              </label>
+            </div>
+
+            <label className="wide">
+              {direction === "in" ? "Nguồn kết nối từ xa" : "Đích kết nối từ xa"}
+              <select value={remoteMode} onChange={(event) => setRemoteMode(event.target.value)}>
+                <option value="any">Mọi địa chỉ (any)</option><option value="cidr">Chỉ một IP/mạng cụ thể</option>
+              </select>
+              <small>{direction === "in" ? "Giới hạn mạng được phép kết nối vào máy chủ." : "Giới hạn mạng đích mà máy chủ được kết nối tới."}</small>
+            </label>
+            {remoteMode === "cidr" && <label className="wide">
+              CIDR IPv4/IPv6
+              <input value={remoteAddress} onChange={(event) => setRemoteAddress(event.target.value)} required placeholder="VD: 10.20.0.0/16 hoặc 2001:db8::/64" />
+              <small className={addressFamilyMismatch ? "field-error" : ""}>{addressFamilyMismatch ? `Địa chỉ này không khớp ${expectedIpVersion === 6 ? "IPv6" : "IPv4"} của zone/chain đã chọn.` : "IP đơn dùng /32 (IPv4) hoặc /128 (IPv6)."}</small>
+            </label>}
+
+            <label className="wide">
+              Lý do / ticket
+              <textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Cho phép HTTPS từ mạng quản trị" />
+            </label>
+          </div>
+
+          <div className="firewall-rule-preview">
+            <span>Rule chuẩn bị gửi phê duyệt</span>
+            <b>{ruleAction.toUpperCase()} {protocol.toUpperCase()} {servicePort || "?"} · {direction === "in" ? "Inbound" : "Outbound"} · {remoteValue || "CIDR chưa nhập"}</b>
+            <small>{scopeText}</small>
+          </div>
+          <div className="warning-box"><b>Thay đổi có kiểm soát</b><p>Tác vụ chỉ chạy sau khi quản trị viên khác phê duyệt. Agent sẽ kiểm tra lại zone/chain vẫn tồn tại trước khi áp dụng.</p></div>
+        </div>
+
+        <div className="modal-actions firewall-add-actions">
+          <button type="button" className="button ghost" onClick={close}>Hủy</button>
+          <button className="button primary" disabled={busy || !formReady}>{busy ? "Đang thêm…" : addressFamilyMismatch ? "CIDR không đúng IP family" : scopeReady ? "Thêm Rule" : "Cần nâng cấp Agent và quét lại"}</button>
+        </div>
+      </form>
+    </div>
   );
 }
 

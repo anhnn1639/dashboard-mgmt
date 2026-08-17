@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings  # noqa: E402
+from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings, validate_firewall_job_parameters  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -89,6 +89,19 @@ class ClassificationTests(unittest.TestCase):
     def test_oracle_linux_is_classified_as_linux(self):
         family, verification = classify_os(Inventory(hostname="ol-01", os_family="linux", os_name="Oracle Linux Server 8.10", distribution_id="ol"))
         self.assertEqual((family, verification), ("linux", "verified"))
+
+    def test_firewall_add_requires_backend_specific_server_scope(self):
+        common = {"name": "HTTPS", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 443}
+        invalid = [
+            {**common, "backend": "firewalld", "family": "ipv4"},
+            {**common, "backend": "nftables", "family": "inet", "table": "nat", "chain": "input"},
+            {**common, "backend": "iptables", "family": "ipv4", "table": "filter"},
+            {**common, "backend": "windows", "profile": "Work"},
+        ]
+        for parameters in invalid:
+            with self.subTest(backend=parameters["backend"]), self.assertRaises(HTTPException) as raised:
+                validate_firewall_job_parameters("firewall.rule.add", parameters)
+            self.assertEqual(raised.exception.status_code, 422)
 
     def test_guacamole_host_key_is_a_known_hosts_entry(self):
         encoded_key = base64.b64encode(b"test-ed25519-host-key-material").decode()

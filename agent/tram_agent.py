@@ -366,13 +366,14 @@ def firewall_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     name = str(parameters.get("name", "")).strip()
     if not 1 <= len(name) <= 128 or any(ord(character) < 32 for character in name):
         raise ValueError("Invalid firewall rule name")
-    local_port = int(parameters.get("local_port", parameters.get("port", 0)))
+    local_port_value = parameters.get("local_port", parameters.get("port", 0))
+    local_port = "any" if str(local_port_value).strip().lower() == "any" else int(local_port_value)
     remote_port_value = parameters.get("remote_port", "any")
     remote_port = "any" if str(remote_port_value).strip().lower() in {"", "any"} else int(remote_port_value)
     protocol = str(parameters.get("protocol", "tcp")).lower()
     rule_action = str(parameters.get("action", "allow")).lower()
     direction = str(parameters.get("direction", "in")).lower()
-    if not 1 <= local_port <= 65535 or (remote_port != "any" and not 1 <= remote_port <= 65535):
+    if (local_port != "any" and not 1 <= local_port <= 65535) or (remote_port != "any" and not 1 <= remote_port <= 65535):
         raise ValueError("Invalid firewall port")
     if protocol not in {"tcp", "udp"} or rule_action not in {"allow", "deny", "reject"} or direction not in {"in", "out"}:
         raise ValueError("Invalid firewall rule")
@@ -554,6 +555,14 @@ def parse_firewalld_rules(output: str) -> list[dict[str, Any]]:
     return rules
 
 
+def parse_firewalld_zones(output: str) -> list[str]:
+    return sorted({
+        line.split()[0]
+        for line in output.splitlines()
+        if line and not line.startswith((" ", "\t")) and FIREWALL_OBJECT_RE.fullmatch(line.split()[0])
+    })
+
+
 def parse_nft_rules(output: str) -> list[dict[str, Any]]:
     try:
         documents = json.loads(output).get("nftables", [])
@@ -588,6 +597,34 @@ def parse_nft_rules(output: str) -> list[dict[str, Any]]:
             "spec": {"family": family, "table": table, "chain": chain, "handle": int(handle), "comment": str(rule.get("comment") or "")},
         })
     return rules
+
+
+def parse_nft_filter_targets(output: str) -> list[dict[str, str]]:
+    try:
+        documents = json.loads(output).get("nftables", [])
+    except (AttributeError, ValueError):
+        return []
+    targets: list[dict[str, str]] = []
+    for document in documents:
+        chain = document.get("chain") if isinstance(document, dict) else None
+        if not isinstance(chain, dict) or chain.get("type") != "filter":
+            continue
+        hook = str(chain.get("hook", "")).lower()
+        if hook not in {"input", "output"}:
+            continue
+        family, table, name = (str(chain.get(key, "")) for key in ("family", "table", "name"))
+        if family not in {"ip", "ip6", "inet"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(name):
+            continue
+        direction = "in" if hook == "input" else "out"
+        targets.append({
+            "id": f"{family}:{table}:{name}",
+            "label": f"{family} {table} → {name} ({hook.upper()})",
+            "family": family,
+            "table": table,
+            "chain": name,
+            "direction": direction,
+        })
+    return targets
 
 
 IPTABLES_TABLES = ("filter", "nat", "mangle", "raw", "security")
@@ -642,7 +679,39 @@ def parse_iptables_rules(output: str, family: str) -> list[dict[str, Any]]:
     return rules
 
 
-def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]], list[str]]:
+def parse_iptables_filter_targets(output: str, family: str) -> list[dict[str, str]]:
+    table = "filter"
+    chains: set[str] = set()
+    for line in output.splitlines():
+        if line.startswith("*"):
+            table = line[1:].strip()
+            continue
+        if table != "filter":
+            continue
+        tokens = line.split()
+        if line.startswith(":"):
+            chain = line[1:].split()[0]
+        elif len(tokens) >= 2 and tokens[0] in {"-P", "-N"}:
+            chain = tokens[1]
+        else:
+            continue
+        if chain in {"INPUT", "OUTPUT"}:
+            chains.add(chain)
+    return [
+        {
+            "id": f"{family}:filter:{chain}",
+            "label": f"{family} filter → {chain}",
+            "family": family,
+            "table": "filter",
+            "chain": chain,
+            "direction": "in" if chain == "INPUT" else "out",
+        }
+        for chain in ("INPUT", "OUTPUT")
+        if chain in chains
+    ]
+
+
+def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]], list[dict[str, str]], list[str]]:
     save_name = "ip6tables-save" if family == "ipv6" else "iptables-save"
     command_name = "ip6tables" if family == "ipv6" else "iptables"
     diagnostics: list[str] = []
@@ -650,13 +719,14 @@ def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]], list[
     if save_binary:
         code, output = run([save_binary], output_limit=5_000_000)
         if code == 0:
-            return True, parse_iptables_rules(output, family), diagnostics
+            return True, parse_iptables_rules(output, family), parse_iptables_filter_targets(output, family), diagnostics
         diagnostics.append(f"{save_name} exit {code}: {' '.join(output.split())[:300] or 'no output'}")
     command_binary = find_system_command(command_name)
     if not command_binary:
         diagnostics.append(f"{command_name} not found in PATH or standard system directories")
-        return False, [], diagnostics
+        return False, [], [], diagnostics
     rules: list[dict[str, Any]] = []
+    targets: list[dict[str, str]] = []
     scanned = False
     for table in IPTABLES_TABLES:
         code, output = run([command_binary, "-w", "-t", table, "-S"], output_limit=5_000_000)
@@ -666,11 +736,12 @@ def scan_iptables_family(family: str) -> tuple[bool, list[dict[str, Any]], list[
             continue
         scanned = True
         rules.extend(parse_iptables_rules(f"*{table}\n{output}\nCOMMIT", family))
-    return scanned, rules, diagnostics
+        targets.extend(parse_iptables_filter_targets(f"*{table}\n{output}\nCOMMIT", family))
+    return scanned, rules, targets, diagnostics
 
 
 def windows_firewall_rules() -> tuple[int, str]:
-    script = "$rows=@(Get-NetFirewallRule -PolicyStore ActiveStore|ForEach-Object{$r=$_;$p=$r|Get-NetFirewallPortFilter;$a=$r|Get-NetFirewallAddressFilter;[pscustomobject]@{id=$r.Name;backend='windows';name=$r.DisplayName;direction=([string]$r.Direction).ToLower();action=([string]$r.Action).ToLower();enabled=([bool]($r.Enabled -eq 'True'));protocol=([string]$p.Protocol).ToLower();localPort=([string]($p.LocalPort -join ','));remotePort=([string]($p.RemotePort -join ','));source=([string]($a.RemoteAddress -join ','));destination=([string]($a.LocalAddress -join ','));profile=([string]$r.Profile);raw=([string]$r.Description);removable=([bool]($r.PolicyStoreSourceType -eq 'Local'));reorderable=$false;spec=@{name=$r.Name;policyStoreSourceType=([string]$r.PolicyStoreSourceType)}}});[pscustomobject]@{backend='windows';backends=@('windows');rules=$rows}|ConvertTo-Json -Depth 6 -Compress"
+    script = "$profiles=@(Get-NetFirewallProfile -ErrorAction Stop);$rows=@(Get-NetFirewallRule -PolicyStore ActiveStore|ForEach-Object{$r=$_;$p=$r|Get-NetFirewallPortFilter;$a=$r|Get-NetFirewallAddressFilter;[pscustomobject]@{id=$r.Name;backend='windows';name=$r.DisplayName;direction=([string]$r.Direction).ToLower();action=([string]$r.Action).ToLower();enabled=([bool]($r.Enabled -eq 'True'));protocol=([string]$p.Protocol).ToLower();localPort=([string]($p.LocalPort -join ','));remotePort=([string]($p.RemotePort -join ','));source=([string]($a.RemoteAddress -join ','));destination=([string]($a.LocalAddress -join ','));profile=([string]$r.Profile);raw=([string]$r.Description);removable=([bool]($r.PolicyStoreSourceType -eq 'Local'));reorderable=$false;spec=@{name=$r.Name;policyStoreSourceType=([string]$r.PolicyStoreSourceType)}}});$cap=[pscustomobject]@{profiles=@('Any')+@($profiles|ForEach-Object{$_.Name.ToString()});activeProfiles=@($profiles|Where-Object {$_.Enabled -eq 'True'}|ForEach-Object{$_.Name.ToString()});zones=@();defaultZone='';targets=@()};[pscustomobject]@{backend='windows';backends=@('windows');capabilities=$cap;rules=$rows}|ConvertTo-Json -Depth 7 -Compress"
     return powershell(script, timeout=300, output_limit=5_000_000)
 
 
@@ -683,29 +754,38 @@ def linux_firewall_rules() -> tuple[int, str]:
             code, output = run([firewall_cmd, "--list-all-zones"], output_limit=5_000_000)
             if code == 0:
                 rules = parse_firewalld_rules(output)
-                return 0, json.dumps({"backend": "firewalld", "backends": ["firewalld"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+                zones = parse_firewalld_zones(output)
+                default_code, default_output = run([firewall_cmd, "--get-default-zone"])
+                default_zone = default_output.strip() if default_code == 0 and default_output.strip() in zones else ""
+                capabilities = {"profiles": [], "activeProfiles": [], "zones": zones, "defaultZone": default_zone, "targets": []}
+                return 0, json.dumps({"backend": "firewalld", "backends": ["firewalld"], "capabilities": capabilities, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     ufw = find_system_command("ufw")
     if ufw:
         code, output = run([ufw, "status", "numbered"], output_limit=5_000_000)
         if code == 0:
             rules = parse_ufw_rules(output)
-            return 0, json.dumps({"backend": "ufw", "backends": ["ufw"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+            capabilities = {"profiles": [], "activeProfiles": [], "zones": [], "defaultZone": "", "targets": []}
+            return 0, json.dumps({"backend": "ufw", "backends": ["ufw"], "capabilities": capabilities, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     nft = find_system_command("nft")
     if nft:
         code, output = run([nft, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
         if code == 0:
             rules = parse_nft_rules(output)
-            return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+            capabilities = {"profiles": [], "activeProfiles": [], "zones": [], "defaultZone": "", "targets": parse_nft_filter_targets(output)}
+            return 0, json.dumps({"backend": "nftables", "backends": ["nftables"], "capabilities": capabilities, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     rules: list[dict[str, Any]] = []
     families: list[str] = []
+    targets: list[dict[str, str]] = []
     for family in ("ipv4", "ipv6"):
-        scanned, family_rules, family_diagnostics = scan_iptables_family(family)
+        scanned, family_rules, family_targets, family_diagnostics = scan_iptables_family(family)
         diagnostics.extend(f"{family}: {message}" for message in family_diagnostics)
         if scanned:
             rules.extend(family_rules)
+            targets.extend(family_targets)
             families.append(family)
     if families:
-        return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+        capabilities = {"profiles": [], "activeProfiles": [], "zones": [], "defaultZone": "", "targets": targets}
+        return 0, json.dumps({"backend": "iptables", "backends": ["iptables"], "families": families, "capabilities": capabilities, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
     warning = "No active or supported firewall backend found (firewalld, UFW, nftables, iptables)"
     if diagnostics:
         warning += ". Agent diagnostics: " + "; ".join(diagnostics)
@@ -737,6 +817,8 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         profile = str(parameters.get("profile", "Any"))
         if profile not in {"Any", "Domain", "Private", "Public"}:
             raise ValueError("Invalid Windows firewall profile")
+        if values["local_port"] == "any" and values["direction"] != "out":
+            raise ValueError("Inbound Windows firewall rules require a local port")
         direction = "Inbound" if values["direction"] == "in" else "Outbound"
         rule_action = "Allow" if values["action"] == "allow" else "Block"
         remote_port = "Any" if values["remote_port"] == "any" else str(values["remote_port"])
@@ -746,6 +828,8 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         binary = find_system_command("ufw")
         if not binary:
             return 1, "UFW is not installed"
+        if values["local_port"] == "any":
+            raise ValueError("UFW rules require a destination service port")
         command = [binary, "--force", "allow" if values["action"] == "allow" else values["action"], values["direction"], "proto", values["protocol"], "from", values["source"]]
         if values["remote_port"] != "any": command += ["port", str(values["remote_port"])]
         command += ["to", values["destination"], "port", str(values["local_port"]), "comment", values["name"]]
@@ -755,11 +839,19 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         zone = str(parameters.get("zone", "public"))
         if not binary or not FIREWALL_OBJECT_RE.fullmatch(zone):
             raise ValueError("Invalid firewalld zone")
+        zone_code, zone_output = run([binary, "--get-zones"])
+        if zone_code or zone not in zone_output.split():
+            raise ValueError("firewalld zone is no longer available; scan the server again")
         if values["direction"] != "in":
             raise ValueError("firewalld zone rules support inbound traffic only")
         family = str(parameters.get("family", "ipv6" if ":" in values["source"] or ":" in values["destination"] else "ipv4"))
         if family not in {"ipv4", "ipv6"}:
             raise ValueError("Invalid firewalld address family")
+        if values["local_port"] == "any":
+            raise ValueError("firewalld rules require a destination service port")
+        for address in (values["source"], values["destination"]):
+            if address != "any" and ipaddress.ip_network(address).version != (4 if family == "ipv4" else 6):
+                raise ValueError("Firewall address does not match the selected IP family")
         parts = [f'rule family="{family}"']
         if values["source"] != "any": parts.append(f'source address="{values["source"]}"')
         if values["destination"] != "any": parts.append(f'destination address="{values["destination"]}"')
@@ -773,6 +865,16 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         family = str(parameters.get("family", "inet")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "input"))
         if not binary or family not in {"ip", "ip6", "inet"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
             raise ValueError("Invalid nftables target")
+        target_code, target_output = run([binary, "-j", "list", "ruleset"], output_limit=5_000_000)
+        target = next((item for item in parse_nft_filter_targets(target_output) if item["family"] == family and item["table"] == table and item["chain"] == chain), None) if target_code == 0 else None
+        if not target or target["direction"] != values["direction"]:
+            raise ValueError("nftables filter chain is no longer available; scan the server again")
+        if values["local_port"] == "any":
+            raise ValueError("nftables rules require a destination service port")
+        expected_version = {"ip": 4, "ip6": 6}.get(family)
+        for address in (values["source"], values["destination"]):
+            if address != "any" and expected_version and ipaddress.ip_network(address).version != expected_version:
+                raise ValueError("Firewall address does not match the selected nftables family")
         command = [binary, "add", "rule", family, table, chain]
         address_family = "ip6" if ":" in values["source"] or ":" in values["destination"] else "ip"
         if values["source"] != "any": command += [address_family, "saddr", values["source"]]
@@ -785,6 +887,15 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         binary = find_system_command("ip6tables" if family == "ipv6" else "iptables")
         if not binary or family not in {"ipv4", "ipv6"} or not FIREWALL_OBJECT_RE.fullmatch(table) or not FIREWALL_OBJECT_RE.fullmatch(chain):
             raise ValueError("Invalid iptables target")
+        target_code, target_output = run([binary, "-w", "-t", table, "-S"], output_limit=5_000_000)
+        target = next((item for item in parse_iptables_filter_targets(f"*{table}\n{target_output}\nCOMMIT", family) if item["chain"] == chain), None) if target_code == 0 else None
+        if not target or target["direction"] != values["direction"]:
+            raise ValueError("iptables filter chain is no longer available; scan the server again")
+        if values["local_port"] == "any":
+            raise ValueError("iptables rules require a destination service port")
+        for address in (values["source"], values["destination"]):
+            if address != "any" and ipaddress.ip_network(address).version != (4 if family == "ipv4" else 6):
+                raise ValueError("Firewall address does not match the selected iptables family")
         command = [binary, "-t", table, "-A", chain, "-p", values["protocol"], "--dport", str(values["local_port"])]
         if values["source"] != "any": command += ["-s", values["source"]]
         if values["destination"] != "any": command += ["-d", values["destination"]]

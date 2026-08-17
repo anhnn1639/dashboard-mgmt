@@ -36,3 +36,17 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(source, /Kết nối PostgreSQL/);
   assert.match(source, /Admin local đầu tiên/);
 });
+
+test("firewall add form uses server capabilities and a viewport-safe scroll region", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(source, /Dữ liệu trực tiếp từ máy chủ/);
+  assert.match(source, /Profile Windows Firewall/);
+  assert.match(source, /Zone firewalld/);
+  assert.match(source, /Filter chain trên máy chủ/);
+  assert.match(source, /capabilities\.targets\.map/);
+  assert.doesNotMatch(source, /Table<input name="table"/);
+  assert.doesNotMatch(source, /Chain<input name="chain"/);
+  assert.match(styles, /\.add-firewall-modal\s*{[^}]*max-height:\s*calc\(100% - 32px\)/s);
+  assert.match(styles, /\.firewall-add-scroll\s*{[^}]*overflow-y:\s*auto/s);
+});

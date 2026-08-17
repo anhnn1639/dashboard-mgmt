@@ -508,6 +508,24 @@ def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) ->
         required = {"backend", "name", "direction", "action", "protocol", "local_port"}
         if not required.issubset(parameters):
             raise HTTPException(status_code=422, detail="Firewall rule parameters are incomplete")
+        backend = str(parameters.get("backend", "")).lower()
+        direction = str(parameters.get("direction", "")).lower()
+        if backend not in {"windows", "ufw", "firewalld", "nftables", "iptables"} or direction not in {"in", "out"}:
+            raise HTTPException(status_code=422, detail="Firewall backend or direction is invalid")
+        if parameters.get("protocol") not in {"tcp", "udp"} or parameters.get("action") not in {"allow", "deny", "reject"}:
+            raise HTTPException(status_code=422, detail="Firewall protocol or action is invalid")
+        if backend == "firewalld" and (direction != "in" or not parameters.get("zone") or parameters.get("family") not in {"ipv4", "ipv6"}):
+            raise HTTPException(status_code=422, detail="firewalld requires an inbound zone and IP family reported by the server")
+        if backend in {"nftables", "iptables"}:
+            if not all(parameters.get(key) for key in ("family", "table", "chain")) or parameters.get("table") != "filter":
+                raise HTTPException(status_code=422, detail="Netfilter requires a filter chain reported by the server")
+        if backend == "windows" and parameters.get("profile") not in {"Any", "Domain", "Private", "Public"}:
+            raise HTTPException(status_code=422, detail="Windows Firewall profile is invalid")
+        if str(parameters.get("local_port", "")).lower() == "any" and not (backend == "windows" and direction == "out"):
+            raise HTTPException(status_code=422, detail="Only outbound Windows rules may use any local port")
+        for key in ("name", "source", "destination"):
+            if not isinstance(parameters.get(key, ""), str) or len(str(parameters.get(key, ""))) > 512:
+                raise HTTPException(status_code=422, detail=f"Firewall {key} is invalid")
         if len(json.dumps(parameters, ensure_ascii=False)) > 10_000:
             raise HTTPException(status_code=422, detail="Firewall rule parameters are too large")
         return
