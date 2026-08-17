@@ -798,6 +798,12 @@ def ps_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def nft_string_literal(value: str) -> str:
+    if not value or len(value.encode("utf-8")) > 256 or any(ord(character) < 32 for character in value):
+        raise ValueError("Invalid nftables string")
+    return json.dumps(value, ensure_ascii=False)
+
+
 def run_many(commands: list[list[str]], ignored_errors: tuple[str, ...] = ()) -> tuple[int, str]:
     results: list[str] = []
     for command in commands:
@@ -880,7 +886,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         if values["source"] != "any": command += [address_family, "saddr", values["source"]]
         if values["destination"] != "any": command += [address_family, "daddr", values["destination"]]
         if values["remote_port"] != "any": command += [values["protocol"], "sport", str(values["remote_port"])]
-        command += [values["protocol"], "dport", str(values["local_port"]), "accept" if values["action"] == "allow" else values["action"], "comment", f"TramOps - {values['name']}"]
+        command += [values["protocol"], "dport", str(values["local_port"]), "accept" if values["action"] == "allow" else values["action"], "comment", nft_string_literal(f"TramOps - {values['name']}")]
         return run(command)
     if backend == "iptables":
         family = str(parameters.get("family", "ipv4")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "INPUT" if values["direction"] == "in" else "OUTPUT"))

@@ -318,6 +318,28 @@ trusted
             tram_agent.add_firewall_rule({**common, "backend": "iptables", "family": "ipv4", "table": "filter", "chain": "INPUT"}, {"os_family": "linux"})
         self.assertEqual(iptables_commands[-1][:8], ["/usr/sbin/iptables", "-w", "-t", "filter", "-I", "INPUT", "1", "-p"])
 
+    def test_nftables_comment_is_one_quoted_and_escaped_literal(self):
+        commands = []
+        ruleset = json.dumps({"nftables": [{"chain": {"family": "ip", "table": "filter", "name": "INPUT", "type": "filter", "hook": "input"}}]})
+
+        def fake_run(command, **_):
+            commands.append(command)
+            return (0, ruleset) if "list" in command else (0, "ok")
+
+        parameters = {
+            "backend": "nftables", "name": 'SSH "jump" \\ ops', "direction": "in",
+            "action": "allow", "protocol": "tcp", "local_port": 22,
+            "source": "10.64.83.172/32", "destination": "any",
+            "family": "ip", "table": "filter", "chain": "INPUT",
+        }
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/nft"), patch.object(tram_agent, "run", side_effect=fake_run):
+            tram_agent.add_firewall_rule(parameters, {"os_family": "linux"})
+
+        command = commands[-1]
+        self.assertEqual(command[-2], "comment")
+        self.assertEqual(json.loads(command[-1]), 'TramOps - SSH "jump" \\ ops')
+        self.assertTrue(command[-1].startswith('"') and command[-1].endswith('"'))
+
     def test_docker_managed_iptables_rule_cannot_be_deleted(self):
         output = "-A FORWARD -j DOCKER-USER"
         rule = tram_agent.parse_iptables_rules(f"*filter\n{output}\nCOMMIT", "ipv4")[0]
