@@ -261,6 +261,8 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
 - PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
 - Không đổi Agent/MSI; production vẫn dùng Agent `0.7.2`. Chỉ cần rebuild `api` và `dashboard`.
+- Sửa nhận diện LV khi `lsblk` trả `/dev/mapper/<vg>-<lv>` nhưng `lvs` trả `/dev/<vg>/<lv>`: dashboard ánh xạ đúng quy tắc escape dấu gạch ngang của device-mapper, nên root LV hiện lại nút Extend và dùng đúng path do `lvs` cung cấp cho Agent.
+- Unallocated Windows không phải partition nên không hỗ trợ kéo-thả. Nếu Recovery nằm giữa C: và vùng trống, Windows native chỉ extend sau khi Recovery được di chuyển hoặc xóa/tạo lại trong maintenance window có backup; dashboard chỉ báo khóa, không tự làm thao tác phá hủy này.
 
 1. Cấu hình enterprise/EV code-signing certificate cho workflow và thay artifact unsigned.
 2. Lập luồng migrate domain/CA có dual-endpoint overlap cho agent cũ; không tắt domain cũ đột ngột.

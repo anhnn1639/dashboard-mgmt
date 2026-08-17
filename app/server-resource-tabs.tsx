@@ -112,6 +112,7 @@ type StorageNode = {
   number?: number;
   model?: string;
   serial?: string;
+  vgName?: string;
   partitionTable?: string;
   protected?: boolean;
   readOnly?: boolean;
@@ -171,6 +172,7 @@ function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
     driveLetter: storageText(value.driveLetter),
     model: storageText(value.model),
     serial: storageText(value.serial),
+    vgName: storageText(value.vgName),
     partitionTable: storageText(value.partitionTable),
     sizeBytes: bytes(value.sizeBytes),
     freeBytes: bytes(value.freeBytes),
@@ -206,6 +208,12 @@ function parseStorage(output: string | undefined): StorageScan {
     lvmCandidates: objectArray(raw.lvmCandidates).map((item) => ({ path: String(item.path ?? ""), sizeBytes: bytes(item.sizeBytes) })).filter((item) => item.path),
     capabilities: raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities as StorageScan["capabilities"] : {},
   };
+}
+
+function logicalVolumeMapperPath(logical: LogicalVolume) {
+  if (!logical.vgName || !logical.name) return "";
+  const escapeMapperName = (value: string) => value.replaceAll("-", "--");
+  return `/dev/mapper/${escapeMapperName(logical.vgName)}-${escapeMapperName(logical.name)}`;
 }
 
 type StorageTarget = {
@@ -278,7 +286,7 @@ export function StorageResourceTab({
       };
     }
     if (node.type === "lvm") {
-      const logical = scan.logicalVolumes.find((item) => item.path === node.path);
+      const logical = scan.logicalVolumes.find((item) => item.path === node.path || logicalVolumeMapperPath(item) === node.path);
       return logical ? {
         key: `lv:${logical.path}`,
         kind: "linux_lv",
@@ -307,7 +315,9 @@ export function StorageResourceTab({
         : extendCapacity < 1024 ** 2
           ? target.kind === "linux_lv"
             ? "Volume Group không còn dung lượng trống để extend Logical Volume."
-            : "Không có unallocated space liền kề partition. Hãy tăng virtual disk và quét lại; partition Recovery có thể chặn vùng trống của ổ C:."
+            : target.kind === "windows_partition" && bytes(disk.unallocatedBytes) >= 1024 ** 2
+              ? `Disk còn ${formatBytes(disk.unallocatedBytes)} unallocated nhưng không nằm liền kề partition này; partition Recovery hoặc partition khác đang nằm ở giữa.`
+              : "Không có unallocated space liền kề partition. Hãy tăng virtual disk và quét lại."
           : `Có thể mở rộng tối đa ${formatBytes(extendCapacity)}.`;
     return (
       <div key={key} className="storage-tree-item">
@@ -435,7 +445,7 @@ export function StorageResourceTab({
         })}
         {!disks.length && <div className="empty-state">Chưa có dữ liệu Disk; nhấn “Quét lại”.</div>}
       </div>
-      <p className="storage-extend-note">Nút Extend chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn. Di chuột lên nút mờ để xem nguyên nhân; ổ C: có partition Recovery nằm phía sau sẽ không được tự động di chuyển.</p>
+      <p className="storage-extend-note">Nút Extend chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn. Unallocated không thể kéo thả; nếu Recovery nằm giữa ổ C: và vùng trống thì phải di chuyển hoặc xóa/tạo lại Recovery bằng quy trình bảo trì có backup.</p>
       {osFamily === "linux" && scan.volumeGroups.length > 0 && <div className="vg-grid">
         {scan.volumeGroups.map((vg) => {
           const target: StorageTarget = { key: `vg:${vg.name}`, kind: "linux_vg", label: `Volume Group ${vg.name}`, name: vg.name, protected: false, mounted: vg.logicalVolumes.length > 0 };

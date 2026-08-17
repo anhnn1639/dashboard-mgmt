@@ -99,7 +99,9 @@ test("storage extend stays visible and audit exposes retained operation details"
   const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
   assert.match(resources, /<span>Thao tác<\/span>/);
   assert.match(resources, /disabled=\{!canExtend\}/);
-  assert.match(resources, /partition Recovery có thể chặn/);
+  assert.match(resources, /partition Recovery hoặc partition khác đang nằm ở giữa/);
+  assert.match(resources, /logicalVolumeMapperPath\(item\) === node\.path/);
+  assert.match(resources, /Unallocated không thể kéo thả/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);
