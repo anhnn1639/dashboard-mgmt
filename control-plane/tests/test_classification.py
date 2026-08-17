@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -224,6 +224,19 @@ class ClassificationTests(unittest.TestCase):
             guacamole_ssh_host_key("tunnel-relay", 49152, f"old-host ssh-ed25519 {encoded_key} comment"),
             f"[tunnel-relay]:49152 ssh-ed25519 {encoded_key}",
         )
+
+    def test_guacamole_rdp_certificate_pin_uses_freerdp_compatible_separators(self):
+        sha1 = "0123456789abcdef0123456789abcdef01234567"
+        sha256 = sha1 + "89abcdef0123456789abcdef"
+        self.assertEqual(
+            guacamole_rdp_certificate_fingerprint(f"sha1:{sha1}"),
+            "sha1:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67",
+        )
+        self.assertEqual(
+            guacamole_rdp_certificate_fingerprint(f"sha256:{sha256}"),
+            "sha256:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef",
+        )
+        self.assertIsNone(guacamole_rdp_certificate_fingerprint("sha1:not-a-digest"))
 
     def test_guacamole_launch_url_opens_the_json_connection_directly(self):
         url = guacamole_launch_url(

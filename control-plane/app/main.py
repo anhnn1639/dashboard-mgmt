@@ -1108,6 +1108,24 @@ def guacamole_ssh_host_key(address: str, port: int, public_key: str | None) -> s
     return f"{known_hosts_address} {key_type} {encoded_key}"
 
 
+def guacamole_rdp_certificate_fingerprint(value: object) -> str | None:
+    """Return an RDP certificate pin in the format expected by FreeRDP."""
+    fingerprint = str(value or "").strip().lower()
+    match = re.fullmatch(r"(sha1|sha256):?((?:[0-9a-f]{2}:?){20,32})", fingerprint)
+    if not match:
+        return None
+    algorithm, digest = match.groups()
+    digest = digest.replace(":", "")
+    expected_length = 40 if algorithm == "sha1" else 64
+    if len(digest) != expected_length:
+        return None
+    # FreeRDP 2.x compares against the colon-separated representation returned
+    # by OpenSSL. FreeRDP 3.x accepts both separated and compact forms. Always
+    # emit the representation that works with both versions.
+    separated = ":".join(digest[index:index + 2] for index in range(0, len(digest), 2))
+    return f"{algorithm}:{separated}"
+
+
 def expire_file_payloads(db: Session) -> int:
     cutoff = now() - timedelta(hours=settings.file_transfer_ttl_hours)
     transfers = db.execute(
@@ -2085,12 +2103,10 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
         if known_host:
             common["host-key"] = known_host
     else:
-        fingerprint = str((server.inventory or {}).get("extra", {}).get("rdp_certificate_fingerprint", "")).lower().replace(":", "")
-        if fingerprint.startswith("sha1"):
-            fingerprint = "sha1:" + fingerprint.removeprefix("sha1")
-        elif fingerprint.startswith("sha256"):
-            fingerprint = "sha256:" + fingerprint.removeprefix("sha256")
-        if not re.fullmatch(r"(?:sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})", fingerprint):
+        fingerprint = guacamole_rdp_certificate_fingerprint(
+            (server.inventory or {}).get("extra", {}).get("rdp_certificate_fingerprint")
+        )
+        if not fingerprint:
             await tunnel_hub.cancel(session_id, "rdp-certificate-missing")
             raise HTTPException(status_code=409, detail="Agent chưa cung cấp fingerprint certificate RDP; cấu hình certificate RDP rồi đồng bộ inventory")
         common.update({"security": "nla", "ignore-cert": "false", "cert-fingerprints": fingerprint, "enable-drive": "false", "disable-upload": "true", "disable-download": "true", "enable-printing": "false", "width": str(payload.width), "height": str(payload.height), "resize-method": "display-update"})
