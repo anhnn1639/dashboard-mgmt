@@ -1900,7 +1900,7 @@ textarea:focus-visible {
 }
 .audit-row {
   display: grid;
-  grid-template-columns: 70px 0.8fr 1.3fr 1.2fr 0.7fr 0.7fr;
+  grid-template-columns: 72px 0.75fr 1.1fr 1fr minmax(180px, 1.8fr) 0.6fr 0.65fr;
   align-items: center;
   gap: 12px;
   min-height: 49px;
@@ -1921,6 +1921,16 @@ textarea:focus-visible {
 }
 .audit-row b {
   color: #abb8c9;
+}
+.audit-detail {
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  color: #91a0b4;
+}
+.audit-load-more {
+  display: flex;
+  justify-content: center;
+  padding-top: 12px;
 }
 .result-good {
   color: #59c29e;
@@ -2460,7 +2470,7 @@ textarea:focus-visible {
     display: none;
   }
   .audit-row {
-    grid-template-columns: 65px 0.8fr 1.4fr 1fr 0.7fr;
+    grid-template-columns: 65px 0.8fr 1.2fr 1fr minmax(150px, 1.4fr) 0.7fr;
   }
   .audit-row > :last-child {
     display: none;
@@ -2622,7 +2632,9 @@ textarea:focus-visible {
     grid-template-columns: 55px 1fr 1.2fr;
   }
   .audit-row > :nth-child(4),
-  .audit-row > :nth-child(5) {
+  .audit-row > :nth-child(5),
+  .audit-row > :nth-child(6),
+  .audit-row > :nth-child(7) {
     display: none;
   }
 }
@@ -4178,6 +4190,18 @@ textarea:focus-visible {
   padding: 4px 8px;
   font-size: 9px;
   cursor: pointer;
+}
+.storage-row-actions button:disabled {
+  border-color: #2a3442;
+  color: #59687b;
+  background: #111923;
+  cursor: not-allowed;
+}
+.storage-extend-note {
+  margin: 10px 0 0;
+  color: #667890;
+  font-size: 9px;
+  line-height: 1.55;
 }
 .vg-grid {
   display: grid;

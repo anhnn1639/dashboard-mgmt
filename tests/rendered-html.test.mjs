@@ -93,3 +93,14 @@ test("recording deletion requires a distinct second administrator", async () => 
   assert.match(source, /Gửi yêu cầu xóa/);
   assert.match(source, /selectedRecordingIds/);
 });
+
+test("storage extend stays visible and audit exposes retained operation details", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
+  assert.match(resources, /<span>Thao tác<\/span>/);
+  assert.match(resources, /disabled=\{!canExtend\}/);
+  assert.match(resources, /partition Recovery có thể chặn/);
+  assert.match(source, /Chi tiết thao tác/);
+  assert.match(source, /Tải thêm nhật ký/);
+  assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);
+});

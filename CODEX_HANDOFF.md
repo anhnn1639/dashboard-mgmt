@@ -238,13 +238,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `27/27`, gồm job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, endpoint job approve đã gỡ, recording delete bắt buộc admin thứ hai khác requester, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Control plane `28/28`, gồm audit retention 30 ngày/hash anchor/API detail-pagination, job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, endpoint job approve đã gỡ, recording delete bắt buộc admin thứ hai khác requester, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
 - Agent security `41/41`, gồm WUA + Configuration Manager scan/install, storage free-region parser, selected-only apt/dnf version pin, stale update guard, protected process, source log allowlist, account built-in membership, severity word matching; cùng toàn bộ quoted nft comment, firewall capabilities/order/reorder/rollback/stale guard, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
-- Render test workspace `6/6` pass, gồm shell, Windows/Linux fleet, modal resource nằm trong viewport/cuộn nội bộ, form firewall theo capabilities, tìm kiếm/filter rule và UI recording delete hai quản trị viên.
+- Render test workspace `7/7` pass, gồm shell, Windows/Linux fleet, modal resource nằm trong viewport/cuộn nội bộ, form firewall theo capabilities, tìm kiếm/filter rule, UI recording delete hai quản trị viên, nút Extend luôn hiển thị và audit detail/retention.
 - Kiểm tra browser local bằng dữ liệu mẫu pass: cây Disk mở đúng cấp; modal hiển thị footer ở desktop và cuộn nội bộ tại `390x700`; Services/Users giữ bố cục; log tô toàn dòng error đỏ và warning vàng. Route dữ liệu mẫu và dev server đã gỡ/dừng trước commit.
 - Render trực quan modal thêm firewall pass trên Windows profile, Ubuntu/UFW, Oracle Linux/firewalld zone và Red Hat/iptables INPUT/OUTPUT. DOM đo ở 1024x600 và 390x700 xác nhận modal nằm trọn viewport, không có tràn ngang, body có thanh cuộn riêng và footer luôn hiển thị.
 - Python `py_compile` pass.
@@ -253,6 +253,14 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - GitHub Actions build MSI 0.7.2 run `32043508096` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.2`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
+
+### Cập nhật Extend và audit retention 2026-08-17
+
+- Dashboard luôn hiển thị nút `Extend` trên partition/LV. Nút bật khi Agent báo tối thiểu 1 MiB có thể mở rộng; root LV Linux được extend nhưng vẫn khóa xóa, còn partition boot/root trực tiếp tiếp tục được bảo vệ.
+- Windows yêu cầu unallocated space liền kề. Với layout 100 GiB hiện tại, partition Recovery nằm sau C: nên `Extend` của C: hiện mờ và giải thích nguyên nhân; ứng dụng không tự di chuyển/xóa Recovery.
+- Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
+- PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
+- Không đổi Agent/MSI; production vẫn dùng Agent `0.7.2`. Chỉ cần rebuild `api` và `dashboard`.
 
 1. Cấu hình enterprise/EV code-signing certificate cho workflow và thay artifact unsigned.
 2. Lập luồng migrate domain/CA có dual-endpoint overlap cho agent cũ; không tắt domain cũ đột ngột.

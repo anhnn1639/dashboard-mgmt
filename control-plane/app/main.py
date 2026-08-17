@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import io
@@ -38,7 +39,7 @@ from ldap3 import ALL, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, select, text, update
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, select, text, update
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -74,6 +75,7 @@ class Settings(BaseSettings):
     tunnel_max_sessions_per_agent: int = 4
     file_max_bytes: int = 50 * 1024 * 1024
     file_transfer_ttl_hours: int = 24
+    audit_retention_days: int = Field(default=30, ge=1, le=3650)
     clamav_host: str = "clamav"
     clamav_port: int = 3310
     clamav_timeout_seconds: int = 60
@@ -880,6 +882,45 @@ def audit(db: Session, actor: str, action: str, target: str, request: Request | 
     db.add(AuditEvent(occurred_at=occurred, actor=actor, action=action, target=target, result=result, source_ip=client_ip(request) if request else "", detail=detail or {}, previous_hash=previous_hash, event_hash=event_hash))
 
 
+def prune_audit_events(db: Session) -> int:
+    """Delete expired audit rows while preserving a durable hash-chain anchor."""
+    cutoff = now() - timedelta(days=settings.audit_retention_days)
+    expired_count = int(
+        db.execute(
+            select(func.count()).select_from(AuditEvent).where(AuditEvent.occurred_at < cutoff)
+        ).scalar_one()
+    )
+    if expired_count == 0:
+        return 0
+    newest_expired = db.execute(
+        select(AuditEvent)
+        .where(AuditEvent.occurred_at < cutoff)
+        .order_by(AuditEvent.occurred_at.desc())
+        .limit(1)
+    ).scalar_one()
+    anchor = {
+        "cutoff": cutoff.isoformat(),
+        "deletedCount": expired_count,
+        "lastDeletedHash": newest_expired.event_hash,
+        "lastDeletedOccurredAt": aware(newest_expired.occurred_at).isoformat(),
+        "retentionDays": settings.audit_retention_days,
+    }
+    db.execute(
+        delete(AuditEvent)
+        .where(AuditEvent.occurred_at < cutoff)
+        .execution_options(synchronize_session=False)
+    )
+    db.merge(SystemSetting(key="audit_retention_anchor", value=json.dumps(anchor, sort_keys=True, separators=(",", ":"))))
+    audit(
+        db,
+        "system:audit-retention",
+        "audit.retention.pruned",
+        "audit-events",
+        detail=anchor,
+    )
+    return expired_count
+
+
 def issue_jwt(user: User) -> str:
     timestamp = now()
     return jwt.encode({"sub": user.id, "username": user.username, "role": user.role, "iss": settings.jwt_issuer, "iat": timestamp, "exp": timestamp + timedelta(minutes=settings.jwt_ttl_minutes)}, settings.jwt_secret, algorithm="HS256")
@@ -1204,6 +1245,7 @@ def startup() -> None:
         with factory() as db:
             retire_legacy_pending_jobs(db)
             expire_file_payloads(db)
+            prune_audit_events(db)
             exists = db.execute(select(User).limit(1)).scalar_one_or_none()
             if not exists and settings.bootstrap_admin_password:
                 if len(settings.bootstrap_admin_password) < 14:
@@ -1216,6 +1258,43 @@ def startup() -> None:
         # The API remains available in setup mode so an operator can repair the
         # connection from the first-run wizard.
         return
+
+
+audit_retention_task: asyncio.Task[None] | None = None
+
+
+async def audit_retention_loop() -> None:
+    while True:
+        await asyncio.sleep(3600)
+        factory = SessionLocal
+        if factory is None:
+            continue
+        try:
+            with factory() as db:
+                prune_audit_events(db)
+                db.commit()
+        except Exception:
+            # Retention must never make the API unavailable. The next hourly
+            # cycle and the next application startup retry the cleanup.
+            continue
+
+
+@app.on_event("startup")
+async def start_audit_retention() -> None:
+    global audit_retention_task
+    if audit_retention_task is None or audit_retention_task.done():
+        audit_retention_task = asyncio.create_task(audit_retention_loop())
+
+
+@app.on_event("shutdown")
+async def stop_audit_retention() -> None:
+    global audit_retention_task
+    if audit_retention_task is None:
+        return
+    audit_retention_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await audit_retention_task
+    audit_retention_task = None
 
 
 @app.get("/livez")
@@ -2049,9 +2128,30 @@ def list_jobs(user: User = Depends(current_user), db: Session = Depends(db_sessi
 
 
 @app.get("/api/v1/audit")
-def list_audit(_: User = Depends(require_role("admin", "auditor")), db: Session = Depends(db_session)):
-    events = db.execute(select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(500)).scalars().all()
-    return {"items": [{"id": item.id, "occurredAt": aware(item.occurred_at).isoformat(), "actor": item.actor, "action": item.action, "target": item.target, "result": item.result, "sourceIp": item.source_ip, "hash": item.event_hash, "previousHash": item.previous_hash} for item in events]}
+def list_audit(before: datetime | None = None, _: User = Depends(require_role("admin", "auditor")), db: Session = Depends(db_session)):
+    query = select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(500)
+    if before is not None:
+        query = query.where(AuditEvent.occurred_at < aware(before))
+    events = db.execute(query).scalars().all()
+    return {
+        "items": [
+            {
+                "id": item.id,
+                "occurredAt": aware(item.occurred_at).isoformat(),
+                "actor": item.actor,
+                "action": item.action,
+                "target": item.target,
+                "result": item.result,
+                "sourceIp": item.source_ip,
+                "detail": item.detail or {},
+                "hash": item.event_hash,
+                "previousHash": item.previous_hash,
+            }
+            for item in events
+        ],
+        "nextBefore": aware(events[-1].occurred_at).isoformat() if len(events) == 500 else None,
+        "retentionDays": settings.audit_retention_days,
+    }
 
 
 @app.get("/api/v1/sessions")

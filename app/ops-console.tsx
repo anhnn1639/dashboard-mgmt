@@ -2854,6 +2854,12 @@ function RecordingPlayer({
   );
 }
 
+function auditDetailText(detail: Record<string, unknown>) {
+  return Object.entries(detail ?? {})
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(" · ");
+}
+
 function AuditView({ token }: { token: string }) {
   const [rows, setRows] = useState<
     Array<{
@@ -2864,8 +2870,12 @@ function AuditView({ token }: { token: string }) {
       target: string;
       result: string;
       sourceIp: string;
+      detail: Record<string, unknown>;
     }>
   >([]);
+  const [auditNextBefore, setAuditNextBefore] = useState<string | null>(null);
+  const [auditRetentionDays, setAuditRetentionDays] = useState(30);
+  const [auditBusy, setAuditBusy] = useState(false);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [deletionRequests, setDeletionRequests] = useState<RecordingDeletionRequest[]>([]);
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
@@ -2889,21 +2899,33 @@ function AuditView({ token }: { token: string }) {
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then((data) => setDeletionRequests(data.items ?? []))
       .catch(() => setDeletionRequests([])), [token]);
+  const loadAudit = useCallback(async (before?: string) => {
+    setAuditBusy(true);
+    try {
+      const suffix = before ? `?before=${encodeURIComponent(before)}` : "";
+      const response = await fetch(`/api/v1/audit${suffix}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (response.status === 403) setForbidden(true);
+      if (!response.ok) throw new Error("audit-unavailable");
+      const data = await response.json();
+      setRows((current) => before ? [...current, ...(data.items ?? [])] : (data.items ?? []));
+      setAuditNextBefore(data.nextBefore ?? null);
+      setAuditRetentionDays(Number(data.retentionDays) || 30);
+    } catch {
+      if (!before) setRows([]);
+    } finally {
+      setAuditBusy(false);
+    }
+  }, [token]);
   useEffect(() => {
-    fetch("/api/v1/audit", { headers: { Authorization: `Bearer ${token}` } })
-      .then((response) => {
-        if (response.status === 403) setForbidden(true);
-        return response.ok ? response.json() : Promise.reject();
-      })
-      .then((data) => setRows(data.items ?? []))
-      .catch(() => setRows([]));
+    const auditTimer = window.setTimeout(() => void loadAudit(), 0);
     fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then(setCurrentUser)
       .catch(() => setCurrentUser(null));
     void loadSessions();
     void loadDeletionRequests();
-  }, [token, loadSessions, loadDeletionRequests]);
+    return () => window.clearTimeout(auditTimer);
+  }, [token, loadSessions, loadDeletionRequests, loadAudit]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
   const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
@@ -2945,7 +2967,7 @@ function AuditView({ token }: { token: string }) {
         <div className="panel-head">
           <div>
             <h2>Nhật ký kiểm toán</h2>
-            <p>Sự kiện và recording phiên truy cập được quản lý tập trung.</p>
+            <p>Mọi thao tác người dùng được lưu trong PostgreSQL và tự xóa sau {auditRetentionDays} ngày.</p>
           </div>
           <div className="audit-integrity">◆ Chuỗi hash liên kết</div>
         </div>
@@ -2964,41 +2986,46 @@ function AuditView({ token }: { token: string }) {
           </button>
         </div>
         {tab === "events" ? (
-          <div className="audit-table">
-            <div className="audit-row head">
-              <span>Thời gian</span>
-              <span>Chủ thể</span>
-              <span>Hành động</span>
-              <span>Đối tượng</span>
-              <span>Kết quả</span>
-              <span>IP nguồn</span>
-            </div>
-            {rows.length ? (
-              rows.map((row) => (
-                <div className="audit-row" key={row.id}>
-                  <time>
-                    {new Date(row.occurredAt).toLocaleString("vi-VN")}
-                  </time>
-                  <b>{row.actor}</b>
-                  <code>{row.action}</code>
-                  <span>{row.target}</span>
-                  <span
-                    className={
-                      row.result === "success" ? "result-good" : "result-warn"
-                    }
-                  >
-                    {row.result}
-                  </span>
-                  <span>{row.sourceIp || "—"}</span>
-                </div>
-              ))
-            ) : (
-              <div className="empty-state">
-                {forbidden
-                  ? "Vai trò hiện tại không có quyền đọc audit."
-                  : "Chưa có sự kiện audit trong database."}
+          <div className="audit-events-panel">
+            <div className="audit-table">
+              <div className="audit-row head">
+                <span>Thời gian</span>
+                <span>Chủ thể</span>
+                <span>Hành động</span>
+                <span>Đối tượng</span>
+                <span>Chi tiết thao tác</span>
+                <span>Kết quả</span>
+                <span>IP nguồn</span>
               </div>
-            )}
+              {rows.length ? (
+                rows.map((row) => (
+                  <div className="audit-row" key={row.id}>
+                    <time>
+                      {new Date(row.occurredAt).toLocaleString("vi-VN")}
+                    </time>
+                    <b>{row.actor}</b>
+                    <code>{row.action}</code>
+                    <span>{row.target}</span>
+                    <span className="audit-detail">{auditDetailText(row.detail) || "—"}</span>
+                    <span
+                      className={
+                        row.result === "success" ? "result-good" : "result-warn"
+                      }
+                    >
+                      {row.result}
+                    </span>
+                    <span>{row.sourceIp || "—"}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="empty-state">
+                  {forbidden
+                    ? "Vai trò hiện tại không có quyền đọc audit."
+                    : "Chưa có sự kiện audit trong database."}
+                </div>
+              )}
+            </div>
+            {auditNextBefore && <div className="audit-load-more"><button type="button" className="button ghost" disabled={auditBusy} onClick={() => void loadAudit(auditNextBefore)}>{auditBusy ? "Đang tải..." : "Tải thêm nhật ký"}</button></div>}
           </div>
         ) : (
           <div className="recording-management">

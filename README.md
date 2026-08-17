@@ -242,6 +242,10 @@ Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` t
 
 Tác vụ đặc quyền được tạo ở trạng thái `queued` và Agent nhận ở lần check-in kế tiếp. API không còn endpoint approve; RBAC, MFA, validation tham số và audit vẫn bắt buộc.
 
+Nút **Extend** luôn hiển thị trên partition/LV. Nút chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn: Windows cần vùng unallocated liền kề partition, còn Linux LVM cần dung lượng trống trong Volume Group. Root LV được phép extend nhưng vẫn bị khóa xóa; partition boot/root trực tiếp không được tự động extend. Ứng dụng không tự di chuyển partition Recovery của Windows.
+
+Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA, cấu hình, agent, job vận hành, file, phiên SSH/RDP và recording) được ghi vào `audit_events` trong PostgreSQL với actor, IP nguồn, kết quả, tham số an toàn và chuỗi hash. Giao diện audit phân trang 500 bản ghi mỗi lần. Bản ghi quá 30 ngày được dọn lúc API khởi động và mỗi giờ; hash cuối của phần đã xóa được giữ trong `system_settings.audit_retention_anchor` để duy trì dấu vết liên kết.
+
 ## API tác vụ allowlist
 
 `inventory.collect`, `service.*`, `user.create|disable|enable|delete|password.reset`, `group.create|delete`, `user.add_group`, `group.remove_user`, `patch.*`, `logs.read`, `process.list`, `firewall.list|rule.add|rule.remove`, `storage.list|extend`, `network.list`, `system.reboot`.

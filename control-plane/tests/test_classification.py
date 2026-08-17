@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, recording_file, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, recording_file, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -96,6 +96,36 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(AUTO_REFRESH_ACTIONS["user.update"], ("user.list", "group.list"))
         self.assertEqual(AUTO_REFRESH_ACTIONS["process.kill"], ("process.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["patch.install"], ("patch.scan",))
+
+    def test_audit_retention_deletes_rows_older_than_thirty_days_and_keeps_anchor(self):
+        old_id = str(uuid.uuid4())
+        recent_id = str(uuid.uuid4())
+        old_hash = hashlib.sha256(old_id.encode()).hexdigest()
+        recent_hash = hashlib.sha256(recent_id.encode()).hexdigest()
+        with SessionLocal() as db:
+            db.add_all([
+                AuditEvent(id=old_id, occurred_at=datetime.now(UTC) - timedelta(days=31), actor="old-user", action="test.old", target="expired", detail={"test": True}, previous_hash="0" * 64, event_hash=old_hash),
+                AuditEvent(id=recent_id, occurred_at=datetime.now(UTC), actor="recent-user", action="test.recent", target="kept", detail={"operation": "verify"}, previous_hash=old_hash, event_hash=recent_hash),
+            ])
+            db.flush()
+            self.assertGreaterEqual(prune_audit_events(db), 1)
+            db.commit()
+            self.assertIsNone(db.get(AuditEvent, old_id))
+            self.assertIsNotNone(db.get(AuditEvent, recent_id))
+            anchor = json.loads(db.get(SystemSetting, "audit_retention_anchor").value)
+            self.assertEqual(anchor["lastDeletedHash"], old_hash)
+            self.assertEqual(anchor["retentionDays"], 30)
+
+        with TestClient(app) as client:
+            token = self.login_admin(client)
+            response = client.get("/api/v1/audit", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["retentionDays"], 30)
+            row = next(item for item in payload["items"] if item["id"] == recent_id)
+            self.assertEqual(row["detail"], {"operation": "verify"})
+            paged = client.get("/api/v1/audit", params={"before": (datetime.now(UTC) + timedelta(days=1)).isoformat()}, headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(paged.status_code, 200, paged.text)
 
     def test_storage_actions_must_match_the_server_os(self):
         windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server")

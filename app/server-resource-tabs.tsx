@@ -297,6 +297,18 @@ export function StorageResourceTab({
     const key = String(node.id ?? node.path ?? `${node.name}-${depth}`);
     const target = nodeTarget(node, disk);
     const isSelected = Boolean(target && selected?.key === target.key);
+    const extendCapacity = bytes(target?.extendableBytes);
+    const protectedPartition = Boolean(target?.protected && target.kind === "linux_partition");
+    const canExtend = Boolean(target && extendCapacity >= 1024 ** 2 && !protectedPartition);
+    const extendReason = !target
+      ? ""
+      : protectedPartition
+        ? "Partition root/boot trực tiếp được bảo vệ; chỉ Logical Volume root mới được extend tự động."
+        : extendCapacity < 1024 ** 2
+          ? target.kind === "linux_lv"
+            ? "Volume Group không còn dung lượng trống để extend Logical Volume."
+            : "Không có unallocated space liền kề partition. Hãy tăng virtual disk và quét lại; partition Recovery có thể chặn vùng trống của ổ C:."
+          : `Có thể mở rộng tối đa ${formatBytes(extendCapacity)}.`;
     return (
       <div key={key} className="storage-tree-item">
         <div className={`storage-tree-row ${isSelected ? "selected" : ""}`} style={{ "--tree-depth": depth } as CSSProperties}>
@@ -310,7 +322,7 @@ export function StorageResourceTab({
           <span>{node.mountpoints?.join(", ") || (node.driveLetter ? `${node.driveLetter}:\\` : "—")}</span>
           <span>{formatBytes(node.freeBytes)}</span>
           <span className="storage-row-actions">
-            {target && bytes(target.extendableBytes) > 0 && !target.protected && <button type="button" onClick={() => { setSelected(target); setModal("extend"); }}>Extend</button>}
+            {target && <button type="button" disabled={!canExtend} title={extendReason} onClick={() => { setSelected(target); setModal("extend"); }}>Extend</button>}
           </span>
         </div>
         {children.length > 0 && expanded.includes(key) && <div>{children.map((child) => renderNode(child, disk, depth + 1))}</div>}
@@ -406,7 +418,7 @@ export function StorageResourceTab({
         {osFamily === "linux" && <div><b>{scan.volumeGroups.length}</b><span>Volume Group</span></div>}
       </div>
       <div className="storage-tree">
-        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>Mount</span><span>Còn trống</span><span /></div>
+        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>Mount</span><span>Còn trống</span><span>Thao tác</span></div>
         {disks.map((disk, index) => {
           const key = String(disk.id ?? disk.path ?? disk.number ?? index);
           const children = osFamily === "windows" ? disk.partitions ?? [] : disk.children ?? [];
@@ -423,6 +435,7 @@ export function StorageResourceTab({
         })}
         {!disks.length && <div className="empty-state">Chưa có dữ liệu Disk; nhấn “Quét lại”.</div>}
       </div>
+      <p className="storage-extend-note">Nút Extend chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn. Di chuột lên nút mờ để xem nguyên nhân; ổ C: có partition Recovery nằm phía sau sẽ không được tự động di chuyển.</p>
       {osFamily === "linux" && scan.volumeGroups.length > 0 && <div className="vg-grid">
         {scan.volumeGroups.map((vg) => {
           const target: StorageTarget = { key: `vg:${vg.name}`, kind: "linux_vg", label: `Volume Group ${vg.name}`, name: vg.name, protected: false, mounted: vg.logicalVolumes.length > 0 };
@@ -432,7 +445,7 @@ export function StorageResourceTab({
 
       {modal === "extend" && selected && <ModalShell title={`Extend ${selected.label}`} subtitle={`Dung lượng có thể dùng: ${formatBytes(selected.extendableBytes)}`} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitExtend}>
-          <label>Dung lượng thêm (GiB)<input name="size_gb" type="number" min="0.01" step="0.01" max={(bytes(selected.extendableBytes) / 1024 ** 3).toFixed(2)} required /></label>
+          <label>Dung lượng thêm (GiB)<input name="size_gb" type="number" min="0.001" step="0.001" max={(bytes(selected.extendableBytes) / 1024 ** 3).toFixed(3)} required /></label>
           <div className="resource-help">Agent sẽ kiểm tra lại vùng trống liên tục/LVM free ngay trước khi mở rộng. Filesystem ext4/xfs và Windows volume được grow cùng partition.</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Extend</button></div>
         </form>
