@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import Inventory, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings, validate_firewall_job_parameters  # noqa: E402
+from app.main import Inventory, Job, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings, validate_firewall_job_parameters  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -102,6 +102,53 @@ class ClassificationTests(unittest.TestCase):
             with self.subTest(backend=parameters["backend"]), self.assertRaises(HTTPException) as raised:
                 validate_firewall_job_parameters("firewall.rule.add", parameters)
             self.assertEqual(raised.exception.status_code, 422)
+
+    def test_each_firewall_mutation_result_queues_one_automatic_refresh(self):
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            token_response = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "firewall-refresh", "expected_os_family": "linux"})
+            agent_id = str(uuid.uuid4())
+            agent_key = ec.generate_private_key(ec.SECP256R1())
+            csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id)])).sign(agent_key, hashes.SHA256())
+            enroll = client.post("/api/v1/enroll", json={"token": token_response.json()["token"], "agent_id": agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "firewall-refresh", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.6.5", "addresses": ["10.30.1.70"]}})
+            self.assertEqual(enroll.status_code, 201, enroll.text)
+            certificate = x509.load_pem_x509_certificate(enroll.json()["certificate"].encode())
+
+            with SessionLocal() as db:
+                mutation = Job(server_id=agent_id, action="firewall.rule.add", parameters={}, reason="Add test firewall rule", status="dispatched", risk="high", created_by="test-creator")
+                db.add(mutation)
+                db.commit()
+                mutation_id = mutation.id
+
+            path = f"/api/v1/agent/jobs/{mutation_id}/result"
+            result_payload = {"status": "succeeded", "exit_code": 0, "output": "inserted"}
+            body, signed_headers = signed_agent_request(agent_key, certificate, path, result_payload)
+            result = client.post(path, headers=signed_headers, content=body)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertIsNotNone(result.json()["refresh_job_id"])
+
+            body, signed_headers = signed_agent_request(agent_key, certificate, path, result_payload)
+            replay = client.post(path, headers=signed_headers, content=body)
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertIsNone(replay.json()["refresh_job_id"])
+
+            with SessionLocal() as db:
+                failed_mutation = Job(server_id=agent_id, action="firewall.rule.remove", parameters={}, reason="Remove test firewall rule", status="dispatched", risk="high", created_by="test-creator")
+                db.add(failed_mutation)
+                db.commit()
+                failed_mutation_id = failed_mutation.id
+            failed_path = f"/api/v1/agent/jobs/{failed_mutation_id}/result"
+            failed_payload = {"status": "failed", "exit_code": 1, "output": "not removed"}
+            body, signed_headers = signed_agent_request(agent_key, certificate, failed_path, failed_payload)
+            failed_result = client.post(failed_path, headers=signed_headers, content=body)
+            self.assertEqual(failed_result.status_code, 200, failed_result.text)
+            self.assertIsNotNone(failed_result.json()["refresh_job_id"])
+            with SessionLocal() as db:
+                refreshes = db.query(Job).filter(Job.server_id == agent_id, Job.action == "firewall.list").all()
+                self.assertEqual(len(refreshes), 2)
+                self.assertTrue(all(refresh.status == "queued" for refresh in refreshes))
+                self.assertTrue(any(mutation_id[:8] in refresh.reason for refresh in refreshes))
+                self.assertTrue(any(failed_mutation_id[:8] in refresh.reason for refresh in refreshes))
 
     def test_guacamole_host_key_is_a_known_hosts_entry(self):
         encoded_key = base64.b64encode(b"test-ed25519-host-key-material").decode()

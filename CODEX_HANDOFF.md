@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent mới nhất: `0.6.4`; endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`. MSI 0.6.4 đã được bundle từ GitHub Actions vào repository.
+- Agent nguồn mới nhất: `0.6.5`; endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`. MSI trong repository còn là 0.6.4 cho tới khi workflow của source 0.6.5 hoàn tất và artifact đã được kiểm tra/bundle.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
@@ -26,6 +26,8 @@
 - API và Agent 0.6.4 validate lại backend-specific scope. Ngay trước khi chạy, Agent đọc lại zone hoặc filter chain để chặn metadata stale; chỉ cho table filter/base chain input-output, kiểm tra CIDR đúng IPv4/IPv6 và giữ phê duyệt bốn mắt/audit như cũ.
 - Modal thêm firewall đổi nút gửi thành **Thêm Rule** và hiển thị **Đang chờ quét firewall…** khi backend chưa sẵn sàng, tránh trường hợp bấm mà không có phản hồi. Chính sách bốn mắt vẫn được thực thi tại API cho `firewall.rule.add`; không được bỏ chỉ bằng cờ từ client.
 - Sau nâng cấp agent, job firewall `failed` cũ vẫn còn bền vững trong PostgreSQL. Dashboard hiện ghi rõ thời điểm của lỗi cũ và tự tạo một lần quét mới khi người dùng mở lại tab Firewall nếu job mới nhất đang `failed`; nút **Quét lại** luôn có thể tạo job thủ công.
+- Agent 0.6.5 chèn rule mới lên vị trí đầu tiên trên các backend có thứ tự quản trị rõ ràng: UFW dùng `insert 1`, nftables dùng `insert rule`, iptables/ip6tables dùng `-I CHAIN 1`. Windows giữ semantics native (Block ưu tiên Allow) và firewalld giữ semantics zone/rich-rule priority, không giả lập một thứ tự không tồn tại.
+- Sau mỗi kết quả thêm, xóa hoặc sắp xếp firewall — thành công hay thất bại — API tự tạo đúng một job `firewall.list`; kết quả gửi lặp không tạo thêm job quét. Dashboard polling nhận kết quả mới, đồng thời hiển thị rõ rule chưa được áp dụng khi mutation còn `pending_approval`, đang chạy hoặc đang quét lại. Phê duyệt bốn mắt và audit vẫn bắt buộc theo chính sách repository.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -142,7 +144,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.6.4 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đang cài agent thủ công cập nhật 0.6.5 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -194,7 +196,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** hiển thị đúng URL production, Agent `0.6.4`, Linux available và Windows MSI 0.6.4 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.6.5`, Linux available và Windows MSI 0.6.5 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -205,7 +207,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.6.4`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.6.5`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -224,8 +226,8 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `19/19`, gồm validate scope thêm rule riêng theo Windows/firewalld/nftables/iptables, chặn parameter firewall lạ/rỗng/backend không có thứ tự, direct Guacamole client route, configured domain, bundle generation, CA pin, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
-- Agent security `29/29`, gồm capabilities zone/profile/filter chain, live stale-target guard và IP-family guard khi thêm rule, unit Linux bắt buộc `AF_NETLINK`, parser firewalld/UFW/nftables/iptables, fallback thư mục hệ thống và `iptables -S` khi thiếu save helper/PATH, chẩn đoán không có backend, khóa rule Docker, ruleset rỗng, reorder UFW/nftables/iptables qua save/restore hoặc native fallback, rollback/stale snapshot guard, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
+- Control plane `20/20`, gồm tự tạo đúng một lượt quét firewall sau mọi kết quả mutation (kể cả failed, không nhân đôi khi replay), validate scope thêm rule riêng theo Windows/firewalld/nftables/iptables, chặn parameter firewall lạ/rỗng/backend không có thứ tự, direct Guacamole client route, configured domain, bundle generation, CA pin, OS binding, replay rejection, lịch sử/output job và tunnel chuẩn bị trước Guacamole.
+- Agent security `30/30`, gồm chèn rule UFW/nftables/iptables lên đầu, capabilities zone/profile/filter chain, live stale-target guard và IP-family guard khi thêm rule, unit Linux bắt buộc `AF_NETLINK`, parser firewalld/UFW/nftables/iptables, fallback thư mục hệ thống và `iptables -S` khi thiếu save helper/PATH, chẩn đoán không có backend, khóa rule Docker, ruleset rỗng, reorder UFW/nftables/iptables qua save/restore hoặc native fallback, rollback/stale snapshot guard, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.

@@ -287,6 +287,37 @@ trusted
             with self.assertRaisesRegex(ValueError, "does not match"):
                 tram_agent.add_firewall_rule(parameters, {"os_family": "linux"})
 
+    def test_new_ordered_firewall_rules_are_inserted_first(self):
+        common = {
+            "name": "SSH từ jump", "direction": "in", "action": "allow",
+            "protocol": "tcp", "local_port": 22, "source": "10.11.12.10/32",
+            "destination": "any",
+        }
+
+        ufw_commands = []
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/ufw"), patch.object(
+            tram_agent, "run", side_effect=lambda command, **_: (ufw_commands.append(command) or (0, "ok"))
+        ):
+            tram_agent.add_firewall_rule({**common, "backend": "ufw"}, {"os_family": "linux"})
+        self.assertEqual(ufw_commands[0][:5], ["/usr/sbin/ufw", "--force", "insert", "1", "allow"])
+
+        nft_commands = []
+        nft_ruleset = json.dumps({"nftables": [{"chain": {"family": "inet", "table": "filter", "name": "input", "type": "filter", "hook": "input"}}]})
+        def nft_run(command, **_):
+            nft_commands.append(command)
+            return (0, nft_ruleset) if "list" in command else (0, "ok")
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/nft"), patch.object(tram_agent, "run", side_effect=nft_run):
+            tram_agent.add_firewall_rule({**common, "backend": "nftables", "family": "inet", "table": "filter", "chain": "input"}, {"os_family": "linux"})
+        self.assertEqual(nft_commands[-1][:6], ["/usr/sbin/nft", "insert", "rule", "inet", "filter", "input"])
+
+        iptables_commands = []
+        def iptables_run(command, **_):
+            iptables_commands.append(command)
+            return (0, "-P INPUT ACCEPT\n-P OUTPUT ACCEPT") if "-S" in command else (0, "ok")
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/iptables"), patch.object(tram_agent, "run", side_effect=iptables_run):
+            tram_agent.add_firewall_rule({**common, "backend": "iptables", "family": "ipv4", "table": "filter", "chain": "INPUT"}, {"os_family": "linux"})
+        self.assertEqual(iptables_commands[-1][:8], ["/usr/sbin/iptables", "-w", "-t", "filter", "-I", "INPUT", "1", "-p"])
+
     def test_docker_managed_iptables_rule_cannot_be_deleted(self):
         output = "-A FORWARD -j DOCKER-USER"
         rule = tram_agent.parse_iptables_rules(f"*filter\n{output}\nCOMMIT", "ipv4")[0]

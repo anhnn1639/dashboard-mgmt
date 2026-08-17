@@ -830,7 +830,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
             return 1, "UFW is not installed"
         if values["local_port"] == "any":
             raise ValueError("UFW rules require a destination service port")
-        command = [binary, "--force", "allow" if values["action"] == "allow" else values["action"], values["direction"], "proto", values["protocol"], "from", values["source"]]
+        command = [binary, "--force", "insert", "1", "allow" if values["action"] == "allow" else values["action"], values["direction"], "proto", values["protocol"], "from", values["source"]]
         if values["remote_port"] != "any": command += ["port", str(values["remote_port"])]
         command += ["to", values["destination"], "port", str(values["local_port"]), "comment", values["name"]]
         return run(command)
@@ -875,7 +875,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         for address in (values["source"], values["destination"]):
             if address != "any" and expected_version and ipaddress.ip_network(address).version != expected_version:
                 raise ValueError("Firewall address does not match the selected nftables family")
-        command = [binary, "add", "rule", family, table, chain]
+        command = [binary, "insert", "rule", family, table, chain]
         address_family = "ip6" if ":" in values["source"] or ":" in values["destination"] else "ip"
         if values["source"] != "any": command += [address_family, "saddr", values["source"]]
         if values["destination"] != "any": command += [address_family, "daddr", values["destination"]]
@@ -896,7 +896,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         for address in (values["source"], values["destination"]):
             if address != "any" and ipaddress.ip_network(address).version != (4 if family == "ipv4" else 6):
                 raise ValueError("Firewall address does not match the selected iptables family")
-        command = [binary, "-t", table, "-A", chain, "-p", values["protocol"], "--dport", str(values["local_port"])]
+        command = [binary, "-w", "-t", table, "-I", chain, "1", "-p", values["protocol"], "--dport", str(values["local_port"])]
         if values["source"] != "any": command += ["-s", values["source"]]
         if values["destination"] != "any": command += ["-d", values["destination"]]
         if values["remote_port"] != "any": command += ["--sport", str(values["remote_port"])]

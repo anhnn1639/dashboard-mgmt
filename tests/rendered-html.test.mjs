@@ -45,6 +45,9 @@ test("firewall add form uses server capabilities and a viewport-safe scroll regi
   assert.match(source, /Zone firewalld/);
   assert.match(source, /Filter chain trên máy chủ/);
   assert.match(source, /capabilities\.targets\.map/);
+  assert.match(source, /hệ thống đang tự quét lại danh sách/);
+  assert.match(source, /Chưa áp dụng · đang chờ quản trị viên khác phê duyệt/);
+  assert.match(source, /autoRefreshForLatestMutation\.status !== "succeeded"/);
   assert.doesNotMatch(source, /Table<input name="table"/);
   assert.doesNotMatch(source, /Chain<input name="chain"/);
   assert.match(styles, /\.add-firewall-modal\s*{[^}]*max-height:\s*calc\(100% - 32px\)/s);

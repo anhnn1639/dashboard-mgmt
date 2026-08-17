@@ -1730,9 +1730,21 @@ function ServerDrawer({
     ? jobs.find((job) => job.action === currentReadAction)
     : undefined;
   const latestFirewallJob = jobs.find((job) => job.action === "firewall.list");
-  const firewallScan = parseFirewallOutput(
-    jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded")?.output,
+  const latestSuccessfulFirewallJob = jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded");
+  const latestFirewallMutation = jobs.find((job) => ["firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"].includes(job.action));
+  const autoRefreshForLatestMutation = latestFirewallMutation
+    ? jobs.find((job) => job.action === "firewall.list" && job.reason.includes(latestFirewallMutation.id.slice(0, 8)))
+    : undefined;
+  const mutationIsActive = Boolean(
+    latestFirewallMutation && ["pending_approval", "queued", "dispatched"].includes(latestFirewallMutation.status),
   );
+  const mutationNeedsRefresh = Boolean(
+    latestFirewallMutation &&
+    (mutationIsActive || (autoRefreshForLatestMutation
+      ? autoRefreshForLatestMutation.status !== "succeeded"
+      : !latestSuccessfulFirewallJob || new Date(latestFirewallMutation.createdAt) > new Date(latestSuccessfulFirewallJob.createdAt))),
+  );
+  const firewallScan = parseFirewallOutput(latestSuccessfulFirewallJob?.output);
   const firewallRules = firewallScan.rules;
   const selectedRules = firewallRules.filter((rule) =>
     selectedFirewallRules.includes(firewallRuleKey(rule)),
@@ -1860,11 +1872,13 @@ function ServerDrawer({
     if (parameters.remote_port && String(parameters.remote_port).toLowerCase() !== "any")
       parameters.remote_port = Number(parameters.remote_port);
     try {
-      await queueJob(
+      const created = await queueJob(
         "firewall.rule.add",
         parameters,
         String(form.get("reason") ?? "Thêm firewall rule từ máy chủ đã chọn"),
       );
+      if (created.status === "pending_approval")
+        notify("Rule chưa được áp dụng: đang chờ một quản trị viên khác phê duyệt.");
       closeFirewallModal();
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể tạo firewall rule");
@@ -1876,7 +1890,7 @@ function ServerDrawer({
     if (firewallConfirmation !== "CONFIRM" || selectedRules.length === 0) return;
     setBusy(true);
     try {
-      await queueJob(
+      const created = await queueJob(
         "firewall.rule.remove",
         {
           rules: selectedRules.map((rule) => ({
@@ -1888,6 +1902,8 @@ function ServerDrawer({
         },
         `Xóa ${selectedRules.length} firewall rule đã xác nhận trên ${server.name}`,
       );
+      if (created.status === "pending_approval")
+        notify("Rule chưa bị xóa: đang chờ một quản trị viên khác phê duyệt.");
       setSelectedFirewallRules([]);
       closeFirewallModal();
     } catch (reason) {
@@ -2157,6 +2173,20 @@ function ServerDrawer({
                     <span><b>{firewallRules.length}</b> rule · backend <strong>{firewallScan.backend || "chưa xác định"}</strong></span>
                     <span>{selectedRules.length} rule đang chọn</span>
                   </div>
+                  {mutationNeedsRefresh && latestFirewallMutation && (
+                    <div className={`firewall-mutation-status ${latestFirewallMutation.status}`}>
+                      <b>{latestFirewallMutation.action === "firewall.rule.add" ? "Thêm rule" : latestFirewallMutation.action === "firewall.rule.remove" ? "Xóa rule" : "Đổi thứ tự rule"}</b>
+                      <span>{latestFirewallMutation.status === "pending_approval"
+                        ? "Chưa áp dụng · đang chờ quản trị viên khác phê duyệt"
+                        : latestFirewallMutation.status === "queued"
+                          ? "Đã duyệt · đang chờ Agent nhận tác vụ"
+                          : latestFirewallMutation.status === "dispatched"
+                            ? "Agent đang áp dụng thay đổi"
+                            : latestFirewallMutation.status === "succeeded"
+                              ? "Đã áp dụng · hệ thống đang tự quét lại danh sách"
+                              : "Thay đổi thất bại · mở Công việc để xem kết quả"}</span>
+                    </div>
+                  )}
                   <div className="firewall-table-scroll">
                     <table className="firewall-table">
                       <thead>
@@ -2214,12 +2244,12 @@ function ServerDrawer({
                       </tbody>
                     </table>
                     {!latestReadJob && <div className="empty-state">Chưa có dữ liệu; nhấn “Quét lại”.</div>}
-                    {latestReadJob && ["queued", "approved", "running"].includes(latestReadJob.status) && <div className="empty-state">Agent đang xử lý: {latestReadJob.status}</div>}
+                    {latestReadJob && ["queued", "dispatched"].includes(latestReadJob.status) && <div className="empty-state">Agent đang tải lại danh sách firewall: {latestReadJob.status}</div>}
                     {latestReadJob?.status === "failed" && <div className="firewall-scan-error"><b>Không thể quét firewall trên agent {server.agentVersion || "chưa rõ phiên bản"}</b><small>Kết quả lúc {new Date(latestReadJob.createdAt).toLocaleString("vi-VN")}. Mở lại tab hoặc bấm “Quét lại” để tạo lần quét mới.</small><pre>{latestReadJob.output || "Agent không trả về nội dung lỗi. Hãy nâng cấp agent và quét lại."}</pre></div>}
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
                     {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning"><b>Agent {server.agentVersion || "chưa rõ phiên bản"}</b><span>{firewallScan.warning}</span></div>}
                   </div>
-                  <p className="firewall-note">Kéo biểu tượng ⠿ để đổi thứ tự trong cùng UFW IP family hoặc cùng nftables/iptables table và chain; thay đổi chỉ chạy sau phê duyệt và agent sẽ từ chối nếu snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
+                  <p className="firewall-note">Rule mới được chèn đầu chain UFW/nftables/iptables; sau mọi kết quả thêm, xóa hoặc đổi thứ tự, hệ thống tự quét lại danh sách thật từ Agent. Thay đổi chỉ chạy sau phê duyệt và Agent sẽ từ chối nếu snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
                 </section>
               )}
 

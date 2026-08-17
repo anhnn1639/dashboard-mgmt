@@ -495,6 +495,8 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
 }
 
+FIREWALL_MUTATION_ACTIONS = {"firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"}
+
 
 def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) -> None:
     if action == "firewall.list":
@@ -1709,6 +1711,7 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     server = verify_agent(request, db, job.server_id, await request.body())
+    queue_firewall_refresh = job.status == "dispatched" and job.action in FIREWALL_MUTATION_ACTIONS
     job.status = payload.status
     job.exit_code = payload.exit_code
     job.output = payload.output
@@ -1740,8 +1743,30 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
             transfer.content_encrypted = None
             transfer.nonce = ""
     audit(db, f"agent:{server.id}", f"job.{payload.status}", job.id, request, payload.status, {"action": job.action, "exit_code": payload.exit_code})
+    db.flush()
+    refresh_job = None
+    if queue_firewall_refresh:
+        refresh_job = Job(
+            server_id=server.id,
+            action="firewall.list",
+            parameters={},
+            reason=f"Tự động quét lại sau {job.action} {job.id[:8]}",
+            status="queued",
+            risk=SAFE_ACTIONS["firewall.list"]["risk"],
+            created_by=job.created_by,
+        )
+        db.add(refresh_job)
+        db.flush()
+        audit(
+            db,
+            f"agent:{server.id}",
+            "job.auto_refresh",
+            refresh_job.id,
+            request,
+            detail={"trigger_job_id": job.id, "trigger_action": job.action},
+        )
     db.commit()
-    return {"accepted": True}
+    return {"accepted": True, "refresh_job_id": refresh_job.id if refresh_job else None}
 
 
 @app.post("/api/v1/jobs", status_code=201)
