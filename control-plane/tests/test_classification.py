@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import Inventory, Job, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, settings, validate_firewall_job_parameters  # noqa: E402
+from app.main import FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -102,6 +102,29 @@ class ClassificationTests(unittest.TestCase):
             with self.subTest(backend=parameters["backend"]), self.assertRaises(HTTPException) as raised:
                 validate_firewall_job_parameters("firewall.rule.add", parameters)
             self.assertEqual(raised.exception.status_code, 422)
+
+    def test_legacy_pending_jobs_are_cancelled_without_execution(self):
+        server_id = str(uuid.uuid4())
+        with SessionLocal() as db:
+            db.add(Server(id=server_id, name="legacy-pending", os_family="linux", os_name="Ubuntu 24.04"))
+            job = Job(server_id=server_id, action="file.deliver", parameters={}, reason="Legacy pending file", status="pending_approval", risk="critical", created_by="legacy-admin")
+            db.add(job)
+            db.flush()
+            transfer = FileTransfer(server_id=server_id, job_id=job.id, original_name="legacy.txt", size_bytes=6, sha256=hashlib.sha256(b"legacy").hexdigest(), status="pending_approval", reason="Legacy pending file", created_by="legacy-admin", content_encrypted=b"cipher", nonce="nonce")
+            db.add(transfer)
+            db.commit()
+            job_id, transfer_id = job.id, transfer.id
+
+        with SessionLocal() as db:
+            self.assertEqual(retire_legacy_pending_jobs(db), 1)
+            db.commit()
+            retired_job = db.get(Job, job_id)
+            retired_transfer = db.get(FileTransfer, transfer_id)
+            self.assertEqual(retired_job.status, "cancelled")
+            self.assertIn("hãy tạo lại", retired_job.output)
+            self.assertEqual(retired_transfer.status, "cancelled")
+            self.assertIsNone(retired_transfer.content_encrypted)
+            self.assertEqual(retired_transfer.nonce, "")
 
     def test_each_firewall_mutation_result_queues_one_automatic_refresh(self):
         with TestClient(app) as client:
@@ -287,6 +310,16 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(listed_job["action"], "service.list")
             self.assertIn("output", listed_job)
 
+            direct_job = client.post(
+                "/api/v1/jobs",
+                headers=headers,
+                json={"server_id": agent_id, "action": "system.reboot", "parameters": {}, "reason": "Test direct high-risk execution", "require_approval": True},
+            )
+            self.assertEqual(direct_job.status_code, 201, direct_job.text)
+            self.assertEqual(direct_job.json()["status"], "queued")
+            removed_approval_endpoint = client.post(f"/api/v1/jobs/{direct_job.json()['id']}/approve", headers=headers)
+            self.assertEqual(removed_approval_endpoint.status_code, 404, removed_approval_endpoint.text)
+
             invalid_firewall_job = client.post(
                 "/api/v1/jobs",
                 headers=headers,
@@ -406,7 +439,7 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(confirmed_change.status_code, 200, confirmed_change.text)
             self.assertTrue(confirmed_change.json()["existingAgentsNeedMigration"])
 
-    def test_clean_file_is_encrypted_and_queued_for_four_eyes_approval(self):
+    def test_clean_file_is_encrypted_and_queued_directly(self):
         with TestClient(app) as client:
             headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
             token_response = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "file-test", "expected_os_family": "linux"})
@@ -424,7 +457,8 @@ class ClassificationTests(unittest.TestCase):
                     data={"reason": "CHG-1234 approved configuration"},
                 )
             self.assertEqual(uploaded.status_code, 201, uploaded.text)
-            self.assertEqual(uploaded.json()["status"], "pending_approval")
+            self.assertEqual(uploaded.json()["status"], "queued")
+            self.assertEqual(uploaded.json()["note"], "The clean file is queued for the agent")
             self.assertEqual(uploaded.json()["sha256"], hashlib.sha256(b"setting: approved\n").hexdigest())
 
             listed = client.get(f"/api/v1/servers/{agent_id}/files", headers=headers)

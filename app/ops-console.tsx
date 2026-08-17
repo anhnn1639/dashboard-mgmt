@@ -1731,12 +1731,14 @@ function ServerDrawer({
     : undefined;
   const latestFirewallJob = jobs.find((job) => job.action === "firewall.list");
   const latestSuccessfulFirewallJob = jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded");
-  const latestFirewallMutation = jobs.find((job) => ["firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"].includes(job.action));
+  const latestFirewallMutation = jobs.find((job) =>
+    ["firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"].includes(job.action) && job.status !== "cancelled",
+  );
   const autoRefreshForLatestMutation = latestFirewallMutation
     ? jobs.find((job) => job.action === "firewall.list" && job.reason.includes(latestFirewallMutation.id.slice(0, 8)))
     : undefined;
   const mutationIsActive = Boolean(
-    latestFirewallMutation && ["pending_approval", "queued", "dispatched"].includes(latestFirewallMutation.status),
+    latestFirewallMutation && ["queued", "dispatched"].includes(latestFirewallMutation.status),
   );
   const mutationNeedsRefresh = Boolean(
     latestFirewallMutation &&
@@ -1766,7 +1768,6 @@ function ServerDrawer({
     nextAction: string,
     parameters: Record<string, unknown>,
     reason: string,
-    requireApproval = true,
   ) {
     const response = await fetch("/api/v1/jobs", {
       method: "POST",
@@ -1779,12 +1780,11 @@ function ServerDrawer({
         action: nextAction,
         parameters,
         reason,
-        require_approval: requireApproval,
       }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail ?? "Không thể tạo tác vụ");
-    notify(`Đã tạo tác vụ ${nextAction} · ${data.status}.`);
+    notify(`Đã gửi tác vụ ${nextAction} tới Agent · ${data.status}.`);
     await loadJobs();
     return data as { id: string; status: string; risk: string };
   }
@@ -1796,7 +1796,6 @@ function ServerDrawer({
         currentReadAction,
         parameters,
         `Đọc dữ liệu ${activeTab} từ ${server.name}`,
-        false,
       );
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể yêu cầu dữ liệu mới");
@@ -1809,7 +1808,7 @@ function ServerDrawer({
     const options = actionOptions[tab] ?? [];
     if (options.length) setAction(options[0].value);
     if (tab === "firewall" && (!latestFirewallJob || latestFirewallJob.status === "failed"))
-      void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`, false).catch((reason) =>
+      void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`).catch((reason) =>
         notify(reason instanceof Error ? reason.message : "Không thể quét firewall"),
       );
   }
@@ -1872,13 +1871,11 @@ function ServerDrawer({
     if (parameters.remote_port && String(parameters.remote_port).toLowerCase() !== "any")
       parameters.remote_port = Number(parameters.remote_port);
     try {
-      const created = await queueJob(
+      await queueJob(
         "firewall.rule.add",
         parameters,
         String(form.get("reason") ?? "Thêm firewall rule từ máy chủ đã chọn"),
       );
-      if (created.status === "pending_approval")
-        notify("Rule chưa được áp dụng: đang chờ một quản trị viên khác phê duyệt.");
       closeFirewallModal();
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể tạo firewall rule");
@@ -1890,7 +1887,7 @@ function ServerDrawer({
     if (firewallConfirmation !== "CONFIRM" || selectedRules.length === 0) return;
     setBusy(true);
     try {
-      const created = await queueJob(
+      await queueJob(
         "firewall.rule.remove",
         {
           rules: selectedRules.map((rule) => ({
@@ -1902,8 +1899,6 @@ function ServerDrawer({
         },
         `Xóa ${selectedRules.length} firewall rule đã xác nhận trên ${server.name}`,
       );
-      if (created.status === "pending_approval")
-        notify("Rule chưa bị xóa: đang chờ một quản trị viên khác phê duyệt.");
       setSelectedFirewallRules([]);
       closeFirewallModal();
     } catch (reason) {
@@ -1965,7 +1960,7 @@ function ServerDrawer({
       const data = await response.json();
       if (!response.ok)
         throw new Error(data.detail ?? "Không thể tải file vào vùng cách ly");
-      notify("File sạch đã vào vùng cách ly và đang chờ quản trị viên khác phê duyệt.");
+      notify("File sạch đã được xếp hàng để Agent nhận và chuyển vào inbox cách ly.");
       event.currentTarget.reset();
       await loadTransfers();
     } catch (reason) {
@@ -2014,7 +2009,6 @@ function ServerDrawer({
                 "inventory.collect",
                 {},
                 "Làm mới dữ liệu máy chủ",
-                false,
               ).catch((reason) => notify(reason.message))
             }
           >
@@ -2176,10 +2170,8 @@ function ServerDrawer({
                   {mutationNeedsRefresh && latestFirewallMutation && (
                     <div className={`firewall-mutation-status ${latestFirewallMutation.status}`}>
                       <b>{latestFirewallMutation.action === "firewall.rule.add" ? "Thêm rule" : latestFirewallMutation.action === "firewall.rule.remove" ? "Xóa rule" : "Đổi thứ tự rule"}</b>
-                      <span>{latestFirewallMutation.status === "pending_approval"
-                        ? "Chưa áp dụng · đang chờ quản trị viên khác phê duyệt"
-                        : latestFirewallMutation.status === "queued"
-                          ? "Đã duyệt · đang chờ Agent nhận tác vụ"
+                      <span>{latestFirewallMutation.status === "queued"
+                          ? "Đang chờ Agent nhận tác vụ"
                           : latestFirewallMutation.status === "dispatched"
                             ? "Agent đang áp dụng thay đổi"
                             : latestFirewallMutation.status === "succeeded"
@@ -2249,7 +2241,7 @@ function ServerDrawer({
                     {latestReadJob?.status === "succeeded" && firewallRules.length === 0 && <div className="empty-state">Không tìm thấy firewall rule trên backend hiện tại.</div>}
                     {latestReadJob?.status === "succeeded" && firewallScan.warning && <div className="firewall-scan-warning"><b>Agent {server.agentVersion || "chưa rõ phiên bản"}</b><span>{firewallScan.warning}</span></div>}
                   </div>
-                  <p className="firewall-note">Rule mới được chèn đầu chain UFW/nftables/iptables; sau mọi kết quả thêm, xóa hoặc đổi thứ tự, hệ thống tự quét lại danh sách thật từ Agent. Thay đổi chỉ chạy sau phê duyệt và Agent sẽ từ chối nếu snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
+                  <p className="firewall-note">Rule mới được xếp hàng ngay và chèn đầu chain UFW/nftables/iptables; sau mọi kết quả thêm, xóa hoặc đổi thứ tự, hệ thống tự quét lại danh sách thật từ Agent. Agent vẫn từ chối nếu zone/chain hoặc snapshot đã cũ. Windows Firewall không hỗ trợ thứ tự do quản trị viên gán: Block xung đột vẫn ưu tiên hơn Allow. Firewalld dùng priority và các chain hành động riêng nên chưa cho kéo để tránh tạo cảm giác sai về thứ tự thực thi.</p>
                 </section>
               )}
 
@@ -2257,7 +2249,7 @@ function ServerDrawer({
                 <div className="update-summary-card">
                   <strong>{server.updates}</strong>
                   <span>Bản cập nhật đang chờ</span>
-                  <p>Cài bản vá bảo mật và reboot đều được kiểm soát phê duyệt bốn mắt.</p>
+                  <p>Cài bản vá bảo mật và reboot được xếp hàng trực tiếp, có RBAC và audit.</p>
                 </div>
               )}
 
@@ -2290,7 +2282,7 @@ function ServerDrawer({
               <b>Không đi qua SFTP, RDP drive hoặc clipboard</b>
               <p>
                 File tối đa 50 MiB, được quét ClamAV trước khi mã hóa lưu trong PostgreSQL,
-                cần phê duyệt bốn mắt và được Defender/ClamAV quét lại tại máy đích. Agent
+                sau đó được xếp hàng trực tiếp và quét lại bằng Defender/ClamAV tại máy đích. Agent
                 không tự chạy file và không ghi đè file đã có.
               </p>
             </div>
@@ -2529,7 +2521,7 @@ function ServerDrawer({
             </div>
             <label>Lý do / ticket<textarea name="reason" required minLength={5} rows={2} placeholder="CHG-1234 · Đưa Allow SSH lên trước Deny" /></label>
             <div className="warning-box"><b>Kiểm tra tránh mất kết nối</b><p>Hãy xác nhận rule Allow quản trị cần thiết vẫn nằm trước Deny/Drop. Agent đối chiếu lại nội dung và vị trí rule ngay trước khi áp dụng; snapshot khác sẽ bị từ chối.</p></div>
-            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang gửi…" : "Gửi chờ phê duyệt"}</button></div>
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={closeFirewallModal}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang gửi…" : "Áp dụng thứ tự"}</button></div>
           </form>
         </div>
       )}
@@ -2757,11 +2749,11 @@ function FirewallAddModal({
           </div>
 
           <div className="firewall-rule-preview">
-            <span>Rule chuẩn bị gửi phê duyệt</span>
+            <span>Rule chuẩn bị gửi tới Agent</span>
             <b>{ruleAction.toUpperCase()} {protocol.toUpperCase()} {servicePort || "?"} · {direction === "in" ? "Inbound" : "Outbound"} · {remoteValue || "CIDR chưa nhập"}</b>
             <small>{scopeText}</small>
           </div>
-          <div className="warning-box"><b>Thay đổi có kiểm soát</b><p>Tác vụ chỉ chạy sau khi quản trị viên khác phê duyệt. Agent sẽ kiểm tra lại zone/chain vẫn tồn tại trước khi áp dụng.</p></div>
+          <div className="warning-box"><b>Thực thi trực tiếp có kiểm soát</b><p>Tác vụ được xếp hàng ngay. Agent sẽ kiểm tra lại zone/chain vẫn tồn tại và CIDR hợp lệ trước khi áp dụng.</p></div>
         </div>
 
         <div className="modal-actions firewall-add-actions">
@@ -2847,33 +2839,16 @@ function JobsView({ token }: { token: string }) {
       createdAt: string;
     }>
   >([]);
-  const [message, setMessage] = useState("");
   useEffect(() => {
     fetch("/api/v1/jobs", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then((data) => setJobs(data.items ?? []))
       .catch(() => setJobs([]));
   }, [token]);
-  async function approve(jobId: string) {
-    const response = await fetch(`/api/v1/jobs/${jobId}/approve`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setMessage(data.detail ?? "Không thể phê duyệt tác vụ");
-      return;
-    }
-    setJobs((current) =>
-      current.map((job) =>
-        job.id === jobId ? { ...job, status: data.status } : job,
-      ),
-    );
-    setMessage("Đã phê duyệt; agent sẽ nhận tác vụ ở lần check-in tiếp theo.");
-  }
   const statusLabel = (status: string) =>
     ({
-      pending_approval: "Chờ phê duyệt",
+      pending_approval: "Job cũ chưa chạy",
+      cancelled: "Đã hủy",
       queued: "Đang chờ agent",
       dispatched: "Đang chạy",
       succeeded: "Hoàn tất",
@@ -2885,11 +2860,10 @@ function JobsView({ token }: { token: string }) {
         <div>
           <h2>Luồng công việc</h2>
           <p>
-            Tác vụ có cấu trúc, kiểm soát phê duyệt và lưu trong PostgreSQL.
+            Tác vụ được kiểm tra theo allowlist, xếp hàng trực tiếp và lưu audit trong PostgreSQL.
           </p>
         </div>
       </div>
-      {message && <p className="settings-message">{message}</p>}
       <div className="jobs-table">
         <div className="jobs-row head">
           <span>Công việc</span>
@@ -2914,9 +2888,6 @@ function JobsView({ token }: { token: string }) {
                 >
                   {statusLabel(job.status)}
                 </span>
-                {job.status === "pending_approval" && (
-                  <button onClick={() => approve(job.id)}>Phê duyệt</button>
-                )}
               </div>
             </div>
           ))

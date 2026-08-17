@@ -233,12 +233,10 @@ class Job(Base):
     action: Mapped[str] = mapped_column(String(80), index=True)
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     reason: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(30), default="pending_approval", index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     risk: Mapped[str] = mapped_column(String(20), default="medium")
     created_by: Mapped[str] = mapped_column(String(36))
-    approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -415,7 +413,6 @@ class JobCreateRequest(BaseModel):
     action: str
     parameters: dict[str, Any] = Field(default_factory=dict)
     reason: str = Field(min_length=5, max_length=2000)
-    require_approval: bool = True
 
 
 class JobResultRequest(BaseModel):
@@ -465,34 +462,34 @@ class SetupCompleteRequest(BaseModel):
 
 
 SAFE_ACTIONS: dict[str, dict[str, Any]] = {
-    "inventory.collect": {"roles": {"admin", "operator"}, "risk": "low", "approval": False},
-    "service.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "service.restart": {"roles": {"admin", "operator"}, "risk": "medium", "approval": True},
-    "service.start": {"roles": {"admin", "operator"}, "risk": "medium", "approval": True},
-    "service.stop": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "user.create": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "user.disable": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "user.enable": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "user.delete": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
-    "user.password.reset": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "group.create": {"roles": {"admin", "operator"}, "risk": "medium", "approval": True},
-    "group.delete": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
-    "user.add_group": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "group.remove_user": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "user.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "group.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "patch.scan": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "patch.install_security": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "logs.read": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low", "approval": False},
-    "process.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high", "approval": True},
-    "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
-    "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
-    "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low", "approval": False},
-    "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical", "approval": True},
+    "inventory.collect": {"roles": {"admin", "operator"}, "risk": "low"},
+    "service.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "service.restart": {"roles": {"admin", "operator"}, "risk": "medium"},
+    "service.start": {"roles": {"admin", "operator"}, "risk": "medium"},
+    "service.stop": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.create": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.disable": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.enable": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "user.password.reset": {"roles": {"admin", "operator"}, "risk": "high"},
+    "group.create": {"roles": {"admin", "operator"}, "risk": "medium"},
+    "group.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "user.add_group": {"roles": {"admin", "operator"}, "risk": "high"},
+    "group.remove_user": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "group.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "patch.scan": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "patch.install_security": {"roles": {"admin", "operator"}, "risk": "high"},
+    "logs.read": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low"},
+    "process.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high"},
+    "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high"},
+    "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical"},
 }
 
 FIREWALL_MUTATION_ACTIONS = {"firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"}
@@ -1003,6 +1000,29 @@ def expire_file_payloads(db: Session) -> int:
     return len(transfers)
 
 
+def retire_legacy_pending_jobs(db: Session) -> int:
+    jobs = db.execute(select(Job).where(Job.status == "pending_approval")).scalars().all()
+    for job in jobs:
+        job.status = "cancelled"
+        job.finished_at = now()
+        if not job.output:
+            job.output = "Job cũ đã bị hủy khi hệ thống chuyển sang thực thi trực tiếp; hãy tạo lại thao tác nếu vẫn cần."
+        transfer = db.execute(select(FileTransfer).where(FileTransfer.job_id == job.id)).scalar_one_or_none()
+        if transfer and transfer.status == "pending_approval":
+            transfer.status = "cancelled"
+            transfer.content_encrypted = None
+            transfer.nonce = ""
+        audit(
+            db,
+            "system:direct-execution-migration",
+            "job.legacy_pending.cancelled",
+            job.id,
+            result="cancelled",
+            detail={"server_id": job.server_id, "action": job.action},
+        )
+    return len(jobs)
+
+
 @app.on_event("startup")
 def startup() -> None:
     if not settings.database_url:
@@ -1013,6 +1033,7 @@ def startup() -> None:
         if factory is None:
             return
         with factory() as db:
+            retire_legacy_pending_jobs(db)
             expire_file_payloads(db)
             exists = db.execute(select(User).limit(1)).scalar_one_or_none()
             if not exists and settings.bootstrap_admin_password:
@@ -1328,14 +1349,14 @@ async def upload_server_file(
         raise HTTPException(status_code=503, detail="Malware scanner is unavailable; file was not stored") from exc
 
     encrypted, nonce = encrypt_file(bytes(content), transfer_id, server.id, sha256, settings.job_secret_key)
-    transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="pending_approval", scan_result=scan_result[:255], reason=reason, created_by=user.id, content_encrypted=encrypted, nonce=nonce)
-    job = Job(server_id=server.id, action="file.deliver", parameters={"transfer_id": transfer.id, "filename": filename, "sha256": sha256, "size_bytes": len(content)}, reason=reason, status="pending_approval", risk="critical", created_by=user.id)
+    transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="queued", scan_result=scan_result[:255], reason=reason, created_by=user.id, content_encrypted=encrypted, nonce=nonce)
+    job = Job(server_id=server.id, action="file.deliver", parameters={"transfer_id": transfer.id, "filename": filename, "sha256": sha256, "size_bytes": len(content)}, reason=reason, status="queued", risk="critical", created_by=user.id)
     db.add_all([transfer, job])
     db.flush()
     transfer.job_id = job.id
-    audit(db, user.username, "file.upload.clean", transfer.id, request, detail={"server": server.name, "filename": filename, "size": len(content), "sha256": sha256, "scanner": "clamav", "approval": True})
+    audit(db, user.username, "file.upload.clean", transfer.id, request, detail={"server": server.name, "filename": filename, "size": len(content), "sha256": sha256, "scanner": "clamav", "delivery": "direct"})
     db.commit()
-    return {**file_transfer_json(transfer), "note": "A different administrator must approve the delivery job"}
+    return {**file_transfer_json(transfer), "note": "The clean file is queued for the agent"}
 
 
 @app.post("/api/v1/enrollment-tokens", status_code=201)
@@ -1781,38 +1802,12 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
     server = db.get(Server, payload.server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
-    requires = bool(policy["approval"] or payload.require_approval)
-    job = Job(server_id=server.id, action=payload.action, parameters=protect_parameters(payload.parameters), reason=payload.reason, status="pending_approval" if requires else "queued", risk=policy["risk"], created_by=user.id)
+    job = Job(server_id=server.id, action=payload.action, parameters=protect_parameters(payload.parameters), reason=payload.reason, status="queued", risk=policy["risk"], created_by=user.id)
     db.add(job)
     db.flush()
-    audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "approval": requires})
+    audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "execution": "direct"})
     db.commit()
     return {"id": job.id, "status": job.status, "risk": job.risk}
-
-
-@app.post("/api/v1/jobs/{job_id}/approve")
-def approve_job(job_id: str, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
-    if expire_file_payloads(db):
-        db.commit()
-    job = db.get(Job, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "pending_approval":
-        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
-    if job.created_by == user.id:
-        raise HTTPException(status_code=409, detail="Four-eyes policy: creator cannot approve own job")
-    job.status = "queued"
-    job.approved_by = user.id
-    job.approved_at = now()
-    if job.action == "file.deliver":
-        parameters = reveal_parameters(job.parameters)
-        transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
-        if not transfer or transfer.status != "pending_approval" or not transfer.content_encrypted:
-            raise HTTPException(status_code=409, detail="File transfer is no longer available")
-        transfer.status = "queued"
-    audit(db, user.username, "job.approve", job.id, request)
-    db.commit()
-    return {"id": job.id, "status": job.status}
 
 
 @app.get("/api/v1/jobs")

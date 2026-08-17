@@ -1242,14 +1242,6 @@ textarea:focus-visible {
 .firewall-mutation-status b {
   color: #bed7fa;
 }
-.firewall-mutation-status.pending_approval {
-  border-color: #66502d;
-  color: #bba273;
-  background: rgba(211, 158, 68, 0.07);
-}
-.firewall-mutation-status.pending_approval b {
-  color: #e2b766;
-}
 .firewall-mutation-status.failed {
   border-color: #71343d;
   color: #c98b91;

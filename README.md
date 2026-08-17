@@ -14,11 +14,11 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Nginx trên host giữ public TCP `80/443`; Caddy chỉ xuất HTTPS web trên `127.0.0.1:3000`. Port `80` của Nginx chỉ chuyển hướng sang HTTPS.
 - RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT ngắn hạn và Argon2 password hashing.
 - Công việc có cấu trúc và allowlist; không có endpoint chạy shell tùy ý.
-- Quy tắc “4 mắt”: người tạo không thể tự duyệt tác vụ nguy hiểm.
+- Tác vụ được xếp hàng trực tiếp sau khi kiểm tra MFA/RBAC, allowlist tham số và ghi audit.
 - Quản lý local user/group theo máy đang chọn: tạo/khóa/mở khóa/xóa/reset mật khẩu, tạo/xóa group và thêm/xóa thành viên.
 - Scan/cài security updates, start/stop/restart service, xem process, firewall, journal/Event Log và reboot.
 - SSH/RDP trong trình duyệt qua Apache Guacamole 1.6 và reverse tunnel của agent; không cần mở `22/3389` từ control plane tới máy đích.
-- Truyền file một chiều qua mTLS `9443`: ClamAV trung tâm, mã hóa AES-GCM trong PostgreSQL, duyệt bốn mắt, kiểm tra SHA-256 và quét lại bằng Defender/ClamAV tại endpoint trước khi đưa vào inbox.
+- Truyền file một chiều qua mTLS `9443`: ClamAV trung tâm, mã hóa AES-GCM trong PostgreSQL, xếp hàng trực tiếp, kiểm tra SHA-256 và quét lại bằng Defender/ClamAV tại endpoint trước khi đưa vào inbox.
 - Audit log liên kết hash để phát hiện chỉnh sửa/xóa/chèn sự kiện ngoài luồng.
 - Docker Compose cho Ubuntu 24.04 với Postgres, API, dashboard, Caddy, Guacamole và guacd.
 
@@ -43,7 +43,7 @@ Windows/Linux Agent ── WebSocket mTLS/9443 ── Caddy/API ─────�
         ├─ chỉ relay tới localhost:22 (Linux) hoặc localhost:3389 (Windows)
         └─ private key không rời máy; không có listener inbound của agent
 
-Upload ── TLS/443 ── ClamAV cách ly ── AES-GCM/PostgreSQL ── duyệt 4 mắt
+Upload ── TLS/443 ── ClamAV cách ly ── AES-GCM/PostgreSQL ── job trực tiếp
         ── mTLS/9443 ── SHA-256 ── Defender/ClamAV endpoint ── inbox 0600/ACL
 ```
 
@@ -208,7 +208,7 @@ Nếu SSH không mở được, không mở inbound `22`. Trên máy Linux đíc
 1. Chọn máy chủ, tải file tối đa 50 MiB và nhập ticket/lý do.
 2. API giữ upload trong `/tmp` container gắn `noexec,nosuid,nodev`, gửi bytes qua `INSTREAM` tới ClamAV trên mạng Docker riêng. Socket `3310` không được public.
 3. File sạch được mã hóa AES-GCM có AAD gắn với transfer/server/SHA-256 rồi lưu trong PostgreSQL. File nhiễm hoặc scanner lỗi không được lưu nội dung.
-4. Một admin khác phải duyệt job `file.deliver`; người upload không tự duyệt được.
+4. API tạo ngay job `file.deliver` ở trạng thái `queued`; Agent nhận ở lần check-in kế tiếp.
 5. Đúng agent tải file qua API mTLS `9443`, kiểm tra kích thước/SHA-256, quét lại bằng Microsoft Defender hoặc ClamAV endpoint, sau đó publish không ghi đè vào `%ProgramData%\TramVanHanh\Inbox` hoặc `/var/lib/tram-agent/inbox`.
 6. Sau khi agent báo thành công/thất bại, ciphertext bị xóa khỏi PostgreSQL; metadata, hash và audit được giữ lại. Không có luồng tải file từ server về dashboard hoặc server-sang-server.
 
@@ -238,7 +238,7 @@ Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` t
 | Firewall | UFW allow/deny/delete | chỉ đọc ở bản hiện tại | `New/Remove-NetFirewallRule` |
 | Mở rộng storage | `lvextend --resizefs` | `lvextend --resizefs` | `Resize-Partition` tới `SizeMax` |
 
-Tác vụ đặc quyền luôn vào `pending_approval`. Một admin khác phải gọi endpoint approve hoặc dùng màn hình phê duyệt khi được bổ sung.
+Tác vụ đặc quyền được tạo ở trạng thái `queued` và Agent nhận ở lần check-in kế tiếp. API không còn endpoint approve; RBAC, MFA, validation tham số và audit vẫn bắt buộc.
 
 ## API tác vụ allowlist
 
