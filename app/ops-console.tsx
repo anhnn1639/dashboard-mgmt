@@ -2,6 +2,7 @@
 
 import Guacamole from "guacamole-common-js";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AccountsResourceTab, LogsResourceTab, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -65,34 +66,6 @@ function serverRoute(server: Server) {
 
 function sectionRoute(section: string) {
   return `#/${section}`;
-}
-
-function parseServiceOutput(output: string | undefined) {
-  if (!output) return [];
-  try {
-    const parsed = JSON.parse(output) as unknown;
-    const rows = Array.isArray(parsed) ? parsed : [parsed];
-    return rows
-      .filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
-      .map((row) => ({
-        name: String(row.Name ?? row.name ?? ""),
-        displayName: String(row.DisplayName ?? row.displayName ?? "—"),
-        status: String(row.Status ?? row.status ?? row.state ?? "chưa rõ"),
-        startType: String(row.StartType ?? row.startType ?? "—"),
-      }))
-      .filter((row) => row.name);
-  } catch {
-    return output
-      .split(/\r?\n/)
-      .map((line) => line.match(/^\s*(?:●\s*)?(\S+\.service)\s+\S+\s+(\S+)\s+(\S+)\s*(.*)$/))
-      .filter((match): match is RegExpMatchArray => Boolean(match))
-      .map((match) => ({
-        name: match[1],
-        displayName: match[4] || "—",
-        status: match[3],
-        startType: "—",
-      }));
-  }
 }
 
 type FirewallRule = {
@@ -1557,7 +1530,7 @@ type ServerTab =
 const serverTabs: Array<{ id: ServerTab; label: string; icon: string }> = [
   { id: "overview", label: "Tổng quan", icon: "⌂" },
   { id: "storage", label: "Disk", icon: "◫" },
-  { id: "services", label: "Dịch vụ", icon: "◉" },
+  { id: "services", label: "Services", icon: "◉" },
   { id: "accounts", label: "Tài khoản", icon: "◎" },
   { id: "firewall", label: "Firewall", icon: "◇" },
   { id: "processes", label: "Tiến trình", icon: "▤" },
@@ -1565,30 +1538,6 @@ const serverTabs: Array<{ id: ServerTab; label: string; icon: string }> = [
   { id: "files", label: "Truyền file", icon: "↳" },
   { id: "logs", label: "Nhật ký", icon: "≡" },
 ];
-
-const actionOptions: Partial<Record<ServerTab, Array<{ value: string; label: string }>>> = {
-  accounts: [
-    { value: "user.create", label: "Tạo user" },
-    { value: "user.password.reset", label: "Đặt lại mật khẩu" },
-    { value: "user.disable", label: "Khóa user" },
-    { value: "user.enable", label: "Mở khóa user" },
-    { value: "user.delete", label: "Xóa user" },
-    { value: "group.create", label: "Tạo group" },
-    { value: "group.delete", label: "Xóa group" },
-    { value: "user.add_group", label: "Thêm user vào group" },
-    { value: "group.remove_user", label: "Xóa user khỏi group" },
-  ],
-  services: [
-    { value: "service.restart", label: "Khởi động lại service" },
-    { value: "service.start", label: "Bật service" },
-    { value: "service.stop", label: "Dừng service" },
-  ],
-  storage: [{ value: "storage.extend", label: "Mở rộng ổ/Logical Volume" }],
-  updates: [
-    { value: "patch.install_security", label: "Cài bản vá bảo mật" },
-    { value: "system.reboot", label: "Khởi động lại máy chủ" },
-  ],
-};
 
 const readActionByTab: Partial<Record<ServerTab, string>> = {
   storage: "storage.list",
@@ -1642,7 +1591,6 @@ function ServerDrawer({
         Users?: Fact[];
         Groups?: Fact[];
         Storage?: Fact[];
-        LogicalVolumes?: Array<{ lv_path?: string }>;
         Services?: Fact[];
       };
     };
@@ -1659,7 +1607,6 @@ function ServerDrawer({
   };
   const [detail, setDetail] = useState<Detail | null>(null);
   const [activeTab, setActiveTab] = useState<ServerTab>("overview");
-  const [action, setAction] = useState("user.create");
   const [busy, setBusy] = useState(false);
   const [firewallModal, setFirewallModal] = useState<"add" | "delete" | "reorder" | null>(null);
   const [selectedFirewallRules, setSelectedFirewallRules] = useState<string[]>([]);
@@ -1677,6 +1624,7 @@ function ServerDrawer({
     }>
   >([]);
   const [jobs, setJobs] = useState<ServerJob[]>([]);
+  const [configuredLogSources, setConfiguredLogSources] = useState<string[]>(server.osFamily === "windows" ? ["System"] : ["journal"]);
   const loadTransfers = useCallback(
     () =>
       fetch(`/api/v1/servers/${server.id}/files`, {
@@ -1707,13 +1655,24 @@ function ServerDrawer({
         .catch(() => setJobs([])),
     [server.id, token],
   );
+  const loadLogSources = useCallback(
+    () =>
+      fetch(`/api/v1/servers/${server.id}/log-sources`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((response) => (response.ok ? response.json() : Promise.reject()))
+        .then((data) => setConfiguredLogSources(Array.isArray(data.sources) ? data.sources : server.osFamily === "windows" ? ["System"] : ["journal"]))
+        .catch(() => setConfiguredLogSources(server.osFamily === "windows" ? ["System"] : ["journal"])),
+    [server.id, server.osFamily, token],
+  );
   useEffect(() => {
     void loadDetail();
     void loadTransfers();
     void loadJobs();
+    void loadLogSources();
     const timer = window.setInterval(() => void loadJobs(), 5_000);
     return () => window.clearInterval(timer);
-  }, [loadDetail, loadTransfers, loadJobs]);
+  }, [loadDetail, loadTransfers, loadJobs, loadLogSources]);
   const facts = detail?.inventory?.extra;
   const groups = (facts?.Groups ?? [])
     .map((item) => item.name ?? item.Name ?? "")
@@ -1722,13 +1681,18 @@ function ServerDrawer({
     .map((item) => item.name ?? item.Name ?? "")
     .filter(Boolean);
   const storage = facts?.Storage ?? [];
-  const logicalVolumes = facts?.LogicalVolumes ?? [];
-  const serviceFacts = facts?.Services ?? [];
-  const services = serviceFacts.map((item) => item.name ?? item.Name ?? "").filter(Boolean);
   const currentReadAction = readActionByTab[activeTab];
   const latestReadJob = currentReadAction
     ? jobs.find((job) => job.action === currentReadAction)
     : undefined;
+  const latestSuccessfulReadJob = currentReadAction
+    ? jobs.find((job) => job.action === currentReadAction && job.status === "succeeded")
+    : undefined;
+  const latestUserJob = jobs.find((job) => job.action === "user.list");
+  const latestSuccessfulUserJob = jobs.find((job) => job.action === "user.list" && job.status === "succeeded");
+  const latestGroupJob = jobs.find((job) => job.action === "group.list");
+  const latestSuccessfulGroupJob = jobs.find((job) => job.action === "group.list" && job.status === "succeeded");
+  const latestSuccessfulLogSourcesJob = jobs.find((job) => job.action === "logs.sources" && job.status === "succeeded");
   const latestFirewallJob = jobs.find((job) => job.action === "firewall.list");
   const latestSuccessfulFirewallJob = jobs.find((job) => job.action === "firewall.list" && job.status === "succeeded");
   const latestFirewallMutation = jobs.find((job) =>
@@ -1752,18 +1716,6 @@ function ServerDrawer({
     selectedFirewallRules.includes(firewallRuleKey(rule)),
   );
   const removableRules = firewallRules.filter((rule) => rule.removable !== false);
-  const refreshedServices =
-    activeTab === "services" && latestReadJob?.status === "succeeded"
-      ? parseServiceOutput(latestReadJob.output)
-      : [];
-  const serviceRows = refreshedServices.length
-    ? refreshedServices
-    : serviceFacts.map((service, index) => ({
-        name: service.name ?? service.Name ?? `service-${index + 1}`,
-        displayName: service.DisplayName ?? "—",
-        status: service.Status ?? "chưa tải",
-        startType: service.StartType ?? service.state ?? "—",
-      }));
   async function queueJob(
     nextAction: string,
     parameters: Record<string, unknown>,
@@ -1789,14 +1741,18 @@ function ServerDrawer({
     return data as { id: string; status: string; risk: string };
   }
   async function refreshCurrentTab(parameters: Record<string, unknown> = {}) {
-    if (!currentReadAction) return;
+    if (!currentReadAction && activeTab !== "accounts") return;
     setBusy(true);
     try {
-      await queueJob(
-        currentReadAction,
-        parameters,
-        `Đọc dữ liệu ${activeTab} từ ${server.name}`,
-      );
+      if (activeTab === "accounts") {
+        await queueJob("user.list", {}, `Đọc Users từ ${server.name}`);
+        await queueJob("group.list", {}, `Đọc Groups từ ${server.name}`);
+      } else if (activeTab === "logs") {
+        await queueJob("logs.sources", {}, `Quét nguồn log từ ${server.name}`);
+        await queueJob("logs.read", {}, `Đọc 500 dòng log từ ${server.name}`);
+      } else if (currentReadAction) {
+        await queueJob(currentReadAction, parameters, `Đọc dữ liệu ${activeTab} từ ${server.name}`);
+      }
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể yêu cầu dữ liệu mới");
     } finally {
@@ -1805,33 +1761,52 @@ function ServerDrawer({
   }
   function selectTab(tab: ServerTab) {
     setActiveTab(tab);
-    const options = actionOptions[tab] ?? [];
-    if (options.length) setAction(options[0].value);
     if (tab === "firewall" && (!latestFirewallJob || latestFirewallJob.status === "failed"))
       void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`).catch((reason) =>
         notify(reason instanceof Error ? reason.message : "Không thể quét firewall"),
       );
+    if (tab === "accounts") {
+      if (!jobs.some((job) => job.action === "user.list" && job.status !== "failed")) void queueJob("user.list", {}, `Đọc Users từ ${server.name}`).catch((reason) => notify(reason instanceof Error ? reason.message : "Không thể đọc Users"));
+      if (!jobs.some((job) => job.action === "group.list" && job.status !== "failed")) void queueJob("group.list", {}, `Đọc Groups từ ${server.name}`).catch((reason) => notify(reason instanceof Error ? reason.message : "Không thể đọc Groups"));
+      return;
+    }
+    if (tab === "logs") {
+      if (!jobs.some((job) => job.action === "logs.sources" && job.status !== "failed")) void queueJob("logs.sources", {}, `Quét nguồn log từ ${server.name}`).catch((reason) => notify(reason instanceof Error ? reason.message : "Không thể quét nguồn log"));
+      if (!jobs.some((job) => job.action === "logs.read" && job.status !== "failed")) void queueJob("logs.read", {}, `Đọc 500 dòng log từ ${server.name}`).catch((reason) => notify(reason instanceof Error ? reason.message : "Không thể đọc log"));
+      return;
+    }
+    const readAction = readActionByTab[tab];
+    if (readAction && tab !== "firewall" && !jobs.some((job) => job.action === readAction && job.status !== "failed"))
+      void queueJob(readAction, {}, `Đọc dữ liệu ${tab} từ ${server.name}`).catch((reason) => notify(reason instanceof Error ? reason.message : "Không thể đọc dữ liệu"));
   }
-  async function submitAction(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function runResourceAction(nextAction: string, parameters: Record<string, unknown>, reason: string) {
     setBusy(true);
-    const form = new FormData(event.currentTarget);
-    const parameters: Record<string, unknown> = {};
-    for (const [key, value] of form.entries())
-      if (key !== "reason" && value !== "") parameters[key] = value;
-    if (action === "user.create")
-      parameters.groups = form.get("group") ? [form.get("group")] : [];
-    if (parameters.port) parameters.port = Number(parameters.port);
-    if (parameters.size_gb) parameters.size_gb = Number(parameters.size_gb);
     try {
-      await queueJob(
-        action,
-        parameters,
-        String(form.get("reason") ?? "Thao tác từ máy chủ đã chọn"),
-      );
-      event.currentTarget.reset();
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Không thể tạo tác vụ");
+      await queueJob(nextAction, parameters, reason);
+      return true;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Không thể gửi tác vụ");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function saveLogSources(sources: string[]) {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/v1/servers/${server.id}/log-sources`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ sources }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Không thể lưu nguồn log");
+      setConfiguredLogSources(data.sources);
+      await queueJob("logs.read", {}, `Đọc 500 dòng log sau khi đổi cấu hình trên ${server.name}`);
+      return true;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Không thể lưu nguồn log");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -2092,73 +2067,30 @@ function ServerDrawer({
 
           {activeTab !== "overview" && activeTab !== "files" && (
             <>
-              <div className="server-tab-toolbar">
+              {activeTab === "firewall" && <div className="server-tab-toolbar">
                 <div>
                   <h2>{serverTabs.find((tab) => tab.id === activeTab)?.label}</h2>
                   <p>Dữ liệu thật từ Agent và lịch sử tác vụ trong PostgreSQL.</p>
                 </div>
-                {currentReadAction && activeTab !== "firewall" && (
+                <div className="firewall-toolbar-actions">
                   <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
-                    {busy ? "Đang yêu cầu…" : "↻ Lấy dữ liệu mới"}
+                    {busy ? "Đang quét…" : "↻ Quét lại"}
                   </button>
-                )}
-                {activeTab === "firewall" && (
-                  <div className="firewall-toolbar-actions">
-                    <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
-                      {busy ? "Đang quét…" : "↻ Quét lại"}
-                    </button>
-                    <button className="firewall-icon-button add" type="button" aria-label="Thêm firewall rule" title="Thêm firewall rule" onClick={() => setFirewallModal("add")}>+</button>
-                    <button className="firewall-icon-button remove" type="button" aria-label="Xóa firewall rule đã chọn" title="Xóa firewall rule đã chọn" disabled={selectedRules.length === 0} onClick={() => { setFirewallConfirmation(""); setFirewallModal("delete"); }}>−</button>
-                  </div>
-                )}
-              </div>
+                  <button className="firewall-icon-button add" type="button" aria-label="Thêm firewall rule" title="Thêm firewall rule" onClick={() => setFirewallModal("add")}>+</button>
+                  <button className="firewall-icon-button remove" type="button" aria-label="Xóa firewall rule đã chọn" title="Xóa firewall rule đã chọn" disabled={selectedRules.length === 0} onClick={() => { setFirewallConfirmation(""); setFirewallModal("delete"); }}>−</button>
+                </div>
+              </div>}
 
               {activeTab === "storage" && (
-                <div className="inventory-table">
-                  <div className="inventory-row head"><span>Ổ / thiết bị</span><span>Filesystem</span><span>Dung lượng</span><span>Còn trống</span></div>
-                  {storage.length ? storage.map((volume, index) => {
-                    const name = volume.DriveLetter ?? volume.path ?? volume.Path ?? volume.name ?? `volume-${index + 1}`;
-                    const size = Number(volume.Size ?? volume.size ?? 0);
-                    const remaining = Number(volume.SizeRemaining ?? 0);
-                    return (
-                      <div className="inventory-row" key={`${name}-${index}`}>
-                        <b>{name}{volume.DriveLetter ? ":" : ""}</b>
-                        <span>{volume.FileSystem ?? volume.fstype ?? "—"}</span>
-                        <span>{size ? `${(size / 1024 ** 3).toFixed(1)} GB` : "—"}</span>
-                        <span>{remaining ? `${(remaining / 1024 ** 3).toFixed(1)} GB` : "—"}</span>
-                      </div>
-                    );
-                  }) : <div className="empty-state">Chưa có dữ liệu ổ đĩa trong inventory.</div>}
-                </div>
+                <StorageResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "services" && (
-                <div className="inventory-table services-table">
-                  <div className="inventory-row head"><span>Service</span><span>Tên hiển thị</span><span>Trạng thái</span><span>Khởi động</span></div>
-                  {serviceRows.length ? serviceRows.slice(0, 250).map((service, index) => {
-                    return (
-                      <div className="inventory-row" key={`${service.name}-${index}`}>
-                        <b>{service.name}</b>
-                        <span>{service.displayName}</span>
-                        <span className={`service-state ${String(service.status).toLowerCase()}`}>{service.status}</span>
-                        <span>{service.startType}</span>
-                      </div>
-                    );
-                  }) : <div className="empty-state">Chưa có danh sách dịch vụ; nhấn “Lấy dữ liệu mới”.</div>}
-                </div>
+                <ServicesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "accounts" && (
-                <div className="account-columns">
-                  <section>
-                    <h3>Tài khoản local ({users.length})</h3>
-                    <div className="compact-list">{(facts?.Users ?? []).map((user, index) => <div key={`${user.name ?? user.Name}-${index}`}><b>{user.name ?? user.Name}</b><span>{user.Enabled === false ? "Đã khóa" : user.shell ?? user.home ?? "Hoạt động"}</span></div>)}</div>
-                  </section>
-                  <section>
-                    <h3>Nhóm local ({groups.length})</h3>
-                    <div className="compact-list">{(facts?.Groups ?? []).map((group, index) => <div key={`${group.name ?? group.Name}-${index}`}><b>{group.name ?? group.Name}</b><span>{(group.members ?? group.Members ?? []).slice(0, 4).join(", ") || "Không có thành viên trực tiếp"}</span></div>)}</div>
-                  </section>
-                </div>
+                <AccountsResourceTab userOutput={latestSuccessfulUserJob?.output} groupOutput={latestSuccessfulGroupJob?.output} job={latestUserJob?.status === "failed" ? latestUserJob : latestGroupJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "firewall" && (
@@ -2215,7 +2147,7 @@ function ServerDrawer({
                               onDragEnd={() => setDraggedFirewallRule(null)}
                               onDragOver={(event) => {
                                 const source = firewallRules.find((item) => firewallRuleKey(item) === draggedFirewallRule);
-                                if (source?.orderGroup === rule.orderGroup && source.id !== rule.id && rule.reorderable === true) {
+                                if (source && source.orderGroup === rule.orderGroup && source.id !== rule.id && rule.reorderable === true) {
                                   event.preventDefault();
                                   event.dataTransfer.dropEffect = "move";
                                 }
@@ -2249,22 +2181,15 @@ function ServerDrawer({
               )}
 
               {activeTab === "updates" && (
-                <div className="update-summary-card">
-                  <strong>{server.updates}</strong>
-                  <span>Bản cập nhật đang chờ</span>
-                  <p>Cài bản vá bảo mật và reboot được xếp hàng trực tiếp, có RBAC và audit.</p>
-                </div>
+                <UpdatesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
-              {latestReadJob && activeTab !== "firewall" && (
-                <section className="operation-result">
-                  <header>
-                    <b>{latestReadJob.action}</b>
-                    <span className={`job-state ${latestReadJob.status}`}>{latestReadJob.status}</span>
-                    <time>{new Date(latestReadJob.createdAt).toLocaleString("vi-VN")}</time>
-                  </header>
-                  {latestReadJob.output ? <pre>{latestReadJob.output}</pre> : <p>Agent sẽ trả kết quả ở lần check-in tiếp theo.</p>}
-                </section>
+              {activeTab === "processes" && (
+                <ProcessesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+              )}
+
+              {activeTab === "logs" && (
+                <LogsResourceTab output={latestSuccessfulReadJob?.output} sourceOutput={latestSuccessfulLogSourcesJob?.output} configured={configuredLogSources} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} saveSources={saveLogSources} />
               )}
             </>
           )}
@@ -2309,187 +2234,6 @@ function ServerDrawer({
             </>
           )}
 
-          {(actionOptions[activeTab]?.length ?? 0) > 0 && (
-            <>
-          <h3>Thao tác trên {server.name}</h3>
-          <form className="server-action-form" onSubmit={submitAction}>
-            <label>
-              Loại tác vụ
-              <select
-                value={action}
-                onChange={(event) => setAction(event.target.value)}
-              >
-                {(actionOptions[activeTab] ?? []).map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            {action === "user.create" && (
-              <>
-                <label>
-                  Tên user
-                  <input name="username" required pattern="[A-Za-z0-9._-]+" />
-                </label>
-                <label>
-                  Mật khẩu ban đầu
-                  <input
-                    name="password"
-                    type="password"
-                    minLength={12}
-                    required
-                  />
-                </label>
-                <label>
-                  Group trên máy chủ
-                  <select name="group">
-                    <option value="">Chọn group…</option>
-                    {groups.map((group) => (
-                      <option key={group}>{group}</option>
-                    ))}
-                  </select>
-                </label>
-              </>
-            )}
-            {action === "group.create" && (
-              <label>
-                Tên group
-                <input name="group" required pattern="[A-Za-z0-9._-]+" />
-              </label>
-            )}
-            {[
-              "user.password.reset",
-              "user.disable",
-              "user.enable",
-              "user.delete",
-            ].includes(action) && (
-              <>
-                <label>
-                  User trên máy chủ
-                  <select name="username" required>
-                    <option value="">Chọn user…</option>
-                    {users.map((user) => (
-                      <option key={user}>{user}</option>
-                    ))}
-                  </select>
-                </label>
-                {action === "user.password.reset" && (
-                  <label>
-                    Mật khẩu mới
-                    <input
-                      name="password"
-                      type="password"
-                      minLength={12}
-                      required
-                    />
-                  </label>
-                )}
-              </>
-            )}
-            {action === "group.delete" && (
-              <label>
-                Group trên máy chủ
-                <select name="group" required>
-                  <option value="">Chọn group…</option>
-                  {groups.map((group) => (
-                    <option key={group}>{group}</option>
-                  ))}
-                </select>
-              </label>
-            )}
-            {["user.add_group", "group.remove_user"].includes(action) && (
-              <>
-                <label>
-                  User
-                  <select name="username" required>
-                    <option value="">Chọn user…</option>
-                    {users.map((user) => (
-                      <option key={user}>{user}</option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Group
-                  <select name="group" required>
-                    <option value="">Chọn group…</option>
-                    {groups.map((group) => (
-                      <option key={group}>{group}</option>
-                    ))}
-                  </select>
-                </label>
-              </>
-            )}
-            {["service.restart", "service.start", "service.stop"].includes(
-              action,
-            ) && (
-              <label>
-                Service trên máy chủ
-                <select name="name" required>
-                  <option value="">Chọn service…</option>
-                  {services.map((service) => (
-                    <option key={service}>{service}</option>
-                  ))}
-                </select>
-              </label>
-            )}
-            {action === "storage.extend" &&
-              (server.osFamily === "windows" ? (
-                <label>
-                  Ổ Windows
-                  <select name="drive" required>
-                    <option value="">Chọn ổ…</option>
-                    {storage.map((volume, index) => {
-                      const drive =
-                        volume.DriveLetter ?? volume.path ?? volume.Path ?? "";
-                      return drive ? (
-                        <option key={`${drive}-${index}`} value={drive}>
-                          {drive}:
-                        </option>
-                      ) : null;
-                    })}
-                  </select>
-                </label>
-              ) : (
-                <>
-                  <label>
-                    Logical Volume trên máy chủ
-                    <select name="logical_volume" required>
-                      <option value="">Chọn Logical Volume…</option>
-                      {logicalVolumes.map((volume) =>
-                        volume.lv_path ? (
-                          <option key={volume.lv_path} value={volume.lv_path}>
-                            {volume.lv_path}
-                          </option>
-                        ) : null,
-                      )}
-                    </select>
-                  </label>
-                  <label>
-                    Dung lượng thêm (GB)
-                    <input
-                      name="size_gb"
-                      type="number"
-                      min="1"
-                      max="10240"
-                      required
-                    />
-                  </label>
-                </>
-              ))}
-            <label>
-              Lý do / ticket
-              <textarea
-                name="reason"
-                required
-                rows={2}
-                placeholder="CHG-1234 · Mô tả thay đổi"
-              />
-            </label>
-            <button className="button primary" disabled={busy}>
-              {busy ? "Đang gửi…" : "Gửi tác vụ có kiểm soát"}
-            </button>
-          </form>
-            </>
-          )}
         </div>
       </section>
       {firewallModal === "add" && (
@@ -2586,13 +2330,14 @@ function FirewallAddModal({
   const remotePort = windowsOutbound ? servicePort : "any";
   const source = direction === "in" || backend === "windows" ? remoteValue : "any";
   const destination = direction === "out" && backend !== "windows" ? remoteValue : "any";
-  const backendDescription = {
+  const backendDescriptions: Record<string, string> = {
     windows: "Profile được Agent đọc bằng Get-NetFirewallProfile trên đúng Windows Server này.",
     ufw: "UFW tự ánh xạ Inbound/Outbound sang chain phù hợp; không cần nhập table hoặc chain.",
     firewalld: "public là zone của firewalld, không phải chain. Danh sách zone bên dưới lấy trực tiếp từ máy chủ.",
     nftables: "Chỉ base chain loại filter có hook INPUT/OUTPUT lấy từ nftables được phép chọn; chain NAT/DOCKER bị loại.",
     iptables: "INPUT/OUTPUT là chain. UI chỉ cho chọn chain filter đang tồn tại do Agent báo về.",
-  }[backend] ?? "Đang chờ Agent quét backend firewall và trả metadata từ máy chủ.";
+  };
+  const backendDescription = backendDescriptions[backend] ?? "Đang chờ Agent quét backend firewall và trả metadata từ máy chủ.";
   const scopeText = !backend
     ? "Chưa xác định backend"
     : backend === "windows"

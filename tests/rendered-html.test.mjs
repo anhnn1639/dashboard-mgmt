@@ -21,6 +21,7 @@ test("server-renders the secure operations console shell", async () => {
 
 test("dashboard includes automatic Windows and Linux fleet views", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
   assert.match(source, /Máy chủ Linux/);
   assert.match(source, /Máy chủ Windows/);
   assert.match(source, /server\.osFamily === scope/);
@@ -29,12 +30,24 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(source, /Nhật ký kiểm toán/);
   assert.match(source, /serverRoute\(server\)/);
   assert.match(source, /Truyền file/);
-  assert.match(source, /service\.restart/);
+  assert.match(resources, /service\.restart/);
   assert.match(source, /firewall\.list/);
-  assert.match(source, /parseServiceOutput/);
+  assert.match(resources, /Disk & Volumes/);
+  assert.match(resources, /Users & Groups/);
+  assert.match(resources, /patch\.install/);
+  assert.match(resources, /process\.kill/);
+  assert.match(resources, /Tối đa 500 dòng/);
   assert.match(source, /\/api\/v1\/setup\/status/);
   assert.match(source, /Kết nối PostgreSQL/);
   assert.match(source, /Admin local đầu tiên/);
+});
+
+test("resource dialogs fit the viewport and scroll internally", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(styles, /\.resource-modal\s*{[^}]*max-height:\s*calc\(100dvh - 16px\)/s);
+  assert.match(styles, /\.resource-modal-body\s*{[^}]*overflow-y:\s*auto/s);
+  assert.match(styles, /\.storage-tree\s*{[^}]*overflow:\s*auto/s);
+  assert.match(styles, /\.resource-table-scroll\s*{[^}]*overflow:\s*auto/s);
 });
 
 test("firewall add form uses server capabilities and a viewport-safe scroll region", async () => {

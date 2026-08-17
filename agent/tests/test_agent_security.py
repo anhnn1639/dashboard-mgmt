@@ -429,6 +429,74 @@ trusted
                     {"os_family": "linux"},
                 )
 
+    def test_parted_free_regions_are_reported_in_bytes(self):
+        output = "BYT;\n/dev/sda:107374182400B:scsi:512:4096:gpt:Disk;\n:1048576B:1073741823B:1072693248B:free;\n1:1073741824B:53687091199B:52613349376B:ext4:root:;\n:53687091200B:107373133823B:53686042624B:free;"
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/parted"), patch.object(tram_agent, "run", return_value=(0, output)):
+            regions = tram_agent.parted_free_regions("/dev/sda")
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(regions[-1]["startBytes"], 53687091200)
+        self.assertEqual(regions[-1]["sizeBytes"], 53686042624)
+
+    def test_update_install_uses_only_selected_apt_packages(self):
+        scan = json.dumps({"platform": "linux", "manager": "apt", "updates": [
+            {"id": "openssl", "name": "openssl", "version": "3.0.2-1", "repository": "security"},
+            {"id": "curl", "name": "curl", "version": "8.0.1-1", "repository": "updates"},
+        ]})
+        commands = []
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "find_system_command", return_value="/usr/bin/apt-get"), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+            code, _ = tram_agent.install_updates({"updates": [{"id": "openssl", "version": "3.0.2-1"}]}, {"os_family": "linux", "distribution_id": "ubuntu"})
+        self.assertEqual(code, 0)
+        self.assertEqual(commands, [["/usr/bin/apt-get", "-y", "--only-upgrade", "install", "openssl=3.0.2-1"]])
+
+    def test_update_install_rejects_a_stale_package_version(self):
+        scan = json.dumps({"updates": [{"id": "openssl", "name": "openssl", "version": "3.0.2-2"}]})
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                tram_agent.install_updates({"updates": [{"id": "openssl", "version": "3.0.2-1"}]}, {"os_family": "linux", "distribution_id": "ubuntu"})
+
+    def test_dnf_install_pins_only_the_selected_version(self):
+        scan = json.dumps({"updates": [
+            {"id": "openssl.x86_64", "name": "openssl", "version": "1:3.2.2-6.el9_5"},
+            {"id": "curl.x86_64", "name": "curl", "version": "8.0.1-4.el9"},
+        ]})
+        commands = []
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "find_system_command", side_effect=lambda name: "/usr/bin/dnf" if name == "dnf" else None), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+            code, _ = tram_agent.install_updates({"updates": [{"id": "openssl.x86_64", "version": "1:3.2.2-6.el9_5"}]}, {"os_family": "linux", "distribution_id": "rhel"})
+        self.assertEqual(code, 0)
+        self.assertEqual(commands, [["/usr/bin/dnf", "-y", "upgrade", "openssl.x86_64-1:3.2.2-6.el9_5"]])
+
+    def test_account_group_update_preserves_builtin_memberships(self):
+        snapshot = {
+            "groups": [
+                {"name": "Users", "protected": True},
+                {"name": "Administrators", "protected": True},
+                {"name": "AppOps", "protected": False},
+            ],
+            "adminGroups": ["Administrators"],
+            "defaultGroups": ["Users"],
+        }
+        desired = tram_agent.desired_account_groups(snapshot, ["AppOps"], False, {"Users", "Administrators"})
+        self.assertEqual(desired, {"Users", "AppOps"})
+        desired_admin = tram_agent.desired_account_groups(snapshot, ["AppOps"], True, {"Users"})
+        self.assertEqual(desired_admin, {"Users", "Administrators", "AppOps"})
+
+    def test_log_severity_matches_words_not_substrings(self):
+        self.assertEqual(tram_agent.normalize_severity("", "server started normally"), "info")
+        self.assertEqual(tram_agent.normalize_severity("", "service failed to start"), "error")
+        self.assertEqual(tram_agent.normalize_severity("", "warning: disk latency"), "warning")
+
+    def test_logs_reject_a_source_not_scanned_from_the_server(self):
+        available = json.dumps([{"id": "journal", "type": "journal"}])
+        with patch.object(tram_agent, "log_sources", return_value=(0, available)):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                tram_agent.read_logs({"limit": 500, "sources": ["/etc/shadow"]}, False)
+
+    def test_process_kill_protects_init_and_the_agent(self):
+        with self.assertRaisesRegex(ValueError, "protected"):
+            tram_agent.kill_processes({"processes": [{"pid": 1, "name": "systemd", "created": 1.0}]})
+        with self.assertRaisesRegex(ValueError, "protected"):
+            tram_agent.kill_processes({"processes": [{"pid": tram_agent.os.getpid(), "name": "python", "created": 1.0}]})
+
 
 if __name__ == "__main__":
     unittest.main()

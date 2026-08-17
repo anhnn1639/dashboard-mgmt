@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -50,7 +51,12 @@ AGENT_VERSION = load_agent_version()
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
+LINUX_ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
+WINDOWS_ACCOUNT_RE = re.compile(r"^[^\\/\[\]:;|=,+*?<>@\x00-\x1f]{1,20}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
+PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~-]{0,254}$")
+DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_.+/-]{1,180}$")
+MOUNT_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_.-]+/?){1,12}$")
 FIREWALL_OBJECT_RE = re.compile(r"^[A-Za-z0-9_.@:+/-]{1,160}$")
 TRANSFER_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,179}$")
 SYSTEM_COMMAND_DIRS = tuple(Path(value) for value in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"))
@@ -65,10 +71,11 @@ ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
 ALLOWED_ACTIONS = {
     "inventory.collect", "service.list", "service.restart", "service.start", "service.stop",
-    "user.create", "user.disable", "user.enable", "user.delete", "user.password.reset",
+    "user.create", "user.update", "user.disable", "user.enable", "user.delete", "user.password.reset",
     "group.create", "group.delete", "user.add_group", "patch.scan",
-    "patch.install_security", "logs.read", "process.list", "firewall.list", "system.reboot",
+    "patch.install", "logs.sources", "logs.read", "process.list", "process.kill", "firewall.list", "system.reboot",
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
+    "storage.create", "storage.delete",
     "firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
 
@@ -1406,6 +1413,981 @@ def deliver_file(config: Config, parameters: dict[str, Any], inventory: dict[str
         return 4, f"Secure file delivery failed: {exc}"
 
 
+def json_rows(output: str) -> list[dict[str, Any]]:
+    if not output.strip():
+        return []
+    parsed = json.loads(output)
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def ps_quote(value: str) -> str:
+    if any(ord(character) < 32 for character in value):
+        raise ValueError("Invalid PowerShell string")
+    return "'" + value.replace("'", "''") + "'"
+
+
+def require_groups(parameters: dict[str, Any]) -> list[str]:
+    raw = parameters.get("groups", [])
+    if not isinstance(raw, list) or len(raw) > 100:
+        raise ValueError("Invalid groups")
+    groups = [str(group) for group in raw]
+    if len(set(groups)) != len(groups) or any(not GROUP_RE.fullmatch(group) for group in groups):
+        raise ValueError("Invalid groups")
+    return groups
+
+
+def linux_service_rows() -> tuple[int, str]:
+    binary = find_system_command("systemctl")
+    if not binary:
+        return 127, "systemctl is not installed"
+    files_code, files_output = run([binary, "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+    units_code, units_output = run([binary, "list-units", "--type=service", "--all", "--no-legend", "--no-pager", "--plain"])
+    if files_code != 0 and units_code != 0:
+        return units_code or files_code, units_output or files_output
+    startup: dict[str, str] = {}
+    for line in files_output.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and SERVICE_RE.fullmatch(fields[0]):
+            startup[fields[0]] = fields[1]
+    runtime: dict[str, tuple[str, str, str]] = {}
+    for line in units_output.splitlines():
+        fields = line.lstrip("● ").split(None, 4)
+        if len(fields) >= 4 and SERVICE_RE.fullmatch(fields[0]):
+            runtime[fields[0]] = (fields[2], fields[3], fields[4] if len(fields) > 4 else "")
+    names = sorted(set(startup) | set(runtime), key=str.casefold)
+    rows = []
+    for name in names:
+        active, sub, description = runtime.get(name, ("inactive", "dead", ""))
+        rows.append({
+            "name": name,
+            "displayName": description or name,
+            "status": active,
+            "subState": sub,
+            "startType": startup.get(name, "unknown"),
+            "startsWithOs": startup.get(name, "") in {"enabled", "enabled-runtime", "static", "generated"},
+        })
+    return 0, json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+
+
+def service_rows(windows: bool) -> tuple[int, str]:
+    if windows:
+        script = "Get-CimInstance Win32_Service|Sort-Object Name|ForEach-Object{[pscustomobject]@{name=$_.Name;displayName=$_.DisplayName;status=$_.State;subState=$_.Status;startType=$_.StartMode;startsWithOs=($_.StartMode -eq 'Auto')}}|ConvertTo-Json -Depth 3 -Compress"
+        return powershell(script, output_limit=5_000_000)
+    return linux_service_rows()
+
+
+def linux_account_rows() -> dict[str, Any]:
+    import grp
+    import pwd
+    passwd_binary = find_system_command("passwd")
+    chage_binary = find_system_command("chage")
+    users: list[dict[str, Any]] = []
+    all_groups = list(grp.getgrall())
+    group_names = {item.gr_gid: item.gr_name for item in all_groups}
+    admin_groups = [name for name in ("sudo", "wheel") if any(group.gr_name == name for group in all_groups)]
+    for item in pwd.getpwall():
+        supplementary = sorted({group.gr_name for group in all_groups if item.pw_name in group.gr_mem})
+        primary = group_names.get(item.pw_gid, str(item.pw_gid))
+        groups = [primary, *[group for group in supplementary if group != primary]]
+        locked = False
+        password_status = "unknown"
+        if passwd_binary:
+            code, output = run([passwd_binary, "-S", item.pw_name])
+            if code == 0:
+                fields = output.split()
+                if len(fields) >= 2:
+                    password_status = fields[1]
+                    locked = fields[1] in {"L", "LK", "NP"}
+        account_expires = ""
+        max_password_days: int | None = None
+        if chage_binary:
+            code, output = run([chage_binary, "-l", item.pw_name])
+            if code == 0:
+                for line in output.splitlines():
+                    key, _, value = line.partition(":")
+                    normalized = key.strip().lower()
+                    if normalized == "account expires":
+                        account_expires = "" if value.strip().lower() == "never" else value.strip()
+                    elif normalized == "maximum number of days between password change":
+                        with contextlib.suppress(ValueError):
+                            max_password_days = int(value.strip())
+        users.append({
+            "name": item.pw_name,
+            "uid": item.pw_uid,
+            "home": item.pw_dir,
+            "shell": item.pw_shell,
+            "enabled": not locked,
+            "locked": locked,
+            "passwordStatus": password_status,
+            "groups": groups,
+            "isAdmin": item.pw_uid == 0 or any(group in admin_groups for group in groups),
+            "accountExpires": account_expires,
+            "maxPasswordDays": max_password_days,
+            "protected": item.pw_uid < 1000,
+        })
+    groups = [{"name": item.gr_name, "gid": item.gr_gid, "members": sorted(item.gr_mem), "protected": item.gr_gid < 1000} for item in all_groups]
+    return {"users": users, "groups": groups, "adminGroups": admin_groups}
+
+
+def windows_account_rows() -> tuple[int, str]:
+    script = "$groups=@(Get-LocalGroup|Sort-Object Name|ForEach-Object{$g=$_;$members=@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue|ForEach-Object{$_.Name.Split('\\')[-1]});[pscustomobject]@{name=$g.Name;members=$members;protected=($g.SID.Value -like 'S-1-5-32-*')}});$membership=@{};foreach($g in $groups){foreach($m in $g.members){if(-not $membership.ContainsKey($m)){$membership[$m]=@()};$membership[$m]+=,$g.name}};$admin=(Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue).Name;$default=(Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction SilentlyContinue).Name;$users=@(Get-LocalUser|Sort-Object Name|ForEach-Object{$rid=[int]$_.SID.Value.Split('-')[-1];[pscustomobject]@{name=$_.Name;enabled=$_.Enabled;locked=$false;lastLogon=$_.LastLogon;passwordExpires=$_.PasswordExpires;passwordLastSet=$_.PasswordLastSet;accountExpires=$_.AccountExpires;groups=@($membership[$_.Name]);isAdmin=(@($membership[$_.Name]) -contains $admin);protected=($rid -in @(500,501,503,504))}});[pscustomobject]@{users=$users;groups=$groups;adminGroups=@($admin);defaultGroups=@($default)}|ConvertTo-Json -Depth 6 -Compress"
+    return powershell(script, output_limit=5_000_000)
+
+
+def account_rows(windows: bool) -> tuple[int, str]:
+    if windows:
+        return windows_account_rows()
+    return 0, json.dumps(linux_account_rows(), ensure_ascii=False, separators=(",", ":"))
+
+
+def current_account_snapshot(windows: bool) -> dict[str, Any]:
+    code, output = account_rows(windows)
+    if code != 0:
+        raise RuntimeError(output or "Cannot read local accounts")
+    parsed = json.loads(output)
+    return parsed if isinstance(parsed, dict) else {"users": [], "groups": [], "adminGroups": [], "defaultGroups": []}
+
+
+def desired_account_groups(snapshot: dict[str, Any], requested: list[str], is_admin: bool, current: set[str] | None = None, *, include_defaults: bool = False) -> set[str]:
+    available = {str(item.get("name")): item for item in snapshot.get("groups", []) if isinstance(item, dict)}
+    if any(group not in available for group in requested):
+        raise ValueError("A selected group no longer exists")
+    admin_groups = {str(group) for group in snapshot.get("adminGroups", []) if group}
+    protected_groups = {name for name, item in available.items() if item.get("protected")}
+    protected_non_admin = protected_groups - admin_groups
+    if any(group in protected_non_admin for group in requested):
+        raise ValueError("Built-in groups are managed by the operating system")
+    desired = set(requested) - admin_groups
+    if is_admin and admin_groups:
+        desired.add(sorted(admin_groups, key=str.casefold)[0])
+    if current:
+        desired.update(current & protected_non_admin)
+    if include_defaults:
+        desired.update(str(group) for group in snapshot.get("defaultGroups", []) if group)
+    return desired
+
+
+def validate_password(password: str, *, optional: bool = False) -> str:
+    if optional and not password:
+        return ""
+    if not 12 <= len(password) <= 1024 or "\n" in password or "\r" in password or ":" in password:
+        raise ValueError("Password must have at least 12 characters and cannot contain ':' or a newline")
+    return password
+
+
+def delete_local_users(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    raw = parameters.get("usernames", [parameters.get("username")])
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 50:
+        raise ValueError("Select between 1 and 50 users")
+    names = [str(value) for value in raw]
+    if len(set(names)) != len(names) or any(not NAME_RE.fullmatch(name) for name in names):
+        raise ValueError("Invalid users")
+    snapshot = current_account_snapshot(windows)
+    by_name = {str(user.get("name")): user for user in snapshot.get("users", []) if isinstance(user, dict)}
+    if any(name not in by_name or by_name[name].get("protected") for name in names):
+        raise ValueError("A selected user no longer exists or is protected")
+    commands: list[list[str]] = []
+    if windows:
+        script = ";".join(f"Remove-LocalUser -Name {ps_quote(name)} -ErrorAction Stop" for name in names)
+        return powershell(script)
+    binary = find_system_command("userdel")
+    if not binary:
+        return 127, "userdel is not installed"
+    commands = [[binary, "--remove", name] for name in names]
+    return run_many(commands)
+
+
+def delete_local_groups(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    raw = parameters.get("groups", [parameters.get("group")])
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 50:
+        raise ValueError("Select between 1 and 50 groups")
+    names = [str(value) for value in raw]
+    if len(set(names)) != len(names) or any(not GROUP_RE.fullmatch(name) for name in names):
+        raise ValueError("Invalid groups")
+    snapshot = current_account_snapshot(windows)
+    by_name = {str(group.get("name")): group for group in snapshot.get("groups", []) if isinstance(group, dict)}
+    if any(name not in by_name or by_name[name].get("protected") for name in names):
+        raise ValueError("A selected group no longer exists or is protected")
+    if windows:
+        return powershell(";".join(f"Remove-LocalGroup -Name {ps_quote(name)} -ErrorAction Stop" for name in names))
+    binary = find_system_command("groupdel")
+    if not binary:
+        return 127, "groupdel is not installed"
+    return run_many([[binary, name] for name in names])
+
+
+def update_local_user(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    username = require_name(parameters, "username")
+    groups = require_groups(parameters)
+    password = validate_password(str(parameters.get("password", "")), optional=True)
+    enabled = bool(parameters.get("enabled", True))
+    is_admin = bool(parameters.get("is_admin", False))
+    account_expires = str(parameters.get("account_expires", "")).strip()
+    if account_expires and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", account_expires):
+        raise ValueError("Invalid account expiration date")
+    snapshot = current_account_snapshot(windows)
+    users = {str(item.get("name")): item for item in snapshot.get("users", []) if isinstance(item, dict)}
+    if username not in users or users[username].get("protected"):
+        raise ValueError("The user no longer exists or is protected")
+    current = {str(group) for group in users[username].get("groups", [])}
+    desired = desired_account_groups(snapshot, groups, is_admin, current)
+    if windows:
+        statements = []
+        if password:
+            statements.append(f"$p=ConvertTo-SecureString {ps_quote(password)} -AsPlainText -Force;Set-LocalUser -Name {ps_quote(username)} -Password $p -ErrorAction Stop")
+        statements.append(("Enable-LocalUser" if enabled else "Disable-LocalUser") + f" -Name {ps_quote(username)} -ErrorAction Stop")
+        if account_expires:
+            statements.append(f"Set-LocalUser -Name {ps_quote(username)} -AccountExpires ([datetime]{ps_quote(account_expires)}) -ErrorAction Stop")
+        elif "account_expires" in parameters:
+            statements.append(f"Set-LocalUser -Name {ps_quote(username)} -AccountNeverExpires $true -ErrorAction Stop")
+        for group in sorted(desired - current):
+            statements.append(f"Add-LocalGroupMember -Group {ps_quote(group)} -Member {ps_quote(username)} -ErrorAction Stop")
+        for group in sorted(current - desired):
+            statements.append(f"Remove-LocalGroupMember -Group {ps_quote(group)} -Member {ps_quote(username)} -ErrorAction Stop")
+        return powershell(";".join(statements))
+    primary = next(iter(users[username].get("groups", [])), "")
+    gpasswd = find_system_command("gpasswd")
+    usermod = find_system_command("usermod")
+    chage = find_system_command("chage")
+    if not gpasswd or not usermod:
+        return 127, "usermod/gpasswd is not installed"
+    commands = [[gpasswd, "-a", username, group] for group in sorted(desired - current)]
+    commands += [[gpasswd, "-d", username, group] for group in sorted((current - desired) - {primary})]
+    commands.append([usermod, "--unlock" if enabled else "--lock", username])
+    if account_expires:
+        commands.append([usermod, "--expiredate", account_expires, username])
+    elif "account_expires" in parameters:
+        commands.append([usermod, "--expiredate", "", username])
+    if "max_password_days" in parameters:
+        max_days = int(parameters.get("max_password_days", -1))
+        if not -1 <= max_days <= 99999 or not chage:
+            raise ValueError("Invalid maximum password age")
+        commands.append([chage, "-M", str(max_days), username])
+    code, output = run_many(commands)
+    if code == 0 and password:
+        return run_with_input([find_system_command("chpasswd") or "/usr/sbin/chpasswd"], f"{username}:{password}\n")
+    return code, output
+
+
+def byte_value(value: Any) -> int:
+    try:
+        return max(0, int(float(str(value).strip() or "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def lvm_report(command: str, columns: str) -> list[dict[str, Any]]:
+    binary = find_system_command(command)
+    if not binary:
+        return []
+    code, output = run([binary, "--reportformat", "json", "--units", "b", "--nosuffix", "--options", columns], output_limit=5_000_000)
+    if code != 0:
+        return []
+    try:
+        reports = json.loads(output).get("report", [])
+        if reports and isinstance(reports[0], dict):
+            rows = reports[0].get(command[:-1], [])
+            return rows if isinstance(rows, list) else []
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return []
+
+
+def parted_free_regions(disk: str) -> list[dict[str, int]]:
+    binary = find_system_command("parted")
+    if not binary or not DEVICE_RE.fullmatch(disk):
+        return []
+    code, output = run([binary, "--machine", "--script", disk, "unit", "B", "print", "free"], output_limit=1_000_000)
+    if code != 0:
+        return []
+    regions: list[dict[str, int]] = []
+    for line in output.splitlines():
+        fields = line.rstrip(";").split(":")
+        if len(fields) < 5 or fields[4].strip().lower() != "free":
+            continue
+        try:
+            start = int(fields[1].rstrip("B"))
+            end = int(fields[2].rstrip("B"))
+            size = int(fields[3].rstrip("B"))
+        except ValueError:
+            continue
+        if size >= 4 * 1024 * 1024:
+            regions.append({"startBytes": start, "endBytes": end, "sizeBytes": size})
+    return regions
+
+
+def normalize_mountpoints(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return [str(value)] if value else []
+
+
+def linux_storage_scan() -> tuple[int, str]:
+    lsblk = find_system_command("lsblk")
+    if not lsblk:
+        return 127, "lsblk is not installed"
+    columns = "NAME,KNAME,PATH,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,FSAVAIL,FSUSE%,MOUNTPOINTS,MODEL,SERIAL,TRAN,RO,RM,PTTYPE,PARTTYPE,PARTN,START,LOG-SEC"
+    code, output = run([lsblk, "--json", "--bytes", "--tree", "--output", columns], output_limit=10_000_000)
+    if code != 0:
+        fallback = "NAME,KNAME,PATH,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS,MODEL,RO,RM,PTTYPE"
+        code, output = run([lsblk, "--json", "--bytes", "--tree", "--output", fallback], output_limit=10_000_000)
+    if code != 0:
+        return code, output
+    try:
+        devices = json.loads(output).get("blockdevices", [])
+    except (AttributeError, ValueError):
+        return 2, "lsblk returned invalid JSON"
+    pvs = lvm_report("pvs", "pv_name,vg_name,pv_size,pv_free")
+    vgs = lvm_report("vgs", "vg_name,vg_size,vg_free,pv_count,lv_count")
+    lvs = lvm_report("lvs", "lv_path,lv_name,vg_name,lv_size,data_percent,devices")
+    pv_by_path = {str(item.get("pv_name", "")).strip(): item for item in pvs}
+    vg_by_name: dict[str, dict[str, Any]] = {}
+    for item in vgs:
+        name = str(item.get("vg_name", "")).strip()
+        if not name:
+            continue
+        vg_by_name[name] = {
+            "name": name,
+            "sizeBytes": byte_value(item.get("vg_size")),
+            "freeBytes": byte_value(item.get("vg_free")),
+            "physicalVolumes": [],
+            "logicalVolumes": [],
+        }
+    for item in pvs:
+        vg_name = str(item.get("vg_name", "")).strip()
+        if vg_name in vg_by_name:
+            vg_by_name[vg_name]["physicalVolumes"].append(str(item.get("pv_name", "")).strip())
+    logical_volumes: list[dict[str, Any]] = []
+    for item in lvs:
+        path = str(item.get("lv_path", "")).strip()
+        vg_name = str(item.get("vg_name", "")).strip()
+        if not path or vg_name not in vg_by_name:
+            continue
+        logical = {
+            "id": path,
+            "path": path,
+            "name": str(item.get("lv_name", "")).strip(),
+            "vgName": vg_name,
+            "sizeBytes": byte_value(item.get("lv_size")),
+            "extendableBytes": vg_by_name[vg_name]["freeBytes"],
+            "dataPercent": str(item.get("data_percent", "")).strip(),
+            "devices": str(item.get("devices", "")).strip(),
+            "filesystem": "",
+            "mountpoints": [],
+        }
+        logical_volumes.append(logical)
+        vg_by_name[vg_name]["logicalVolumes"].append(path)
+    logical_by_path = {item["path"]: item for item in logical_volumes}
+    free_by_disk: dict[str, list[dict[str, int]]] = {}
+
+    def decorate(device: dict[str, Any], parent_disk: str = "") -> dict[str, Any]:
+        path = str(device.get("path") or ("/dev/" + str(device.get("name", ""))))
+        kind = str(device.get("type", ""))
+        disk_path = path if kind == "disk" else parent_disk
+        if kind == "disk":
+            free_by_disk[path] = parted_free_regions(path)
+        children = [decorate(child, disk_path) for child in device.get("children", []) if isinstance(child, dict)]
+        mountpoints = normalize_mountpoints(device.get("mountpoints"))
+        size = byte_value(device.get("size"))
+        filesystem = str(device.get("fstype") or "")
+        row: dict[str, Any] = {
+            "id": path,
+            "name": str(device.get("name", "")),
+            "path": path,
+            "parent": str(device.get("pkname") or ""),
+            "type": kind,
+            "filesystem": filesystem,
+            "label": str(device.get("label") or ""),
+            "uuid": str(device.get("uuid") or ""),
+            "sizeBytes": size,
+            "freeBytes": byte_value(device.get("fsavail")),
+            "usedPercent": str(device.get("fsuse%") or ""),
+            "mountpoints": mountpoints,
+            "model": str(device.get("model") or "").strip(),
+            "serial": str(device.get("serial") or "").strip(),
+            "transport": str(device.get("tran") or ""),
+            "readOnly": str(device.get("ro", "0")) in {"1", "true", "True"},
+            "removable": str(device.get("rm", "0")) in {"1", "true", "True"},
+            "partitionTable": str(device.get("pttype") or ""),
+            "partitionType": str(device.get("parttype") or ""),
+            "partitionNumber": byte_value(device.get("partn")),
+            "startSector": byte_value(device.get("start")),
+            "logicalSectorBytes": byte_value(device.get("log-sec")) or 512,
+            "children": children,
+            "extendableBytes": 0,
+            "protected": "/" in mountpoints or "/boot" in mountpoints or "/boot/efi" in mountpoints,
+        }
+        if kind == "disk":
+            regions = free_by_disk[path]
+            row["freeRegions"] = regions
+            row["unallocatedBytes"] = sum(region["sizeBytes"] for region in regions)
+        if kind == "part" and disk_path:
+            start = row["startSector"] * row["logicalSectorBytes"]
+            end = start + size - 1
+            for region in free_by_disk.get(disk_path, []):
+                if 0 <= region["startBytes"] - end <= 2 * 1024 * 1024:
+                    if filesystem in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
+                        row["extendableBytes"] = region["sizeBytes"]
+                    break
+        pv = pv_by_path.get(path)
+        if pv:
+            row["lvm"] = {"vgName": str(pv.get("vg_name", "")).strip(), "pvFreeBytes": byte_value(pv.get("pv_free"))}
+        if path in logical_by_path:
+            logical_by_path[path]["filesystem"] = filesystem
+            logical_by_path[path]["uuid"] = row["uuid"]
+            logical_by_path[path]["mountpoints"] = mountpoints
+            logical_by_path[path]["freeBytes"] = row["freeBytes"]
+            logical_by_path[path]["protected"] = row["protected"]
+        return row
+
+    decorated = [decorate(device) for device in devices if isinstance(device, dict)]
+    candidates: list[dict[str, Any]] = []
+
+    def collect_candidates(row: dict[str, Any]) -> None:
+        if row.get("type") == "part" and not row.get("filesystem") and not row.get("mountpoints") and not row.get("children"):
+            candidates.append({"path": row["path"], "sizeBytes": row["sizeBytes"], "disk": row.get("parent", "")})
+        for child in row.get("children", []):
+            collect_candidates(child)
+
+    for row in decorated:
+        collect_candidates(row)
+    result = {
+        "platform": "linux",
+        "disks": decorated,
+        "volumeGroups": list(vg_by_name.values()),
+        "logicalVolumes": logical_volumes,
+        "lvmCandidates": candidates,
+        "capabilities": {
+            "partitionCreate": bool(find_system_command("parted")),
+            "lvm": all(find_system_command(command) for command in ("pvs", "vgs", "lvs", "lvcreate", "vgcreate")),
+        },
+    }
+    return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def windows_storage_scan() -> tuple[int, str]:
+    script = "$disks=@(Get-Disk|Sort-Object Number|ForEach-Object{$d=$_;$parts=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue|Sort-Object Offset|ForEach-Object{$p=$_;$v=$null;try{$v=Get-Volume -Partition $p -ErrorAction Stop}catch{};$max=$p.Size;try{$max=(Get-PartitionSupportedSize -DiskNumber $d.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop).SizeMax}catch{};[pscustomobject]@{id=($d.Number.ToString()+':'+$p.PartitionNumber.ToString());diskNumber=$d.Number;partitionNumber=$p.PartitionNumber;driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};type=$p.Type;offsetBytes=[int64]$p.Offset;sizeBytes=[int64]$p.Size;extendableBytes=[math]::Max(0,[int64]$max-[int64]$p.Size);filesystem=if($v){$v.FileSystem}else{''};label=if($v){$v.FileSystemLabel}else{''};freeBytes=if($v){[int64]$v.SizeRemaining}else{0};health=if($v){$v.HealthStatus.ToString()}else{''};path=$p.AccessPaths|Select-Object -First 1;protected=[bool]($p.IsBoot -or $p.IsSystem)}});[pscustomobject]@{id=$d.UniqueId;number=$d.Number;name=$d.FriendlyName;model=$d.Model;serial=$d.SerialNumber;sizeBytes=[int64]$d.Size;partitionTable=$d.PartitionStyle.ToString();health=$d.HealthStatus.ToString();operationalStatus=($d.OperationalStatus -join ', ');readOnly=[bool]$d.IsReadOnly;system=[bool]$d.IsSystem;boot=[bool]$d.IsBoot;unallocatedBytes=[int64]$d.LargestFreeExtent;partitions=$parts}});[pscustomobject]@{platform='windows';disks=$disks;volumeGroups=@();logicalVolumes=@();lvmCandidates=@();capabilities=@{partitionCreate=$true;lvm=$false}}|ConvertTo-Json -Depth 8 -Compress"
+    return powershell(script, timeout=180, output_limit=10_000_000)
+
+
+def storage_scan(windows: bool) -> tuple[int, str]:
+    return windows_storage_scan() if windows else linux_storage_scan()
+
+
+def parsed_storage_scan(windows: bool) -> dict[str, Any]:
+    code, output = storage_scan(windows)
+    if code != 0:
+        raise RuntimeError(output or "Cannot scan storage")
+    parsed = json.loads(output)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Storage scan returned invalid data")
+    return parsed
+
+
+def storage_int(parameters: dict[str, Any], key: str, minimum: int = 1, maximum: int = 16 * 1024**4) -> int:
+    try:
+        value = int(parameters.get(key, 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {key}") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"Invalid {key}")
+    return value
+
+
+def linux_mount_path(value: Any) -> str:
+    path = str(value or "").rstrip("/") or "/"
+    if not MOUNT_PATH_RE.fullmatch(path) or not any(path == root or path.startswith(root + "/") for root in ("/mnt", "/srv", "/data", "/opt", "/var/lib")):
+        raise ValueError("Mount point must be below /mnt, /srv, /data, /opt or /var/lib")
+    return path
+
+
+def format_and_mount_linux(device: str, parameters: dict[str, Any]) -> tuple[int, str]:
+    filesystem = str(parameters.get("filesystem", "ext4")).lower()
+    if filesystem not in {"ext4", "xfs"}:
+        raise ValueError("Only ext4 and xfs are supported for new Linux filesystems")
+    label = str(parameters.get("label", "")).strip()
+    if label and not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", label):
+        raise ValueError("Invalid filesystem label")
+    formatter = find_system_command(f"mkfs.{filesystem}")
+    if not formatter:
+        return 127, f"mkfs.{filesystem} is not installed"
+    command = [formatter, "-F"] if filesystem == "ext4" else [formatter, "-f"]
+    if label:
+        command += ["-L", label]
+    command.append(device)
+    code, output = run(command, timeout=1800)
+    if code != 0 or not parameters.get("mount_point"):
+        return code, output
+    mount_point = linux_mount_path(parameters.get("mount_point"))
+    Path(mount_point).mkdir(parents=True, exist_ok=True)
+    mount = find_system_command("mount")
+    blkid = find_system_command("blkid")
+    if not mount or not blkid:
+        return 127, "mount/blkid is not installed"
+    uuid_code, uuid_output = run([blkid, "-s", "UUID", "-o", "value", device])
+    if uuid_code != 0 or not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", uuid_output.strip()):
+        return 2, "Cannot read filesystem UUID"
+    code, mount_output = run([mount, device, mount_point])
+    if code != 0:
+        return code, mount_output
+    fstab = Path("/etc/fstab")
+    line = f"UUID={uuid_output.strip()} {mount_point} {filesystem} defaults 0 {2 if filesystem == 'ext4' else 0}"
+    existing = fstab.read_text(errors="replace") if fstab.exists() else ""
+    if f"UUID={uuid_output.strip()} " not in existing:
+        with fstab.open("a", encoding="utf-8") as handle:
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return 0, json.dumps({"device": device, "filesystem": filesystem, "mountPoint": mount_point}, separators=(",", ":"))
+
+
+def find_linux_storage_node(scan: dict[str, Any], path: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    def walk(node: dict[str, Any], disk: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if node.get("path") == path:
+            return node, disk
+        for child in node.get("children", []):
+            found, parent = walk(child, disk)
+            if found:
+                return found, parent
+        return None, None
+    for disk in scan.get("disks", []):
+        found, parent = walk(disk, disk)
+        if found:
+            return found, parent
+    return None, None
+
+
+def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    kind = str(parameters.get("kind", ""))
+    add_bytes = storage_int(parameters, "add_bytes", 1024**2)
+    if windows:
+        if kind not in {"windows_partition", ""}:
+            raise ValueError("Invalid Windows storage target")
+        disk_number = storage_int(parameters, "disk_number", 0, 4096)
+        partition_number = storage_int(parameters, "partition_number", 1, 4096)
+        script = f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$s=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$target=[int64]$p.Size+{add_bytes};if($target -gt [int64]$s.SizeMax){{throw 'Requested size exceeds live contiguous capacity'}};Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -Size $target -Confirm:$false -ErrorAction Stop;Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number}|Select DiskNumber,PartitionNumber,DriveLetter,Size|ConvertTo-Json -Compress"
+        return powershell(script, timeout=1800)
+    scan = parsed_storage_scan(False)
+    if kind == "linux_lv":
+        path = str(parameters.get("path", ""))
+        logical = next((item for item in scan.get("logicalVolumes", []) if item.get("path") == path), None)
+        if not logical or add_bytes > byte_value(logical.get("extendableBytes")) or not DEVICE_RE.fullmatch(path):
+            raise ValueError("Logical Volume changed or has insufficient free space")
+        binary = find_system_command("lvextend")
+        if not binary:
+            return 127, "lvextend is not installed"
+        return run([binary, "--resizefs", "--size", f"+{add_bytes}B", path], timeout=1800)
+    if kind != "linux_partition":
+        raise ValueError("Invalid Linux storage target")
+    path = str(parameters.get("path", ""))
+    node, disk = find_linux_storage_node(scan, path)
+    if not node or not disk or node.get("type") != "part" or node.get("protected") or add_bytes > byte_value(node.get("extendableBytes")):
+        raise ValueError("Partition changed, is protected or has insufficient contiguous space")
+    number = byte_value(node.get("partitionNumber"))
+    if not number:
+        raise ValueError("Partition number is unavailable")
+    start = byte_value(node.get("startSector")) * byte_value(node.get("logicalSectorBytes"))
+    new_end = start + byte_value(node.get("sizeBytes")) + add_bytes - 1
+    parted = find_system_command("parted")
+    if not parted:
+        return 127, "parted is not installed"
+    code, output = run([parted, "--script", str(disk["path"]), "unit", "B", "resizepart", str(number), f"{new_end}B"], timeout=600)
+    if code != 0:
+        return code, output
+    partprobe = find_system_command("partprobe")
+    if partprobe:
+        run([partprobe, str(disk["path"])], timeout=120)
+    filesystem = str(node.get("filesystem", ""))
+    if filesystem not in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
+        raise ValueError("This filesystem cannot be extended safely by the Agent")
+    if filesystem == "LVM2_member":
+        pvresize = find_system_command("pvresize")
+        return run([pvresize, path], timeout=600) if pvresize else (127, "pvresize is not installed")
+    if filesystem in {"ext2", "ext3", "ext4"}:
+        resize = find_system_command("resize2fs")
+        return run([resize, path], timeout=1800) if resize else (127, "resize2fs is not installed")
+    if filesystem == "xfs":
+        mountpoints = node.get("mountpoints", [])
+        grow = find_system_command("xfs_growfs")
+        return run([grow, str(mountpoints[0])], timeout=1800) if grow and mountpoints else (2, "XFS must be mounted and xfs_growfs installed")
+    return 2, f"Partition grew but filesystem {filesystem or 'unknown'} requires a manual grow operation"
+
+
+def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    kind = str(parameters.get("kind", ""))
+    size_bytes = storage_int(parameters, "size_bytes", 16 * 1024**2)
+    if windows:
+        if kind != "windows_partition":
+            raise ValueError("Invalid Windows storage create type")
+        disk_number = storage_int(parameters, "disk_number", 0, 4096)
+        filesystem = str(parameters.get("filesystem", "NTFS")).upper()
+        if filesystem not in {"NTFS", "REFS"}:
+            raise ValueError("Invalid Windows filesystem")
+        label = str(parameters.get("label", "New Volume"))
+        if not 1 <= len(label) <= 32 or any(ord(character) < 32 for character in label):
+            raise ValueError("Invalid volume label")
+        drive = str(parameters.get("drive_letter", "")).upper().rstrip(":")
+        if drive and not re.fullmatch(r"[D-Z]", drive):
+            raise ValueError("Invalid drive letter")
+        assign = f"-DriveLetter {drive}" if drive else "-AssignDriveLetter"
+        script = f"$d=Get-Disk -Number {disk_number} -ErrorAction Stop;if($d.IsReadOnly -or $d.IsOffline -or $d.LargestFreeExtent -lt {size_bytes}){{throw 'Disk changed or has insufficient unallocated space'}};$p=New-Partition -DiskNumber {disk_number} -Size {size_bytes} {assign} -ErrorAction Stop;$v=$p|Format-Volume -FileSystem {filesystem} -NewFileSystemLabel {ps_quote(label)} -Confirm:$false -Force -ErrorAction Stop;[pscustomobject]@{{diskNumber={disk_number};partitionNumber=$p.PartitionNumber;driveLetter=$p.DriveLetter;filesystem=$v.FileSystem;sizeBytes=[int64]$p.Size}}|ConvertTo-Json -Compress"
+        return powershell(script, timeout=1800)
+    scan = parsed_storage_scan(False)
+    if kind == "linux_lv":
+        vg_name = str(parameters.get("vg_name", ""))
+        name = str(parameters.get("name", ""))
+        if not GROUP_RE.fullmatch(vg_name) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", name):
+            raise ValueError("Invalid Logical Volume name")
+        vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
+        if not vg or size_bytes > byte_value(vg.get("freeBytes")):
+            raise ValueError("Volume Group changed or has insufficient free space")
+        lvcreate = find_system_command("lvcreate")
+        if not lvcreate:
+            return 127, "lvcreate is not installed"
+        code, output = run([lvcreate, "--yes", "--size", f"{size_bytes}B", "--name", name, vg_name], timeout=900)
+        if code != 0:
+            return code, output
+        return format_and_mount_linux(f"/dev/{vg_name}/{name}", parameters)
+    if kind == "linux_vg":
+        name = str(parameters.get("name", ""))
+        device = str(parameters.get("device", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", name):
+            raise ValueError("Invalid Volume Group name")
+        candidate = next((item for item in scan.get("lvmCandidates", []) if item.get("path") == device), None)
+        if not candidate or byte_value(candidate.get("sizeBytes")) < size_bytes:
+            raise ValueError("LVM device changed or is not empty")
+        pvcreate, vgcreate = find_system_command("pvcreate"), find_system_command("vgcreate")
+        if not pvcreate or not vgcreate:
+            return 127, "pvcreate/vgcreate is not installed"
+        code, output = run([pvcreate, "--yes", device], timeout=600)
+        return run([vgcreate, name, device], timeout=600) if code == 0 else (code, output)
+    if kind != "linux_partition":
+        raise ValueError("Invalid Linux storage create type")
+    disk_path = str(parameters.get("disk", ""))
+    start_bytes = storage_int(parameters, "start_bytes", 1024**2)
+    disk = next((item for item in scan.get("disks", []) if item.get("path") == disk_path and item.get("type") == "disk"), None)
+    if not disk or disk.get("readOnly") or disk.get("removable"):
+        raise ValueError("Disk changed, is read-only or removable")
+    region = next((item for item in disk.get("freeRegions", []) if start_bytes >= byte_value(item.get("startBytes")) and start_bytes + size_bytes - 1 <= byte_value(item.get("endBytes"))), None)
+    if not region:
+        raise ValueError("Selected unallocated region changed or is too small")
+    parted = find_system_command("parted")
+    if not parted:
+        return 127, "parted is not installed"
+    before = {str(child.get("path")) for child in disk.get("children", [])}
+    fs_hint = "ext4" if str(parameters.get("filesystem", "ext4")) == "ext4" else "xfs"
+    end_bytes = start_bytes + size_bytes - 1
+    code, output = run([parted, "--script", "--align", "optimal", disk_path, "unit", "B", "mkpart", "primary", fs_hint, f"{start_bytes}B", f"{end_bytes}B"], timeout=600)
+    if code != 0:
+        return code, output
+    partprobe = find_system_command("partprobe")
+    if partprobe:
+        run([partprobe, disk_path], timeout=120)
+    time.sleep(1)
+    refreshed = parsed_storage_scan(False)
+    refreshed_disk = next((item for item in refreshed.get("disks", []) if item.get("path") == disk_path), {})
+    created = next((child for child in refreshed_disk.get("children", []) if child.get("path") not in before and child.get("type") == "part"), None)
+    if not created:
+        return 2, "Partition was created but the kernel has not exposed the new device yet"
+    return format_and_mount_linux(str(created["path"]), parameters)
+
+
+def unmount_linux_storage(item: dict[str, Any]) -> str:
+    mountpoints = [str(value) for value in item.get("mountpoints", []) if value]
+    if item.get("protected") or any(path in {"/", "/boot", "/boot/efi"} for path in mountpoints):
+        raise ValueError("System storage cannot be removed")
+    device = str(item.get("path", ""))
+    uuid_value = str(item.get("uuid", ""))
+    if not uuid_value and DEVICE_RE.fullmatch(device):
+        blkid = find_system_command("blkid")
+        if blkid:
+            code, output = run([blkid, "-s", "UUID", "-o", "value", device])
+            if code == 0:
+                uuid_value = output.strip()
+    if mountpoints:
+        umount = find_system_command("umount")
+        if not umount:
+            raise RuntimeError("umount is not installed")
+        for mountpoint in sorted(mountpoints, key=len, reverse=True):
+            code, output = run([umount, mountpoint], timeout=300)
+            if code != 0:
+                raise RuntimeError(output or f"Cannot unmount {mountpoint}")
+    return uuid_value
+
+
+def remove_linux_fstab_uuid(uuid_value: str) -> None:
+    if not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", uuid_value):
+        return
+    fstab = Path("/etc/fstab")
+    if not fstab.exists():
+        return
+    existing = fstab.read_text(encoding="utf-8", errors="replace")
+    lines = existing.splitlines(keepends=True)
+    kept = [line for line in lines if not re.match(rf"^\s*UUID={re.escape(uuid_value)}(?:\s|$)", line, re.IGNORECASE)]
+    if kept == lines:
+        return
+    temporary = fstab.with_name(".fstab.tram-agent.tmp")
+    temporary.write_text("".join(kept), encoding="utf-8")
+    os.chmod(temporary, fstab.stat().st_mode)
+    os.replace(temporary, fstab)
+
+
+def delete_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    kind = str(parameters.get("kind", ""))
+    if windows:
+        if kind != "windows_partition":
+            raise ValueError("Invalid Windows storage delete type")
+        disk_number = storage_int(parameters, "disk_number", 0, 4096)
+        partition_number = storage_int(parameters, "partition_number", 1, 4096)
+        script = f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;if($p.IsBoot -or $p.IsSystem){{throw 'Boot and system partitions are protected'}};Remove-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -Confirm:$false -ErrorAction Stop"
+        return powershell(script, timeout=600)
+    scan = parsed_storage_scan(False)
+    if kind == "linux_lv":
+        path = str(parameters.get("path", ""))
+        logical = next((item for item in scan.get("logicalVolumes", []) if item.get("path") == path), None)
+        if not logical or logical.get("protected"):
+            raise ValueError("Logical Volume changed or is protected")
+        lvremove = find_system_command("lvremove")
+        if not lvremove:
+            return 127, "lvremove is not installed"
+        uuid_value = unmount_linux_storage(logical)
+        code, output = run([lvremove, "--yes", path], timeout=600)
+        if code == 0:
+            remove_linux_fstab_uuid(uuid_value)
+        return code, output
+    if kind == "linux_vg":
+        name = str(parameters.get("name", ""))
+        vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == name), None)
+        if not vg or vg.get("logicalVolumes"):
+            raise ValueError("Volume Group changed or still contains Logical Volumes")
+        vgremove, pvremove = find_system_command("vgremove"), find_system_command("pvremove")
+        if not vgremove or not pvremove:
+            return 127, "vgremove/pvremove is not installed"
+        code, output = run([vgremove, "--yes", name], timeout=600)
+        if code != 0:
+            return code, output
+        cleanup_code, cleanup_output = run_many([[pvremove, "--yes", str(device)] for device in vg.get("physicalVolumes", [])])
+        return cleanup_code, cleanup_output or output
+    if kind != "linux_partition":
+        raise ValueError("Invalid Linux storage delete type")
+    path = str(parameters.get("path", ""))
+    node, disk = find_linux_storage_node(scan, path)
+    if not node or not disk or node.get("type") != "part" or node.get("protected") or node.get("children") or node.get("lvm"):
+        raise ValueError("Partition changed, is in use or is protected")
+    number = byte_value(node.get("partitionNumber"))
+    parted = find_system_command("parted")
+    if not parted or not number:
+        return 127, "parted or partition number is unavailable"
+    uuid_value = unmount_linux_storage(node)
+    code, output = run([parted, "--script", str(disk["path"]), "rm", str(number)], timeout=600)
+    if code == 0:
+        remove_linux_fstab_uuid(uuid_value)
+        partprobe = find_system_command("partprobe")
+        if partprobe:
+            run([partprobe, str(disk["path"])], timeout=120)
+    return code, output
+
+
+def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
+    if inventory["os_family"] == "windows":
+        script = "$s=New-Object -ComObject Microsoft.Update.Session;$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0\");$rows=@(foreach($u in $r.Updates){[pscustomobject]@{id=$u.Identity.UpdateID;revision=$u.Identity.RevisionNumber;name=$u.Title;version='';architecture='';repository='Microsoft Update';severity=$u.MsrcSeverity;kb=@($u.KBArticleIDs);sizeBytes=[int64]$u.MaxDownloadSize;description=$u.Description;rebootRequired=[bool]$u.RebootRequired}});[pscustomobject]@{platform='windows';updates=$rows}|ConvertTo-Json -Depth 6 -Compress"
+        return powershell(script, timeout=300, output_limit=10_000_000)
+    if inventory.get("distribution_id") in {"ubuntu", "debian"}:
+        apt = find_system_command("apt") or find_system_command("apt-get")
+        if not apt:
+            return 127, "apt is not installed"
+        command = [apt, "list", "--upgradable"] if Path(apt).name == "apt" else [apt, "-s", "upgrade"]
+        code, output = run(command, timeout=300, output_limit=5_000_000)
+        if code != 0:
+            return code, output
+        rows: list[dict[str, Any]] = []
+        if Path(apt).name == "apt":
+            for line in output.splitlines():
+                match = re.match(r"^([^/\s]+)/([^\s]+)\s+(\S+)\s+(\S+)\s+\[upgradable from: ([^\]]+)\]", line)
+                if not match:
+                    continue
+                name, repository, version, architecture, current = match.groups()
+                rows.append({"id": name, "name": name, "version": version, "currentVersion": current, "architecture": architecture, "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{name} {current} → {version}"})
+        else:
+            for line in output.splitlines():
+                match = re.match(r"^Inst\s+(\S+)\s+(?:\[([^\]]+)\]\s+)?\((\S+)\s+([^\s)]+)", line)
+                if match:
+                    name, current, version, repository = match.groups()
+                    rows.append({"id": name, "name": name, "version": version, "currentVersion": current or "", "architecture": "", "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{name} {current or ''} → {version}"})
+        return 0, json.dumps({"platform": "linux", "manager": "apt", "updates": rows}, ensure_ascii=False, separators=(",", ":"))
+    tool = find_system_command("dnf") or find_system_command("yum")
+    if not tool:
+        return 127, "dnf/yum is not installed"
+    code, output = run([tool, "--quiet", "check-update"], timeout=300, output_limit=5_000_000)
+    if code not in {0, 100}:
+        return code, output
+    rows = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not re.fullmatch(r"[A-Za-z0-9+_.:-]+", fields[0]):
+            continue
+        package_arch, version, repository = fields[:3]
+        name, _, architecture = package_arch.rpartition(".")
+        if not name:
+            name, architecture = package_arch, ""
+        rows.append({"id": package_arch, "name": name, "version": version, "currentVersion": "", "architecture": architecture, "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{package_arch} → {version} từ {repository}"})
+    return 0, json.dumps({"platform": "linux", "manager": Path(tool).name, "updates": rows}, ensure_ascii=False, separators=(",", ":"))
+
+
+def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    raw = parameters.get("updates", [])
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 100 or any(not isinstance(item, dict) for item in raw):
+        raise ValueError("Select between 1 and 100 updates")
+    scan_code, scan_output = scan_updates(inventory)
+    if scan_code != 0:
+        return scan_code, scan_output
+    available = {str(item.get("id")): item for item in json.loads(scan_output).get("updates", []) if isinstance(item, dict)}
+    selected: list[dict[str, Any]] = []
+    for requested in raw:
+        identifier = str(requested.get("id", ""))
+        current = available.get(identifier)
+        if not current or str(requested.get("version", "")) != str(current.get("version", "")):
+            raise ValueError("An update changed or is no longer available; scan again")
+        selected.append(current)
+    if inventory["os_family"] == "windows":
+        encoded = base64.b64encode(json.dumps([{"id": item["id"], "revision": item.get("revision", 0)} for item in selected]).encode()).decode()
+        script = f"$wanted=( [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json );$s=New-Object -ComObject Microsoft.Update.Session;$q=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0\");$c=New-Object -ComObject Microsoft.Update.UpdateColl;foreach($u in $q.Updates){{$match=$wanted|Where-Object{{$_.id -eq $u.Identity.UpdateID -and [int]$_.revision -eq [int]$u.Identity.RevisionNumber}};if($match){{if(-not $u.EulaAccepted){{$u.AcceptEula()}};[void]$c.Add($u)}}}};if($c.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$d=$s.CreateUpdateDownloader();$d.Updates=$c;[void]$d.Download();$i=$s.CreateUpdateInstaller();$i.Updates=$c;$r=$i.Install();[pscustomobject]@{{resultCode=$r.ResultCode;rebootRequired=$r.RebootRequired;count=$c.Count}}|ConvertTo-Json -Compress"
+        return powershell(script, timeout=7200)
+    if inventory.get("distribution_id") in {"ubuntu", "debian"}:
+        apt_get = find_system_command("apt-get")
+        if not apt_get:
+            return 127, "apt-get is not installed"
+        packages = []
+        for item in selected:
+            name, version = str(item["name"]), str(item["version"])
+            if not PACKAGE_RE.fullmatch(name) or not PACKAGE_RE.fullmatch(version):
+                raise ValueError("Invalid selected package")
+            packages.append(f"{name}={version}")
+        return run([apt_get, "-y", "--only-upgrade", "install", *packages], timeout=7200, output_limit=5_000_000)
+    tool = find_system_command("dnf") or find_system_command("yum")
+    packages = [f"{item['id']}-{item['version']}" for item in selected]
+    if not tool or any(not PACKAGE_RE.fullmatch(package) for package in packages):
+        raise ValueError("Invalid selected package or package manager unavailable")
+    return run([tool, "-y", "upgrade", *packages], timeout=7200, output_limit=5_000_000)
+
+
+def log_sources(windows: bool) -> tuple[int, str]:
+    if windows:
+        script = "$rows=@(Get-WinEvent -ListLog * -ErrorAction SilentlyContinue|Where-Object{$_.IsEnabled}|Sort-Object LogName|Select-Object -First 300|ForEach-Object{[pscustomobject]@{id=$_.LogName;label=$_.LogName;type='eventlog';records=[int64]$_.RecordCount}});$rows|ConvertTo-Json -Depth 3 -Compress"
+        return powershell(script, timeout=180, output_limit=5_000_000)
+    rows = [{"id": "journal", "label": "System journal", "type": "journal", "records": 0}]
+    root = Path("/var/log")
+    if root.exists():
+        with contextlib.suppress(OSError):
+            for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
+                if len(rows) >= 300:
+                    break
+                try:
+                    resolved = path.resolve(strict=True)
+                    if resolved.is_file() and str(resolved).startswith(str(root.resolve()) + os.sep) and resolved.stat().st_size <= 10 * 1024**3:
+                        with resolved.open("rb") as sample_handle:
+                            sample = sample_handle.read(4096)
+                        if b"\x00" not in sample:
+                            rows.append({"id": str(resolved), "label": str(resolved), "type": "file", "records": 0})
+                except (OSError, RuntimeError):
+                    continue
+    return 0, json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+
+
+def normalize_severity(value: Any, message: str = "") -> str:
+    normalized = str(value or "").lower()
+    combined = f"{normalized} {message.lower()}"
+    if re.search(r"\b(?:critical|fatal|error|err|failed|failure)\b", combined) or normalized in {"1", "2", "3"}:
+        return "error"
+    if re.search(r"\b(?:warning|warn)\b", combined) or normalized == "4":
+        return "warning"
+    return "info"
+
+
+def read_logs(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    limit = min(500, max(1, int(parameters.get("limit", 500))))
+    raw_sources = parameters.get("sources", ["System"] if windows else ["journal"])
+    if not isinstance(raw_sources, list) or not 1 <= len(raw_sources) <= 20:
+        raise ValueError("Select between 1 and 20 log sources")
+    sources = [str(source) for source in raw_sources]
+    per_source = max(1, limit // len(sources))
+    rows: list[dict[str, Any]] = []
+    if windows:
+        if any(not re.fullmatch(r"[A-Za-z0-9_. /-]{1,180}", source) for source in sources):
+            raise ValueError("Invalid Windows Event Log source")
+        encoded = base64.b64encode(json.dumps(sources).encode()).decode()
+        script = f"$sources=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json);$available=@{{}};Get-WinEvent -ListLog * -ErrorAction SilentlyContinue|ForEach-Object{{$available[$_.LogName]=$true}};$rows=@(foreach($source in $sources){{if(-not $available.ContainsKey($source)){{throw 'Event Log source changed or is unavailable'}};Get-WinEvent -LogName $source -MaxEvents {per_source} -ErrorAction SilentlyContinue|ForEach-Object{{[pscustomobject]@{{timestamp=$_.TimeCreated.ToString('o');source=$source;severity=if($_.Level -le 2){{'error'}}elseif($_.Level -eq 3){{'warning'}}else{{'info'}};id=$_.Id;provider=$_.ProviderName;message=$_.Message}}}}}});$rows|Sort-Object timestamp -Descending|Select-Object -First {limit}|ConvertTo-Json -Depth 4 -Compress"
+        return powershell(script, timeout=300, output_limit=10_000_000)
+    available_code, available_output = log_sources(False)
+    if available_code != 0:
+        return available_code, available_output
+    available = {str(item.get("id")) for item in json.loads(available_output) if isinstance(item, dict)}
+    if any(source not in available for source in sources):
+        raise ValueError("A log source changed or is outside the allowed server list")
+    for source in sources:
+        if source == "journal":
+            journalctl = find_system_command("journalctl")
+            if not journalctl:
+                continue
+            code, output = run([journalctl, "--no-pager", "-n", str(per_source), "-o", "json"], output_limit=8_000_000)
+            if code != 0:
+                continue
+            for line in output.splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                message = str(entry.get("MESSAGE", ""))
+                raw_timestamp = str(entry.get("__REALTIME_TIMESTAMP", ""))
+                try:
+                    timestamp = datetime.fromtimestamp(int(raw_timestamp) / 1_000_000, UTC).isoformat()
+                except (OSError, OverflowError, ValueError):
+                    timestamp = raw_timestamp
+                rows.append({"timestamp": timestamp, "source": str(entry.get("SYSLOG_IDENTIFIER") or entry.get("_SYSTEMD_UNIT") or "journal"), "severity": normalize_severity(entry.get("PRIORITY"), message), "message": message})
+        else:
+            path = Path(source)
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()[-per_source:]
+            except OSError as exc:
+                rows.append({"timestamp": "", "source": source, "severity": "error", "message": f"Cannot read log: {exc}"})
+                continue
+            for line in lines:
+                message = line.rstrip("\r\n")
+                rows.append({"timestamp": "", "source": source, "severity": normalize_severity("", message), "message": message})
+    return 0, json.dumps(rows[-limit:], ensure_ascii=False, separators=(",", ":"))
+
+
+def kill_processes(parameters: dict[str, Any]) -> tuple[int, str]:
+    raw = parameters.get("processes", [])
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 100 or any(not isinstance(item, dict) for item in raw):
+        raise ValueError("Select between 1 and 100 processes")
+    protected_names = {"system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "lsass.exe", "systemd", "init", "kthreadd", "tram-agent", "tram_agent.py"}
+    selected: list[psutil.Process] = []
+    for item in raw:
+        pid = int(item.get("pid", 0))
+        expected_name = str(item.get("name", ""))
+        expected_created = float(item.get("created", 0))
+        if pid <= 2 or pid in {os.getpid(), os.getppid()} or expected_name.lower() in protected_names:
+            raise ValueError("A protected process cannot be terminated")
+        try:
+            process = psutil.Process(pid)
+            if process.name() != expected_name or abs(process.create_time() - expected_created) > 0.01:
+                raise ValueError("A selected process changed; scan again")
+            selected.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            raise ValueError("A selected process changed or cannot be accessed") from exc
+    for process in selected:
+        process.terminate()
+    _, alive = psutil.wait_procs(selected, timeout=8)
+    for process in alive:
+        process.kill()
+    return 0, json.dumps({"terminated": [process.pid for process in selected]}, separators=(",", ":"))
+
+
 def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
     if action not in ALLOWED_ACTIONS:
         return 126, "Action is not allowlisted by this agent"
@@ -1415,53 +2397,67 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
     if action == "inventory.collect":
         return 0, json.dumps(collect_inventory(), ensure_ascii=False, indent=2)
     if action == "service.list":
-        return powershell("Get-Service|Select Name,DisplayName,Status,StartType|ConvertTo-Json -Depth 2") if windows else run(["/usr/bin/systemctl", "list-units", "--type=service", "--all", "--no-pager"])
+        return service_rows(windows)
     if action in {"service.start", "service.stop", "service.restart"}:
         name = require_name(parameters, "name", service=True)
         verb = action.split(".")[1]
         if windows:
             cmdlet = {"start": "Start-Service", "stop": "Stop-Service", "restart": "Restart-Service"}[verb]
             return powershell(f"{cmdlet} -Name '{name}' -ErrorAction Stop; Get-Service -Name '{name}'|Select Name,Status|ConvertTo-Json -Compress")
-        return run(["/usr/bin/systemctl", verb, name], timeout=180)
+        systemctl = find_system_command("systemctl")
+        return run([systemctl, verb, name], timeout=180) if systemctl else (127, "systemctl is not installed")
     if action == "group.create":
         group = require_group(parameters)
+        if not windows and not LINUX_ACCOUNT_RE.fullmatch(group):
+            raise ValueError("Linux group names must use lowercase letters, digits, '_', '.' or '-'")
+        snapshot = current_account_snapshot(windows)
+        if group in {str(item.get("name")) for item in snapshot.get("groups", []) if isinstance(item, dict)}:
+            raise ValueError("Group already exists")
         if windows:
-            return powershell(f"if(-not(Get-LocalGroup -Name '{group}' -ErrorAction SilentlyContinue)){{New-LocalGroup -Name '{group}' -ErrorAction Stop}}")
-        return run(["/usr/sbin/groupadd", group])
+            return powershell(f"New-LocalGroup -Name {ps_quote(group)} -ErrorAction Stop")
+        binary = find_system_command("groupadd")
+        return run([binary, group]) if binary else (127, "groupadd is not installed")
     if action == "group.delete":
-        group = require_group(parameters)
-        return powershell(f"Remove-LocalGroup -Name '{group}' -ErrorAction Stop") if windows else run(["/usr/sbin/groupdel", group])
+        return delete_local_groups(parameters, windows)
     if action == "user.list":
-        facts = management_facts("windows" if windows else "linux")
-        return 0, json.dumps(facts.get("Users", []), ensure_ascii=False)
+        code, output = account_rows(windows)
+        return (code, json.dumps(json.loads(output).get("users", []), ensure_ascii=False, separators=(",", ":"))) if code == 0 else (code, output)
     if action == "group.list":
-        facts = management_facts("windows" if windows else "linux")
-        return 0, json.dumps(facts.get("Groups", []), ensure_ascii=False)
+        code, output = account_rows(windows)
+        return (code, json.dumps(json.loads(output).get("groups", []), ensure_ascii=False, separators=(",", ":"))) if code == 0 else (code, output)
     if action == "user.create":
         username = require_name(parameters, "username")
-        groups = parameters.get("groups", [])
-        if not isinstance(groups, list) or any(not GROUP_RE.fullmatch(str(group)) for group in groups):
-            raise ValueError("Invalid groups")
+        account_pattern = WINDOWS_ACCOUNT_RE if windows else LINUX_ACCOUNT_RE
+        if not account_pattern.fullmatch(username):
+            raise ValueError("Username is not valid for this operating system")
+        groups = require_groups(parameters)
+        snapshot = current_account_snapshot(windows)
+        if username in {str(item.get("name")) for item in snapshot.get("users", []) if isinstance(item, dict)}:
+            raise ValueError("User already exists")
+        groups = sorted(desired_account_groups(snapshot, groups, bool(parameters.get("is_admin", False)), include_defaults=windows), key=str.casefold)
+        password = validate_password(str(parameters.get("password", "")))
         if windows:
-            password = str(parameters.get("password", ""))
-            if len(password) < 12:
-                raise ValueError("Password must have at least 12 characters")
-            group_script = ";".join(f"Add-LocalGroupMember -Group '{group}' -Member '{username}' -ErrorAction Stop" for group in groups)
-            escaped = password.replace("'", "''")
-            return powershell(f"$p=ConvertTo-SecureString '{escaped}' -AsPlainText -Force;New-LocalUser -Name '{username}' -Password $p -PasswordNeverExpires:$false -UserMayNotChangePassword:$false -ErrorAction Stop;{group_script}")
-        command = ["/usr/sbin/useradd", "--create-home", "--shell", "/bin/bash"]
+            group_script = ";".join(f"Add-LocalGroupMember -Group {ps_quote(group)} -Member {ps_quote(username)} -ErrorAction Stop" for group in groups)
+            script = f"try{{$p=ConvertTo-SecureString {ps_quote(password)} -AsPlainText -Force;New-LocalUser -Name {ps_quote(username)} -Password $p -PasswordNeverExpires:$false -UserMayNotChangePassword:$false -ErrorAction Stop;{group_script}}}catch{{if(Get-LocalUser -Name {ps_quote(username)} -ErrorAction SilentlyContinue){{Remove-LocalUser -Name {ps_quote(username)} -ErrorAction SilentlyContinue}};throw}}"
+            return powershell(script)
+        useradd = find_system_command("useradd")
+        if not useradd:
+            return 127, "useradd is not installed"
+        command = [useradd, "--create-home", "--shell", "/bin/bash"]
         if groups:
             command += ["--groups", ",".join(str(group) for group in groups)]
         command.append(username)
         exit_code, output = run(command)
         if exit_code:
             return exit_code, output
-        password = str(parameters.get("password", ""))
-        if password:
-            if len(password) < 12 or "\n" in password or ":" in password:
-                raise ValueError("Password must have at least 12 characters and cannot contain ':'")
-            return run_with_input(["/usr/sbin/chpasswd"], f"{username}:{password}\n")
-        return 0, output
+        password_code, password_output = run_with_input([find_system_command("chpasswd") or "/usr/sbin/chpasswd"], f"{username}:{password}\n")
+        if password_code:
+            userdel = find_system_command("userdel")
+            if userdel:
+                run([userdel, "--remove", username])
+        return password_code, password_output
+    if action == "user.update":
+        return update_local_user(parameters, windows)
     if action == "user.disable":
         username = require_name(parameters, "username")
         return powershell(f"Disable-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/usermod", "--lock", "--expiredate", "1", username])
@@ -1469,8 +2465,7 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         username = require_name(parameters, "username")
         return powershell(f"Enable-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/usermod", "--unlock", "--expiredate", "", username])
     if action == "user.delete":
-        username = require_name(parameters, "username")
-        return powershell(f"Remove-LocalUser -Name '{username}' -ErrorAction Stop") if windows else run(["/usr/sbin/userdel", "--remove", username])
+        return delete_local_users(parameters, windows)
     if action == "user.password.reset":
         username = require_name(parameters, "username")
         password = str(parameters.get("password", ""))
@@ -1489,30 +2484,19 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         group = require_group(parameters)
         return powershell(f"Remove-LocalGroupMember -Group '{group}' -Member '{username}' -ErrorAction Stop") if windows else run(["/usr/bin/gpasswd", "-d", username, group])
     if action == "patch.scan":
-        return 0, json.dumps({"pending_updates": pending_updates(inventory)})
-    if action == "patch.install_security":
-        if windows:
-            script = "$s=New-Object -ComObject Microsoft.Update.Session;$q=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0\");$c=New-Object -ComObject Microsoft.Update.UpdateColl;foreach($u in $q.Updates){if(-not $u.EulaAccepted){$u.AcceptEula()};[void]$c.Add($u)};$d=$s.CreateUpdateDownloader();$d.Updates=$c;[void]$d.Download();$i=$s.CreateUpdateInstaller();$i.Updates=$c;$r=$i.Install();[pscustomobject]@{ResultCode=$r.ResultCode;RebootRequired=$r.RebootRequired;Count=$c.Count}|ConvertTo-Json -Compress"
-            return powershell(script, timeout=7200)
-        if inventory["distribution_id"] == "ubuntu":
-            return run(["/usr/bin/unattended-upgrade", "--verbose"], timeout=7200)
-        tool = "/usr/bin/dnf" if Path("/usr/bin/dnf").exists() else "/usr/bin/yum"
-        return run([tool, "-y", "update", "--security"], timeout=7200)
+        return scan_updates(inventory)
+    if action == "patch.install":
+        return install_updates(parameters, inventory)
+    if action == "logs.sources":
+        return log_sources(windows)
     if action == "logs.read":
-        limit = min(1000, max(1, int(parameters.get("limit", 200))))
-        if windows:
-            log_name = str(parameters.get("log", "System"))
-            if log_name not in {"System", "Application", "Security"}:
-                raise ValueError("Invalid Windows event log")
-            return powershell(f"Get-WinEvent -LogName '{log_name}' -MaxEvents {limit}|Select TimeCreated,Id,LevelDisplayName,ProviderName,Message|ConvertTo-Json -Depth 3")
-        unit = parameters.get("unit")
-        command = ["/usr/bin/journalctl", "--no-pager", "-n", str(limit), "-o", "short-iso"]
-        if unit:
-            command += ["-u", require_name(parameters, "unit", service=True)]
-        return run(command)
+        return read_logs(parameters, windows)
     if action == "process.list":
-        rows = [{"pid": p.info["pid"], "name": p.info["name"], "username": p.info.get("username"), "cpu": p.info.get("cpu_percent"), "memory": p.info.get("memory_percent")} for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent"])]
+        rows = [{"pid": p.info["pid"], "name": p.info["name"], "created": p.info.get("create_time"), "username": p.info.get("username")} for p in psutil.process_iter(["pid", "name", "create_time", "username"]) if p.info.get("name")]
+        rows.sort(key=lambda item: (str(item["name"]).casefold(), int(item["pid"])))
         return 0, json.dumps(rows[:2000], ensure_ascii=False)
+    if action == "process.kill":
+        return kill_processes(parameters)
     if action == "firewall.list":
         return windows_firewall_rules() if windows else linux_firewall_rules()
     if action == "firewall.rule.add":
@@ -1522,19 +2506,13 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
     if action == "firewall.rule.reorder":
         return reorder_firewall_rule(parameters, inventory)
     if action == "storage.list":
-        facts = management_facts("windows" if windows else "linux")
-        return 0, json.dumps(facts.get("Storage", []), ensure_ascii=False)
+        return storage_scan(windows)
     if action == "storage.extend":
-        if windows:
-            drive = str(parameters.get("drive", "")).upper().rstrip(":")
-            if not re.fullmatch(r"[A-Z]", drive):
-                raise ValueError("Invalid Windows drive letter")
-            return powershell(f"$s=Get-PartitionSupportedSize -DriveLetter '{drive}';Resize-Partition -DriveLetter '{drive}' -Size $s.SizeMax -Confirm:$false -ErrorAction Stop;Get-Volume -DriveLetter '{drive}'|Select DriveLetter,Size,SizeRemaining|ConvertTo-Json -Compress", timeout=1800)
-        logical_volume = str(parameters.get("logical_volume", ""))
-        size_gb = int(parameters.get("size_gb", 0))
-        if not re.fullmatch(r"/dev/(?:mapper/)?[A-Za-z0-9_.+/-]{1,180}", logical_volume) or not 1 <= size_gb <= 10240:
-            raise ValueError("Invalid logical volume or extension size")
-        return run(["/usr/sbin/lvextend", "--resizefs", "--size", f"+{size_gb}G", logical_volume], timeout=1800)
+        return extend_storage(parameters, windows)
+    if action == "storage.create":
+        return create_storage(parameters, windows)
+    if action == "storage.delete":
+        return delete_storage(parameters, windows)
     if action == "network.list":
         if windows:
             return powershell("Get-NetIPConfiguration|Select InterfaceAlias,InterfaceDescription,IPv4Address,IPv4DefaultGateway,DNSServer|ConvertTo-Json -Depth 4")

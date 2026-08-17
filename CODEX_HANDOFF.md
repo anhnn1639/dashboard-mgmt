@@ -6,9 +6,9 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn và MSI mới nhất: `0.6.6`; endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn mới nhất: `0.7.0`; MSI bundle trong repository hiện vẫn là `0.6.6` cho tới khi workflow build từ commit nguồn 0.7.0 hoàn tất. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
-- Dashboard mới mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp các action allowlist hiện có.
+- Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
 - Sau khi DNS chạy, log `guacd` xác nhận hai lỗi kế tiếp: host key bị pin cho `tunnel-relay` nhưng thiếu cổng relay động (`Host key does not match known hosts entry`) và recording/typescript bị `Permission denied`. API hiện sinh known_hosts dạng `[tunnel-relay]:PORT KEY_TYPE KEY`; recording-init dùng đúng owner guacd `1000`, shared GID cấu hình bằng `RECORDING_GID`, còn API/Guacamole chỉ được thêm nhóm để đọc. Log phiên mới ngày 16/08 cho thấy recording đã chạy nhưng host key vẫn mismatch: nguyên nhân cuối là agent 0.4.1 luôn gửi ED25519 trong khi libssh2 của guacd ưu tiên/đàm phán ECDSA P-256 trước. Agent 0.4.2 chọn ECDSA, rồi ED25519, rồi RSA theo đúng thứ tự tương thích với guacd.
 - Sau Agent 0.4.2, API đã mở được relay nhưng trình duyệt rơi về trang danh sách Guacamole và `guacd` không nhận connection. Nguyên nhân là URL launch chỉ trỏ `/guacamole/?data=...` thay vì route client. API hiện trả thẳng `/guacamole/#/client/BASE64URL?data=...`, trong đó identifier là `CONNECTION_NAME\0c\0json` và encrypted JSON được percent-encode toàn bộ.
@@ -30,6 +30,9 @@
 - Sau mỗi kết quả thêm, xóa hoặc sắp xếp firewall — thành công hay thất bại — API tự tạo đúng một job `firewall.list`; kết quả gửi lặp không tạo thêm job quét. Dashboard polling nhận kết quả mới, đồng thời hiển thị rõ mutation đang chờ Agent, đang chạy hoặc đang quét lại.
 - Theo yêu cầu mô hình một quản trị viên, toàn bộ job website và `file.deliver` hiện tạo thẳng ở trạng thái `queued`; endpoint `/api/v1/jobs/{id}/approve`, nút duyệt và policy approval đã bị loại bỏ. Job `pending_approval` từ bản cũ được đánh dấu `cancelled` khi API khởi động và payload file tương ứng bị xóa; quản trị viên phải tạo lại nếu vẫn cần. MFA, RBAC, allowlist/validation, audit và các kiểm tra tại Agent vẫn giữ nguyên.
 - Ảnh test thực tế xác nhận `firewall.rule.add` đã tới Agent 0.6.5 nhưng nftables báo syntax error tại comment `TramOps - SSH ALLOW`: nft CLI ghép argv thành grammar nên comment có khoảng trắng phải mang dấu nháy literal. Agent 0.6.6 dùng JSON-compatible quoted/escaped string cho nft comment, vẫn gọi subprocess bằng argv và không qua shell; unit test bao phủ khoảng trắng, dấu nháy và backslash. API tiếp tục trả `exitCode`/`output` theo RBAC và UI hiển thị nguyên văn lỗi có vùng cuộn.
+- Agent/dashboard 0.7.0 thay toàn bộ form thao tác chung ở các tab tài nguyên. **Disk** hiển thị cây Disk → partition → filesystem/LVM, dung lượng thực/unallocated/free/extendable; Windows dùng Storage cmdlet, Ubuntu dùng apt/systemd/parted/LVM, Red Hat và Oracle Linux dùng dnf/yum/systemd/parted/LVM. Modal tạo/extend/xóa chỉ nhận target/capacity Agent vừa quét, nằm trong viewport và cuộn nội bộ trên màn hình nhỏ. Boot/system/root bị khóa; layout được đối chiếu lại ngay trước thao tác; volume dữ liệu đang mount chỉ xóa sau khi unmount thành công và dòng UUID tương ứng được dọn khỏi fstab sau khi xóa thành công.
+- Tab **Services** chỉ liệt kê tên, trạng thái, start cùng OS và Start/Stop/Restart; có filter running/stopped/other. **Tài khoản** có Users/Groups, multi-select, tạo/xóa, đổi password/expiry/group/quyền sudo-wheel-Administrators; hiển thị mọi local user/group nhưng khóa built-in theo UID/GID/SID. **Tiến trình** chỉ hiển thị tên và đối chiếu PID/name/create-time trước khi kill. **Cập nhật** chỉ cài đúng các gói/version được chọn, không còn action update-all. **Nhật ký** lấy tối đa 500 dòng, cấu hình nguồn bền vững trong PostgreSQL, chỉ cho file thật dưới `/var/log` hoặc Windows Event Log đang bật và tô cả dòng error/warning.
+- Sau mọi mutation Services/Users/Groups/Disk/Process/Updates, API tự tạo job quét lại tương ứng giống Firewall; dashboard polling hiển thị dữ liệu thật mới nhất. Các thao tác vẫn chạy trực tiếp không qua phê duyệt, nhưng giữ MFA, RBAC, allowlist, live stale-target guard và audit PostgreSQL.
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
@@ -146,7 +149,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.6.6 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đang cài agent thủ công cập nhật 0.7.0 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -198,7 +201,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.6.6`, Linux available và Windows MSI 0.6.6 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.0`, Linux available và Windows MSI 0.7.0 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -209,7 +212,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.6.6`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.0`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -225,16 +228,20 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 8. Xác nhận claim Windows không dùng được trên Linux và replay bị từ chối.
 9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline. Khi mở SSH, xác nhận API có log `agent stream prepared`; nếu còn lỗi Guacamole, lấy đồng thời log `api guacamole guacd` để tách lỗi credential/host-key/recording.
 10. Test uninstall/upgrade MSI và xác nhận không để lộ claim/private key trong log.
+11. Trên Windows, Ubuntu, Red Hat và Oracle Linux staging, quét từng tab mới; xác nhận danh sách là dữ liệu thật của endpoint, action mutation tự sinh job quét lại và UI cập nhật sau check-in kế tiếp.
+12. Với Disk, chỉ test extend/create/delete trên disk dữ liệu staging đã snapshot/backup; kiểm tra boot/root/system không chọn được, capacity vượt giới hạn bị chặn và filesystem/mount/fstab sau reboot đúng như UI.
+13. Chọn đúng một update trong danh sách và xác nhận chỉ gói/version đó được cài; không có luồng update-all.
 
 ## Kiểm thử local đã đạt
 
-- Control plane `21/21`, gồm mọi job mới/file sạch được xếp hàng trực tiếp, endpoint approve đã bị gỡ và job chờ duyệt cũ được hủy không thực thi; output lỗi được trả theo RBAC ở cả danh sách máy chủ và danh sách Công việc; tự tạo đúng một lượt quét firewall sau mọi kết quả mutation (kể cả failed, không nhân đôi khi replay), validate scope thêm rule riêng theo Windows/firewalld/nftables/iptables, chặn parameter firewall lạ/rỗng/backend không có thứ tự, direct Guacamole client route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `31/31`, gồm quoted/escaped nftables comment, chèn rule UFW/nftables/iptables lên đầu, capabilities zone/profile/filter chain, live stale-target guard và IP-family guard khi thêm rule, unit Linux bắt buộc `AF_NETLINK`, parser firewalld/UFW/nftables/iptables, fallback thư mục hệ thống và `iptables -S` khi thiếu save helper/PATH, chẩn đoán không có backend, khóa rule Docker, ruleset rỗng, reorder UFW/nftables/iptables qua save/restore hoặc native fallback, rollback/stale snapshot guard, xóa UFW theo thứ tự giảm dần, chặn injection tên object firewall, thứ tự SSH host key, parser locator MSI, bootstrap TLS và version contract.
+- Control plane `25/25`, gồm job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, endpoint approve đã gỡ, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Agent security `39/39`, gồm storage free-region parser, selected-only apt/dnf version pin, stale update guard, protected process, source log allowlist, account built-in membership, severity word matching; cùng toàn bộ quoted nft comment, firewall capabilities/order/reorder/rollback/stale guard, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
-- Render trực quan workspace máy chủ pass: bố cục toàn vùng nội dung, breadcrumb, action SSH, tab ngang lớn, bảng dịch vụ và form thao tác hiển thị đúng.
+- Render test workspace `4/4` pass, gồm shell, Windows/Linux fleet, modal resource nằm trong viewport/cuộn nội bộ và form firewall theo capabilities.
+- Kiểm tra browser local bằng dữ liệu mẫu pass: cây Disk mở đúng cấp; modal hiển thị footer ở desktop và cuộn nội bộ tại `390x700`; Services/Users giữ bố cục; log tô toàn dòng error đỏ và warning vàng. Route dữ liệu mẫu và dev server đã gỡ/dừng trước commit.
 - Render trực quan modal thêm firewall pass trên Windows profile, Ubuntu/UFW, Oracle Linux/firewalld zone và Red Hat/iptables INPUT/OUTPUT. DOM đo ở 1024x600 và 390x700 xác nhận modal nằm trọn viewport, không có tràn ngang, body có thanh cuộn riêng và footer luôn hiển thị.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.

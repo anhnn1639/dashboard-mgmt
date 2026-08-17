@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, FileTransfer, Inventory, Job, Server, SessionLocal, SystemSetting, classify_os, guacamole_launch_url, guacamole_ssh_host_key, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -89,6 +89,42 @@ class ClassificationTests(unittest.TestCase):
     def test_oracle_linux_is_classified_as_linux(self):
         family, verification = classify_os(Inventory(hostname="ol-01", os_family="linux", os_name="Oracle Linux Server 8.10", distribution_id="ol"))
         self.assertEqual((family, verification), ("linux", "verified"))
+
+    def test_resource_mutations_have_matching_automatic_refreshes(self):
+        self.assertEqual(AUTO_REFRESH_ACTIONS["storage.extend"], ("storage.list",))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["service.restart"], ("service.list",))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["user.update"], ("user.list", "group.list"))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["process.kill"], ("process.list",))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["patch.install"], ("patch.scan",))
+
+    def test_storage_actions_must_match_the_server_os(self):
+        windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server")
+        linux = Server(id=str(uuid.uuid4()), name="linux", os_family="linux", os_name="Ubuntu")
+        validate_job_parameters("storage.extend", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "add_bytes": 1024**3}, windows)
+        validate_job_parameters("storage.create", {"kind": "linux_lv", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3}, linux)
+        with self.assertRaisesRegex(Exception, "operating system"):
+            validate_job_parameters("storage.extend", {"kind": "linux_partition", "path": "/dev/sda1", "add_bytes": 1024**3}, windows)
+        with self.assertRaisesRegex(Exception, "operating system"):
+            validate_job_parameters("storage.extend", {"kind": "linux_vg", "name": "vg0", "add_bytes": 1024**3}, linux)
+        with self.assertRaisesRegex(Exception, "unsupported"):
+            validate_job_parameters("storage.delete", {"kind": "linux_lv", "path": "/dev/vg0/data", "command": "rm -rf /"}, linux)
+
+    def test_resource_job_payloads_reject_nested_or_malformed_values(self):
+        linux = Server(id=str(uuid.uuid4()), name="linux", os_family="linux", os_name="Ubuntu")
+        with self.assertRaisesRegex(Exception, "group selection"):
+            validate_job_parameters("user.create", {"username": "ops", "password": "CorrectHorse123!", "groups": [{"name": "sudo"}], "is_admin": True}, linux)
+        with self.assertRaisesRegex(Exception, "processes"):
+            validate_job_parameters("process.kill", {"processes": [{"pid": 1, "name": "systemd", "created": 1.0}]}, linux)
+        with self.assertRaisesRegex(Exception, "updates"):
+            validate_job_parameters("patch.install", {"updates": [{"id": "openssl", "version": "3", "shell": "reboot"}]}, linux)
+
+    def test_log_source_configuration_is_os_scoped(self):
+        windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server")
+        linux = Server(id=str(uuid.uuid4()), name="linux", os_family="linux", os_name="Oracle Linux")
+        self.assertEqual(validate_log_sources(windows, ["System", "Application"]), ["System", "Application"])
+        self.assertEqual(validate_log_sources(linux, ["journal", "/var/log/messages"]), ["journal", "/var/log/messages"])
+        with self.assertRaisesRegex(Exception, "below /var/log"):
+            validate_log_sources(linux, ["/etc/shadow"])
 
     def test_firewall_add_requires_backend_specific_server_scope(self):
         common = {"name": "HTTPS", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 443}

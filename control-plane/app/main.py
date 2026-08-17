@@ -15,7 +15,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
@@ -421,6 +421,10 @@ class JobResultRequest(BaseModel):
     output: str = Field(default="", max_length=5_000_000)
 
 
+class LogSourcesUpdateRequest(BaseModel):
+    sources: list[str] = Field(min_length=1, max_length=20)
+
+
 class SessionLaunchRequest(BaseModel):
     server_id: str
     protocol: Literal["ssh", "rdp"]
@@ -468,6 +472,7 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "service.start": {"roles": {"admin", "operator"}, "risk": "medium"},
     "service.stop": {"roles": {"admin", "operator"}, "risk": "high"},
     "user.create": {"roles": {"admin", "operator"}, "risk": "high"},
+    "user.update": {"roles": {"admin", "operator"}, "risk": "high"},
     "user.disable": {"roles": {"admin", "operator"}, "risk": "high"},
     "user.enable": {"roles": {"admin", "operator"}, "risk": "high"},
     "user.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
@@ -479,20 +484,46 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "user.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "group.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "patch.scan": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
-    "patch.install_security": {"roles": {"admin", "operator"}, "risk": "high"},
+    "patch.install": {"roles": {"admin", "operator"}, "risk": "high"},
+    "logs.sources": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low"},
     "logs.read": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low"},
     "process.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "process.kill": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical"},
     "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "storage.create": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "storage.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical"},
 }
 
-FIREWALL_MUTATION_ACTIONS = {"firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder"}
+AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
+    "firewall.rule.add": ("firewall.list",),
+    "firewall.rule.remove": ("firewall.list",),
+    "firewall.rule.reorder": ("firewall.list",),
+    "service.start": ("service.list",),
+    "service.stop": ("service.list",),
+    "service.restart": ("service.list",),
+    "user.create": ("user.list", "group.list"),
+    "user.update": ("user.list", "group.list"),
+    "user.disable": ("user.list",),
+    "user.enable": ("user.list",),
+    "user.delete": ("user.list", "group.list"),
+    "user.password.reset": ("user.list",),
+    "user.add_group": ("user.list", "group.list"),
+    "group.remove_user": ("user.list", "group.list"),
+    "group.create": ("group.list",),
+    "group.delete": ("group.list", "user.list"),
+    "storage.extend": ("storage.list",),
+    "storage.create": ("storage.list",),
+    "storage.delete": ("storage.list",),
+    "process.kill": ("process.list",),
+    "patch.install": ("patch.scan",),
+}
 
 
 def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) -> None:
@@ -548,6 +579,105 @@ def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) ->
             raise HTTPException(status_code=422, detail="Firewall backend does not support ordered rules")
         if len(json.dumps(parameters, ensure_ascii=False)) > 50_000:
             raise HTTPException(status_code=422, detail="Firewall reorder parameters are too large")
+
+
+def validate_job_parameters(action: str, parameters: dict[str, Any], server: Server) -> None:
+    if len(json.dumps(parameters, ensure_ascii=False)) > 250_000:
+        raise HTTPException(status_code=422, detail="Job parameters are too large")
+    if action.startswith("firewall."):
+        validate_firewall_job_parameters(action, parameters)
+        return
+    empty_actions = {"inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "logs.sources", "process.list", "storage.list", "network.list", "system.reboot"}
+    if action in empty_actions:
+        if parameters:
+            raise HTTPException(status_code=422, detail=f"{action} does not accept parameters")
+        return
+    if action in {"service.start", "service.stop", "service.restart"}:
+        if set(parameters) != {"name"} or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,160}", str(parameters.get("name", ""))):
+            raise HTTPException(status_code=422, detail="Select a valid service reported by the server")
+        return
+    if action == "user.create":
+        allowed = {"username", "password", "groups", "is_admin"}
+        username_pattern = r"[^\\/\[\]:;|=,+*?<>@\x00-\x1f]{1,20}" if server.os_family == "windows" else r"[a-z_][a-z0-9_.-]{0,31}"
+        if set(parameters) - allowed or not re.fullmatch(username_pattern, str(parameters.get("username", ""))):
+            raise HTTPException(status_code=422, detail="Invalid user creation parameters")
+        password = str(parameters.get("password", ""))
+        groups = parameters.get("groups", [])
+        if not 12 <= len(password) <= 1024 or any(value in password for value in ("\n", "\r", ":")) or not isinstance(groups, list) or len(groups) > 100 or any(not isinstance(group, str) or not re.fullmatch(r"[A-Za-z0-9_.@ -]{1,128}", group) for group in groups) or len(groups) != len(set(groups)):
+            raise HTTPException(status_code=422, detail="Password or group selection is invalid")
+        return
+    if action == "user.update":
+        allowed = {"username", "password", "groups", "is_admin", "enabled", "account_expires", "max_password_days"}
+        groups = parameters.get("groups", [])
+        if set(parameters) - allowed or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", str(parameters.get("username", ""))) or not isinstance(groups, list) or len(groups) > 100 or any(not isinstance(group, str) or not re.fullmatch(r"[A-Za-z0-9_.@ -]{1,128}", group) for group in groups) or len(groups) != len(set(groups)):
+            raise HTTPException(status_code=422, detail="Invalid user update parameters")
+        password = str(parameters.get("password", ""))
+        if password and (not 12 <= len(password) <= 1024 or any(value in password for value in ("\n", "\r", ":"))):
+            raise HTTPException(status_code=422, detail="New password must contain at least 12 characters")
+        if parameters.get("account_expires") and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(parameters["account_expires"])):
+            raise HTTPException(status_code=422, detail="Invalid account expiration date")
+        if "max_password_days" in parameters and (server.os_family == "windows" or isinstance(parameters["max_password_days"], bool) or not isinstance(parameters["max_password_days"], int) or not -1 <= parameters["max_password_days"] <= 99999):
+            raise HTTPException(status_code=422, detail="Invalid maximum password age")
+        return
+    if action == "user.delete":
+        names = parameters.get("usernames", [])
+        if set(parameters) != {"usernames"} or not isinstance(names, list) or not 1 <= len(names) <= 50:
+            raise HTTPException(status_code=422, detail="Select between 1 and 50 users")
+        return
+    if action == "group.create":
+        group_pattern = r"[A-Za-z0-9_.@ -]{1,128}" if server.os_family == "windows" else r"[a-z_][a-z0-9_.-]{0,31}"
+        if set(parameters) != {"group"} or not re.fullmatch(group_pattern, str(parameters.get("group", ""))):
+            raise HTTPException(status_code=422, detail="Invalid group name")
+        return
+    if action == "group.delete":
+        groups = parameters.get("groups", [])
+        if set(parameters) != {"groups"} or not isinstance(groups, list) or not 1 <= len(groups) <= 50 or any(not isinstance(group, str) or not re.fullmatch(r"[A-Za-z0-9_.@ -]{1,128}", group) for group in groups) or len(groups) != len(set(groups)):
+            raise HTTPException(status_code=422, detail="Select between 1 and 50 groups")
+        return
+    if action == "process.kill":
+        processes = parameters.get("processes", [])
+        if set(parameters) != {"processes"} or not isinstance(processes, list) or not 1 <= len(processes) <= 100 or any(not isinstance(item, dict) or set(item) != {"pid", "name", "created"} or isinstance(item.get("pid"), bool) or not isinstance(item.get("pid"), int) or item["pid"] <= 2 or not isinstance(item.get("name"), str) or not 1 <= len(item["name"]) <= 512 or any(ord(character) < 32 for character in item["name"]) or isinstance(item.get("created"), bool) or not isinstance(item.get("created"), (int, float)) for item in processes):
+            raise HTTPException(status_code=422, detail="Select between 1 and 100 processes")
+        return
+    if action == "patch.install":
+        updates = parameters.get("updates", [])
+        if set(parameters) != {"updates"} or not isinstance(updates, list) or not 1 <= len(updates) <= 100 or any(not isinstance(item, dict) or set(item) - {"id", "version", "revision"} or not isinstance(item.get("id"), str) or not 1 <= len(item["id"]) <= 300 or not isinstance(item.get("version", ""), str) or len(item.get("version", "")) > 300 or ("revision" in item and (isinstance(item["revision"], bool) or not isinstance(item["revision"], int))) for item in updates):
+            raise HTTPException(status_code=422, detail="Select between 1 and 100 updates")
+        return
+    if action in {"storage.extend", "storage.create", "storage.delete"}:
+        kind = str(parameters.get("kind", ""))
+        allowed_kinds = {"windows_partition"} if server.os_family == "windows" else ({"linux_partition", "linux_lv"} if action == "storage.extend" else {"linux_partition", "linux_lv", "linux_vg"})
+        if kind not in allowed_kinds:
+            raise HTTPException(status_code=422, detail="Storage target does not match the server operating system")
+        schemas: dict[tuple[str, str], tuple[set[str], set[str]]] = {
+            ("storage.extend", "windows_partition"): ({"kind", "disk_number", "partition_number", "add_bytes"}, set()),
+            ("storage.extend", "linux_partition"): ({"kind", "path", "add_bytes"}, set()),
+            ("storage.extend", "linux_lv"): ({"kind", "path", "add_bytes"}, set()),
+            ("storage.create", "windows_partition"): ({"kind", "disk_number", "size_bytes", "filesystem", "label"}, {"drive_letter"}),
+            ("storage.create", "linux_partition"): ({"kind", "disk", "start_bytes", "size_bytes", "filesystem"}, {"label", "mount_point"}),
+            ("storage.create", "linux_lv"): ({"kind", "vg_name", "name", "size_bytes"}, {"filesystem", "label", "mount_point"}),
+            ("storage.create", "linux_vg"): ({"kind", "device", "name", "size_bytes"}, set()),
+            ("storage.delete", "windows_partition"): ({"kind", "disk_number", "partition_number"}, set()),
+            ("storage.delete", "linux_partition"): ({"kind", "path"}, set()),
+            ("storage.delete", "linux_lv"): ({"kind", "path"}, set()),
+            ("storage.delete", "linux_vg"): ({"kind", "name"}, set()),
+        }
+        required, optional = schemas[(action, kind)]
+        if not required.issubset(parameters) or set(parameters) - required - optional:
+            raise HTTPException(status_code=422, detail="Storage parameters are incomplete or unsupported")
+        numeric = [key for key in ("add_bytes", "size_bytes") if key in parameters]
+        numeric += [key for key in ("disk_number", "partition_number", "start_bytes") if key in parameters]
+        if any(isinstance(parameters[key], bool) or not isinstance(parameters[key], int) or parameters[key] < (1 if key in {"add_bytes", "size_bytes", "partition_number"} else 0) for key in numeric):
+            raise HTTPException(status_code=422, detail="Storage size must be a positive byte value")
+        if any(not isinstance(value, str) or len(value) > 256 or any(ord(character) < 32 for character in value) for key, value in parameters.items() if key not in numeric and key != "kind"):
+            raise HTTPException(status_code=422, detail="Storage text parameters are invalid")
+        return
+    if action == "logs.read":
+        sources = parameters.get("sources", [])
+        if set(parameters) != {"limit", "sources"} or parameters.get("limit") != 500 or not isinstance(sources, list) or not 1 <= len(sources) <= 20:
+            raise HTTPException(status_code=422, detail="Invalid log read request")
+        return
+    # Existing compatibility actions are still revalidated by the Agent.
 
 
 async def mark_tunnel_closed(session_id: str, reason: str) -> None:
@@ -1235,6 +1365,59 @@ def get_server(server_id: str, _: User = Depends(current_user), db: Session = De
     return {**server_json(server), "inventory": server.inventory}
 
 
+def log_sources_setting_key(server_id: str) -> str:
+    return f"log_sources:{server_id}"
+
+
+def configured_log_sources(db: Session, server: Server) -> list[str]:
+    setting = db.get(SystemSetting, log_sources_setting_key(server.id))
+    if setting:
+        try:
+            parsed = json.loads(setting.value)
+            if isinstance(parsed, list) and parsed:
+                return [str(item) for item in parsed[:20]]
+        except (TypeError, ValueError):
+            pass
+    return ["System"] if server.os_family == "windows" else ["journal"]
+
+
+def validate_log_sources(server: Server, sources: list[str]) -> list[str]:
+    normalized = list(dict.fromkeys(source.strip() for source in sources))
+    if not 1 <= len(normalized) <= 20 or any(not source for source in normalized):
+        raise HTTPException(status_code=422, detail="Select between 1 and 20 log sources")
+    if server.os_family == "windows":
+        if any(not re.fullmatch(r"[A-Za-z0-9_. /-]{1,180}", source) for source in normalized):
+            raise HTTPException(status_code=422, detail="Invalid Windows Event Log source")
+    else:
+        for source in normalized:
+            if source == "journal":
+                continue
+            path = PurePosixPath(source)
+            if not source.startswith("/var/log/") or ".." in path.parts or len(source) > 300:
+                raise HTTPException(status_code=422, detail="Linux log files must be below /var/log")
+    return normalized
+
+
+@app.get("/api/v1/servers/{server_id}/log-sources")
+def get_server_log_sources(server_id: str, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return {"sources": configured_log_sources(db, server)}
+
+
+@app.put("/api/v1/servers/{server_id}/log-sources")
+def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    sources = validate_log_sources(server, payload.sources)
+    db.merge(SystemSetting(key=log_sources_setting_key(server.id), value=json.dumps(sources, ensure_ascii=False, separators=(",", ":"))))
+    audit(db, user.username, "logs.sources.update", server.id, request, detail={"sources": sources})
+    db.commit()
+    return {"sources": sources}
+
+
 def job_json(job: Job, *, include_output: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": job.id,
@@ -1738,7 +1921,7 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     server = verify_agent(request, db, job.server_id, await request.body())
-    queue_firewall_refresh = job.status == "dispatched" and job.action in FIREWALL_MUTATION_ACTIONS
+    refresh_actions = AUTO_REFRESH_ACTIONS.get(job.action, ()) if job.status == "dispatched" else ()
     job.status = payload.status
     job.exit_code = payload.exit_code
     job.output = payload.output
@@ -1771,29 +1954,31 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
             transfer.nonce = ""
     audit(db, f"agent:{server.id}", f"job.{payload.status}", job.id, request, payload.status, {"action": job.action, "exit_code": payload.exit_code})
     db.flush()
-    refresh_job = None
-    if queue_firewall_refresh:
+    refresh_jobs: list[Job] = []
+    for refresh_action in refresh_actions:
+        refresh_parameters = {"limit": 500, "sources": configured_log_sources(db, server)} if refresh_action == "logs.read" else {}
         refresh_job = Job(
             server_id=server.id,
-            action="firewall.list",
-            parameters={},
+            action=refresh_action,
+            parameters=refresh_parameters,
             reason=f"Tự động quét lại sau {job.action} {job.id[:8]}",
             status="queued",
-            risk=SAFE_ACTIONS["firewall.list"]["risk"],
+            risk=SAFE_ACTIONS[refresh_action]["risk"],
             created_by=job.created_by,
         )
         db.add(refresh_job)
         db.flush()
+        refresh_jobs.append(refresh_job)
         audit(
             db,
             f"agent:{server.id}",
             "job.auto_refresh",
             refresh_job.id,
             request,
-            detail={"trigger_job_id": job.id, "trigger_action": job.action},
+            detail={"trigger_job_id": job.id, "trigger_action": job.action, "refresh_action": refresh_action},
         )
     db.commit()
-    return {"accepted": True, "refresh_job_id": refresh_job.id if refresh_job else None}
+    return {"accepted": True, "refresh_job_id": refresh_jobs[0].id if refresh_jobs else None, "refresh_job_ids": [item.id for item in refresh_jobs]}
 
 
 @app.post("/api/v1/jobs", status_code=201)
@@ -1803,12 +1988,14 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
         raise HTTPException(status_code=400, detail="Action is not allowlisted")
     if user.role not in policy["roles"]:
         raise HTTPException(status_code=403, detail="Role cannot execute this action")
-    if payload.action.startswith("firewall."):
-        validate_firewall_job_parameters(payload.action, payload.parameters)
     server = db.get(Server, payload.server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
-    job = Job(server_id=server.id, action=payload.action, parameters=protect_parameters(payload.parameters), reason=payload.reason, status="queued", risk=policy["risk"], created_by=user.id)
+    parameters = dict(payload.parameters)
+    if payload.action == "logs.read":
+        parameters = {"limit": 500, "sources": configured_log_sources(db, server)}
+    validate_job_parameters(payload.action, parameters, server)
+    job = Job(server_id=server.id, action=payload.action, parameters=protect_parameters(parameters), reason=payload.reason, status="queued", risk=policy["risk"], created_by=user.id)
     db.add(job)
     db.flush()
     audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "execution": "direct"})
