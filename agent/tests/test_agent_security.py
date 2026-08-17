@@ -448,6 +448,15 @@ trusted
         self.assertEqual(code, 0)
         self.assertEqual(commands, [["/usr/bin/apt-get", "-y", "--only-upgrade", "install", "openssl=3.0.2-1"]])
 
+    def test_windows_update_scan_indexes_the_com_collection(self):
+        scripts = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"updates":[]}'))):
+            code, _ = tram_agent.scan_updates({"os_family": "windows"})
+        self.assertEqual(code, 0)
+        self.assertIn('Search("IsInstalled=0")', scripts[0])
+        self.assertIn("$r.Updates.Item($i)", scripts[0])
+        self.assertNotIn("foreach($u in $r.Updates)", scripts[0])
+
     def test_update_install_rejects_a_stale_package_version(self):
         scan = json.dumps({"updates": [{"id": "openssl", "name": "openssl", "version": "3.0.2-2"}]})
         with patch.object(tram_agent, "scan_updates", return_value=(0, scan)):

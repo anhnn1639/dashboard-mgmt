@@ -139,14 +139,42 @@ type StorageScan = {
   capabilities: { partitionCreate?: boolean; lvm?: boolean };
 };
 
+function objectArray(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  return value && typeof value === "object" ? [value as Record<string, unknown>] : [];
+}
+
+function stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  return value === undefined || value === null || value === "" ? [] : [String(value)];
+}
+
+function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
+  return {
+    ...value,
+    mountpoints: stringArray(value.mountpoints),
+    children: objectArray(value.children).map(normalizeStorageNode),
+    partitions: objectArray(value.partitions).map(normalizeStorageNode),
+    freeRegions: objectArray(value.freeRegions).map((region) => ({
+      startBytes: bytes(region.startBytes),
+      endBytes: bytes(region.endBytes),
+      sizeBytes: bytes(region.sizeBytes),
+    })),
+  } as StorageNode;
+}
+
 function parseStorage(output: string | undefined): StorageScan {
   const raw = parseObject(output);
   return {
     platform: raw.platform === "windows" || raw.platform === "linux" ? raw.platform : "",
-    disks: Array.isArray(raw.disks) ? raw.disks as StorageNode[] : [],
-    volumeGroups: Array.isArray(raw.volumeGroups) ? raw.volumeGroups as VolumeGroup[] : [],
-    logicalVolumes: Array.isArray(raw.logicalVolumes) ? raw.logicalVolumes as LogicalVolume[] : [],
-    lvmCandidates: Array.isArray(raw.lvmCandidates) ? raw.lvmCandidates as Array<{ path: string; sizeBytes: number }> : [],
+    disks: objectArray(raw.disks).map(normalizeStorageNode),
+    volumeGroups: objectArray(raw.volumeGroups).map((group) => ({
+      ...group,
+      physicalVolumes: stringArray(group.physicalVolumes),
+      logicalVolumes: stringArray(group.logicalVolumes),
+    })) as VolumeGroup[],
+    logicalVolumes: objectArray(raw.logicalVolumes).map(normalizeStorageNode) as LogicalVolume[],
+    lvmCandidates: objectArray(raw.lvmCandidates).map((item) => ({ path: String(item.path ?? ""), sizeBytes: bytes(item.sizeBytes) })).filter((item) => item.path),
     capabilities: raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities as StorageScan["capabilities"] : {},
   };
 }
@@ -576,7 +604,7 @@ export type UpdateRow = { id: string; revision?: number; name: string; version?:
 
 export function UpdatesResourceTab({ output, job, serverName, busy, refresh, queue }: { output?: string; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
   const payload = useMemo(() => parseObject(output), [output]);
-  const rows = Array.isArray(payload.updates) ? payload.updates as UpdateRow[] : [];
+  const rows = objectArray(payload.updates) as UpdateRow[];
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   async function install() {

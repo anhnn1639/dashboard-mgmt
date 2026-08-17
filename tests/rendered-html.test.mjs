@@ -35,6 +35,8 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(resources, /Disk & Volumes/);
   assert.match(resources, /Users & Groups/);
   assert.match(resources, /patch\.install/);
+  assert.match(resources, /objectArray\(value\.partitions\)\.map\(normalizeStorageNode\)/);
+  assert.match(resources, /objectArray\(payload\.updates\)/);
   assert.match(resources, /process\.kill/);
   assert.match(resources, /Tối đa 500 dòng/);
   assert.match(source, /\/api\/v1\/setup\/status/);
