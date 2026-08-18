@@ -457,6 +457,7 @@ class Metrics(BaseModel):
 class CheckinRequest(BaseModel):
     agent_id: str
     agent_version: str
+    active_job_id: str | None = Field(default=None, max_length=36)
     inventory: Inventory | None = None
     metrics: Metrics
 
@@ -490,6 +491,11 @@ class SessionLaunchRequest(BaseModel):
 class RecordingDeletionCreateRequest(BaseModel):
     session_ids: list[str] = Field(min_length=1, max_length=100)
     reason: str = Field(min_length=5, max_length=1000)
+
+
+class RecordingRetentionRequest(BaseModel):
+    enabled: bool = True
+    days: int = Field(default=180, ge=30, le=3650)
 
 
 class DatabaseSetupRequest(BaseModel):
@@ -1031,6 +1037,101 @@ def prune_audit_events(db: Session) -> int:
     return expired_count
 
 
+RECORDING_RETENTION_KEY = "recording_retention"
+RECORDING_RETENTION_STATUS_KEY = "recording_retention_status"
+
+
+def read_recording_retention(db: Session) -> dict[str, Any]:
+    result: dict[str, Any] = {"enabled": True, "days": 180}
+    setting = db.get(SystemSetting, RECORDING_RETENTION_KEY)
+    if setting:
+        try:
+            parsed = json.loads(setting.value)
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("enabled"), bool):
+                    result["enabled"] = parsed["enabled"]
+                days = parsed.get("days")
+                if isinstance(days, int) and not isinstance(days, bool) and 30 <= days <= 3650:
+                    result["days"] = days
+        except (TypeError, ValueError):
+            pass
+    status = db.get(SystemSetting, RECORDING_RETENTION_STATUS_KEY)
+    if status:
+        try:
+            parsed_status = json.loads(status.value)
+            if isinstance(parsed_status, dict):
+                result["lastRun"] = parsed_status
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def recording_session_id_from_name(name: str) -> str | None:
+    if len(name) < 36:
+        return None
+    session_id = name[:36]
+    try:
+        parsed = uuid.UUID(session_id)
+    except ValueError:
+        return None
+    if str(parsed) != session_id.lower() or (len(name) > 36 and name[36] not in "-._"):
+        return None
+    return session_id
+
+
+def prune_recording_files(db: Session) -> dict[str, Any]:
+    config = read_recording_retention(db)
+    timestamp = now()
+    result: dict[str, Any] = {
+        "ranAt": timestamp.isoformat(),
+        "enabled": bool(config["enabled"]),
+        "days": int(config["days"]),
+        "deletedFiles": 0,
+        "deletedBytes": 0,
+        "errors": 0,
+    }
+    if not config["enabled"]:
+        return result
+    cutoff = timestamp - timedelta(days=int(config["days"]))
+    result["cutoff"] = cutoff.isoformat()
+    try:
+        root = Path(settings.recording_root).resolve(strict=True)
+        if not root.is_dir():
+            raise OSError("recording root is not a directory")
+        candidates = list(root.iterdir())
+    except (OSError, RuntimeError) as exc:
+        result["errors"] = 1
+        result["error"] = str(exc)[:500]
+        db.merge(SystemSetting(key=RECORDING_RETENTION_STATUS_KEY, value=json.dumps(result, separators=(",", ":"))))
+        return result
+    active_session_ids = set(db.execute(select(RemoteSession.id).where(RemoteSession.status.not_in({"closed", "failed"}))).scalars().all())
+    for candidate in candidates:
+        session_id = recording_session_id_from_name(candidate.name)
+        if not session_id or session_id in active_session_ids or candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            stat = resolved.stat()
+            if resolved.parent != root or not resolved.is_file() or datetime.fromtimestamp(stat.st_mtime, UTC) >= cutoff:
+                continue
+            resolved.unlink()
+            result["deletedFiles"] += 1
+            result["deletedBytes"] += stat.st_size
+        except OSError:
+            result["errors"] += 1
+    db.merge(SystemSetting(key=RECORDING_RETENTION_STATUS_KEY, value=json.dumps(result, separators=(",", ":"))))
+    if result["deletedFiles"] or result["errors"]:
+        audit(
+            db,
+            "system:recording-retention",
+            "session.recording.retention.pruned",
+            "recordings",
+            result="success" if not result["errors"] else "partial",
+            detail={key: value for key, value in result.items() if key != "enabled"},
+        )
+    return result
+
+
 def issue_jwt(user: User) -> str:
     timestamp = now()
     return jwt.encode({"sub": user.id, "username": user.username, "role": user.role, "iss": settings.jwt_issuer, "iat": timestamp, "exp": timestamp + timedelta(minutes=settings.jwt_ttl_minutes)}, settings.jwt_secret, algorithm="HS256")
@@ -1408,6 +1509,7 @@ def startup() -> None:
             retire_legacy_pending_jobs(db)
             expire_file_payloads(db)
             prune_audit_events(db)
+            prune_recording_files(db)
             exists = db.execute(select(User).limit(1)).scalar_one_or_none()
             if not exists and settings.bootstrap_admin_password:
                 if len(settings.bootstrap_admin_password) < 14:
@@ -1423,6 +1525,7 @@ def startup() -> None:
 
 
 audit_retention_task: asyncio.Task[None] | None = None
+recording_retention_task: asyncio.Task[None] | None = None
 
 
 async def audit_retention_loop() -> None:
@@ -1441,22 +1544,42 @@ async def audit_retention_loop() -> None:
             continue
 
 
+async def recording_retention_loop() -> None:
+    while True:
+        await asyncio.sleep(21600)
+        factory = SessionLocal
+        if factory is None:
+            continue
+        try:
+            with factory() as db:
+                prune_recording_files(db)
+                db.commit()
+        except Exception:
+            # A failed cleanup must not stop remote administration. The next
+            # six-hour cycle retries and keeps a durable status when possible.
+            continue
+
+
 @app.on_event("startup")
 async def start_audit_retention() -> None:
-    global audit_retention_task
+    global audit_retention_task, recording_retention_task
     if audit_retention_task is None or audit_retention_task.done():
         audit_retention_task = asyncio.create_task(audit_retention_loop())
+    if recording_retention_task is None or recording_retention_task.done():
+        recording_retention_task = asyncio.create_task(recording_retention_loop())
 
 
 @app.on_event("shutdown")
 async def stop_audit_retention() -> None:
-    global audit_retention_task
-    if audit_retention_task is None:
-        return
-    audit_retention_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await audit_retention_task
+    global audit_retention_task, recording_retention_task
+    for task in (audit_retention_task, recording_retention_task):
+        if task is None:
+            continue
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     audit_retention_task = None
+    recording_retention_task = None
 
 
 @app.get("/livez")
@@ -1779,6 +1902,41 @@ def configured_log_sources(db: Session, server: Server) -> list[str]:
     return ["System"] if server.os_family == "windows" else ["journal"]
 
 
+INITIAL_SERVER_SCAN_ACTIONS = (
+    "inventory.collect",
+    "storage.list",
+    "service.list",
+    "user.list",
+    "group.list",
+    "firewall.list",
+    "process.list",
+    "network.list",
+    "logs.sources",
+    "logs.read",
+    "patch.scan",
+)
+
+
+def queue_initial_server_scan(db: Session, server: Server, actor: str) -> list[str]:
+    job_ids: list[str] = []
+    for action in INITIAL_SERVER_SCAN_ACTIONS:
+        parameters = {"limit": 500, "sources": configured_log_sources(db, server)} if action == "logs.read" else {}
+        job = Job(
+            server_id=server.id,
+            action=action,
+            parameters=parameters,
+            reason="Tự động quét dữ liệu ban đầu sau khi cài Agent",
+            status="queued",
+            risk=SAFE_ACTIONS[action]["risk"],
+            created_by=actor,
+        )
+        db.add(job)
+        db.flush()
+        job_ids.append(job.id)
+    audit(db, actor, "server.initial_scan.queued", server.id, detail={"actions": list(INITIAL_SERVER_SCAN_ACTIONS), "job_ids": job_ids})
+    return job_ids
+
+
 def validate_log_sources(server: Server, sources: list[str]) -> list[str]:
     normalized = list(dict.fromkeys(source.strip() for source in sources))
     if not 1 <= len(normalized) <= 20 or any(not source for source in normalized):
@@ -2018,6 +2176,9 @@ def issue_agent_identity(
     server.remote_protocol = remote_protocol
     server.verified_os = verification == "verified"
     db.add(server)
+    db.flush()
+    if existing is None:
+        queue_initial_server_scan(db, server, actor)
     action = "agent.certificate.rotate" if replacing_certificate else "agent.enroll"
     audit(db, actor, action, agent_id, request, detail={"os_family": family, "distribution": inventory.distribution_id, "verified": server.verified_os})
     try:
@@ -2299,7 +2460,23 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
     if payload.metrics.services_running is not None:
         server.services_running = payload.metrics.services_running
     server.alerts = payload.metrics.alerts
-    jobs = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "queued").order_by(Job.created_at).limit(10)).scalars().all()
+    jobs: list[Job] = []
+    if payload.active_job_id:
+        active_job = db.get(Job, payload.active_job_id)
+        if not active_job or active_job.server_id != server.id or active_job.status != "dispatched":
+            raise HTTPException(status_code=409, detail="Agent active job does not match control-plane state")
+    else:
+        interrupted = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "dispatched")).scalars().all()
+        for job in interrupted:
+            job.status = "queued"
+            job.started_at = None
+            if job.action == "file.deliver":
+                parameters = reveal_parameters(job.parameters)
+                transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
+                if transfer and transfer.server_id == server.id:
+                    transfer.status = "queued"
+            audit(db, f"agent:{server.id}", "job.interrupted.requeued", job.id, request, detail={"action": job.action})
+        jobs = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "queued").order_by(Job.created_at).limit(1)).scalars().all()
     for job in jobs:
         job.status = "dispatched"
         job.started_at = now()
@@ -2309,7 +2486,7 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
             if transfer and transfer.server_id == server.id:
                 transfer.status = "transferring"
     db.commit()
-    return {"server_time": now().isoformat(), "inventory_interval_seconds": 1800, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
+    return {"server_time": now().isoformat(), "checkin_interval_seconds": 10, "inventory_interval_seconds": 1800, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
 
 
 @app.post("/api/v1/agent/jobs/{job_id}/result")
@@ -2318,6 +2495,10 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     server = verify_agent(request, db, job.server_id, await request.body())
+    if job.status in {"succeeded", "failed"}:
+        return {"accepted": True, "duplicate": True, "refresh_job_id": None, "refresh_job_ids": []}
+    if job.status != "dispatched":
+        raise HTTPException(status_code=409, detail="Job is not dispatched")
     refresh_actions = AUTO_REFRESH_ACTIONS.get(job.action, ()) if job.status == "dispatched" else ()
     job.status = payload.status
     job.exit_code = payload.exit_code
@@ -2521,6 +2702,30 @@ def recording_deletion_json(item: RecordingDeletionRequest, db: Session) -> dict
         "completedAt": aware(item.completed_at).isoformat() if item.completed_at else None,
         "error": item.error,
     }
+
+
+@app.get("/api/v1/settings/recording-retention")
+def get_recording_retention(_: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
+    return read_recording_retention(db)
+
+
+@app.put("/api/v1/settings/recording-retention")
+def update_recording_retention(payload: RecordingRetentionRequest, request: Request, user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
+    previous = read_recording_retention(db)
+    config = payload.model_dump()
+    db.merge(SystemSetting(key=RECORDING_RETENTION_KEY, value=json.dumps(config, separators=(",", ":"))))
+    db.flush()
+    result = prune_recording_files(db) if payload.enabled else None
+    audit(
+        db,
+        user.username,
+        "settings.recording_retention.update",
+        "recordings",
+        request,
+        detail={"previous": {"enabled": previous["enabled"], "days": previous["days"]}, "current": config, "immediate_prune": result},
+    )
+    db.commit()
+    return read_recording_retention(db)
 
 
 @app.get("/api/v1/recording-deletion-requests")

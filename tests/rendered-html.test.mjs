@@ -92,9 +92,12 @@ test("recording deletion requires a distinct second administrator", async () => 
   assert.match(source, /Chờ quản trị viên khác/);
   assert.match(source, /Gửi yêu cầu xóa/);
   assert.match(source, /selectedRecordingIds/);
+  assert.match(source, /Lý do \/ ticket là bắt buộc/);
+  assert.match(source, /settings\/recording-retention/);
+  assert.match(source, /Mặc định 180 ngày/);
 });
 
-test("storage resize and Windows Update diagnostics stay explicit", async () => {
+test("storage resize stays explicit and Updates shows only patches", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
   assert.match(resources, /<span>Thao tác<\/span>/);
@@ -106,8 +109,9 @@ test("storage resize and Windows Update diagnostics stay explicit", async () => 
   assert.match(resources, /Thứ tự vật lý các phân vùng/);
   assert.match(resources, /type === "unallocated"/);
   assert.match(resources, /Shrink không di chuyển phần đang chắn/);
-  assert.match(resources, /Đang hiển thị.*update Windows đã lưu trong cache cục bộ/);
-  assert.match(resources, /Máy không cài ConfigMgr client; đây không phải lỗi/);
+  assert.doesNotMatch(resources, /Windows Update API/);
+  assert.doesNotMatch(resources, /Configuration Manager/);
+  assert.match(resources, /objectArray\(payload\.updates\)/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);

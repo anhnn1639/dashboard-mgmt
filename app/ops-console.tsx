@@ -2888,6 +2888,9 @@ function AuditView({ token }: { token: string }) {
   const [deleteModal, setDeleteModal] = useState(false);
   const [deleteReason, setDeleteReason] = useState("");
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [deleteValidation, setDeleteValidation] = useState("");
+  const [retention, setRetention] = useState<{ enabled: boolean; days: number; lastRun?: { ranAt?: string; deletedFiles?: number; errors?: number } }>({ enabled: true, days: 180 });
+  const [retentionModal, setRetentionModal] = useState(false);
   const [recordingBusy, setRecordingBusy] = useState(false);
   const [recordingMessage, setRecordingMessage] = useState("");
   const loadSessions = useCallback(() =>
@@ -2900,6 +2903,11 @@ function AuditView({ token }: { token: string }) {
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then((data) => setDeletionRequests(data.items ?? []))
       .catch(() => setDeletionRequests([])), [token]);
+  const loadRecordingRetention = useCallback(() =>
+    fetch("/api/v1/settings/recording-retention", { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((data) => setRetention({ enabled: data.enabled !== false, days: Number(data.days) || 180, lastRun: data.lastRun }))
+      .catch(() => undefined), [token]);
   const loadAudit = useCallback(async (before?: string) => {
     setAuditBusy(true);
     try {
@@ -2925,8 +2933,9 @@ function AuditView({ token }: { token: string }) {
       .catch(() => setCurrentUser(null));
     void loadSessions();
     void loadDeletionRequests();
+    void loadRecordingRetention();
     return () => window.clearTimeout(auditTimer);
-  }, [token, loadSessions, loadDeletionRequests, loadAudit]);
+  }, [token, loadSessions, loadDeletionRequests, loadRecordingRetention, loadAudit]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
   const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
@@ -2934,24 +2943,57 @@ function AuditView({ token }: { token: string }) {
     setSelectedRecordingIds((current) => current.includes(sessionId) ? current.filter((item) => item !== sessionId) : [...current, sessionId]);
   }
   async function requestRecordingDeletion() {
-    if (deleteConfirmation !== "DELETE" || deleteReason.trim().length < 5 || selectedRecordingIds.length === 0) return;
+    if (selectedRecordingIds.length === 0) return setDeleteValidation("Hãy chọn ít nhất một recording còn khả dụng.");
+    if (deleteReason.trim().length < 5) return setDeleteValidation("Lý do / ticket là bắt buộc và phải có ít nhất 5 ký tự.");
+    if (deleteConfirmation !== "DELETE") return setDeleteValidation("Hãy gõ chính xác DELETE để xác nhận tạo yêu cầu.");
     setRecordingBusy(true);
+    setDeleteValidation("");
     setRecordingMessage("");
-    const response = await fetch("/api/v1/recording-deletion-requests", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ session_ids: selectedRecordingIds, reason: deleteReason }),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (response.ok) {
+    try {
+      const response = await fetch("/api/v1/recording-deletion-requests", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ session_ids: selectedRecordingIds, reason: deleteReason }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) return setDeleteValidation(data.detail ?? "Không thể tạo yêu cầu xóa recording.");
       setRecordingMessage("Đã tạo yêu cầu. Video chỉ bị xóa sau khi một quản trị viên khác duyệt.");
       setSelectedRecordingIds([]);
       setDeleteModal(false);
       setDeleteReason("");
       setDeleteConfirmation("");
       await loadDeletionRequests();
-    } else setRecordingMessage(data.detail ?? "Không thể tạo yêu cầu xóa recording");
-    setRecordingBusy(false);
+    } catch {
+      setDeleteValidation("Không kết nối được API. Hãy thử lại; chưa có yêu cầu nào được tạo.");
+    } finally {
+      setRecordingBusy(false);
+    }
+  }
+  async function saveRecordingRetention(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const enabled = form.get("enabled") === "on";
+    const days = Number(form.get("days"));
+    if (!Number.isInteger(days) || days < 30 || days > 3650) return setRecordingMessage("Số ngày lưu recording phải từ 30 đến 3650 ngày.");
+    setRecordingBusy(true);
+    setRecordingMessage("");
+    try {
+      const response = await fetch("/api/v1/settings/recording-retention", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ enabled, days }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể lưu thời gian lưu recording");
+      setRetention({ enabled: data.enabled !== false, days: Number(data.days) || days, lastRun: data.lastRun });
+      setRetentionModal(false);
+      setRecordingMessage(enabled ? `Đã bật tự động xóa recording cũ hơn ${days} ngày.` : "Đã tắt tự động xóa recording.");
+      await loadSessions();
+    } catch (error) {
+      setRecordingMessage(error instanceof Error ? error.message : "Không thể lưu thời gian lưu recording.");
+    } finally {
+      setRecordingBusy(false);
+    }
   }
   async function approveRecordingDeletion(item: RecordingDeletionRequest) {
     setRecordingBusy(true);
@@ -3034,7 +3076,9 @@ function AuditView({ token }: { token: string }) {
               <div className="recording-actions">
                 <label><input type="checkbox" checked={selectableSessions.length > 0 && selectableSessions.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableSessions.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableSessions.map((session) => session.id))} /> Chọn tất cả video khả dụng</label>
                 <span>{selectedRecordingIds.length} video đang chọn</span>
-                <button className="button danger" disabled={selectedRecordingIds.length === 0} onClick={() => setDeleteModal(true)}>Xóa video đã chọn</button>
+                <span>{retention.enabled ? `Tự động xóa sau ${retention.days} ngày` : "Tự động xóa đang tắt"}</span>
+                <button className="resource-icon-button settings" type="button" title="Cấu hình thời gian lưu recording" onClick={() => setRetentionModal(true)}>⚙</button>
+                <button className="button danger" disabled={selectedRecordingIds.length === 0} onClick={() => { setDeleteValidation(""); setDeleteModal(true); }}>Xóa video đã chọn</button>
               </div>
             )}
             {recordingMessage && <div className="recording-message">{recordingMessage}</div>}
@@ -3106,12 +3150,14 @@ function AuditView({ token }: { token: string }) {
           <section className="modal firewall-modal" role="dialog" aria-modal="true" aria-label="Yêu cầu xóa recording">
             <div className="modal-head"><div><span className="modal-icon danger">−</span><div><h2>Yêu cầu xóa {selectedSessions.length} video</h2><p>Cần một quản trị viên khác duyệt trước khi file bị xóa.</p></div></div><button type="button" onClick={() => setDeleteModal(false)}>×</button></div>
             <div className="firewall-delete-list">{selectedSessions.map((session) => <div key={session.id}><b>{session.serverName} · {session.protocol.toUpperCase()}</b><span>{session.username} · {new Date(session.startedAt).toLocaleString("vi-VN")}</span></div>)}</div>
-            <label>Lý do / ticket<textarea rows={3} minLength={5} value={deleteReason} onChange={(event) => setDeleteReason(event.target.value)} placeholder="CHG-1234 · Lý do xóa recording" /></label>
-            <label>Gõ DELETE để tạo yêu cầu<input value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoComplete="off" /></label>
-            <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setDeleteModal(false)}>Hủy</button><button type="button" className="button danger" disabled={recordingBusy || deleteConfirmation !== "DELETE" || deleteReason.trim().length < 5} onClick={() => void requestRecordingDeletion()}>Gửi yêu cầu xóa</button></div>
+            <label>Lý do / ticket <b>(bắt buộc)</b><textarea rows={3} minLength={5} value={deleteReason} onChange={(event) => { setDeleteReason(event.target.value); setDeleteValidation(""); }} placeholder="CHG-1234 · Lý do xóa recording" /></label>
+            <label>Gõ DELETE để tạo yêu cầu<input value={deleteConfirmation} onChange={(event) => { setDeleteConfirmation(event.target.value); setDeleteValidation(""); }} autoComplete="off" /></label>
+            {deleteValidation && <div className="danger-panel">{deleteValidation}</div>}
+            <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setDeleteModal(false)}>Hủy</button><button type="button" className="button danger" disabled={recordingBusy} onClick={() => void requestRecordingDeletion()}>{recordingBusy ? "Đang gửi..." : "Gửi yêu cầu xóa"}</button></div>
           </section>
         </div>
       )}
+      {retentionModal && <ModalShell title="Tự động dọn recording" subtitle="Dọn file theo tuổi để bảo vệ dung lượng ổ đĩa; tác vụ hệ thống chạy trực tiếp, không cần phê duyệt" close={() => setRetentionModal(false)}><form className="resource-form" onSubmit={saveRecordingRetention}><label className="check"><input name="enabled" type="checkbox" defaultChecked={retention.enabled} /> Bật tự động xóa recording cũ</label><label>Thời gian lưu (ngày)<input name="days" type="number" min={30} max={3650} defaultValue={retention.days} required /></label><div className="resource-help">Mặc định 180 ngày (xấp xỉ 6 tháng). Khi lưu cấu hình, hệ thống dọn ngay các file đủ tuổi rồi tự kiểm tra lại mỗi 6 giờ. Recording đang được ghi không bị xóa.</div>{retention.lastRun?.ranAt && <div className="resource-help">Lần dọn gần nhất: {new Date(retention.lastRun.ranAt).toLocaleString("vi-VN")} · đã xóa {retention.lastRun.deletedFiles ?? 0} file{retention.lastRun.errors ? ` · ${retention.lastRun.errors} lỗi` : ""}</div>}<div className="modal-actions"><button type="button" className="button ghost" onClick={() => setRetentionModal(false)}>Hủy</button><button className="button primary" disabled={recordingBusy}>{recordingBusy ? "Đang lưu..." : "Lưu cấu hình"}</button></div></form></ModalShell>}
       {selectedRecording && (
         <RecordingPlayer
           session={selectedRecording}

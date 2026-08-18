@@ -754,15 +754,6 @@ export type UpdateRow = { id: string; revision?: number; name: string; version?:
 export function UpdatesResourceTab({ output, job, serverName, busy, refresh, queue }: { output?: string; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
   const payload = useMemo(() => parseObject(output), [output]);
   const rows = objectArray(payload.updates) as UpdateRow[];
-  const diagnostics = payload.diagnostics && typeof payload.diagnostics === "object" ? payload.diagnostics as Record<string, unknown> : null;
-  const wuaStatus = String(diagnostics?.wuaStatus ?? "");
-  const configMgrStatus = String(diagnostics?.configMgrStatus ?? "");
-  const wuaErrorCode = String(diagnostics?.wuaErrorCode ?? "").toUpperCase();
-  const currentScanComplete = diagnostics?.currentScanComplete === true;
-  const updateSource = String(diagnostics?.updateSource ?? "Windows Update");
-  const updateServer = String(diagnostics?.updateServer ?? "");
-  const serviceStates = diagnostics?.services && typeof diagnostics.services === "object" && !Array.isArray(diagnostics.services) ? diagnostics.services as Record<string, unknown> : {};
-  const serviceActions = diagnostics?.serviceActions && typeof diagnostics.serviceActions === "object" && !Array.isArray(diagnostics.serviceActions) ? diagnostics.serviceActions as Record<string, unknown> : {};
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   async function install() {
@@ -770,31 +761,10 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  const emptyMessage = !diagnostics
-    ? "Chưa có dữ liệu update; nhấn Quét lại."
-    : wuaStatus === "cached"
-      ? "Cache cục bộ không có update đang chờ; kết quả này không thay thế được một lần quét online thành công."
-      : currentScanComplete
-        ? "Nguồn cập nhật đã quét thành công và không có update đang chờ."
-        : "Chưa thể xác định các update đang chờ vì máy chủ không kết nối được nguồn cập nhật.";
+  const emptyMessage = "Chưa có bản cập nhật khả dụng hoặc chưa quét dữ liệu; nhấn Quét lại.";
   return <section className="resource-tab updates-resource-tab">
     <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div>
     <PendingState job={job} />
-    {diagnostics && <div className="update-source-status">
-      <div className={wuaStatus === "ok" ? "ok" : wuaStatus === "cached" ? "warning" : "error"}>
-        <b>Windows Update API</b>
-        <span>{wuaStatus === "ok" ? `Quét hiện tại thành công · ${String(diagnostics.wuaCount ?? 0)} update` : wuaStatus === "cached" ? `Đang hiển thị ${String(diagnostics.wuaCount ?? 0)} update Windows đã lưu trong cache cục bộ` : "Quét thất bại, chưa thể kết luận máy không có update"}</span>
-        {wuaErrorCode === "0X80072EE2" && <small>Timeout tới {updateSource}{updateServer ? ` (${updateServer})` : ""}. Kiểm tra firewall/proxy/WSUS cho tài khoản LocalSystem; Agent cần HTTPS outbound tới nguồn cập nhật.</small>}
-        {wuaStatus !== "ok" && wuaErrorCode && wuaErrorCode !== "0X80072EE2" && <small>Mã lỗi {wuaErrorCode}: {String(diagnostics.wuaError ?? "Windows Update API không phản hồi.")}</small>}
-        <small>Dịch vụ: wuauserv {String(serviceStates.wuauserv ?? "unknown")} · BITS {String(serviceStates.bits ?? "unknown")}</small>
-        {Object.keys(serviceActions).length > 0 && <small>Agent đã đánh thức dịch vụ: {Object.entries(serviceActions).map(([name, result]) => `${name} (${String(result)})`).join(" · ")}</small>}
-      </div>
-      <div className={configMgrStatus === "error" ? "error" : "neutral"}>
-        <b>Configuration Manager</b>
-        <span>{configMgrStatus === "ok" ? `${String(diagnostics.configMgrCount ?? 0)} update từ ConfigMgr client` : configMgrStatus === "not_installed" ? "Máy không cài ConfigMgr client; đây không phải lỗi" : "ConfigMgr client có mặt nhưng truy vấn thất bại"}</span>
-        {configMgrStatus === "error" && <small>{String(diagnostics.configMgrError ?? "Không đọc được ClientSDK.")}</small>}
-      </div>
-    </div>}
     <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
   </section>;
 }

@@ -3713,6 +3713,7 @@ textarea:focus-visible {
 }
 .recording-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 12px;
@@ -4598,44 +4599,6 @@ textarea:focus-visible {
   color: #b4c3d5;
   line-height: 1.5;
 }
-.update-source-status {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px;
-  margin-bottom: 12px;
-}
-.update-source-status > div {
-  display: grid;
-  gap: 5px;
-  min-width: 0;
-  padding: 11px 12px;
-  border: 1px solid #30435b;
-  border-radius: 8px;
-  color: #93a7c0;
-  background: #0e1925;
-  font-size: 9px;
-  line-height: 1.5;
-}
-.update-source-status b {
-  color: #d4e1f2;
-  font-size: 10px;
-}
-.update-source-status small {
-  overflow-wrap: anywhere;
-  color: #71869f;
-}
-.update-source-status > .ok {
-  border-color: #2d6651;
-  background: rgba(53, 146, 105, .07);
-}
-.update-source-status > .warning {
-  border-color: #735a2f;
-  background: rgba(196, 139, 46, .08);
-}
-.update-source-status > .error {
-  border-color: #733741;
-  background: rgba(205, 63, 76, .08);
-}
 .log-viewer {
   max-height: 620px;
   overflow: auto;
@@ -4840,9 +4803,6 @@ textarea:focus-visible {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
   .storage-layout-warnings > div {
-    grid-template-columns: 1fr;
-  }
-  .update-source-status {
     grid-template-columns: 1fr;
   }
 }

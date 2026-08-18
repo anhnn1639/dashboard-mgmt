@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
+from sqlalchemy import select
 
 tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
@@ -38,7 +39,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -274,7 +275,7 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(listed_failure["exitCode"], 1)
             self.assertEqual(listed_failure["output"], "not removed")
             with SessionLocal() as db:
-                refreshes = db.query(Job).filter(Job.server_id == agent_id, Job.action == "firewall.list").all()
+                refreshes = db.query(Job).filter(Job.server_id == agent_id, Job.action == "firewall.list", Job.reason.like("Tự động quét lại sau%")).all()
                 self.assertEqual(len(refreshes), 2)
                 self.assertTrue(all(refresh.status == "queued" for refresh in refreshes))
                 self.assertTrue(any(mutation_id[:8] in refresh.reason for refresh in refreshes))
@@ -395,12 +396,23 @@ class ClassificationTests(unittest.TestCase):
             enroll = client.post("/api/v1/enroll", json={"token": token_response.json()["token"], "agent_id": agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "win-2025-01", "os_family": "windows", "os_name": "Microsoft Windows Server 2025 Datacenter", "os_version": "26100", "distribution_id": "windows", "architecture": "AMD64", "agent_version": "0.1.0", "addresses": ["10.30.1.50"]}})
             self.assertEqual(enroll.status_code, 201, enroll.text)
             self.assertEqual(enroll.json()["category"], "Windows")
+            with SessionLocal() as db:
+                initial_actions = db.execute(select(Job.action).where(Job.server_id == agent_id).order_by(Job.created_at)).scalars().all()
+                self.assertEqual(tuple(initial_actions), INITIAL_SERVER_SCAN_ACTIONS)
 
             issued = x509.load_pem_x509_certificate(enroll.json()["certificate"].encode())
             checkin_payload = {"agent_id": agent_id, "agent_version": "0.1.0", "inventory": None, "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}}
             checkin_body, checkin_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
             checkin = client.post("/api/v1/agent/checkin", headers=checkin_headers, content=checkin_body)
             self.assertEqual(checkin.status_code, 200, checkin.text)
+            self.assertEqual(checkin.json()["checkin_interval_seconds"], 10)
+            self.assertEqual(len(checkin.json()["jobs"]), 1)
+            checkin_payload["active_job_id"] = checkin.json()["jobs"][0]["id"]
+            active_body, active_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
+            active_checkin = client.post("/api/v1/agent/checkin", headers=active_headers, content=active_body)
+            self.assertEqual(active_checkin.status_code, 200, active_checkin.text)
+            self.assertEqual(active_checkin.json()["jobs"], [])
+            checkin_payload.pop("active_job_id")
 
             rotation_token = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "windows-rotation", "expected_os_family": "windows"})
             replacement_key = ec.generate_private_key(ec.SECP256R1())
@@ -621,6 +633,51 @@ class ClassificationTests(unittest.TestCase):
                 self.assertFalse(typescript.exists())
             with SessionLocal() as db:
                 self.assertEqual(db.get(RecordingDeletionRequest, deletion_id).status, "deleted")
+        finally:
+            settings.recording_root = original_root
+
+    def test_recording_retention_deletes_only_old_closed_session_files(self):
+        original_root = settings.recording_root
+        recording_root = Path(tmp.name) / f"recording-retention-{uuid.uuid4()}"
+        recording_root.mkdir()
+        settings.recording_root = str(recording_root)
+        server_id = str(uuid.uuid4())
+        old_session_id = str(uuid.uuid4())
+        active_session_id = str(uuid.uuid4())
+        old_recording = recording_root / f"{old_session_id}-admin.guac"
+        old_typescript = recording_root / f"{old_session_id}.typescript"
+        recent_recording = recording_root / f"{uuid.uuid4()}-admin.guac"
+        active_recording = recording_root / f"{active_session_id}-admin.guac"
+        unrelated = recording_root / "not-a-recording.log"
+        for path in (old_recording, old_typescript, recent_recording, active_recording, unrelated):
+            path.write_bytes(b"recording")
+        old_timestamp = (datetime.now(UTC) - timedelta(days=181)).timestamp()
+        for path in (old_recording, old_typescript, active_recording, unrelated):
+            os.utime(path, (old_timestamp, old_timestamp))
+        try:
+            with SessionLocal() as db:
+                db.add_all([
+                    Server(id=server_id, name="retention-test", os_family="windows", os_name="Windows Server"),
+                    RemoteSession(id=old_session_id, server_id=server_id, protocol="rdp", remote_username="admin", created_by="admin", status="closed", recording_name=old_recording.name),
+                    RemoteSession(id=active_session_id, server_id=server_id, protocol="rdp", remote_username="admin", created_by="admin", status="waiting", recording_name=active_recording.name),
+                ])
+                db.merge(SystemSetting(key="recording_retention", value=json.dumps({"enabled": True, "days": 180})))
+                db.commit()
+                result = prune_recording_files(db)
+                db.commit()
+                self.assertEqual(result["deletedFiles"], 2)
+                self.assertEqual(result["errors"], 0)
+            self.assertFalse(old_recording.exists())
+            self.assertFalse(old_typescript.exists())
+            self.assertTrue(recent_recording.exists())
+            self.assertTrue(active_recording.exists())
+            self.assertTrue(unrelated.exists())
+            with TestClient(app) as client:
+                headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                configured = client.put("/api/v1/settings/recording-retention", headers=headers, json={"enabled": True, "days": 210})
+                self.assertEqual(configured.status_code, 200, configured.text)
+                self.assertEqual(configured.json()["days"], 210)
+                self.assertIn("lastRun", configured.json())
         finally:
             settings.recording_root = original_root
 

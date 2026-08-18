@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+from concurrent.futures import Future, ThreadPoolExecutor
 import getpass
 import hashlib
 import hmac
@@ -145,7 +146,14 @@ def signed_request(config: Config, method: str, url: str, payload: dict[str, Any
 def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False, output_limit: int = 100_000) -> tuple[int, str]:
     if not sensitive:
         LOG.info("exec action: %s", command[0])
-    completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        detail = "\n".join(part.strip() for part in (stdout, stderr) if part and part.strip())
+        message = f"Command timed out after {timeout} seconds"
+        return 124, (f"{message}\n{detail}" if detail else message)[-output_limit:]
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
     output = stdout if completed.returncode == 0 else "\n".join(part for part in (stdout, stderr) if part)
@@ -2234,12 +2242,12 @@ def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
         script = (
             "$rows=@();$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
             "$updateSource=if($auPolicy.UseWUServer -eq 1 -and $policy.WUServer){'WSUS'}else{'Microsoft Update'};$updateServer=if($updateSource -eq 'WSUS'){[string]$policy.WUServer}else{''};$serviceStates=@{};$serviceActions=@{};foreach($serviceName in @('wuauserv','bits')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){try{Start-Service -Name $serviceName -ErrorAction Stop;$service.WaitForStatus('Running',[TimeSpan]::FromSeconds(15));$serviceActions[$serviceName]='started'}catch{$serviceActions[$serviceName]=$_.Exception.Message}};$serviceStates[$serviceName]=(Get-Service -Name $serviceName -ErrorAction Stop).Status.ToString()}catch{$serviceStates[$serviceName]='missing'}};"
-            "function AddWuaRows([object]$result,[string]$repository){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=[string]$u.Identity.UpdateID;revision=[int]$u.Identity.RevisionNumber;manager='wua';name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
-            "$wuaError='';$wuaErrorCode='';$wuaCachedError='';$wuaCachedErrorCode='';$wuaCount=0;$wuaStatus='error';$wuaMode='cached';$r=$null;try{$cachedSession=New-Object -ComObject Microsoft.Update.Session;$cachedSession.ClientApplicationID='TramVanHanhAgent-Cache';$cachedSearcher=$cachedSession.CreateUpdateSearcher();$cachedSearcher.Online=$false;$r=$cachedSearcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='cached'}catch{$wuaCachedError=$_.Exception.Message;$wuaCachedErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff))};if(-not $r -or $r.Updates.Count -eq 0){try{$onlineSession=New-Object -ComObject Microsoft.Update.Session;$onlineSession.ClientApplicationID='TramVanHanhAgent-Online';$searcher=$onlineSession.CreateUpdateSearcher();$searcher.Online=$true;$r=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='ok';$wuaMode='online'}catch{$wuaError=$_.Exception.Message;$wuaErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff));if($r){$wuaStatus='cached';$wuaMode='cached'}}};if($r){$wuaCount=[int]$r.Updates.Count;$repository=if($wuaMode -eq 'cached'){($updateSource+' (cache cục bộ)')}else{$updateSource};AddWuaRows $r $repository};"
+            "function AddWuaRows([object]$result,[string]$repository,[string]$serviceId=''){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$identity=[string]$u.Identity.UpdateID;if($script:rows|Where-Object{$_.id -eq $identity}){continue};$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=$identity;revision=[int]$u.Identity.RevisionNumber;manager='wua';serviceId=$serviceId;name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
+            "$wuaError='';$wuaErrorCode='';$wuaCachedError='';$wuaCachedErrorCode='';$wuaCount=0;$wuaStatus='error';$wuaMode='cached';$r=$null;try{$cachedSession=New-Object -ComObject Microsoft.Update.Session;$cachedSession.ClientApplicationID='TramVanHanhAgent-Cache';$cachedSearcher=$cachedSession.CreateUpdateSearcher();$cachedSearcher.Online=$false;$r=$cachedSearcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='cached';AddWuaRows $r ($updateSource+' (cache cục bộ)')}catch{$wuaCachedError=$_.Exception.Message;$wuaCachedErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff))};if($rows.Count -eq 0){try{$serviceManager=New-Object -ComObject Microsoft.Update.ServiceManager;foreach($updateService in @($serviceManager.Services)){try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSession.ClientApplicationID='TramVanHanhAgent-ServiceCache';$serviceSearcher=$serviceSession.CreateUpdateSearcher();$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$updateService.ServiceID;$serviceSearcher.Online=$false;$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");AddWuaRows $serviceResult (([string]$updateService.Name)+' (cache cục bộ)') ([string]$updateService.ServiceID)}catch{}}}catch{}};if($rows.Count -eq 0){try{$onlineSession=New-Object -ComObject Microsoft.Update.Session;$onlineSession.ClientApplicationID='TramVanHanhAgent-Online';$searcher=$onlineSession.CreateUpdateSearcher();$searcher.Online=$true;$r=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='ok';$wuaMode='online';AddWuaRows $r $updateSource}catch{$wuaError=$_.Exception.Message;$wuaErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff));if($rows.Count -gt 0){$wuaStatus='cached';$wuaMode='cached'}}};$wuaCount=[int]$rows.Count;"
             "$ccmError='';$ccmCount=0;$ccmStatus='not_installed';try{$rootCcm=Get-CimInstance -Namespace 'root' -ClassName '__Namespace' -Filter \"Name='ccm'\" -ErrorAction Stop;if($rootCcm){$clientSdk=Get-CimInstance -Namespace 'root\\ccm' -ClassName '__Namespace' -Filter \"Name='ClientSDK'\" -ErrorAction Stop;if($clientSdk){$ccmStatus='ok';$ccm=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});$ccmCount=$ccm.Count;foreach($u in $ccm){$id=[string]$u.UpdateID;if(-not ($rows|Where-Object{$_.id -eq $id})){$article=[string]$u.ArticleID;$version=if($article){'KB'+$article}else{$id};$severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';name=[string]$u.Name;version=$version;architecture='';repository='Microsoft Configuration Manager';severity=$severity;kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}}}}}}catch{$ccmStatus='error';$ccmError=$_.Exception.Message};"
             "$manager=if($ccmCount -gt 0 -and $wuaCount -gt 0){'mixed'}elseif($ccmCount -gt 0){'configmgr'}else{'wua'};$currentScanComplete=[bool]($wuaStatus -eq 'ok' -or $ccmStatus -eq 'ok');[pscustomobject]@{platform='windows';manager=$manager;count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=$currentScanComplete;wuaStatus=$wuaStatus;wuaMode=$wuaMode;wuaCount=$wuaCount;wuaError=$wuaError;wuaErrorCode=$wuaErrorCode;wuaCachedError=$wuaCachedError;wuaCachedErrorCode=$wuaCachedErrorCode;configMgrStatus=$ccmStatus;configMgrCount=$ccmCount;configMgrError=$ccmError;updateSource=$updateSource;updateServer=$updateServer;services=$serviceStates;serviceActions=$serviceActions}}|ConvertTo-Json -Depth 8 -Compress"
         )
-        return powershell(script, timeout=600, output_limit=10_000_000)
+        return powershell(script, timeout=180, output_limit=10_000_000)
     if inventory.get("distribution_id") in {"ubuntu", "debian"}:
         apt = find_system_command("apt") or find_system_command("apt-get")
         if not apt:
@@ -2305,8 +2313,11 @@ def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tu
             encoded = base64.b64encode(json.dumps([str(item["id"]) for item in selected]).encode()).decode()
             script = f"$wanted=@([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json);$updates=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{{$_.ComplianceState -eq 0 -and $wanted -contains [string]$_.UpdateID}});if($updates.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$result=Invoke-CimMethod -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdatesManager -MethodName InstallUpdates -Arguments @{{CCMUpdates=[ciminstance[]]$updates}} -ErrorAction Stop;[pscustomobject]@{{manager='configmgr';returnValue=[int]$result.ReturnValue;count=$updates.Count}}|ConvertTo-Json -Compress"
             return powershell(script, timeout=7200)
-        encoded = base64.b64encode(json.dumps([{"id": item["id"], "revision": item.get("revision", 0)} for item in selected]).encode()).decode()
-        script = f"$wanted=( [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json );foreach($serviceName in @('wuauserv','bits')){{try{{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){{Start-Service -Name $serviceName -ErrorAction Stop}}}}catch{{}}}};$s=New-Object -ComObject Microsoft.Update.Session;$s.ClientApplicationID='TramVanHanhAgent-Install';$searcher=$s.CreateUpdateSearcher();$searcher.Online=$false;$q=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$c=New-Object -ComObject Microsoft.Update.UpdateColl;for($index=0;$index -lt $q.Updates.Count;$index++){{$u=$q.Updates.Item($index);$match=$wanted|Where-Object{{$_.id -eq $u.Identity.UpdateID -and [int]$_.revision -eq [int]$u.Identity.RevisionNumber}};if($match){{if(-not $u.EulaAccepted){{$u.AcceptEula()}};[void]$c.Add($u)}}}};if($c.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$d=$s.CreateUpdateDownloader();$d.Updates=$c;$download=$d.Download();if($download.ResultCode -notin 2,3){{throw ('Download failed with WUA result '+$download.ResultCode)}};$i=$s.CreateUpdateInstaller();$i.Updates=$c;$r=$i.Install();[pscustomobject]@{{resultCode=$r.ResultCode;rebootRequired=$r.RebootRequired;count=$c.Count}}|ConvertTo-Json -Compress"
+        service_ids = {str(item.get("serviceId", "")) for item in selected}
+        if len(service_ids) != 1:
+            raise ValueError("Select Windows updates from one update service per operation")
+        encoded = base64.b64encode(json.dumps([{"id": item["id"], "revision": item.get("revision", 0), "serviceId": item.get("serviceId", "")} for item in selected]).encode()).decode()
+        script = f"$wanted=@( [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json );foreach($serviceName in @('wuauserv','bits')){{try{{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){{Start-Service -Name $serviceName -ErrorAction Stop}}}}catch{{}}}};$s=New-Object -ComObject Microsoft.Update.Session;$s.ClientApplicationID='TramVanHanhAgent-Install';$searcher=$s.CreateUpdateSearcher();$serviceId=[string]$wanted[0].serviceId;if($serviceId){{$searcher.ServerSelection=3;$searcher.ServiceID=$serviceId}};$searcher.Online=$false;$q=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$c=New-Object -ComObject Microsoft.Update.UpdateColl;for($index=0;$index -lt $q.Updates.Count;$index++){{$u=$q.Updates.Item($index);$match=$wanted|Where-Object{{$_.id -eq $u.Identity.UpdateID -and [int]$_.revision -eq [int]$u.Identity.RevisionNumber}};if($match){{if(-not $u.EulaAccepted){{$u.AcceptEula()}};[void]$c.Add($u)}}}};if($c.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$d=$s.CreateUpdateDownloader();$d.Updates=$c;$download=$d.Download();if($download.ResultCode -notin 2,3){{throw ('Download failed with WUA result '+$download.ResultCode)}};$i=$s.CreateUpdateInstaller();$i.Updates=$c;$r=$i.Install();[pscustomobject]@{{resultCode=$r.ResultCode;rebootRequired=$r.RebootRequired;count=$c.Count}}|ConvertTo-Json -Compress"
         return powershell(script, timeout=7200)
     if inventory.get("distribution_id") in {"ubuntu", "debian"}:
         apt_get = find_system_command("apt-get")
@@ -2778,6 +2789,17 @@ def post_result(config: Config, job_id: str, exit_code: int, output: str) -> Non
     response.raise_for_status()
 
 
+def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    LOG.info("job %s action=%s", job["id"], job["action"])
+    try:
+        if job["action"] == "file.deliver":
+            return deliver_file(config, job.get("parameters", {}), inventory)
+        return execute_job(job["action"], job.get("parameters", {}), inventory)
+    except Exception as exc:
+        LOG.exception("job failed")
+        return 1, f"{type(exc).__name__}: {exc}"
+
+
 def loop(config: Config, once: bool = False) -> None:
     if not all(path.exists() for path in [config.cert_file, config.key_file, config.ca_file]):
         raise RuntimeError("Agent is not enrolled")
@@ -2785,55 +2807,77 @@ def loop(config: Config, once: bool = False) -> None:
     inventory = collect_inventory()
     expensive_metrics_pending = False
     backoff = config.interval
+    active_job: dict[str, Any] | None = None
+    active_future: Future[tuple[int, str]] | None = None
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tram-job")
     if not once:
         threading.Thread(target=tunnel_control_loop, args=(config,), name="tram-tunnel-control", daemon=True).start()
-    while True:
-        try:
-            ensure_server_ca(config)
-            timestamp = time.time()
-            send_inventory = timestamp - last_inventory >= config.inventory_interval
-            if send_inventory:
-                inventory = collect_inventory()
-            include_expensive = expensive_metrics_pending and not send_inventory
-            payload = {"agent_id": config.agent_id, "agent_version": AGENT_VERSION, "inventory": inventory if send_inventory else None, "metrics": collect_metrics(inventory, include_expensive=include_expensive)}
-            url = config.agent_endpoint + "/checkin"
-            body, headers = signed_request(config, "POST", url, payload)
-            response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
-            response.raise_for_status()
-            data = response.json()
-            if send_inventory:
-                last_inventory = timestamp
-                expensive_metrics_pending = True
-            elif include_expensive:
-                expensive_metrics_pending = False
-            for job in data.get("jobs", []):
-                LOG.info("job %s action=%s", job["id"], job["action"])
-                try:
-                    if job["action"] == "file.deliver":
-                        exit_code, output = deliver_file(config, job.get("parameters", {}), inventory)
-                    else:
-                        exit_code, output = execute_job(job["action"], job.get("parameters", {}), inventory)
-                except Exception as exc:
-                    LOG.exception("job failed")
-                    exit_code, output = 1, f"{type(exc).__name__}: {exc}"
-                post_result(config, job["id"], exit_code, output)
-            backoff = config.interval
-            if once:
-                return
-            time.sleep(config.interval)
-        except requests.RequestException as exc:
-            detail = ""
-            if exc.response is not None:
-                try:
-                    detail = str(exc.response.json().get("detail", ""))
-                except (ValueError, AttributeError):
-                    detail = exc.response.text.strip()[:500]
-            suffix = f" ({detail})" if detail else ""
-            LOG.warning("control plane unavailable: %s%s; retry in %ss", exc, suffix, backoff)
-            if once:
-                raise
-            time.sleep(backoff)
-            backoff = min(300, backoff * 2)
+    try:
+        while True:
+            try:
+                if active_job is not None and active_future is not None and active_future.done():
+                    exit_code, output = active_future.result()
+                    post_result(config, active_job["id"], exit_code, output)
+                    active_job = None
+                    active_future = None
+
+                ensure_server_ca(config)
+                timestamp = time.time()
+                send_inventory = timestamp - last_inventory >= config.inventory_interval
+                if send_inventory:
+                    inventory = collect_inventory()
+                include_expensive = expensive_metrics_pending and not send_inventory
+                payload = {
+                    "agent_id": config.agent_id,
+                    "agent_version": AGENT_VERSION,
+                    "active_job_id": active_job["id"] if active_job else None,
+                    "inventory": inventory if send_inventory else None,
+                    "metrics": collect_metrics(inventory, include_expensive=include_expensive),
+                }
+                url = config.agent_endpoint + "/checkin"
+                body, headers = signed_request(config, "POST", url, payload)
+                response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
+                response.raise_for_status()
+                data = response.json()
+                if send_inventory:
+                    last_inventory = timestamp
+                    expensive_metrics_pending = True
+                elif include_expensive:
+                    expensive_metrics_pending = False
+                jobs = data.get("jobs", [])
+                if active_job is None and jobs:
+                    active_job = jobs[0]
+                    if once:
+                        exit_code, output = execute_dispatched_job(config, active_job, inventory)
+                        post_result(config, active_job["id"], exit_code, output)
+                        return
+                    active_future = worker.submit(execute_dispatched_job, config, active_job, inventory)
+                backoff = config.interval
+                if once:
+                    return
+                checkin_interval = max(5, min(config.interval, int(data.get("checkin_interval_seconds", config.interval))))
+                time.sleep(checkin_interval)
+            except requests.RequestException as exc:
+                detail = ""
+                if exc.response is not None:
+                    try:
+                        detail = str(exc.response.json().get("detail", ""))
+                    except (ValueError, AttributeError):
+                        detail = exc.response.text.strip()[:500]
+                suffix = f" ({detail})" if detail else ""
+                LOG.warning("control plane unavailable: %s%s; retry in %ss", exc, suffix, backoff)
+                if once:
+                    raise
+                time.sleep(backoff)
+                backoff = min(300, backoff * 2)
+            except Exception:
+                LOG.exception("agent loop failed; retry in %ss", backoff)
+                if once:
+                    raise
+                time.sleep(backoff)
+                backoff = min(300, backoff * 2)
+    finally:
+        worker.shutdown(wait=once, cancel_futures=False)
 
 
 def default_config_path() -> str:

@@ -43,6 +43,14 @@ class AgentSecurityTests(unittest.TestCase):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Version="$(var.AgentVersion)"', wix_source)
 
+    def test_command_timeout_is_reported_without_crashing_the_agent(self):
+        timeout = subprocess.TimeoutExpired(["slow-command"], 7, output="partial output")
+        with patch.object(tram_agent.subprocess, "run", side_effect=timeout):
+            code, output = tram_agent.run(["slow-command"], timeout=7)
+        self.assertEqual(code, 124)
+        self.assertIn("timed out after 7 seconds", output)
+        self.assertIn("partial output", output)
+
     def test_linux_service_allows_netlink_for_inventory_and_firewall(self):
         service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
         address_families = next(line for line in service.splitlines() if line.startswith("RestrictAddressFamilies="))
@@ -501,10 +509,12 @@ trusted
         self.assertEqual(commands, [["/usr/bin/apt-get", "-y", "--only-upgrade", "install", "openssl=3.0.2-1"]])
 
     def test_windows_update_scan_indexes_the_com_collection(self):
-        scripts = []
-        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"updates":[]}'))):
+        calls = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **kwargs: (calls.append((script, kwargs)) or (0, '{"updates":[]}'))):
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
+        scripts = [call[0] for call in calls]
         self.assertEqual(code, 0)
+        self.assertEqual(calls[0][1]["timeout"], 180)
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
         self.assertIn("$result.Updates.Item($i)", scripts[0])
         self.assertIn("$searcher.Online=$true", scripts[0])
@@ -513,6 +523,9 @@ trusted
         self.assertIn("Start-Service -Name $serviceName", scripts[0])
         self.assertIn("$cachedSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
         self.assertIn("$onlineSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
+        self.assertIn("Microsoft.Update.ServiceManager", scripts[0])
+        self.assertIn("$serviceSearcher.ServerSelection=3", scripts[0])
+        self.assertIn("$serviceSearcher.ServiceID", scripts[0])
         self.assertIn("currentScanComplete", scripts[0])
         self.assertIn("0x{0:X8}", scripts[0])
         self.assertIn("root\\ccm\\ClientSDK", scripts[0])
@@ -521,13 +534,15 @@ trusted
 
     def test_windows_update_install_reuses_cached_catalog_and_checks_download(self):
         scan = json.dumps({"updates": [
-            {"id": "wua-update-id", "revision": 4, "name": "Cumulative update", "version": "KB5012345", "manager": "wua"},
+            {"id": "wua-update-id", "revision": 4, "name": "Cumulative update", "version": "KB5012345", "manager": "wua", "serviceId": "service-guid"},
         ]})
         scripts = []
         with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"resultCode":2}'))):
             code, _ = tram_agent.install_updates({"updates": [{"id": "wua-update-id", "version": "KB5012345"}]}, {"os_family": "windows"})
         self.assertEqual(code, 0)
         self.assertIn("$searcher.Online=$false", scripts[0])
+        self.assertIn("$searcher.ServerSelection=3", scripts[0])
+        self.assertIn("$searcher.ServiceID=$serviceId", scripts[0])
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
         self.assertIn("Start-Service -Name $serviceName", scripts[0])
         self.assertIn("$download.ResultCode -notin 2,3", scripts[0])
