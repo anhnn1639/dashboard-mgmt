@@ -1,6 +1,8 @@
 import importlib.util
 import base64
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,26 @@ SPEC.loader.exec_module(tram_agent)
 
 
 class AgentSecurityTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "PowerShell parser is available only on Windows")
+    def test_generated_windows_storage_and_update_scripts_parse(self):
+        scripts = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}"))):
+            tram_agent.windows_storage_scan()
+            tram_agent.shrink_storage({"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3}, True)
+            tram_agent.scan_updates({"os_family": "windows"})
+        parser = "$tokens=$null;$errors=$null;[System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors)|Out-Null;if($errors.Count){$errors|ForEach-Object{$_.Message};exit 1}"
+        for script in scripts:
+            completed = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser],
+                input=script,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_agent_version_comes_from_the_shared_version_file(self):
         expected = (MODULE_PATH.parent / "VERSION").read_text(encoding="ascii").strip()
         self.assertEqual(tram_agent.AGENT_VERSION, expected)
@@ -437,6 +459,36 @@ trusted
         self.assertEqual(regions[-1]["startBytes"], 53687091200)
         self.assertEqual(regions[-1]["sizeBytes"], 53686042624)
 
+    def test_windows_storage_scan_reports_ordered_free_segments_and_resize_limits(self):
+        scripts = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"disks":[]}'))):
+            code, _ = tram_agent.windows_storage_scan()
+        self.assertEqual(code, 0)
+        self.assertIn("Sort-Object Offset", scripts[0])
+        self.assertIn("type='unallocated'", scripts[0])
+        self.assertIn("offsetBytes", scripts[0])
+        self.assertIn("shrinkableBytes", scripts[0])
+        self.assertIn("largestFreeExtentBytes", scripts[0])
+        self.assertIn("system|reserved|recovery|oem|unknown", scripts[0])
+
+    def test_windows_shrink_rechecks_live_minimum_and_rejects_special_partitions(self):
+        scripts = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{}'))):
+            code, _ = tram_agent.shrink_storage(
+                {"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3},
+                True,
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("Get-PartitionSupportedSize", scripts[0])
+        self.assertIn("SizeMin", scripts[0])
+        self.assertIn("Resize-Partition", scripts[0])
+        self.assertIn("recovery", scripts[0].lower())
+        with self.assertRaisesRegex(ValueError, "Windows NTFS"):
+            tram_agent.shrink_storage(
+                {"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3},
+                False,
+            )
+
     def test_update_install_uses_only_selected_apt_packages(self):
         scan = json.dumps({"platform": "linux", "manager": "apt", "updates": [
             {"id": "openssl", "name": "openssl", "version": "3.0.2-1", "repository": "security"},
@@ -453,8 +505,12 @@ trusted
         with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"updates":[]}'))):
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
         self.assertEqual(code, 0)
-        self.assertIn('Search("IsInstalled=0")', scripts[0])
-        self.assertIn("$r.Updates.Item($i)", scripts[0])
+        self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
+        self.assertIn("$result.Updates.Item($i)", scripts[0])
+        self.assertIn("$searcher.Online=$true", scripts[0])
+        self.assertIn("$cachedSearcher.Online=$false", scripts[0])
+        self.assertIn("currentScanComplete", scripts[0])
+        self.assertIn("0x{0:X8}", scripts[0])
         self.assertIn("root\\ccm\\ClientSDK", scripts[0])
         self.assertIn("CCM_SoftwareUpdate", scripts[0])
         self.assertNotIn("foreach($u in $r.Updates)", scripts[0])

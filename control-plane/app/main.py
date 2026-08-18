@@ -518,6 +518,7 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical"},
     "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "storage.extend": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "storage.shrink": {"roles": {"admin", "operator"}, "risk": "critical"},
     "storage.create": {"roles": {"admin", "operator"}, "risk": "critical"},
     "storage.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
@@ -542,6 +543,7 @@ AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
     "group.create": ("group.list",),
     "group.delete": ("group.list", "user.list"),
     "storage.extend": ("storage.list",),
+    "storage.shrink": ("storage.list",),
     "storage.create": ("storage.list",),
     "storage.delete": ("storage.list",),
     "process.kill": ("process.list",),
@@ -667,13 +669,17 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         if set(parameters) != {"updates"} or not isinstance(updates, list) or not 1 <= len(updates) <= 100 or any(not isinstance(item, dict) or set(item) - {"id", "version", "revision"} or not isinstance(item.get("id"), str) or not 1 <= len(item["id"]) <= 300 or not isinstance(item.get("version", ""), str) or len(item.get("version", "")) > 300 or ("revision" in item and (isinstance(item["revision"], bool) or not isinstance(item["revision"], int))) for item in updates):
             raise HTTPException(status_code=422, detail="Select between 1 and 100 updates")
         return
-    if action in {"storage.extend", "storage.create", "storage.delete"}:
+    if action in {"storage.extend", "storage.shrink", "storage.create", "storage.delete"}:
         kind = str(parameters.get("kind", ""))
-        allowed_kinds = {"windows_partition"} if server.os_family == "windows" else ({"linux_partition", "linux_lv"} if action == "storage.extend" else {"linux_partition", "linux_lv", "linux_vg"})
+        if action == "storage.shrink":
+            allowed_kinds = {"windows_partition"} if server.os_family == "windows" else set()
+        else:
+            allowed_kinds = {"windows_partition"} if server.os_family == "windows" else ({"linux_partition", "linux_lv"} if action == "storage.extend" else {"linux_partition", "linux_lv", "linux_vg"})
         if kind not in allowed_kinds:
             raise HTTPException(status_code=422, detail="Storage target does not match the server operating system")
         schemas: dict[tuple[str, str], tuple[set[str], set[str]]] = {
             ("storage.extend", "windows_partition"): ({"kind", "disk_number", "partition_number", "add_bytes"}, set()),
+            ("storage.shrink", "windows_partition"): ({"kind", "disk_number", "partition_number", "shrink_bytes"}, set()),
             ("storage.extend", "linux_partition"): ({"kind", "path", "add_bytes"}, set()),
             ("storage.extend", "linux_lv"): ({"kind", "path", "add_bytes"}, set()),
             ("storage.create", "windows_partition"): ({"kind", "disk_number", "size_bytes", "filesystem", "label"}, {"drive_letter"}),
@@ -688,9 +694,9 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         required, optional = schemas[(action, kind)]
         if not required.issubset(parameters) or set(parameters) - required - optional:
             raise HTTPException(status_code=422, detail="Storage parameters are incomplete or unsupported")
-        numeric = [key for key in ("add_bytes", "size_bytes") if key in parameters]
+        numeric = [key for key in ("add_bytes", "shrink_bytes", "size_bytes") if key in parameters]
         numeric += [key for key in ("disk_number", "partition_number", "start_bytes") if key in parameters]
-        if any(isinstance(parameters[key], bool) or not isinstance(parameters[key], int) or parameters[key] < (1 if key in {"add_bytes", "size_bytes", "partition_number"} else 0) for key in numeric):
+        if any(isinstance(parameters[key], bool) or not isinstance(parameters[key], int) or parameters[key] < (1 if key in {"add_bytes", "shrink_bytes", "size_bytes", "partition_number"} else 0) for key in numeric):
             raise HTTPException(status_code=422, detail="Storage size must be a positive byte value")
         if any(not isinstance(value, str) or len(value) > 256 or any(ord(character) < 32 for character in value) for key, value in parameters.items() if key not in numeric and key != "kind"):
             raise HTTPException(status_code=422, detail="Storage text parameters are invalid")

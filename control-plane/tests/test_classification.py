@@ -92,6 +92,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_resource_mutations_have_matching_automatic_refreshes(self):
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.extend"], ("storage.list",))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["storage.shrink"], ("storage.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["service.restart"], ("service.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["user.update"], ("user.list", "group.list"))
         self.assertEqual(AUTO_REFRESH_ACTIONS["process.kill"], ("process.list",))
@@ -131,9 +132,12 @@ class ClassificationTests(unittest.TestCase):
         windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server")
         linux = Server(id=str(uuid.uuid4()), name="linux", os_family="linux", os_name="Ubuntu")
         validate_job_parameters("storage.extend", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "add_bytes": 1024**3}, windows)
+        validate_job_parameters("storage.shrink", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "shrink_bytes": 1024**3}, windows)
         validate_job_parameters("storage.create", {"kind": "linux_lv", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3}, linux)
         with self.assertRaisesRegex(Exception, "operating system"):
             validate_job_parameters("storage.extend", {"kind": "linux_partition", "path": "/dev/sda1", "add_bytes": 1024**3}, windows)
+        with self.assertRaisesRegex(Exception, "operating system"):
+            validate_job_parameters("storage.shrink", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "shrink_bytes": 1024**3}, linux)
         with self.assertRaisesRegex(Exception, "operating system"):
             validate_job_parameters("storage.extend", {"kind": "linux_vg", "name": "vg0", "add_bytes": 1024**3}, linux)
         with self.assertRaisesRegex(Exception, "unsupported"):

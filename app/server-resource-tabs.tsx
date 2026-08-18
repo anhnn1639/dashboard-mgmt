@@ -102,7 +102,11 @@ type StorageNode = {
   sizeBytes?: number;
   freeBytes?: number;
   extendableBytes?: number;
+  shrinkableBytes?: number;
   unallocatedBytes?: number;
+  largestFreeExtentBytes?: number;
+  offsetBytes?: number;
+  endOffsetBytes?: number;
   mountpoints?: string[];
   children?: StorageNode[];
   partitions?: StorageNode[];
@@ -115,6 +119,8 @@ type StorageNode = {
   vgName?: string;
   partitionTable?: string;
   protected?: boolean;
+  resizeProtected?: boolean;
+  resizeReason?: string;
   readOnly?: boolean;
   freeRegions?: Array<{ startBytes: number; endBytes: number; sizeBytes: number }>;
 };
@@ -177,11 +183,17 @@ function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
     sizeBytes: bytes(value.sizeBytes),
     freeBytes: bytes(value.freeBytes),
     extendableBytes: bytes(value.extendableBytes),
+    shrinkableBytes: bytes(value.shrinkableBytes),
     unallocatedBytes: bytes(value.unallocatedBytes),
+    largestFreeExtentBytes: bytes(value.largestFreeExtentBytes),
+    offsetBytes: bytes(value.offsetBytes),
+    endOffsetBytes: bytes(value.endOffsetBytes),
     partitionNumber: Number(value.partitionNumber) || undefined,
     diskNumber: Number(value.diskNumber) || undefined,
     number: Number(value.number) || 0,
     protected: value.protected === true,
+    resizeProtected: value.resizeProtected === true,
+    resizeReason: storageText(value.resizeReason),
     readOnly: value.readOnly === true,
     mountpoints: stringArray(value.mountpoints),
     children: objectArray(value.children).map(normalizeStorageNode),
@@ -224,7 +236,11 @@ type StorageTarget = {
   diskNumber?: number;
   partitionNumber?: number;
   extendableBytes?: number;
+  shrinkableBytes?: number;
+  filesystem?: string;
   protected?: boolean;
+  resizeProtected?: boolean;
+  resizeReason?: string;
   mounted?: boolean;
   name?: string;
 };
@@ -249,11 +265,28 @@ export function StorageResourceTab({
   const scan = useMemo(() => parseStorage(output), [output]);
   const [expanded, setExpanded] = useState<string[]>([]);
   const [selected, setSelected] = useState<StorageTarget | null>(null);
-  const [modal, setModal] = useState<"create" | "extend" | "delete" | null>(null);
+  const [modal, setModal] = useState<"create" | "extend" | "shrink" | "delete" | null>(null);
   const [createKind, setCreateKind] = useState(osFamily === "windows" ? "windows_partition" : "linux_partition");
   const [createTarget, setCreateTarget] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const disks = scan.disks;
+  const windowsLayoutWarnings = osFamily === "windows" ? disks.flatMap((disk) => {
+    const segments = disk.partitions ?? [];
+    return segments.flatMap((partition, index) => {
+      if (!partition.partitionNumber || !partition.driveLetter || bytes(partition.extendableBytes) > 0) return [];
+      const freeIndex = segments.findIndex((segment, candidateIndex) => candidateIndex > index && segment.type === "unallocated" && bytes(segment.sizeBytes) >= 1024 ** 2);
+      if (freeIndex < 0 || freeIndex === index + 1) return [];
+      const blockers = segments.slice(index + 1, freeIndex).filter((segment) => segment.type !== "unallocated");
+      if (!blockers.length) return [];
+      return [{
+        key: `${disk.number}:${partition.partitionNumber}:${freeIndex}`,
+        volume: partition.driveLetter ? `${partition.driveLetter}:` : `Partition ${partition.partitionNumber}`,
+        disk: disk.number,
+        freeBytes: bytes(segments[freeIndex].sizeBytes),
+        blockers: blockers.map((segment) => segment.driveLetter ? `${segment.driveLetter}:` : segment.type || `Partition ${segment.partitionNumber}`).join(", "),
+      }];
+    });
+  }) : [];
 
   function toggle(key: string) {
     setExpanded((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
@@ -269,7 +302,11 @@ export function StorageResourceTab({
         diskNumber: Number(disk.number),
         partitionNumber: Number(node.partitionNumber),
         extendableBytes: bytes(node.extendableBytes),
+        shrinkableBytes: bytes(node.shrinkableBytes),
+        filesystem: node.filesystem,
         protected: Boolean(node.protected),
+        resizeProtected: Boolean(node.resizeProtected),
+        resizeReason: node.resizeReason,
         mounted: false,
       };
     }
@@ -306,12 +343,15 @@ export function StorageResourceTab({
     const target = nodeTarget(node, disk);
     const isSelected = Boolean(target && selected?.key === target.key);
     const extendCapacity = bytes(target?.extendableBytes);
+    const shrinkCapacity = bytes(target?.shrinkableBytes);
     const protectedPartition = Boolean(target?.protected && target.kind === "linux_partition");
-    const canExtend = Boolean(target && extendCapacity >= 1024 ** 2 && !protectedPartition);
+    const resizeProtected = Boolean(target?.resizeProtected || protectedPartition);
+    const canExtend = Boolean(target && extendCapacity >= 1024 ** 2 && !resizeProtected);
+    const canShrink = Boolean(target?.kind === "windows_partition" && target.filesystem?.toUpperCase() === "NTFS" && shrinkCapacity >= 16 * 1024 ** 2 && !resizeProtected);
     const extendReason = !target
       ? ""
-      : protectedPartition
-        ? "Partition root/boot trực tiếp được bảo vệ; chỉ Logical Volume root mới được extend tự động."
+      : resizeProtected
+        ? target.resizeReason || "Partition hệ thống này được bảo vệ và không thể resize từ dashboard."
         : extendCapacity < 1024 ** 2
           ? target.kind === "linux_lv"
             ? "Volume Group không còn dung lượng trống để extend Logical Volume."
@@ -319,20 +359,41 @@ export function StorageResourceTab({
               ? `Disk còn ${formatBytes(disk.unallocatedBytes)} unallocated nhưng không nằm liền kề partition này; partition Recovery hoặc partition khác đang nằm ở giữa.`
               : "Không có unallocated space liền kề partition. Hãy tăng virtual disk và quét lại."
           : `Có thể mở rộng tối đa ${formatBytes(extendCapacity)}.`;
+    const shrinkReason = !target
+      ? ""
+      : resizeProtected
+        ? target.resizeReason || "Partition hệ thống này được bảo vệ."
+        : target.filesystem?.toUpperCase() !== "NTFS"
+          ? "Windows chỉ hỗ trợ Shrink an toàn cho volume NTFS."
+          : shrinkCapacity < 16 * 1024 ** 2
+            ? "Windows không xác nhận đủ dung lượng có thể Shrink; file không thể di chuyển có thể đang nằm cuối volume."
+            : `Có thể Shrink tối đa ${formatBytes(shrinkCapacity)} theo trạng thái vừa quét.`;
+    const unallocated = node.type === "unallocated";
+    const displayName = unallocated
+      ? "Unallocated"
+      : node.driveLetter
+        ? `${node.driveLetter}:`
+        : osFamily === "windows" && node.partitionNumber
+          ? `${node.type || "Partition"} · Partition ${node.partitionNumber}`
+          : node.path ?? node.name ?? "Thiết bị";
+    const physicalPosition = osFamily === "windows"
+      ? `${node.partitionNumber ? `#${node.partitionNumber} · ` : ""}${formatBytes(node.offsetBytes)} → ${formatBytes(node.endOffsetBytes)}`
+      : node.mountpoints?.join(", ") || "—";
     return (
-      <div key={key} className="storage-tree-item">
+      <div key={key} className={`storage-tree-item ${unallocated ? "unallocated" : ""}`}>
         <div className={`storage-tree-row ${isSelected ? "selected" : ""}`} style={{ "--tree-depth": depth } as CSSProperties}>
           <span className="storage-tree-toggle">
             {children.length ? <button type="button" onClick={() => toggle(key)} aria-label="Mở cây phân vùng">{expanded.includes(key) ? "⌄" : "›"}</button> : <i />}
             {target && <input type="checkbox" checked={isSelected} onChange={() => setSelected(isSelected ? null : target)} disabled={target.protected} aria-label={`Chọn ${target.label}`} />}
           </span>
-          <span className="storage-name"><b>{node.driveLetter ? `${node.driveLetter}:` : node.path ?? node.name ?? "Thiết bị"}</b><small>{node.label || node.type || "partition"}{node.protected ? " · system protected" : ""}</small></span>
+          <span className="storage-name"><b>{displayName}</b><small>{unallocated ? "Vùng trống chưa thuộc volume nào" : node.label || node.type || "partition"}{node.protected && !unallocated ? " · được bảo vệ" : ""}</small></span>
           <span>{node.filesystem || "—"}</span>
           <span>{formatBytes(node.sizeBytes)}</span>
-          <span>{node.mountpoints?.join(", ") || (node.driveLetter ? `${node.driveLetter}:\\` : "—")}</span>
-          <span>{formatBytes(node.freeBytes)}</span>
+          <span>{physicalPosition}</span>
+          <span>{unallocated ? formatBytes(node.sizeBytes) : formatBytes(node.freeBytes)}</span>
           <span className="storage-row-actions">
             {target && <button type="button" disabled={!canExtend} title={extendReason} onClick={() => { setSelected(target); setModal("extend"); }}>Extend</button>}
+            {target?.kind === "windows_partition" && <button type="button" disabled={!canShrink} title={shrinkReason} onClick={() => { setSelected(target); setModal("shrink"); }}>Shrink</button>}
           </span>
         </div>
         {children.length > 0 && expanded.includes(key) && <div>{children.map((child) => renderNode(child, disk, depth + 1))}</div>}
@@ -350,6 +411,21 @@ export function StorageResourceTab({
     if (selected.diskNumber !== undefined) parameters.disk_number = selected.diskNumber;
     if (selected.partitionNumber !== undefined) parameters.partition_number = selected.partitionNumber;
     if (!await queue("storage.extend", parameters, `Extend ${selected.label} trên ${serverName}`)) return;
+    setModal(null);
+  }
+
+  async function submitShrink(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selected || selected.kind !== "windows_partition") return;
+    const form = new FormData(event.currentTarget);
+    const shrinkBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3);
+    const parameters: Record<string, unknown> = {
+      kind: selected.kind,
+      disk_number: selected.diskNumber,
+      partition_number: selected.partitionNumber,
+      shrink_bytes: shrinkBytes,
+    };
+    if (!await queue("storage.shrink", parameters, `Shrink ${selected.label} trên ${serverName}`)) return;
     setModal(null);
   }
 
@@ -401,7 +477,7 @@ export function StorageResourceTab({
 
   const freeRegions = disks.flatMap((disk) => (disk.freeRegions ?? []).map((region) => ({ disk, region })));
   const createCapacity = createKind === "windows_partition"
-    ? bytes(disks.find((disk) => String(disk.number) === createTarget)?.unallocatedBytes)
+    ? bytes(disks.find((disk) => String(disk.number) === createTarget)?.largestFreeExtentBytes ?? disks.find((disk) => String(disk.number) === createTarget)?.unallocatedBytes)
     : createKind === "linux_partition"
       ? bytes(freeRegions.find(({ disk, region }) => `${disk.path}|${region.startBytes}` === createTarget)?.region.sizeBytes)
       : createKind === "linux_lv"
@@ -427,8 +503,11 @@ export function StorageResourceTab({
         <div><b>{formatBytes(disks.reduce((sum, disk) => sum + bytes(disk.unallocatedBytes), 0))}</b><span>Unallocated</span></div>
         {osFamily === "linux" && <div><b>{scan.volumeGroups.length}</b><span>Volume Group</span></div>}
       </div>
+      {windowsLayoutWarnings.length > 0 && <div className="storage-layout-warnings">
+        {windowsLayoutWarnings.map((warning) => <div key={warning.key}><b>{warning.volume} chưa thể Extend</b><span>Disk {warning.disk} có {formatBytes(warning.freeBytes)} Unallocated ở phía sau, nhưng {warning.blockers} đang nằm giữa. Shrink không di chuyển phần đang chắn.</span></div>)}
+      </div>}
       <div className="storage-tree">
-        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>Mount</span><span>Còn trống</span><span>Thao tác</span></div>
+        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>{osFamily === "windows" ? "Vị trí vật lý" : "Mount"}</span><span>Còn trống</span><span>Thao tác</span></div>
         {disks.map((disk, index) => {
           const key = String(disk.id ?? disk.path ?? disk.number ?? index);
           const children = osFamily === "windows" ? disk.partitions ?? [] : disk.children ?? [];
@@ -439,13 +518,22 @@ export function StorageResourceTab({
                 <span className="storage-name"><b>{osFamily === "windows" ? `Disk ${disk.number}` : disk.path}</b><small>{disk.model || "Disk"} · {disk.partitionTable || "chưa có partition table"}</small></span>
                 <span>{disk.partitionTable || "—"}</span><span>{formatBytes(disk.sizeBytes)}</span><span>—</span><span>{formatBytes(disk.unallocatedBytes)}</span><span />
               </div>
-              {expanded.includes(key) && <div>{children.map((child) => renderNode(child, disk, 1))}</div>}
+              {expanded.includes(key) && <div>
+                {osFamily === "windows" && children.length > 0 && <div className="storage-disk-layout" aria-label={`Thứ tự vật lý các phân vùng trên Disk ${disk.number}`}>
+                  {children.map((child, childIndex) => {
+                    const segmentName = child.type === "unallocated" ? "Unallocated" : child.driveLetter ? `${child.driveLetter}:` : `P${child.partitionNumber ?? childIndex + 1}`;
+                    const proportion = Math.max(0.5, bytes(child.sizeBytes) / Math.max(1, bytes(disk.sizeBytes)) * 100);
+                    return <div className={child.type === "unallocated" ? "free" : child.protected ? "protected" : "volume"} style={{ flexGrow: proportion }} key={`layout-${child.id ?? childIndex}`} title={`${segmentName} · ${formatBytes(child.sizeBytes)} · offset ${formatBytes(child.offsetBytes)}`}><b>{segmentName}</b><small>{formatBytes(child.sizeBytes)}</small></div>;
+                  })}
+                </div>}
+                {children.map((child) => renderNode(child, disk, 1))}
+              </div>}
             </div>
           );
         })}
         {!disks.length && <div className="empty-state">Chưa có dữ liệu Disk; nhấn “Quét lại”.</div>}
       </div>
-      <p className="storage-extend-note">Nút Extend chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn. Unallocated không thể kéo thả; nếu Recovery nằm giữa ổ C: và vùng trống thì phải di chuyển hoặc xóa/tạo lại Recovery bằng quy trình bảo trì có backup.</p>
+      <p className="storage-extend-note">Các hàng và thanh sơ đồ được xếp theo offset thật từ trái sang phải. Extend chỉ bật khi Agent xác nhận có vùng Unallocated liền ngay bên phải. Unallocated không thể kéo thả; Shrink tạo vùng trống ở cuối chính volume đó và không di chuyển partition khác. Nếu Recovery nằm giữa C: và vùng trống, cần một quy trình bảo trì riêng có backup để di chuyển hoặc xóa/tạo lại Recovery.</p>
       {osFamily === "linux" && scan.volumeGroups.length > 0 && <div className="vg-grid">
         {scan.volumeGroups.map((vg) => {
           const target: StorageTarget = { key: `vg:${vg.name}`, kind: "linux_vg", label: `Volume Group ${vg.name}`, name: vg.name, protected: false, mounted: vg.logicalVolumes.length > 0 };
@@ -461,11 +549,20 @@ export function StorageResourceTab({
         </form>
       </ModalShell>}
 
+      {modal === "shrink" && selected?.kind === "windows_partition" && <ModalShell title={`Shrink ${selected.label}`} subtitle={`Có thể thu nhỏ tối đa theo lần quét này: ${formatBytes(selected.shrinkableBytes)}`} close={() => setModal(null)}>
+        <form className="resource-form" onSubmit={submitShrink}>
+          <label>Dung lượng cần thu nhỏ (GiB)<input name="size_gb" type="number" min="0.016" step="0.001" max={(bytes(selected.shrinkableBytes) / 1024 ** 3).toFixed(3)} required /></label>
+          <div className="resource-help">Vùng Unallocated mới sẽ xuất hiện ngay bên phải volume này. Shrink không di chuyển Recovery hay bất kỳ partition nào, vì vậy không thể dùng Shrink để đưa vùng trống ở cuối Disk vượt qua Recovery về sát ổ C:.</div>
+          <div className="danger-panel">Hãy bảo đảm đã có backup và không có tác vụ ghi dữ liệu lớn. Agent sẽ đọc lại SizeMin ngay trước khi resize và dừng nếu dung lượng an toàn đã thay đổi.</div>
+          <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Shrink</button></div>
+        </form>
+      </ModalShell>}
+
       {modal === "create" && <ModalShell title="Tạo storage mới" subtitle={osFamily === "windows" ? "Tạo partition và format volume" : "Tạo partition, Volume Group hoặc Logical Volume"} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitCreate}>
           {osFamily === "linux" && <label>Loại cần tạo<select value={createKind} onChange={(event) => { setCreateKind(event.target.value); setCreateTarget(""); }}><option value="linux_partition">Partition + filesystem</option><option value="linux_vg">Volume Group từ partition trống</option><option value="linux_lv">Logical Volume trong VG</option></select></label>}
           {createKind === "windows_partition" && <>
-            <label>Disk có unallocated space<select name="disk_number" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn Disk…</option>{disks.filter((disk) => bytes(disk.unallocatedBytes) > 0 && !disk.readOnly).map((disk) => <option key={disk.number} value={disk.number}>Disk {disk.number} · còn {formatBytes(disk.unallocatedBytes)}</option>)}</select></label>
+            <label>Disk có unallocated space<select name="disk_number" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn Disk…</option>{disks.filter((disk) => bytes(disk.largestFreeExtentBytes ?? disk.unallocatedBytes) > 0 && !disk.readOnly).map((disk) => <option key={disk.number} value={disk.number}>Disk {disk.number} · vùng liên tục lớn nhất {formatBytes(disk.largestFreeExtentBytes ?? disk.unallocatedBytes)}</option>)}</select></label>
             <label>Dung lượng (GiB)<input name="size_gb" type="number" min="0.02" step="0.001" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
             <div className="resource-form-grid"><label>Filesystem<select name="filesystem"><option>NTFS</option><option>ReFS</option></select></label><label>Drive letter<input name="drive_letter" maxLength={1} pattern="[D-Zd-z]" placeholder="Tự động" /></label></div>
             <label>Nhãn volume<input name="label" defaultValue="New Volume" maxLength={32} required /></label>
@@ -658,6 +755,13 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
   const payload = useMemo(() => parseObject(output), [output]);
   const rows = objectArray(payload.updates) as UpdateRow[];
   const diagnostics = payload.diagnostics && typeof payload.diagnostics === "object" ? payload.diagnostics as Record<string, unknown> : null;
+  const wuaStatus = String(diagnostics?.wuaStatus ?? "");
+  const configMgrStatus = String(diagnostics?.configMgrStatus ?? "");
+  const wuaErrorCode = String(diagnostics?.wuaErrorCode ?? "").toUpperCase();
+  const currentScanComplete = diagnostics?.currentScanComplete === true;
+  const updateSource = String(diagnostics?.updateSource ?? "Windows Update");
+  const updateServer = String(diagnostics?.updateServer ?? "");
+  const serviceStates = diagnostics?.services && typeof diagnostics.services === "object" && !Array.isArray(diagnostics.services) ? diagnostics.services as Record<string, unknown> : {};
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   async function install() {
@@ -665,7 +769,32 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  return <section className="resource-tab"><div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div><PendingState job={job} /><div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">Không có update đang chờ hoặc chưa quét dữ liệu.</div>}</div>{diagnostics && <div className="resource-help">Windows Update API: {String(diagnostics.wuaCount ?? 0)} · Configuration Manager: {String(diagnostics.configMgrCount ?? 0)}{diagnostics.wuaError ? ` · WUA lỗi: ${String(diagnostics.wuaError)}` : ""}{diagnostics.configMgrError ? ` · ConfigMgr: ${String(diagnostics.configMgrError)}` : ""}</div>}</section>;
+  const emptyMessage = !diagnostics
+    ? "Chưa có dữ liệu update; nhấn Quét lại."
+    : wuaStatus === "cached"
+      ? "Cache cục bộ không có update đang chờ; kết quả này không thay thế được một lần quét online thành công."
+      : currentScanComplete
+        ? "Nguồn cập nhật đã quét thành công và không có update đang chờ."
+        : "Chưa thể xác định các update đang chờ vì máy chủ không kết nối được nguồn cập nhật.";
+  return <section className="resource-tab updates-resource-tab">
+    <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div>
+    <PendingState job={job} />
+    {diagnostics && <div className="update-source-status">
+      <div className={wuaStatus === "ok" ? "ok" : wuaStatus === "cached" ? "warning" : "error"}>
+        <b>Windows Update API</b>
+        <span>{wuaStatus === "ok" ? `Quét hiện tại thành công · ${String(diagnostics.wuaCount ?? 0)} update` : wuaStatus === "cached" ? `Quét online thất bại; đang hiển thị ${String(diagnostics.wuaCount ?? 0)} update từ cache cục bộ` : "Quét thất bại, chưa thể kết luận máy không có update"}</span>
+        {wuaErrorCode === "0X80072EE2" && <small>Timeout tới {updateSource}{updateServer ? ` (${updateServer})` : ""}. Kiểm tra firewall/proxy/WSUS cho tài khoản LocalSystem; Agent cần HTTPS outbound tới nguồn cập nhật.</small>}
+        {wuaStatus !== "ok" && wuaErrorCode && wuaErrorCode !== "0X80072EE2" && <small>Mã lỗi {wuaErrorCode}: {String(diagnostics.wuaError ?? "Windows Update API không phản hồi.")}</small>}
+        <small>Dịch vụ: wuauserv {String(serviceStates.wuauserv ?? "unknown")} · BITS {String(serviceStates.bits ?? "unknown")}</small>
+      </div>
+      <div className={configMgrStatus === "error" ? "error" : "neutral"}>
+        <b>Configuration Manager</b>
+        <span>{configMgrStatus === "ok" ? `${String(diagnostics.configMgrCount ?? 0)} update từ ConfigMgr client` : configMgrStatus === "not_installed" ? "Máy không cài ConfigMgr client; đây không phải lỗi" : "ConfigMgr client có mặt nhưng truy vấn thất bại"}</span>
+        {configMgrStatus === "error" && <small>{String(diagnostics.configMgrError ?? "Không đọc được ClientSDK.")}</small>}
+      </div>
+    </div>}
+    <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
+  </section>;
 }
 
 export type LogRow = { timestamp?: string; source: string; severity?: "error" | "warning" | "info"; message: string; id?: number; provider?: string };

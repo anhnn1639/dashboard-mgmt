@@ -74,7 +74,7 @@ ALLOWED_ACTIONS = {
     "user.create", "user.update", "user.disable", "user.enable", "user.delete", "user.password.reset",
     "group.create", "group.delete", "user.add_group", "patch.scan",
     "patch.install", "logs.sources", "logs.read", "process.list", "process.kill", "firewall.list", "system.reboot",
-    "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend",
+    "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend", "storage.shrink",
     "storage.create", "storage.delete",
     "firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
@@ -1867,7 +1867,24 @@ def linux_storage_scan() -> tuple[int, str]:
 
 
 def windows_storage_scan() -> tuple[int, str]:
-    script = "$disks=@(Get-Disk|Sort-Object Number|ForEach-Object{$d=$_;$parts=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue|Sort-Object Offset|ForEach-Object{$p=$_;$v=$null;try{$v=Get-Volume -Partition $p -ErrorAction Stop}catch{};$max=$p.Size;try{$max=(Get-PartitionSupportedSize -DiskNumber $d.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop).SizeMax}catch{};[pscustomobject]@{id=($d.Number.ToString()+':'+$p.PartitionNumber.ToString());diskNumber=$d.Number;partitionNumber=$p.PartitionNumber;driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};type=$p.Type;offsetBytes=[int64]$p.Offset;sizeBytes=[int64]$p.Size;extendableBytes=[math]::Max(0,[int64]$max-[int64]$p.Size);filesystem=if($v){$v.FileSystem}else{''};label=if($v){$v.FileSystemLabel}else{''};freeBytes=if($v){[int64]$v.SizeRemaining}else{0};health=if($v){$v.HealthStatus.ToString()}else{''};path=$p.AccessPaths|Select-Object -First 1;protected=[bool]($p.IsBoot -or $p.IsSystem)}});[pscustomobject]@{id=$d.UniqueId;number=$d.Number;name=$d.FriendlyName;model=$d.Model;serial=$d.SerialNumber;sizeBytes=[int64]$d.Size;partitionTable=$d.PartitionStyle.ToString();health=$d.HealthStatus.ToString();operationalStatus=($d.OperationalStatus -join ', ');readOnly=[bool]$d.IsReadOnly;system=[bool]$d.IsSystem;boot=[bool]$d.IsBoot;unallocatedBytes=[int64]$d.LargestFreeExtent;partitions=$parts}});[pscustomobject]@{platform='windows';disks=$disks;volumeGroups=@();logicalVolumes=@();lvmCandidates=@();capabilities=@{partitionCreate=$true;lvm=$false}}|ConvertTo-Json -Depth 8 -Compress"
+    script = (
+        "$minimumGap=[int64](16MB);$disks=@(Get-Disk|Sort-Object Number|ForEach-Object{$d=$_;"
+        "$realParts=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue|Sort-Object Offset|ForEach-Object{$p=$_;$v=$null;$supported=$null;"
+        "try{$v=Get-Volume -Partition $p -ErrorAction Stop}catch{};try{$supported=Get-PartitionSupportedSize -DiskNumber $d.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop}catch{};"
+        "$type=[string]$p.Type;$filesystem=if($v){[string]$v.FileSystem}else{''};$special=[bool]($p.IsHidden -or $type -match '(?i)system|reserved|recovery|oem|unknown');"
+        "$extendable=if($supported -and -not $special -and $filesystem -match '^(?i:NTFS|ReFS)$'){[math]::Max(0,[int64]$supported.SizeMax-[int64]$p.Size)}else{0};"
+        "$shrinkable=if($supported -and -not $special -and $filesystem -eq 'NTFS'){[math]::Max(0,[int64]$p.Size-[int64]$supported.SizeMin)}else{0};"
+        "[pscustomobject]@{id=($d.Number.ToString()+':'+$p.PartitionNumber.ToString());diskNumber=[int]$d.Number;partitionNumber=[int]$p.PartitionNumber;driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};"
+        "type=$type;offsetBytes=[int64]$p.Offset;endOffsetBytes=[int64]$p.Offset+[int64]$p.Size;sizeBytes=[int64]$p.Size;extendableBytes=[int64]$extendable;shrinkableBytes=[int64]$shrinkable;"
+        "filesystem=$filesystem;label=if($v){[string]$v.FileSystemLabel}else{''};freeBytes=if($v){[int64]$v.SizeRemaining}else{0};health=if($v){$v.HealthStatus.ToString()}else{''};"
+        "path=$p.AccessPaths|Select-Object -First 1;protected=[bool]($p.IsBoot -or $p.IsSystem -or $special);resizeProtected=$special;resizeReason=if($special){'EFI, MSR, Recovery và OEM không được resize'}elseif($filesystem -notmatch '^(?i:NTFS|ReFS)$'){'Extend chỉ hỗ trợ NTFS/ReFS; Shrink chỉ hỗ trợ NTFS'}else{''}}});"
+        "$segments=@();$cursor=[int64]0;foreach($part in $realParts){$offset=[int64]$part.offsetBytes;$gap=$offset-$cursor;if($gap -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=$offset;sizeBytes=$gap;freeBytes=$gap;protected=$true;resizeProtected=$true}};$segments+=,$part;$cursor=[math]::Max($cursor,[int64]$part.endOffsetBytes)};"
+        "$tail=[int64]$d.Size-$cursor;if($tail -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=[int64]$d.Size;sizeBytes=$tail;freeBytes=$tail;protected=$true;resizeProtected=$true}};"
+        "$unallocated=[int64](($segments|Where-Object{$_.type -eq 'unallocated'}|Measure-Object -Property sizeBytes -Sum).Sum);"
+        "[pscustomobject]@{id=[string]$d.UniqueId;number=[int]$d.Number;name=[string]$d.FriendlyName;model=[string]$d.Model;serial=[string]$d.SerialNumber;sizeBytes=[int64]$d.Size;partitionTable=$d.PartitionStyle.ToString();"
+        "health=$d.HealthStatus.ToString();operationalStatus=($d.OperationalStatus -join ', ');readOnly=[bool]$d.IsReadOnly;system=[bool]$d.IsSystem;boot=[bool]$d.IsBoot;unallocatedBytes=$unallocated;largestFreeExtentBytes=[int64]$d.LargestFreeExtent;partitions=@($segments)}});"
+        "[pscustomobject]@{platform='windows';disks=$disks;volumeGroups=@();logicalVolumes=@();lvmCandidates=@();capabilities=@{partitionCreate=$true;partitionShrink=$true;lvm=$false}}|ConvertTo-Json -Depth 8 -Compress"
+    )
     return powershell(script, timeout=180, output_limit=10_000_000)
 
 
@@ -2014,6 +2031,27 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
         grow = find_system_command("xfs_growfs")
         return run([grow, str(mountpoints[0])], timeout=1800) if grow and mountpoints else (2, "XFS must be mounted and xfs_growfs installed")
     return 2, f"Partition grew but filesystem {filesystem or 'unknown'} requires a manual grow operation"
+
+
+def shrink_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
+    if not windows or str(parameters.get("kind", "")) != "windows_partition":
+        raise ValueError("Shrink is supported only for Windows NTFS partitions")
+    shrink_bytes = storage_int(parameters, "shrink_bytes", 16 * 1024**2)
+    disk_number = storage_int(parameters, "disk_number", 0, 4096)
+    partition_number = storage_int(parameters, "partition_number", 1, 4096)
+    script = (
+        f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;"
+        "$v=$p|Get-Volume -ErrorAction Stop;$type=[string]$p.Type;"
+        "if($p.IsHidden -or $type -match '(?i)system|reserved|recovery|oem|unknown'){throw 'EFI, MSR, Recovery and OEM partitions cannot be shrunk'};"
+        "if([string]$v.FileSystem -ne 'NTFS'){throw 'Only NTFS partitions can be shrunk safely'};"
+        f"$s=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$target=[int64]$p.Size-{shrink_bytes};"
+        "if($target -lt [int64]$s.SizeMin){throw 'Requested shrink exceeds the live supported capacity; scan again'};"
+        f"Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -Size $target -Confirm:$false -ErrorAction Stop;"
+        f"$after=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number};"
+        "[pscustomobject]@{diskNumber=[int]$after.DiskNumber;partitionNumber=[int]$after.PartitionNumber;driveLetter=[string]$after.DriveLetter;sizeBytes=[int64]$after.Size;unallocatedCreatedBytes="
+        f"[int64]{shrink_bytes}}}|ConvertTo-Json -Compress"
+    )
+    return powershell(script, timeout=1800)
 
 
 def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
@@ -2194,13 +2232,14 @@ def delete_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
 def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
     if inventory["os_family"] == "windows":
         script = (
-            "$rows=@();$wuaError='';$wuaCount=0;"
-            "try{$s=New-Object -ComObject Microsoft.Update.Session;$searcher=$s.CreateUpdateSearcher();$r=$searcher.Search(\"IsInstalled=0\");$wuaCount=[int]$r.Updates.Count;"
-            "for($i=0;$i -lt $r.Updates.Count;$i++){$u=$r.Updates.Item($i);$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$rows+=,[pscustomobject]@{id=[string]$u.Identity.UpdateID;revision=[int]$u.Identity.RevisionNumber;manager='wua';name=[string]$u.Title;version=$version;architecture=$architecture;repository='Microsoft Update';severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}}catch{$wuaError=$_.Exception.Message};"
-            "$ccmError='';$ccmCount=0;try{$ccm=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});$ccmCount=$ccm.Count;foreach($u in $ccm){$id=[string]$u.UpdateID;if(-not ($rows|Where-Object{$_.id -eq $id})){$article=[string]$u.ArticleID;$version=if($article){'KB'+$article}else{$id};$severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';name=[string]$u.Name;version=$version;architecture='';repository='Microsoft Configuration Manager';severity=$severity;kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}}}}catch{$ccmError=$_.Exception.Message};"
-            "$manager=if($ccmCount -gt 0 -and $wuaCount -gt 0){'mixed'}elseif($ccmCount -gt 0){'configmgr'}else{'wua'};[pscustomobject]@{platform='windows';manager=$manager;count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{wuaCount=$wuaCount;configMgrCount=$ccmCount;wuaError=$wuaError;configMgrError=$ccmError}}|ConvertTo-Json -Depth 7 -Compress"
+            "$rows=@();$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
+            "$updateSource=if($auPolicy.UseWUServer -eq 1 -and $policy.WUServer){'WSUS'}else{'Microsoft Update'};$updateServer=if($updateSource -eq 'WSUS'){[string]$policy.WUServer}else{''};$serviceStates=@{};foreach($serviceName in @('wuauserv','bits')){try{$serviceStates[$serviceName]=(Get-Service -Name $serviceName -ErrorAction Stop).Status.ToString()}catch{$serviceStates[$serviceName]='missing'}};"
+            "function AddWuaRows([object]$result,[string]$repository){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=[string]$u.Identity.UpdateID;revision=[int]$u.Identity.RevisionNumber;manager='wua';name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
+            "$wuaError='';$wuaErrorCode='';$wuaCachedError='';$wuaCount=0;$wuaStatus='error';$wuaMode='online';$r=$null;try{$s=New-Object -ComObject Microsoft.Update.Session;$searcher=$s.CreateUpdateSearcher();$searcher.ClientApplicationID='TramVanHanhAgent';$searcher.Online=$true;$r=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='ok'}catch{$wuaError=$_.Exception.Message;$wuaErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff));try{$cachedSearcher=$s.CreateUpdateSearcher();$cachedSearcher.ClientApplicationID='TramVanHanhAgent';$cachedSearcher.Online=$false;$r=$cachedSearcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='cached';$wuaMode='cached'}catch{$wuaCachedError=$_.Exception.Message}};if($r){$wuaCount=[int]$r.Updates.Count;$repository=if($wuaMode -eq 'cached'){($updateSource+' (cache cục bộ)')}else{$updateSource};AddWuaRows $r $repository};"
+            "$ccmError='';$ccmCount=0;$ccmStatus='not_installed';try{$rootCcm=Get-CimInstance -Namespace 'root' -ClassName '__Namespace' -Filter \"Name='ccm'\" -ErrorAction Stop;if($rootCcm){$clientSdk=Get-CimInstance -Namespace 'root\\ccm' -ClassName '__Namespace' -Filter \"Name='ClientSDK'\" -ErrorAction Stop;if($clientSdk){$ccmStatus='ok';$ccm=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});$ccmCount=$ccm.Count;foreach($u in $ccm){$id=[string]$u.UpdateID;if(-not ($rows|Where-Object{$_.id -eq $id})){$article=[string]$u.ArticleID;$version=if($article){'KB'+$article}else{$id};$severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';name=[string]$u.Name;version=$version;architecture='';repository='Microsoft Configuration Manager';severity=$severity;kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}}}}}}catch{$ccmStatus='error';$ccmError=$_.Exception.Message};"
+            "$manager=if($ccmCount -gt 0 -and $wuaCount -gt 0){'mixed'}elseif($ccmCount -gt 0){'configmgr'}else{'wua'};$currentScanComplete=[bool]($wuaStatus -eq 'ok' -or $ccmStatus -eq 'ok');[pscustomobject]@{platform='windows';manager=$manager;count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=$currentScanComplete;wuaStatus=$wuaStatus;wuaMode=$wuaMode;wuaCount=$wuaCount;wuaError=$wuaError;wuaErrorCode=$wuaErrorCode;wuaCachedError=$wuaCachedError;configMgrStatus=$ccmStatus;configMgrCount=$ccmCount;configMgrError=$ccmError;updateSource=$updateSource;updateServer=$updateServer;services=$serviceStates}}|ConvertTo-Json -Depth 8 -Compress"
         )
-        return powershell(script, timeout=300, output_limit=10_000_000)
+        return powershell(script, timeout=600, output_limit=10_000_000)
     if inventory.get("distribution_id") in {"ubuntu", "debian"}:
         apt = find_system_command("apt") or find_system_command("apt-get")
         if not apt:
@@ -2522,6 +2561,8 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         return storage_scan(windows)
     if action == "storage.extend":
         return extend_storage(parameters, windows)
+    if action == "storage.shrink":
+        return shrink_storage(parameters, windows)
     if action == "storage.create":
         return create_storage(parameters, windows)
     if action == "storage.delete":
