@@ -509,11 +509,28 @@ trusted
         self.assertIn("$result.Updates.Item($i)", scripts[0])
         self.assertIn("$searcher.Online=$true", scripts[0])
         self.assertIn("$cachedSearcher.Online=$false", scripts[0])
+        self.assertLess(scripts[0].index("$cachedSearcher.Online=$false"), scripts[0].index("$searcher.Online=$true"))
+        self.assertIn("Start-Service -Name $serviceName", scripts[0])
+        self.assertIn("$cachedSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
+        self.assertIn("$onlineSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
         self.assertIn("currentScanComplete", scripts[0])
         self.assertIn("0x{0:X8}", scripts[0])
         self.assertIn("root\\ccm\\ClientSDK", scripts[0])
         self.assertIn("CCM_SoftwareUpdate", scripts[0])
         self.assertNotIn("foreach($u in $r.Updates)", scripts[0])
+
+    def test_windows_update_install_reuses_cached_catalog_and_checks_download(self):
+        scan = json.dumps({"updates": [
+            {"id": "wua-update-id", "revision": 4, "name": "Cumulative update", "version": "KB5012345", "manager": "wua"},
+        ]})
+        scripts = []
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"resultCode":2}'))):
+            code, _ = tram_agent.install_updates({"updates": [{"id": "wua-update-id", "version": "KB5012345"}]}, {"os_family": "windows"})
+        self.assertEqual(code, 0)
+        self.assertIn("$searcher.Online=$false", scripts[0])
+        self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
+        self.assertIn("Start-Service -Name $serviceName", scripts[0])
+        self.assertIn("$download.ResultCode -notin 2,3", scripts[0])
 
     def test_configmgr_update_install_uses_client_sdk(self):
         scan = json.dumps({"updates": [

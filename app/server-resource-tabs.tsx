@@ -762,6 +762,7 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
   const updateSource = String(diagnostics?.updateSource ?? "Windows Update");
   const updateServer = String(diagnostics?.updateServer ?? "");
   const serviceStates = diagnostics?.services && typeof diagnostics.services === "object" && !Array.isArray(diagnostics.services) ? diagnostics.services as Record<string, unknown> : {};
+  const serviceActions = diagnostics?.serviceActions && typeof diagnostics.serviceActions === "object" && !Array.isArray(diagnostics.serviceActions) ? diagnostics.serviceActions as Record<string, unknown> : {};
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   async function install() {
@@ -782,10 +783,11 @@ export function UpdatesResourceTab({ output, job, serverName, busy, refresh, que
     {diagnostics && <div className="update-source-status">
       <div className={wuaStatus === "ok" ? "ok" : wuaStatus === "cached" ? "warning" : "error"}>
         <b>Windows Update API</b>
-        <span>{wuaStatus === "ok" ? `Quét hiện tại thành công · ${String(diagnostics.wuaCount ?? 0)} update` : wuaStatus === "cached" ? `Quét online thất bại; đang hiển thị ${String(diagnostics.wuaCount ?? 0)} update từ cache cục bộ` : "Quét thất bại, chưa thể kết luận máy không có update"}</span>
+        <span>{wuaStatus === "ok" ? `Quét hiện tại thành công · ${String(diagnostics.wuaCount ?? 0)} update` : wuaStatus === "cached" ? `Đang hiển thị ${String(diagnostics.wuaCount ?? 0)} update Windows đã lưu trong cache cục bộ` : "Quét thất bại, chưa thể kết luận máy không có update"}</span>
         {wuaErrorCode === "0X80072EE2" && <small>Timeout tới {updateSource}{updateServer ? ` (${updateServer})` : ""}. Kiểm tra firewall/proxy/WSUS cho tài khoản LocalSystem; Agent cần HTTPS outbound tới nguồn cập nhật.</small>}
         {wuaStatus !== "ok" && wuaErrorCode && wuaErrorCode !== "0X80072EE2" && <small>Mã lỗi {wuaErrorCode}: {String(diagnostics.wuaError ?? "Windows Update API không phản hồi.")}</small>}
         <small>Dịch vụ: wuauserv {String(serviceStates.wuauserv ?? "unknown")} · BITS {String(serviceStates.bits ?? "unknown")}</small>
+        {Object.keys(serviceActions).length > 0 && <small>Agent đã đánh thức dịch vụ: {Object.entries(serviceActions).map(([name, result]) => `${name} (${String(result)})`).join(" · ")}</small>}
       </div>
       <div className={configMgrStatus === "error" ? "error" : "neutral"}>
         <b>Configuration Manager</b>
