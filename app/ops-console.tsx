@@ -2722,6 +2722,7 @@ type SessionRecord = {
   status: string;
   recordingAvailable: boolean;
   recordingSizeBytes: number;
+  recordingStatus?: string;
   startedAt: string;
   finishedAt?: string | null;
 };
@@ -3071,7 +3072,17 @@ function AuditView({ token }: { token: string }) {
                         : "recording-pending"
                     }
                   >
-                    {pendingSessionIds.has(session.id) ? "Chờ duyệt xóa" : session.recordingAvailable ? "● Sẵn sàng" : session.finishedAt ? "Không tìm thấy file" : "Đang ghi"}
+                    {pendingSessionIds.has(session.id)
+                      ? "Chờ duyệt xóa"
+                      : session.recordingAvailable
+                        ? "● Sẵn sàng"
+                        : session.recordingStatus === "permission_denied"
+                          ? "API không có quyền đọc file"
+                          : ["root_missing", "root_invalid", "root_unreadable"].includes(session.recordingStatus ?? "")
+                            ? "Volume recording chưa sẵn sàng"
+                            : session.recordingStatus === "empty"
+                              ? "File recording đang trống"
+                              : session.finishedAt ? "Không tìm thấy file" : "Đang ghi"}
                   </span>
                   <button
                     disabled={!session.recordingAvailable}

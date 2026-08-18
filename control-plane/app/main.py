@@ -2165,36 +2165,63 @@ def list_sessions(_: User = Depends(require_role("admin", "operator", "auditor")
     rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
     items = []
     for item, server_name in rows:
-        path = recording_file(item.id)
-        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
+        paths, recording_status = recording_probe(item.id)
+        path = paths[0] if paths else None
+        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "recordingStatus": recording_status, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
     return {"items": items}
 
 
-def recording_files(session_id: str, include_typescript: bool = False) -> list[Path]:
+def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[list[Path], str]:
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", session_id):
-        return []
-    root = Path(settings.recording_root).resolve()
+        return [], "invalid_session"
+    try:
+        root = Path(settings.recording_root).resolve(strict=True)
+    except FileNotFoundError:
+        return [], "root_missing"
+    except (OSError, RuntimeError):
+        return [], "permission_denied"
     if not root.is_dir():
-        return []
+        return [], "root_invalid"
     try:
         candidates = list(root.iterdir())
+    except PermissionError:
+        return [], "permission_denied"
     except OSError:
-        return []
+        return [], "root_unreadable"
     matches: list[Path] = []
+    saw_empty = False
+    saw_denied = False
     for candidate in candidates:
         name = candidate.name
         if not (name == session_id or (name.startswith(session_id) and len(name) > len(session_id) and name[len(session_id)] in "-._")):
             continue
         try:
             resolved = candidate.resolve(strict=True)
-            if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size <= 0:
+            if resolved.parent != root or not resolved.is_file():
                 continue
+            if resolved.stat().st_size <= 0:
+                saw_empty = True
+                continue
+        except PermissionError:
+            saw_denied = True
+            continue
         except OSError:
             continue
         if not include_typescript and resolved.name.endswith(".typescript"):
             continue
         matches.append(resolved)
-    return sorted(matches, key=lambda item: item.stat().st_mtime, reverse=True)
+    ordered = sorted(matches, key=lambda item: item.stat().st_mtime, reverse=True)
+    if ordered:
+        return ordered, "available"
+    if saw_denied:
+        return [], "permission_denied"
+    if saw_empty:
+        return [], "empty"
+    return [], "not_found"
+
+
+def recording_files(session_id: str, include_typescript: bool = False) -> list[Path]:
+    return recording_probe(session_id, include_typescript)[0]
 
 
 def recording_file(session_id: str) -> Path | None:

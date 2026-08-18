@@ -38,7 +38,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, recording_file, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -589,6 +589,25 @@ class ClassificationTests(unittest.TestCase):
                 self.assertFalse(typescript.exists())
             with SessionLocal() as db:
                 self.assertEqual(db.get(RecordingDeletionRequest, deletion_id).status, "deleted")
+        finally:
+            settings.recording_root = original_root
+
+    def test_recording_probe_reports_mount_state_instead_of_hiding_it(self):
+        original_root = settings.recording_root
+        missing_root = Path(tmp.name) / f"missing-recordings-{uuid.uuid4()}"
+        session_id = str(uuid.uuid4())
+        try:
+            settings.recording_root = str(missing_root)
+            self.assertEqual(recording_probe(session_id), ([], "root_missing"))
+            missing_root.mkdir()
+            self.assertEqual(recording_probe(session_id), ([], "not_found"))
+            empty = missing_root / f"{session_id}-admin.gly"
+            empty.touch()
+            self.assertEqual(recording_probe(session_id), ([], "empty"))
+            empty.write_bytes(b"guacamole-recording")
+            paths, status = recording_probe(session_id)
+            self.assertEqual(status, "available")
+            self.assertEqual(paths, [empty.resolve()])
         finally:
             settings.recording_root = original_root
 
