@@ -19,6 +19,14 @@ type SetupStatus = {
   status: "ready" | "setup_required";
 };
 
+type CurrentUser = {
+  id: string;
+  username: string;
+  displayName: string;
+  role: string;
+  permissions: string[];
+};
+
 type Server = {
   id: string;
   name: string;
@@ -43,14 +51,14 @@ type Server = {
 };
 
 const navItems = [
-  { id: "overview", icon: "⌂", label: "Tổng quan" },
-  { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3 },
-  { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3 },
-  { id: "sessions", icon: "↗", label: "Phiên truy cập" },
-  { id: "jobs", icon: "▶", label: "Công việc" },
-  { id: "audit", icon: "≡", label: "Nhật ký kiểm toán" },
-  { id: "access", icon: "◎", label: "Người dùng & vai trò" },
-  { id: "agents", icon: "↓", label: "Bộ cài Agent" },
+  { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
+  { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
+  { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3, group: "infrastructure", permissions: ["servers.view"] },
+  { id: "sessions", icon: "↗", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
+  { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["servers.view"] },
+  { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
+  { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
+  { id: "agents", icon: "↓", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
 ];
 
 const healthLabel: Record<Health, string> = {
@@ -335,6 +343,9 @@ export function OpsConsole() {
   const [setupStatusError, setSetupStatusError] = useState("");
   const [token, setToken] = useState("");
   const [authReady, setAuthReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [identityReady, setIdentityReady] = useState(true);
+  const [identityError, setIdentityError] = useState("");
   const [active, setActive] = useState("overview");
   const [selected, setSelected] = useState<Server | null>(null);
   const [query, setQuery] = useState("");
@@ -371,11 +382,39 @@ export function OpsConsole() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setToken(window.sessionStorage.getItem("tram_ops_token") ?? "");
+      const storedToken = window.sessionStorage.getItem("tram_ops_token") ?? "";
+      setToken(storedToken);
+      setIdentityReady(!storedToken);
       setAuthReady(true);
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    if (!authReady || !token) return;
+    let mounted = true;
+    fetch("/api/v1/me", { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } })
+      .then((response) => {
+        if (response.status === 401) {
+          window.sessionStorage.removeItem("tram_ops_token");
+          setCurrentUser(null);
+          setIdentityReady(true);
+          setToken("");
+          throw new Error("Unauthorized");
+        }
+        return response.ok ? response.json() : Promise.reject(new Error("Không thể đọc quyền của tài khoản"));
+      })
+      .then((data: CurrentUser) => {
+        if (mounted) setCurrentUser({ ...data, permissions: Array.isArray(data.permissions) ? data.permissions : [] });
+      })
+      .catch((reason) => {
+        if (mounted && reason instanceof Error && reason.message !== "Unauthorized") setIdentityError(reason.message);
+      })
+      .finally(() => {
+        if (mounted) setIdentityReady(true);
+      });
+    return () => { mounted = false; };
+  }, [authReady, token]);
 
   useEffect(() => {
     if (!token) return;
@@ -415,9 +454,12 @@ export function OpsConsole() {
   }, [token]);
 
   useEffect(() => {
+    if (token && !currentUser) return;
+    const allowedNavigation = navItems.filter((item) => item.permissions.some((permission) => currentUser?.permissions.includes(permission)));
+    const fallbackSection = allowedNavigation[0]?.id ?? "overview";
     const applyHashRoute = () => {
       const [section, encodedName] = window.location.hash.replace(/^#\/?/, "").split("/");
-      if (section === "linux" || section === "windows") {
+      if ((section === "linux" || section === "windows") && allowedNavigation.some((item) => item.id === section)) {
         setActive(section);
         if (encodedName) {
           let requestedName = "";
@@ -435,9 +477,13 @@ export function OpsConsole() {
         } else {
           setSelected(null);
         }
-      } else if (navItems.some((item) => item.id === section)) {
+      } else if (allowedNavigation.some((item) => item.id === section)) {
         setActive(section);
         setSelected(null);
+      } else if (section) {
+        setActive(fallbackSection);
+        setSelected(null);
+        window.history.replaceState(null, "", sectionRoute(fallbackSection));
       }
     };
     applyHashRoute();
@@ -447,7 +493,7 @@ export function OpsConsole() {
       window.removeEventListener("hashchange", applyHashRoute);
       window.removeEventListener("popstate", applyHashRoute);
     };
-  }, [servers]);
+  }, [servers, token, currentUser]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -468,6 +514,13 @@ export function OpsConsole() {
   }, [active]);
 
   const scope = active === "linux" || active === "windows" ? active : null;
+  const visibleNavItems = useMemo(
+    () => navItems.filter((item) => item.permissions.some((permission) => currentUser?.permissions.includes(permission))),
+    [currentUser],
+  );
+  const infrastructureNavigation = visibleNavItems.filter((item) => item.group === "infrastructure");
+  const operationsNavigation = visibleNavItems.filter((item) => item.group === "operations");
+  const administrationNavigation = visibleNavItems.filter((item) => item.group === "administration");
   const visibleServers = useMemo(
     () =>
       servers.filter((server) => {
@@ -523,6 +576,7 @@ export function OpsConsole() {
   }
 
   function navigateSection(section: string) {
+    if (!visibleNavItems.some((item) => item.id === section)) return;
     setActive(section);
     setSelected(null);
     setSelectedServerIds([]);
@@ -582,17 +636,23 @@ export function OpsConsole() {
       <LoginScreen
         onLogin={(nextToken) => {
           window.sessionStorage.setItem("tram_ops_token", nextToken);
+          setCurrentUser(null);
+          setIdentityReady(false);
+          setIdentityError("");
           setToken(nextToken);
         }}
       />
     );
+  if (identityError) return <SystemUnavailable message={identityError} />;
+  if (!identityReady || !currentUser)
+    return <div className="auth-loading">Đang tải quyền tài khoản…</div>;
 
   return (
     <main className="shell">
       <aside className="sidebar">
         <button
           className="brand"
-          onClick={() => navigateSection("overview")}
+          onClick={() => navigateSection(visibleNavItems[0]?.id ?? "")}
           aria-label="Về tổng quan"
         >
           <span className="brand-mark">V</span>
@@ -602,8 +662,8 @@ export function OpsConsole() {
           </span>
         </button>
         <nav aria-label="Điều hướng chính">
-          <p className="nav-heading">HẠ TẦNG</p>
-          {navItems.slice(0, 3).map((item) => {
+          {infrastructureNavigation.length > 0 && <p className="nav-heading">HẠ TẦNG</p>}
+          {infrastructureNavigation.map((item) => {
             const count = navCount(item.id, item.count);
             return (
               <button
@@ -617,8 +677,8 @@ export function OpsConsole() {
               </button>
             );
           })}
-          <p className="nav-heading spaced">VẬN HÀNH</p>
-          {navItems.slice(3, 6).map((item) => {
+          {operationsNavigation.length > 0 && <p className="nav-heading spaced">VẬN HÀNH</p>}
+          {operationsNavigation.map((item) => {
             const count = navCount(item.id, item.count);
             return (
               <button
@@ -632,8 +692,8 @@ export function OpsConsole() {
               </button>
             );
           })}
-          <p className="nav-heading spaced">QUẢN TRỊ</p>
-          {navItems.slice(6).map((item) => (
+          {administrationNavigation.length > 0 && <p className="nav-heading spaced">QUẢN TRỊ</p>}
+          {administrationNavigation.map((item) => (
             <button
               key={item.id}
               className={active === item.id ? "active" : ""}
@@ -659,14 +719,17 @@ export function OpsConsole() {
           className="profile"
           onClick={() => {
             window.sessionStorage.removeItem("tram_ops_token");
+            setCurrentUser(null);
+            setIdentityReady(true);
+            setIdentityError("");
             setToken("");
           }}
           title="Đăng xuất"
         >
-          <span className="profile-avatar">AD</span>
+          <span className="profile-avatar">{(currentUser.displayName || currentUser.username).split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("")}</span>
           <span>
-            <b>Administrator</b>
-            <small>Nhấn để đăng xuất</small>
+            <b>{currentUser.displayName || currentUser.username}</b>
+            <small>{currentUser.role} · nhấn để đăng xuất</small>
           </span>
           <strong>⌄</strong>
         </button>
@@ -3516,7 +3579,7 @@ function AgentPackagesView({ token }: { token: string }) {
             agent mTLS trên 9443 vẫn dùng CA riêng.
           </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
-          <li>Linux cài systemd service, tự enroll và khởi động ngay sau khi cài.</li>
+          <li>Linux là gói offline self-contained: không cần Python, pip, apt, dnf, yum hoặc Internet để cài Agent.</li>
           <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
         </ul>
       </article>
@@ -3552,7 +3615,7 @@ function AgentPackagesView({ token }: { token: string }) {
           >
             <span>L</span>
             <b>Tải Linux .run</b>
-            <small>Ubuntu 24.04 · Oracle Linux 7/8</small>
+            <small>Ubuntu 22.04/24.04 · Oracle Linux 7/8 · RHEL 7/8 · x86_64</small>
           </button>
           <button
             className="package-option windows"
@@ -3568,6 +3631,9 @@ function AgentPackagesView({ token }: { token: string }) {
         {busy && <p className="package-progress">Đang sinh claim và đóng gói {busy}…</p>}
         {status && !status.windowsMsiAvailable && (
           <p className="package-warning">MSI chung chưa có trong API image. Build workflow Windows rồi rebuild container API.</p>
+        )}
+        {status && !status.linuxAvailable && (
+          <p className="package-warning">Linux executable offline chưa có trong API image. Build workflow Linux rồi rebuild container API.</p>
         )}
         {status && !status.agentTlsCaAvailable && (
           <p className="package-warning">
@@ -3605,22 +3671,32 @@ function AccessView({ token }: { token: string }) {
   const selectedRole = roles.find((role) => role.name === roleEditor) ?? null;
   const groupedPermissions = useMemo(() => permissions.reduce<Record<string, PermissionRow[]>>((groups, permission) => ({ ...groups, [permission.group]: [...(groups[permission.group] ?? []), permission] }), {}), [permissions]);
   const loadAccess = useCallback(async () => {
-    const headers = { Authorization: `Bearer ${token}` };
-    const [usersResponse, rolesResponse, ldapResponse] = await Promise.all([
-      fetch("/api/v1/users", { headers }),
-      fetch("/api/v1/roles", { headers }),
-      fetch("/api/v1/settings/ldap", { headers }),
-    ]);
-    setForbidden(usersResponse.status === 403);
-    if (usersResponse.ok) setUsers((await usersResponse.json()).items ?? []);
-    if (rolesResponse.ok) {
-      const data = await rolesResponse.json();
-      setRoles(data.items ?? []);
-      setPermissions(data.permissionCatalog ?? []);
-    }
-    if (ldapResponse.ok) {
-      const ldapData = await ldapResponse.json();
-      setLdap((current) => ({ ...current, ...ldapData }));
+    try {
+      const headers = { Authorization: `Bearer ${token}` };
+      const [usersResponse, rolesResponse, ldapResponse] = await Promise.all([
+        fetch("/api/v1/users", { headers }),
+        fetch("/api/v1/roles", { headers }),
+        fetch("/api/v1/settings/ldap", { headers }),
+      ]);
+      const denied = usersResponse.status === 403;
+      setForbidden(denied);
+      if (usersResponse.ok) setUsers((await usersResponse.json()).items ?? []);
+      else setUsers([]);
+      if (rolesResponse.ok) {
+        const data = await rolesResponse.json();
+        setRoles(data.items ?? []);
+        setPermissions(data.permissionCatalog ?? []);
+      } else {
+        setRoles([]);
+        setPermissions([]);
+      }
+      if (ldapResponse.ok) {
+        const ldapData = await ldapResponse.json();
+        setLdap((current) => ({ ...current, ...ldapData }));
+      }
+    } catch {
+      setMessage("Không thể tải danh sách người dùng và role. Hãy kiểm tra kết nối rồi thử lại.");
+      setMessageError(true);
     }
   }, [token]);
   useEffect(() => {
@@ -3683,7 +3759,7 @@ function AccessView({ token }: { token: string }) {
     setBusy(false);
   }
   return <section className="panel view-panel access-workspace">
-    <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và LDAP dùng chung MFA; role tùy chỉnh được lưu trong PostgreSQL và kiểm tra tại API.</p></div><div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div></div>
+    <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và LDAP dùng chung MFA; role tùy chỉnh được lưu trong PostgreSQL và kiểm tra tại API.</p></div>{!forbidden && <div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div>}</div>
     {message && <p className={`settings-message${messageError ? " error" : ""}`}>{message}</p>}
     <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`}>{user.source === "ldap" ? "LDAP / AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng trong PostgreSQL."}</div>}</div>
     <p className="access-note">User LDAP xuất hiện sau lần đăng nhập Domain đầu tiên. Bạn có thể đổi role riêng từng user LDAP tại đây; mật khẩu LDAP vẫn do Active Directory quản lý.</p>

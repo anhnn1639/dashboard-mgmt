@@ -2,48 +2,72 @@
 set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root: sudo sh agent/install-linux.sh" >&2
+  echo "Run as root: sudo ./TramAgent-Linux.run" >&2
   exit 1
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 bootstrap_source=${1:-}
 
-if command -v apt-get >/dev/null 2>&1; then
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip ca-certificates openssh-server clamav clamav-freshclam
-elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y python3 python3-pip ca-certificates openssh-server
-elif command -v yum >/dev/null 2>&1; then
-  yum install -y python3 python3-pip ca-certificates openssh-server
+if [ ! -r /etc/os-release ]; then
+  echo "Unsupported Linux: /etc/os-release is missing" >&2
+  exit 1
 fi
 
-for required_command in python3 install systemctl; do
+# shellcheck disable=SC1091
+. /etc/os-release
+os_id=$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')
+os_version=${VERSION_ID:-}
+case "$os_id:$os_version" in
+  ubuntu:22.04|ubuntu:24.04) ;;
+  ol:7*|ol:8*|rhel:7*|rhel:8*) ;;
+  *)
+    echo "Unsupported Linux release: ${PRETTY_NAME:-$os_id $os_version}" >&2
+    echo "Supported: Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat Enterprise Linux 7/8 (x86_64)." >&2
+    exit 1
+    ;;
+esac
+
+architecture=$(uname -m)
+case "$architecture" in
+  x86_64|amd64) artifact="$script_dir/linux/x86_64/tram-agent" ;;
+  *)
+    echo "Unsupported architecture: $architecture. This package contains the x86_64 Agent." >&2
+    exit 1
+    ;;
+esac
+
+for required_command in install systemctl; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
-    echo "Missing required command: $required_command" >&2
+    echo "Missing required operating-system command: $required_command" >&2
     exit 1
   fi
 done
+if [ ! -s "$artifact" ]; then
+  echo "Standalone Agent artifact is missing from the offline installer" >&2
+  exit 1
+fi
 
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 install -d -m 0700 /var/lib/tram-agent/inbox
 systemctl stop tram-agent.service >/dev/null 2>&1 || true
-python3 -m venv /opt/tram-agent/venv
-/opt/tram-agent/venv/bin/pip install --no-cache-dir --upgrade pip
-/opt/tram-agent/venv/bin/pip install --no-cache-dir -r "$script_dir/requirements.txt"
-install -m 0750 "$script_dir/tram_agent.py" /opt/tram-agent/tram_agent.py
+install -m 0755 "$artifact" /opt/tram-agent/tram-agent
 install -m 0644 "$script_dir/VERSION" /opt/tram-agent/VERSION
 install -m 0644 "$script_dir/tram-agent.service" /etc/systemd/system/tram-agent.service
+if command -v restorecon >/dev/null 2>&1; then
+  restorecon -RF /opt/tram-agent /etc/tram-agent /var/lib/tram-agent /var/log/tram-agent /etc/systemd/system/tram-agent.service >/dev/null 2>&1 || true
+fi
 systemctl daemon-reload
 
-if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+if systemctl list-unit-files ssh.service 2>/dev/null | grep -q '^ssh\.service'; then
   systemctl enable --now ssh
-elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+elif systemctl list-unit-files sshd.service 2>/dev/null | grep -q '^sshd\.service'; then
   systemctl enable --now sshd
+else
+  echo "WARNING: OpenSSH Server is not installed. Agent management works, but SSH sessions require the OS-provided sshd package." >&2
 fi
 if ! command -v clamscan >/dev/null 2>&1; then
-  echo "WARNING: endpoint ClamAV is missing. Secure file delivery will fail closed until a supported scanner is installed." >&2
-  echo "Oracle Linux 8: enable the approved ol8_developer_EPEL repository, then install clamav and update signatures." >&2
+  echo "WARNING: endpoint ClamAV is missing. Secure file delivery remains fail-closed until an approved scanner and signatures are installed." >&2
 fi
 
 if [ -n "$bootstrap_source" ]; then
@@ -54,15 +78,15 @@ if [ -n "$bootstrap_source" ]; then
   install -m 0600 "$bootstrap_source" /etc/tram-agent/bootstrap.json
   cleanup_bootstrap() { rm -f /etc/tram-agent/bootstrap.json; }
   trap cleanup_bootstrap EXIT HUP INT TERM
-  /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
+  /opt/tram-agent/tram-agent \
     --config /etc/tram-agent/agent.json \
     --log-file /var/log/tram-agent/agent.log \
     bootstrap --file /etc/tram-agent/bootstrap.json
   cleanup_bootstrap
   trap - EXIT HUP INT TERM
   systemctl enable --now tram-agent.service
-  echo "Agent enrolled and started. It will appear automatically under Linux in the dashboard."
+  echo "Agent enrolled and started without downloading Python or pip packages."
 else
   systemctl try-restart tram-agent.service
-  echo "Installed. Enroll with the HTTPS URL and CA of this control plane, then enable tram-agent.service."
+  echo "Offline Agent installed. Enroll it, then enable tram-agent.service."
 fi

@@ -56,6 +56,7 @@ services:
       GUACAMOLE_URL: /guacamole
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
+      ALLOWED_HOSTS: ${OPS_DOMAIN},localhost,127.0.0.1,api
       RECORDING_ROOT: /recordings
       RECORDING_GID: ${RECORDING_GID:-1000}
       TUNNEL_BIND_HOST: tunnel-relay

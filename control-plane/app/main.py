@@ -43,9 +43,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, select, text, update
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, encrypt_file, normalize_upload_name, scan_with_clamav
-from .agent_packages import certificate_sha256, linux_run_bundle, safe_package_label, validate_windows_msi, windows_msi_filename
+from .agent_packages import LINUX_AGENT_PATH, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 
 
@@ -65,6 +66,7 @@ class Settings(BaseSettings):
     guacamole_json_secret: str = ""
     job_secret_key: str = ""
     allowed_origins: str = ""
+    allowed_hosts: str = ""
     recording_root: str = "/recordings"
     bootstrap_config_path: str = "/var/lib/tram-ops/bootstrap.json"
     setup_token: str = ""
@@ -83,6 +85,10 @@ class Settings(BaseSettings):
     agent_assets_root: str = "/opt/tram-agent-assets"
     windows_agent_msi: str = "/opt/tram-agent-assets/windows/TramVanHanhAgent.msi"
     web_tls_trust: Literal["internal-ca", "system"] = "internal-ca"
+    auth_window_seconds: int = Field(default=300, ge=60, le=3600)
+    auth_lockout_seconds: int = Field(default=900, ge=60, le=86400)
+    auth_account_failures: int = Field(default=5, ge=3, le=20)
+    auth_ip_failures: int = Field(default=30, ge=10, le=200)
 
 
 settings = Settings()
@@ -181,6 +187,15 @@ class MFACredential(Base):
     enrolled: Mapped[bool] = mapped_column(Boolean, default=False)
     last_counter: Mapped[int] = mapped_column(Integer, default=-1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class AuthThrottle(Base):
+    __tablename__ = "auth_throttles"
+    key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
 
 
 class Server(Base):
@@ -918,10 +933,31 @@ tunnel_hub = TunnelHub(
 )
 
 
-app = FastAPI(title="Trạm Vận Hành API", version=RELEASE_VERSION, docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(
+    title="Trạm Vận Hành API",
+    version=RELEASE_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+allowed_hosts = [item.strip() for item in settings.allowed_hosts.split(",") if item.strip()]
+if allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+
+@app.middleware("http")
+async def add_api_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def build_database_url(payload: DatabaseSetupRequest) -> str:
@@ -1064,6 +1100,68 @@ def reveal_parameters(value: Any) -> Any:
 def client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
     return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "")
+
+
+def auth_throttle_key(scope: str, value: str) -> str:
+    secret = settings.jwt_secret.encode() if settings.jwt_secret else b"tram-auth-throttle-unconfigured"
+    return hmac.new(secret, f"{scope}\0{value}".encode(), hashlib.sha256).hexdigest()
+
+
+def auth_throttle_scopes(request: Request, identity: str) -> list[tuple[str, int]]:
+    source = client_ip(request) or "unknown"
+    normalized_identity = identity.strip().lower()
+    return [
+        (auth_throttle_key("ip", source), settings.auth_ip_failures),
+        (auth_throttle_key("identity-ip", f"{normalized_identity}\0{source}"), settings.auth_account_failures),
+    ]
+
+
+def enforce_auth_throttle(db: Session, scopes: list[tuple[str, int]]) -> None:
+    timestamp = now()
+    blocked_until = max(
+        (
+            aware(row.blocked_until)
+            for key_hash, _ in scopes
+            if (row := db.get(AuthThrottle, key_hash)) is not None and aware(row.blocked_until) is not None
+        ),
+        default=None,
+    )
+    if blocked_until is not None and blocked_until > timestamp:
+        retry_after = max(1, int((blocked_until - timestamp).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            detail="Đăng nhập tạm thời bị giới hạn do quá nhiều lần thử thất bại",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def record_auth_failure(db: Session, scopes: list[tuple[str, int]]) -> None:
+    timestamp = now()
+    window = timedelta(seconds=settings.auth_window_seconds)
+    for key_hash, limit in scopes:
+        row = db.get(AuthThrottle, key_hash)
+        if row is None:
+            row = AuthThrottle(key_hash=key_hash, failures=0, window_started_at=timestamp, updated_at=timestamp)
+            db.add(row)
+        started = aware(row.window_started_at) or timestamp
+        if timestamp - started >= window:
+            row.failures = 0
+            row.window_started_at = timestamp
+            row.blocked_until = None
+        row.failures += 1
+        row.updated_at = timestamp
+        if row.failures >= limit:
+            row.blocked_until = timestamp + timedelta(seconds=settings.auth_lockout_seconds)
+
+
+def clear_auth_throttle(db: Session, scopes: list[tuple[str, int]]) -> None:
+    keys = [key_hash for key_hash, _ in scopes]
+    if keys:
+        db.execute(delete(AuthThrottle).where(AuthThrottle.key_hash.in_(keys)))
+
+
+def prune_auth_throttles(db: Session) -> None:
+    db.execute(delete(AuthThrottle).where(AuthThrottle.updated_at < now() - timedelta(days=1)))
 
 
 def audit(db: Session, actor: str, action: str, target: str, request: Request | None = None, result: str = "success", detail: dict[str, Any] | None = None) -> None:
@@ -1672,7 +1770,13 @@ def healthz() -> dict[str, str]:
 
 @app.get("/api/v1/setup/status")
 def setup_status() -> dict[str, Any]:
-    return database_state()
+    state = database_state()
+    return {
+        "setupRequired": bool(state["setupRequired"]),
+        "databaseConnected": bool(state["databaseConnected"]),
+        "setupTokenRequired": True,
+        "status": state["status"],
+    }
 
 
 @app.post("/api/v1/setup/complete", status_code=201)
@@ -1680,7 +1784,9 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
     current = database_state()
     if not current["setupRequired"]:
         raise HTTPException(status_code=409, detail="System setup has already been completed")
-    if settings.setup_token and not hmac.compare_digest(payload.setup_token, settings.setup_token):
+    if len(settings.setup_token) < 32:
+        raise HTTPException(status_code=503, detail="SETUP_TOKEN chưa được cấu hình an toàn trên máy chủ")
+    if not hmac.compare_digest(payload.setup_token, settings.setup_token):
         raise HTTPException(status_code=403, detail="Setup token is invalid")
 
     database_url = build_database_url(payload.database)
@@ -1730,6 +1836,9 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginRequest, request: Request, db: Session = Depends(db_session)):
+    scopes = auth_throttle_scopes(request, f"password:{payload.source}:{payload.username}")
+    prune_auth_throttles(db)
+    enforce_auth_throttle(db, scopes)
     user = authenticate_ldap(db, payload.username, payload.password) if payload.source == "domain" else db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none()
     valid = payload.source == "domain" and user is not None
     if payload.source == "local" and user:
@@ -1738,9 +1847,11 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(db_sess
         except Exception:
             valid = False
     if not user or not valid or not user.enabled:
+        record_auth_failure(db, scopes)
         audit(db, payload.username, f"auth.{payload.source}.login", "dashboard", request, "denied")
         db.commit()
         raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng")
+    clear_auth_throttle(db, scopes)
     audit(db, user.username, f"auth.{payload.source}.password", "dashboard", request)
     response = mfa_login_response(db, user)
     db.commit()
@@ -1759,6 +1870,9 @@ def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = 
     credential = db.get(MFACredential, claims.get("sub"))
     if not user or not credential or not user.enabled:
         raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ")
+    scopes = auth_throttle_scopes(request, f"mfa:{user.id}")
+    prune_auth_throttles(db)
+    enforce_auth_throttle(db, scopes)
     try:
         secret = job_fernet().decrypt(credential.secret_encrypted.encode()).decode()
     except InvalidToken as exc:
@@ -1767,9 +1881,11 @@ def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = 
     counter = int(now().timestamp()) // totp.interval
     matched_counter = next((candidate for candidate in range(counter - 1, counter + 2) if candidate > credential.last_counter and hmac.compare_digest(totp.at(candidate * totp.interval), payload.code)), None)
     if matched_counter is None:
+        record_auth_failure(db, scopes)
         audit(db, user.username, "auth.mfa", "dashboard", request, "denied")
         db.commit()
         raise HTTPException(status_code=401, detail="Mã MFA không đúng hoặc đã được sử dụng")
+    clear_auth_throttle(db, scopes)
     credential.enrolled = True
     credential.last_counter = matched_counter
     audit(db, user.username, "auth.mfa", "dashboard", request)
@@ -2280,10 +2396,15 @@ def issue_agent_identity(
 @app.get("/api/v1/agent-packages/status")
 def agent_package_status(_: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
+    try:
+        validate_linux_agent(Path(settings.agent_assets_root) / LINUX_AGENT_PATH)
+        linux_available = True
+    except (FileNotFoundError, ValueError):
+        linux_available = False
     return {
         "dashboardUrl": dashboard_url,
         "agentVersion": RELEASE_VERSION,
-        "linuxAvailable": all((Path(settings.agent_assets_root) / name).is_file() for name in ("VERSION", "tram_agent.py", "requirements.txt", "tram-agent.service", "install-linux.sh")),
+        "linuxAvailable": linux_available,
         "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
         "agentTlsCaAvailable": agent_server_ca_available(),
         "claimTtlMinutes": 30,

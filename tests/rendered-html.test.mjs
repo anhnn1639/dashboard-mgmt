@@ -144,3 +144,19 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
   assert.match(source, /method: "PATCH"/);
   assert.match(source, /method: "DELETE"/);
 });
+
+test("viewer navigation is permission-aware and stale admin hashes are replaced", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /fetch\("\/api\/v1\/me"/);
+  assert.match(source, /permissions:\s*\["users\.manage", "roles\.manage", "ldap\.manage"\]/);
+  assert.match(source, /allowedNavigation\.some/);
+  assert.match(source, /window\.history\.replaceState\(null, "", sectionRoute\(fallbackSection\)\)/);
+  assert.match(source, /Đang tải quyền tài khoản/);
+});
+
+test("Linux package is advertised as a self-contained offline installer", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /offline self-contained/);
+  assert.match(source, /Ubuntu 22\.04\/24\.04 · Oracle Linux 7\/8 · RHEL 7\/8 · x86_64/);
+  assert.match(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
+});

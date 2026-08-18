@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import tarfile
 import time
@@ -19,6 +20,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 
 tmp = tempfile.TemporaryDirectory()
@@ -37,9 +39,18 @@ ca_key_path.write_bytes(ca_key.private_bytes(serialization.Encoding.PEM, seriali
 os.environ["AGENT_CA_CERT"] = str(ca_cert_path)
 os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
-os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
+source_agent_assets = Path(__file__).resolve().parents[2] / "agent"
+test_agent_assets = Path(tmp.name) / "agent-assets"
+(test_agent_assets / "linux/x86_64").mkdir(parents=True)
+for asset_name in ("VERSION", "install-linux.sh", "tram-agent.service"):
+    shutil.copyfile(source_agent_assets / asset_name, test_agent_assets / asset_name)
+fake_linux_agent = bytearray(1024 * 1024)
+fake_linux_agent[:6] = b"\x7fELF\x02\x01"
+fake_linux_agent[18:20] = b"\x3e\x00"
+(test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
+os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -91,6 +102,104 @@ class ClassificationTests(unittest.TestCase):
         family, verification = classify_os(Inventory(hostname="ol-01", os_family="linux", os_name="Oracle Linux Server 8.10", distribution_id="ol"))
         self.assertEqual((family, verification), ("linux", "verified"))
 
+    def test_guest_surface_is_minimal_and_api_documentation_is_disabled(self):
+        with TestClient(app) as client:
+            for path in ("/api/openapi.json", "/api/docs", "/api/docs/", "/api/redoc"):
+                self.assertEqual(client.get(path).status_code, 404, path)
+
+            status = client.get("/api/v1/setup/status")
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(
+                set(status.json()),
+                {"setupRequired", "databaseConnected", "setupTokenRequired", "status"},
+            )
+            self.assertTrue(status.json()["setupTokenRequired"])
+            self.assertEqual(client.get("/livez").status_code, 200)
+            self.assertEqual(client.get("/healthz").status_code, 200)
+            self.assertEqual(client.get("/api/v1/agent-server-ca").status_code, 200)
+
+            protected_paths = (
+                "/api/v1/me",
+                "/api/v1/users",
+                "/api/v1/roles",
+                "/api/v1/settings/ldap",
+                "/api/v1/servers",
+                "/api/v1/jobs",
+                "/api/v1/audit",
+                "/api/v1/sessions",
+                "/api/v1/agent-packages/status",
+                f"/api/v1/servers/{uuid.uuid4()}/jobs",
+                f"/api/v1/sessions/{uuid.uuid4()}/recording",
+            )
+            for path in protected_paths:
+                response = client.get(path)
+                self.assertEqual(response.status_code, 401, path)
+                self.assertEqual(response.headers.get("cache-control"), "no-store")
+                self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+
+    def test_every_browser_api_route_is_public_by_design_or_has_authentication(self):
+        public_routes = {
+            "/livez",
+            "/healthz",
+            "/api/v1/setup/status",
+            "/api/v1/setup/complete",
+            "/api/v1/auth/login",
+            "/api/v1/auth/mfa/verify",
+            "/api/v1/agent-bootstrap/claim",
+            "/api/v1/enroll",
+            "/api/v1/agent-server-ca",
+        }
+
+        def depends_on_current_user(dependency) -> bool:
+            return dependency.call is current_user or any(depends_on_current_user(child) for child in dependency.dependencies)
+
+        unprotected: list[str] = []
+        for route in app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            if route.path in public_routes or route.path.startswith("/api/v1/agent/"):
+                continue
+            if not depends_on_current_user(route.dependant):
+                unprotected.append(f"{','.join(sorted(route.methods or []))} {route.path}")
+        self.assertEqual(unprotected, [])
+
+    def test_password_login_is_rate_limited_by_identity_and_source(self):
+        previous_account_limit = settings.auth_account_failures
+        previous_ip_limit = settings.auth_ip_failures
+        settings.auth_account_failures = 3
+        settings.auth_ip_failures = 20
+        source_headers = {"X-Forwarded-For": "198.51.100.45"}
+        try:
+            with TestClient(app) as client:
+                for _ in range(3):
+                    denied = client.post(
+                        "/api/v1/auth/login",
+                        headers=source_headers,
+                        json={"username": f"missing-{uuid.uuid4().hex}", "password": "wrong-password"},
+                    )
+                    self.assertEqual(denied.status_code, 401, denied.text)
+                identity = f"locked-{uuid.uuid4().hex}"
+                for _ in range(3):
+                    denied = client.post(
+                        "/api/v1/auth/login",
+                        headers=source_headers,
+                        json={"username": identity, "password": "wrong-password"},
+                    )
+                    self.assertEqual(denied.status_code, 401, denied.text)
+                throttled = client.post(
+                    "/api/v1/auth/login",
+                    headers=source_headers,
+                    json={"username": identity, "password": "wrong-password"},
+                )
+                self.assertEqual(throttled.status_code, 429, throttled.text)
+                self.assertGreater(int(throttled.headers["retry-after"]), 0)
+        finally:
+            settings.auth_account_failures = previous_account_limit
+            settings.auth_ip_failures = previous_ip_limit
+            with SessionLocal() as db:
+                db.query(AuthThrottle).delete()
+                db.commit()
+
     def test_custom_role_and_per_user_ldap_role_are_enforced(self):
         role_name = f"ldapops_{uuid.uuid4().hex[:8]}"
         ldap_username = f"TEST\\ldap-{uuid.uuid4().hex[:8]}"
@@ -122,6 +231,34 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 409)
             self.assertEqual(client.patch(f"/api/v1/users/{ldap_user_id}", headers=admin_headers, json={"role": "viewer"}).status_code, 200)
             self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 200)
+
+    def test_viewer_can_load_its_allowed_workspace_without_identity_admin_access(self):
+        with SessionLocal() as db:
+            viewer = User(
+                username=f"viewer-{uuid.uuid4().hex[:8]}",
+                password_hash="unused-test-hash",
+                display_name="Read Only Viewer",
+                role="viewer",
+            )
+            db.add(viewer)
+            db.commit()
+            viewer_id = viewer.id
+            viewer_headers = {"Authorization": f"Bearer {issue_jwt(viewer)}"}
+        try:
+            with TestClient(app) as client:
+                profile = client.get("/api/v1/me", headers=viewer_headers)
+                self.assertEqual(profile.status_code, 200, profile.text)
+                self.assertEqual(profile.json()["role"], "viewer")
+                self.assertEqual(set(profile.json()["permissions"]), {"logs.view", "resources.view", "servers.view"})
+                self.assertEqual(client.get("/api/v1/servers", headers=viewer_headers).status_code, 200)
+                self.assertEqual(client.get("/api/v1/users", headers=viewer_headers).status_code, 403)
+                self.assertEqual(client.get("/api/v1/settings/ldap", headers=viewer_headers).status_code, 403)
+        finally:
+            with SessionLocal() as db:
+                stored = db.get(User, viewer_id)
+                if stored:
+                    db.delete(stored)
+                    db.commit()
 
     def test_resource_mutations_have_matching_automatic_refreshes(self):
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.extend"], ("storage.list",))
@@ -547,6 +684,9 @@ class ClassificationTests(unittest.TestCase):
             archive_bytes = linux_package.content.split(marker, 1)[1]
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
                 self.assertEqual(archive.extractfile("VERSION").read().decode().strip(), app.version)
+                self.assertGreater(len(archive.extractfile("linux/x86_64/tram-agent").read()), 1024 * 512)
+                self.assertNotIn("requirements.txt", archive.getnames())
+                self.assertNotIn("tram_agent.py", archive.getnames())
                 bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
                 self.assertEqual(bootstrap["server_url"], "https://ops.company.example")
                 self.assertIn("BEGIN CERTIFICATE", bootstrap["server_ca_certificate"])

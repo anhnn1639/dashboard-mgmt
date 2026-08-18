@@ -1,0 +1,64 @@
+name: Build offline Linux agent
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - codex/**
+    paths:
+      - agent/tram_agent.py
+      - agent/VERSION
+      - agent/requirements.txt
+      - agent/install-linux.sh
+      - agent/tram-agent.service
+      - .github/workflows/build-agent-linux.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-agent:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a glibc 2.17 compatible standalone executable
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              PYTHON=/opt/python/cp311-cp311/bin/python
+              "$PYTHON" -m pip install --disable-pip-version-check --no-cache-dir -r agent/requirements.txt pyinstaller==6.16.0
+              "$PYTHON" -m PyInstaller --noconfirm --clean --onefile --name tram-agent --add-data "agent/VERSION:." agent/tram_agent.py
+              chmod 0755 dist/tram-agent
+            '
+
+      - name: Validate the executable on every supported distribution family
+        run: |
+          set -euo pipefail
+          file dist/tram-agent
+          readelf -h dist/tram-agent | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          test "$(stat -c '%a' dist/tram-agent)" = "755"
+          for image in \
+            ubuntu:22.04 \
+            ubuntu:24.04 \
+            oraclelinux:7 \
+            oraclelinux:8 \
+            registry.access.redhat.com/ubi7/ubi-minimal \
+            registry.access.redhat.com/ubi8/ubi-minimal
+          do
+            echo "Testing $image"
+            docker run --rm -v "$PWD/dist/tram-agent:/opt/test/tram-agent:ro" "$image" /opt/test/tram-agent --help >/dev/null
+          done
+          sha256sum dist/tram-agent
+
+      - name: Upload standalone Linux agent
+        uses: actions/upload-artifact@v4
+        with:
+          name: TramVanHanhAgent-linux-x86_64
+          path: dist/tram-agent
+          if-no-files-found: error

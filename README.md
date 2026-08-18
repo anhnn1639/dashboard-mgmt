@@ -7,7 +7,7 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Dashboard tách tự động **Windows** và **Linux**, không yêu cầu chọn thủ công khi cài agent.
 - Mỗi máy chủ có URL riêng dạng `#/linux/<hostname>` hoặc `#/windows/<hostname>`, breadcrumb quay lại danh sách và workspace toàn màn hình với các tab Tổng quan, Disk, Dịch vụ, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký.
 - Inventory: hostname, OS/version, kiến trúc, IP, kernel, CPU, RAM, disk, uptime, số dịch vụ và bản vá chờ.
-- Agent outbound cho Windows Server 2025, Ubuntu 24.04 và Oracle Linux 7/8.
+- Agent outbound cho Windows Server 2025, Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat Enterprise Linux 7/8.
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
 - Giao diện **Bộ cài Agent** tự sinh Linux `.run` hoặc Windows `.msi` theo đúng domain HTTPS/CA của control plane; không sửa domain bằng tay trên máy đích.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
@@ -161,20 +161,20 @@ curl -fsS https://ops.example.com/api/v1/enrollment-tokens \
 
 Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token chỉ dùng được đúng loại máy.
 
-### 3. Ubuntu 24.04 / Oracle Linux 7, 8 — cài thủ công
+### 3. Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat 7/8 — cài Agent offline
 
-Trên Ubuntu, bộ cài tự cài Python 3, `venv`, OpenSSH Server và ClamAV. Trên Oracle Linux 8, chỉ bật repository EPEL đã được tổ chức phê duyệt rồi cài ClamAV/cập nhật signature. Oracle Linux 7 có ClamAV cũ trong developer EPEL; không dùng bản EOL cho production — cần endpoint scanner còn được nhà cung cấp hỗ trợ, nếu không truyền file sẽ fail-closed.
+Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17. Python runtime cùng toàn bộ thư viện `requests`, `cryptography`, `psutil` và WebSocket đã nằm trong gói; installer không gọi `pip`, `apt`, `dnf`, `yum` hoặc repository Internet. OpenSSH Server và ClamAV là dịch vụ của hệ điều hành: nếu máy chưa có sẵn thì Agent vẫn quản trị được, nhưng SSH hoặc nhận file tương ứng sẽ báo thiếu và fail-closed thay vì tự tải package ngoài.
 
 ```bash
 sudo sh agent/install-linux.sh
-sudo /opt/tram-agent/venv/bin/python /opt/tram-agent/tram_agent.py \
+sudo /opt/tram-agent/tram-agent \
   enroll --server https://ops.example.com \
   --server-ca /path/server-ca.crt --token 'tvo_ONE_TIME_TOKEN'
 sudo systemctl enable --now tram-agent
 sudo systemctl status tram-agent
 ```
 
-Máy sẽ tự xuất hiện trong **Máy chủ Linux**. Ubuntu được nhận diện từ `ID=ubuntu`; Oracle Linux từ `ID=ol`.
+Thông thường không cần luồng thủ công trên: tải `.run` dùng một lần từ **Bộ cài Agent**, chép qua kênh nội bộ, `chmod +x` rồi chạy bằng `sudo`. Máy tự xuất hiện trong **Máy chủ Linux**. Installer chỉ chấp nhận đúng các release được hỗ trợ và `x86_64`.
 
 ### 4. Windows Server 2025 — cài thủ công
 

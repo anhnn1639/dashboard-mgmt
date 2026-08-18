@@ -81,6 +81,18 @@ class AgentSecurityTests(unittest.TestCase):
         address_families = next(line for line in service.splitlines() if line.startswith("RestrictAddressFamilies="))
         self.assertIn("AF_NETLINK", address_families.split("=", 1)[1].split())
 
+    def test_linux_installer_is_offline_and_uses_the_standalone_binary(self):
+        installer = (MODULE_PATH.parent / "install-linux.sh").read_text(encoding="utf-8")
+        service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
+        self.assertNotIn("apt-get", installer)
+        self.assertNotIn("dnf install", installer)
+        self.assertNotIn("yum install", installer)
+        self.assertNotIn("pip install", installer)
+        self.assertIn("ubuntu:22.04|ubuntu:24.04", installer)
+        self.assertIn("ol:7*|ol:8*|rhel:7*|rhel:8*", installer)
+        self.assertIn("linux/x86_64/tram-agent", installer)
+        self.assertIn("ExecStart=/opt/tram-agent/tram-agent", service)
+
     def test_system_command_falls_back_to_standard_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             command = Path(directory) / "iptables"

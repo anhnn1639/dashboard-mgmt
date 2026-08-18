@@ -26,6 +26,7 @@ server {
     ssl_session_cache shared:TramOpsSSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
+    server_tokens off;
 
     client_max_body_size 55m;
 
