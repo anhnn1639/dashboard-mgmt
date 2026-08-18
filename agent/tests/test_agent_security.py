@@ -17,6 +17,31 @@ SPEC.loader.exec_module(tram_agent)
 
 
 class AgentSecurityTests(unittest.TestCase):
+    def test_common_firewall_rule_auto_detects_supported_operating_system_backends(self):
+        common = {"name": "SSH from jump", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 22, "remote_port": "any", "source": "any", "destination": "any", "family": "ipv4"}
+        windows = {"os_family": "windows", "distribution_id": "windows"}
+        with patch.object(tram_agent, "add_firewall_rule", return_value=(0, "created")) as add:
+            code, output = tram_agent.add_firewall_rule_auto(common, windows)
+            self.assertEqual(code, 0)
+            resolved = add.call_args.args[0]
+            self.assertEqual((resolved["backend"], resolved["profile"]), ("windows", "Any"))
+            self.assertEqual(resolved["source"], "0.0.0.0/0")
+            self.assertIn("Auto-selected Windows Firewall", output)
+
+        linux_cases = [
+            ("ubuntu", {"backend": "ufw", "capabilities": {}}, {"backend": "ufw"}),
+            ("ol", {"backend": "firewalld", "capabilities": {"zones": ["public", "internal"], "defaultZone": "public"}}, {"backend": "firewalld", "zone": "public", "family": "ipv4"}),
+            ("rhel", {"backend": "iptables", "capabilities": {"targets": [{"direction": "in", "family": "ipv4", "table": "filter", "chain": "INPUT"}]}}, {"backend": "iptables", "family": "ipv4", "table": "filter", "chain": "INPUT"}),
+        ]
+        for distribution_id, scan, expected in linux_cases:
+            with self.subTest(distribution_id=distribution_id), patch.object(tram_agent, "linux_firewall_rules", return_value=(0, json.dumps(scan))), patch.object(tram_agent, "add_firewall_rule", return_value=(0, "created")) as add:
+                code, output = tram_agent.add_firewall_rule_auto(common, {"os_family": "linux", "distribution_id": distribution_id})
+                self.assertEqual(code, 0)
+                resolved = add.call_args.args[0]
+                for key, value in expected.items():
+                    self.assertEqual(resolved[key], value)
+                self.assertIn("Auto-selected", output)
+
     @unittest.skipUnless(os.name == "nt", "PowerShell parser is available only on Windows")
     def test_generated_windows_storage_and_update_scripts_parse(self):
         scripts = []
@@ -347,6 +372,32 @@ trusted
         with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/iptables"), patch.object(tram_agent, "run", side_effect=iptables_run):
             tram_agent.add_firewall_rule({**common, "backend": "iptables", "family": "ipv4", "table": "filter", "chain": "INPUT"}, {"os_family": "linux"})
         self.assertEqual(iptables_commands[-1][:8], ["/usr/sbin/iptables", "-w", "-t", "filter", "-I", "INPUT", "1", "-p"])
+
+    def test_common_deny_action_maps_to_native_drop_verdicts(self):
+        common = {"name": "Block test", "direction": "in", "action": "deny", "protocol": "tcp", "local_port": 22, "source": "10.0.0.0/8", "destination": "any"}
+        nft_commands = []
+        nft_ruleset = json.dumps({"nftables": [{"chain": {"family": "inet", "table": "filter", "name": "input", "type": "filter", "hook": "input"}}]})
+
+        def nft_run(command, **_):
+            nft_commands.append(command)
+            return (0, nft_ruleset) if "list" in command else (0, "ok")
+
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/nft"), patch.object(tram_agent, "run", side_effect=nft_run):
+            tram_agent.add_firewall_rule({**common, "backend": "nftables", "family": "inet", "table": "filter", "chain": "input"}, {"os_family": "linux"})
+        self.assertIn("drop", nft_commands[-1])
+        self.assertNotIn("deny", nft_commands[-1])
+
+        firewalld_commands = []
+
+        def firewalld_run(command, **_):
+            firewalld_commands.append(command)
+            return (0, "public internal") if "--get-zones" in command else (0, "ok")
+
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/bin/firewall-cmd"), patch.object(tram_agent, "run", side_effect=firewalld_run):
+            tram_agent.add_firewall_rule({**common, "backend": "firewalld", "zone": "public", "family": "ipv4"}, {"os_family": "linux"})
+        rich_arguments = [part for command in firewalld_commands for part in command if part.startswith("--add-rich-rule=")]
+        self.assertTrue(rich_arguments)
+        self.assertTrue(all(argument.endswith(" drop") and " deny" not in argument for argument in rich_arguments))
 
     def test_nftables_comment_is_one_quoted_and_escaped_literal(self):
         commands = []

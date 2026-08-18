@@ -77,7 +77,7 @@ ALLOWED_ACTIONS = {
     "patch.install", "logs.sources", "logs.read", "process.list", "process.kill", "firewall.list", "system.reboot",
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend", "storage.shrink",
     "storage.create", "storage.delete",
-    "firewall.rule.add", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
+    "firewall.rule.add", "firewall.rule.add.auto", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
 
 
@@ -777,10 +777,12 @@ def linux_firewall_rules() -> tuple[int, str]:
     ufw = find_system_command("ufw")
     if ufw:
         code, output = run([ufw, "status", "numbered"], output_limit=5_000_000)
-        if code == 0:
+        if code == 0 and re.search(r"^Status:\s+active\s*$", output, re.IGNORECASE | re.MULTILINE):
             rules = parse_ufw_rules(output)
             capabilities = {"profiles": [], "activeProfiles": [], "zones": [], "defaultZone": "", "targets": []}
             return 0, json.dumps({"backend": "ufw", "backends": ["ufw"], "capabilities": capabilities, "rules": rules}, ensure_ascii=False, separators=(",", ":"))
+        if code == 0:
+            diagnostics.append("ufw is installed but inactive")
     nft = find_system_command("nft")
     if nft:
         code, output = run([nft, "-j", "-a", "list", "ruleset"], output_limit=5_000_000)
@@ -878,7 +880,7 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         if values["destination"] != "any": parts.append(f'destination address="{values["destination"]}"')
         if values["remote_port"] != "any": parts.append(f'source-port port="{values["remote_port"]}" protocol="{values["protocol"]}"')
         parts.append(f'port port="{values["local_port"]}" protocol="{values["protocol"]}"')
-        parts.append("accept" if values["action"] == "allow" else values["action"])
+        parts.append("accept" if values["action"] == "allow" else "drop" if values["action"] == "deny" else "reject")
         rich_rule = " ".join(parts)
         return run_many([[binary, f"--zone={zone}", f"--add-rich-rule={rich_rule}"], [binary, "--permanent", f"--zone={zone}", f"--add-rich-rule={rich_rule}"]])
     if backend == "nftables":
@@ -901,7 +903,8 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         if values["source"] != "any": command += [address_family, "saddr", values["source"]]
         if values["destination"] != "any": command += [address_family, "daddr", values["destination"]]
         if values["remote_port"] != "any": command += [values["protocol"], "sport", str(values["remote_port"])]
-        command += [values["protocol"], "dport", str(values["local_port"]), "accept" if values["action"] == "allow" else values["action"], "comment", nft_string_literal(f"TramOps - {values['name']}")]
+        verdict = "accept" if values["action"] == "allow" else "drop" if values["action"] == "deny" else "reject"
+        command += [values["protocol"], "dport", str(values["local_port"]), verdict, "comment", nft_string_literal(f"TramOps - {values['name']}")]
         return run(command)
     if backend == "iptables":
         family = str(parameters.get("family", "ipv4")); table = str(parameters.get("table", "filter")); chain = str(parameters.get("chain", "INPUT" if values["direction"] == "in" else "OUTPUT"))
@@ -925,6 +928,71 @@ def add_firewall_rule(parameters: dict[str, Any], inventory: dict[str, Any]) -> 
         command += ["-m", "comment", "--comment", f"TramOps - {values['name']}", "-j", target]
         return run(command)
     raise ValueError("Unsupported firewall backend")
+
+
+def add_firewall_rule_auto(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    values = firewall_parameters(parameters)
+    requested_family = str(parameters.get("family", "ipv4")).lower()
+    if requested_family not in {"ipv4", "ipv6"}:
+        raise ValueError("Invalid common firewall IP family")
+    resolved = dict(parameters)
+    # An explicit all-address CIDR keeps nftables/iptables/UFW rules scoped to
+    # the selected IP family instead of accidentally matching both families.
+    if values["source"] == "any":
+        resolved["source"] = "0.0.0.0/0" if requested_family == "ipv4" else "::/0"
+    if values["destination"] == "any":
+        resolved["destination"] = "any"
+
+    if inventory["os_family"] == "windows":
+        resolved.update({"backend": "windows", "profile": "Any"})
+        scope = "Windows Firewall profile Any"
+    else:
+        scan_code, scan_output = linux_firewall_rules()
+        if scan_code != 0:
+            return scan_code, scan_output
+        try:
+            scan = json.loads(scan_output)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Cannot read the live firewall backend") from exc
+        backend = str(scan.get("backend", "")).lower() if isinstance(scan, dict) else ""
+        capabilities = scan.get("capabilities", {}) if isinstance(scan, dict) else {}
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        resolved["backend"] = backend
+        if backend == "firewalld":
+            if values["direction"] != "in":
+                raise ValueError("The selected server uses firewalld zones; common outbound rules are not supported")
+            zones = [str(zone) for zone in capabilities.get("zones", []) if FIREWALL_OBJECT_RE.fullmatch(str(zone))]
+            default_zone = str(capabilities.get("defaultZone", ""))
+            zone = default_zone if default_zone in zones else (zones[0] if zones else "")
+            if not zone:
+                raise ValueError("firewalld did not report an available zone")
+            resolved.update({"zone": zone, "family": requested_family})
+            scope = f"firewalld zone {zone}"
+        elif backend == "ufw":
+            scope = "UFW active policy"
+        elif backend == "nftables":
+            raw_targets = capabilities.get("targets", [])
+            targets = [target for target in raw_targets if isinstance(target, dict) and target.get("direction") == values["direction"]]
+            family_order = ("inet", "ip") if requested_family == "ipv4" else ("inet", "ip6")
+            target = next((target for family in family_order for target in targets if target.get("family") == family), None)
+            if not target:
+                raise ValueError("nftables did not report a compatible INPUT/OUTPUT filter chain")
+            resolved.update({"family": str(target["family"]), "table": str(target["table"]), "chain": str(target["chain"])})
+            scope = f"nftables {target['family']} {target['table']}/{target['chain']}"
+        elif backend == "iptables":
+            raw_targets = capabilities.get("targets", [])
+            target = next((target for target in raw_targets if isinstance(target, dict) and target.get("direction") == values["direction"] and target.get("family") == requested_family), None)
+            if not target:
+                raise ValueError("iptables did not report a compatible INPUT/OUTPUT filter chain")
+            resolved.update({"family": requested_family, "table": str(target["table"]), "chain": str(target["chain"])})
+            scope = f"iptables {requested_family} {target['table']}/{target['chain']}"
+        else:
+            warning = str(scan.get("warning", "No active supported firewall backend found")) if isinstance(scan, dict) else "No active supported firewall backend found"
+            raise ValueError(warning)
+
+    code, output = add_firewall_rule(resolved, inventory)
+    detail = f"Auto-selected {scope} from the live server state."
+    return code, f"{detail}\n{output}" if output else detail
 
 
 def remove_firewall_rules(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
@@ -2564,6 +2632,8 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         return windows_firewall_rules() if windows else linux_firewall_rules()
     if action == "firewall.rule.add":
         return add_firewall_rule(parameters, inventory)
+    if action == "firewall.rule.add.auto":
+        return add_firewall_rule_auto(parameters, inventory)
     if action == "firewall.rule.remove":
         return remove_firewall_rules(parameters, inventory)
     if action == "firewall.rule.reorder":

@@ -683,6 +683,38 @@ textarea:focus-visible {
   margin: 0;
   align-items: center;
 }
+.fleet-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.fleet-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 18px;
+  border-top: 1px solid #202a39;
+  color: #7589a4;
+  background: rgba(43, 91, 157, .06);
+  font-size: 9px;
+}
+.fleet-selection-bar b {
+  color: #a9c9f7;
+}
+.fleet-selection-bar button {
+  border: 0;
+  color: #78a4df;
+  background: transparent;
+  cursor: pointer;
+  font-size: 9px;
+}
+.fleet-selection-bar button:disabled {
+  opacity: .4;
+  cursor: default;
+}
 .filters {
   border: 1px solid #263143;
   border-radius: 6px;
@@ -726,6 +758,17 @@ textarea:focus-visible {
 .server-table th:first-child,
 .server-table td:first-child {
   padding-left: 18px;
+}
+.server-table .server-select-column {
+  width: 46px;
+  padding: 0 8px !important;
+  text-align: center;
+}
+.server-select-column input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--blue);
+  cursor: pointer;
 }
 .server-table td {
   border-bottom: 1px solid #1d2634;
@@ -4641,8 +4684,12 @@ textarea:focus-visible {
   display: flex;
   flex-direction: column;
   width: min(780px, calc(100vw - 16px));
+  min-width: 0;
+  min-height: 0;
   max-width: 100%;
+  max-height: calc(100vh - 16px);
   max-height: calc(100dvh - 16px);
+  max-height: 100%;
   padding: 0;
   overflow: hidden;
 }
@@ -4654,9 +4701,85 @@ textarea:focus-visible {
 }
 .resource-modal-body {
   min-height: 0;
-  overflow-y: auto;
+  max-width: 100%;
+  overflow: auto;
   overscroll-behavior: contain;
   padding: 18px 19px;
+}
+.resource-modal-footer {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 13px 19px;
+  border-top: 1px solid #273548;
+  background: #101925;
+}
+.ldap-settings-modal {
+  width: min(780px, calc(100vw - 16px));
+}
+.ldap-settings-form,
+.ldap-settings-form .form-grid,
+.ldap-settings-form label {
+  min-width: 0;
+}
+.ldap-settings-form .resource-help {
+  overflow-wrap: anywhere;
+}
+.bulk-task-modal {
+  width: min(820px, calc(100vw - 16px));
+}
+.bulk-target-list {
+  display: grid;
+  gap: 6px;
+  max-height: 190px;
+  overflow: auto;
+}
+.bulk-target-list > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #26374c;
+  border-radius: 7px;
+  background: #0c1621;
+}
+.bulk-target-list span,
+.bulk-target-list b,
+.bulk-target-list small {
+  display: block;
+  min-width: 0;
+}
+.bulk-target-list b {
+  overflow: hidden;
+  color: #cbd9ea;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+.bulk-target-list small {
+  margin-top: 3px;
+  color: #647891;
+  font-size: 8px;
+}
+.bulk-target-list em {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: #71d2ae;
+  background: rgba(72, 190, 146, .09);
+  font-size: 8px;
+  font-style: normal;
+}
+.bulk-target-list em.offline {
+  color: #e7ad63;
+  background: rgba(219, 151, 64, .1);
+}
+.bulk-task-result {
+  display: grid;
+  gap: 12px;
 }
 .resource-form {
   display: grid;
@@ -4761,6 +4884,14 @@ textarea:focus-visible {
 }
 
 @media (max-width: 900px) {
+  .fleet-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .fleet-head-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
   .role-manager {
     grid-template-columns: 1fr;
   }
@@ -4807,6 +4938,21 @@ textarea:focus-visible {
   }
 }
 @media (max-width: 560px) {
+  .fleet-head-actions,
+  .resource-modal-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .fleet-head-actions .filters {
+    width: 100%;
+    overflow-x: auto;
+  }
+  .fleet-head-actions .filters button {
+    flex: 1 0 auto;
+  }
+  .resource-modal-footer .button {
+    width: 100%;
+  }
   .access-workspace {
     padding: 13px;
   }
@@ -4825,10 +4971,13 @@ textarea:focus-visible {
   }
   .resource-modal {
     width: calc(100vw - 10px);
+    max-height: calc(100vh - 10px);
     max-height: calc(100dvh - 10px);
+    max-height: 100%;
   }
   .resource-modal .modal-head,
-  .resource-modal-body {
+  .resource-modal-body,
+  .resource-modal-footer {
     padding: 13px;
   }
   .resource-form-grid,

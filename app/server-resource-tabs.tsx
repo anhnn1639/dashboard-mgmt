@@ -58,16 +58,20 @@ export function ModalShell({
   subtitle,
   close,
   children,
+  className = "",
+  footer,
 }: {
   title: string;
   subtitle: string;
   close: () => void;
   children: ReactNode;
+  className?: string;
+  footer?: ReactNode;
 }) {
   return (
     <div className="modal-backdrop resource-modal-backdrop">
       <button className="modal-dismiss" type="button" aria-label="Đóng" onClick={close} />
-      <section className="modal resource-modal" role="dialog" aria-modal="true">
+      <section className={`modal resource-modal ${className}`.trim()} role="dialog" aria-modal="true">
         <div className="modal-head">
           <div>
             <span className="modal-icon">◇</span>
@@ -76,6 +80,7 @@ export function ModalShell({
           <button type="button" aria-label="Đóng" onClick={close}>×</button>
         </div>
         <div className="resource-modal-body">{children}</div>
+        {footer ? <div className="resource-modal-footer">{footer}</div> : null}
       </section>
     </div>
   );

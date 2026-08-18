@@ -39,7 +39,7 @@ os.environ["AGENT_CA_KEY"] = str(ca_key_path)
 os.environ["CADDY_ROOT_CA"] = str(ca_cert_path)
 os.environ["AGENT_ASSETS_ROOT"] = str(Path(__file__).resolve().parents[2] / "agent")
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -130,6 +130,50 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(AUTO_REFRESH_ACTIONS["user.update"], ("user.list", "group.list"))
         self.assertEqual(AUTO_REFRESH_ACTIONS["process.kill"], ("process.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["patch.install"], ("patch.scan",))
+        self.assertEqual(AUTO_REFRESH_ACTIONS["firewall.rule.add.auto"], ("firewall.list",))
+
+    def test_bulk_user_task_persists_one_encrypted_job_per_target(self):
+        server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        with SessionLocal() as db:
+            db.add_all([
+                Server(id=server_ids[0], name="bulk-win-01", os_family="windows", os_name="Windows Server 2022"),
+                Server(id=server_ids[1], name="bulk-win-02", os_family="windows", os_name="Windows Server 2025"),
+            ])
+            db.commit()
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            password = "Bulk-Test-Password-123!"
+            response = client.post("/api/v1/bulk-tasks", headers=headers, json={
+                "os_family": "windows",
+                "server_ids": server_ids,
+                "action": "user.create",
+                "parameters": {"username": "batchops", "password": password, "is_admin": True},
+                "reason": "CHG-2048 create the operations account",
+            })
+            self.assertEqual(response.status_code, 201, response.text)
+            payload = response.json()
+            self.assertEqual(payload["targetCount"], 2)
+            self.assertEqual(payload["summary"], {"username": "batchops", "isAdmin": True})
+            self.assertEqual({item["serverId"] for item in payload["items"]}, set(server_ids))
+            listed = client.get("/api/v1/bulk-tasks?os_family=windows", headers=headers)
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertTrue(any(item["id"] == payload["id"] for item in listed.json()["items"]))
+        with SessionLocal() as db:
+            task = db.get(BulkTask, payload["id"])
+            self.assertIsNotNone(task)
+            items = db.execute(select(BulkTaskItem).where(BulkTaskItem.bulk_task_id == payload["id"])).scalars().all()
+            self.assertEqual(len(items), 2)
+            jobs = [db.get(Job, item.job_id) for item in items]
+            self.assertTrue(all(job and job.action == "user.create" and job.status == "queued" for job in jobs))
+            self.assertTrue(all(password not in json.dumps(job.parameters) for job in jobs if job))
+
+    def test_common_firewall_payload_rejects_unknown_commands_and_wrong_family(self):
+        valid = {"name": "SSH from jump", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 22, "remote_port": "any", "source": "10.64.83.172/32", "destination": "any", "family": "ipv4"}
+        validate_firewall_job_parameters("firewall.rule.add.auto", valid)
+        with self.assertRaises(HTTPException):
+            validate_firewall_job_parameters("firewall.rule.add.auto", {**valid, "command": "iptables -F"})
+        with self.assertRaises(HTTPException):
+            validate_firewall_job_parameters("firewall.rule.add.auto", {**valid, "source": "2001:db8::/64"})
 
     def test_audit_retention_deletes_rows_older_than_thirty_days_and_keeps_anchor(self):
         old_id = str(uuid.uuid4())

@@ -217,15 +217,23 @@ function MiniBar({
 function ServerTable({
   servers,
   onSelect,
+  selection,
 }: {
   servers: Server[];
   onSelect: (server: Server) => void;
+  selection?: {
+    selectedIds: string[];
+    toggle: (serverId: string) => void;
+    toggleAll: () => void;
+  };
 }) {
+  const allSelected = Boolean(servers.length) && servers.every((server) => selection?.selectedIds.includes(server.id));
   return (
     <div className="table-scroll">
       <table className="server-table">
         <thead>
           <tr>
+            {selection ? <th className="server-select-column"><input type="checkbox" aria-label="Chọn tất cả máy chủ đang hiển thị" checked={allSelected} onChange={selection.toggleAll} /></th> : null}
             <th>Máy chủ</th>
             <th>Hệ điều hành</th>
             <th>Trạng thái</th>
@@ -245,6 +253,7 @@ function ServerTable({
               tabIndex={0}
               onKeyDown={(e) => e.key === "Enter" && onSelect(server)}
             >
+              {selection ? <td className="server-select-column" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`Chọn ${server.name}`} checked={selection.selectedIds.includes(server.id)} onChange={() => selection.toggle(server.id)} /></td> : null}
               <td>
                 <div className="server-name">
                   <span className={`os-avatar ${server.osFamily}`}>
@@ -333,6 +342,8 @@ export function OpsConsole() {
   const [modal, setModal] = useState<"command" | "session" | null>(null);
   const [toast, setToast] = useState("");
   const [loading, setLoading] = useState(true);
+  const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
+  const [bulkTaskOpen, setBulkTaskOpen] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -446,6 +457,7 @@ export function OpsConsole() {
       }
       if (event.key === "Escape") {
         setModal(null);
+        setBulkTaskOpen(false);
         setSelected(null);
         if (active === "linux" || active === "windows")
           window.history.pushState(null, "", sectionRoute(active));
@@ -504,6 +516,8 @@ export function OpsConsole() {
   function openServer(server: Server) {
     setActive(server.osFamily);
     setSelected(server);
+    setSelectedServerIds([]);
+    setBulkTaskOpen(false);
     const route = serverRoute(server);
     if (window.location.hash !== route) window.history.pushState(null, "", route);
   }
@@ -511,6 +525,8 @@ export function OpsConsole() {
   function navigateSection(section: string) {
     setActive(section);
     setSelected(null);
+    setSelectedServerIds([]);
+    setBulkTaskOpen(false);
     window.history.pushState(null, "", sectionRoute(section));
   }
 
@@ -902,35 +918,47 @@ export function OpsConsole() {
                     gian thực
                   </p>
                 </div>
-                <div className="filters">
-                  <button
-                    className={filter === "all" ? "active" : ""}
-                    onClick={() => setFilter("all")}
-                  >
-                    Tất cả
-                  </button>
-                  <button
-                    className={filter === "healthy" ? "active" : ""}
-                    onClick={() => setFilter("healthy")}
-                  >
-                    Ổn định
-                  </button>
-                  <button
-                    className={filter === "warning" ? "active" : ""}
-                    onClick={() => setFilter("warning")}
-                  >
-                    Cảnh báo
-                  </button>
-                  <button
-                    className={filter === "critical" ? "active" : ""}
-                    onClick={() => setFilter("critical")}
-                  >
-                    Nguy cấp
-                  </button>
+                <div className="fleet-head-actions">
+                  {scope ? <button type="button" className="button primary compact" disabled={!selectedServerIds.length} onClick={() => setBulkTaskOpen(true)}>＋ Tạo task chung</button> : null}
+                  <div className="filters">
+                    <button
+                      className={filter === "all" ? "active" : ""}
+                      onClick={() => setFilter("all")}
+                    >
+                      Tất cả
+                    </button>
+                    <button
+                      className={filter === "healthy" ? "active" : ""}
+                      onClick={() => setFilter("healthy")}
+                    >
+                      Ổn định
+                    </button>
+                    <button
+                      className={filter === "warning" ? "active" : ""}
+                      onClick={() => setFilter("warning")}
+                    >
+                      Cảnh báo
+                    </button>
+                    <button
+                      className={filter === "critical" ? "active" : ""}
+                      onClick={() => setFilter("critical")}
+                    >
+                      Nguy cấp
+                    </button>
+                  </div>
                 </div>
               </div>
+              {scope ? <div className="fleet-selection-bar"><span><b>{selectedServerIds.length}</b> máy đã chọn cho tác vụ hàng loạt</span><button type="button" onClick={() => setSelectedServerIds([])} disabled={!selectedServerIds.length}>Bỏ chọn</button></div> : null}
               {loading ? <div className="loading-line" /> : null}
-              <ServerTable servers={visibleServers} onSelect={openServer} />
+              <ServerTable
+                servers={visibleServers}
+                onSelect={openServer}
+                selection={scope ? {
+                  selectedIds: selectedServerIds,
+                  toggle: (serverId) => setSelectedServerIds((current) => current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId]),
+                  toggleAll: () => setSelectedServerIds((current) => visibleServers.every((server) => current.includes(server.id)) ? current.filter((id) => !visibleServers.some((server) => server.id === id)) : Array.from(new Set([...current, ...visibleServers.map((server) => server.id)]))),
+                } : undefined}
+              />
             </section>
           )}
         </div>
@@ -954,6 +982,19 @@ export function OpsConsole() {
           }}
         />
       )}
+      {bulkTaskOpen && scope && (
+        <BulkTaskModal
+          close={() => setBulkTaskOpen(false)}
+          openJobs={() => {
+            setBulkTaskOpen(false);
+            navigateSection("jobs");
+          }}
+          notify={notify}
+          scope={scope}
+          servers={servers.filter((server) => selectedServerIds.includes(server.id))}
+          token={token}
+        />
+      )}
       {toast && (
         <div className="toast">
           <span>✓</span>
@@ -962,6 +1003,168 @@ export function OpsConsole() {
       )}
     </main>
   );
+}
+
+type BulkTaskResponse = {
+  id: string;
+  targetCount: number;
+  items: Array<{ serverId: string; serverName: string; jobId: string; status: string }>;
+};
+
+const firewallPresets = {
+  ssh: { name: "Cho phép SSH", protocol: "tcp", port: "22" },
+  http: { name: "Cho phép HTTP", protocol: "tcp", port: "80" },
+  https: { name: "Cho phép HTTPS", protocol: "tcp", port: "443" },
+  dns: { name: "Cho phép DNS", protocol: "udp", port: "53" },
+  rdp: { name: "Cho phép Remote Desktop", protocol: "tcp", port: "3389" },
+  custom: { name: "", protocol: "tcp", port: "" },
+} as const;
+
+function BulkTaskModal({
+  close,
+  notify,
+  openJobs,
+  scope,
+  servers,
+  token,
+}: {
+  close: () => void;
+  notify: (message: string) => void;
+  openJobs: () => void;
+  scope: OSFamily;
+  servers: Server[];
+  token: string;
+}) {
+  const [action, setAction] = useState<"user.create" | "firewall.rule.add.auto">("user.create");
+  const [preset, setPreset] = useState<keyof typeof firewallPresets>(scope === "windows" ? "rdp" : "ssh");
+  const [firewallName, setFirewallName] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].name);
+  const [firewallProtocol, setFirewallProtocol] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].protocol);
+  const [firewallPort, setFirewallPort] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].port);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<BulkTaskResponse | null>(null);
+  const formId = "bulk-task-form";
+
+  function applyPreset(value: keyof typeof firewallPresets) {
+    const selectedPreset = firewallPresets[value];
+    setPreset(value);
+    setFirewallName(selectedPreset.name);
+    setFirewallProtocol(selectedPreset.protocol);
+    setFirewallPort(selectedPreset.port);
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const form = new FormData(event.currentTarget);
+    const parameters = action === "user.create"
+      ? {
+          username: String(form.get("username") ?? "").trim(),
+          password: String(form.get("password") ?? ""),
+          is_admin: form.get("is_admin") === "on",
+        }
+      : {
+          name: firewallName.trim(),
+          direction: scope === "linux" ? "in" : String(form.get("direction") ?? "in"),
+          action: String(form.get("rule_action") ?? "allow"),
+          protocol: firewallProtocol,
+          local_port: Number(firewallPort),
+          remote_port: String(form.get("remote_port") ?? "any").trim() || "any",
+          source: String(form.get("source") ?? "any").trim() || "any",
+          destination: String(form.get("destination") ?? "any").trim() || "any",
+          family: String(form.get("family") ?? "ipv4"),
+        };
+    try {
+      const response = await fetch("/api/v1/bulk-tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          os_family: scope,
+          server_ids: servers.map((server) => server.id),
+          action,
+          parameters,
+          reason: String(form.get("reason") ?? "").trim(),
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể tạo task chung");
+      setResult(data as BulkTaskResponse);
+      notify(`Đã xếp hàng ${servers.length} job trong task chung`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Không thể tạo task chung");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (result) {
+    return <ModalShell
+      title="Task chung đã được tạo"
+      subtitle={`Mã ${result.id.slice(0, 8)} · ${result.targetCount} job được lưu trong PostgreSQL`}
+      close={close}
+      className="bulk-task-modal"
+      footer={<><button type="button" className="button ghost" onClick={close}>Đóng</button><button type="button" className="button primary" onClick={openJobs}>Xem công việc</button></>}
+    >
+      <div className="bulk-task-result">
+        <div className="resource-help">Mỗi máy chủ nhận một job riêng qua Agent mTLS. Máy offline giữ trạng thái chờ và sẽ nhận job khi kết nối lại.</div>
+        <div className="bulk-target-list">{result.items.map((item) => <div key={item.jobId}><span><b>{item.serverName}</b><small>Job {item.jobId.slice(0, 8)}</small></span><em>{item.status === "queued" ? "Đang chờ Agent" : item.status}</em></div>)}</div>
+      </div>
+    </ModalShell>;
+  }
+
+  return <ModalShell
+    title="Tạo task chung"
+    subtitle={`${scope === "windows" ? "Windows" : "Linux"} · ${servers.length} máy chủ đã chọn`}
+    close={close}
+    className="bulk-task-modal"
+    footer={<><button type="button" className="button ghost" onClick={close}>Hủy</button><button type="submit" form={formId} className="button primary" disabled={busy || !servers.length}>{busy ? "Đang tạo..." : `Tạo ${servers.length} job`}</button></>}
+  >
+    <form id={formId} className="resource-form bulk-task-form" onSubmit={submit}>
+      <fieldset>
+        <legend>Máy chủ đích</legend>
+        <div className="bulk-target-list">{servers.map((server) => <div key={server.id}><span><b>{server.name}</b><small>{server.os} {server.version}</small></span><em className={server.health}>{server.health === "offline" ? "Chờ kết nối" : "Sẵn sàng"}</em></div>)}</div>
+      </fieldset>
+      <label>Loại tác vụ
+        <select value={action} onChange={(event) => { setAction(event.target.value as typeof action); setError(""); }}>
+          <option value="user.create">Tạo user local trên nhiều máy</option>
+          <option value="firewall.rule.add.auto">Thêm firewall rule trên nhiều máy</option>
+        </select>
+      </label>
+      {action === "user.create" ? <>
+        <div className="form-grid">
+          <label>Username<input name="username" required maxLength={scope === "windows" ? 20 : 32} pattern={scope === "windows" ? "[^\\/\\[\\]:;|=,+*?<>@]{1,20}" : "[a-z_][a-z0-9_.-]{0,31}"} title={scope === "windows" ? "Tên local Windows tối đa 20 ký tự" : "Linux dùng chữ thường, số, _, . hoặc -"} /></label>
+          <label>Mật khẩu ban đầu<input name="password" type="password" minLength={12} maxLength={1024} autoComplete="new-password" required /></label>
+        </div>
+        <label className="check"><input name="is_admin" type="checkbox" /> Cấp quyền quản trị hệ điều hành</label>
+        <div className="resource-help">Agent đọc group thật trên từng máy ngay trước khi tạo: Windows dùng group Administrators theo SID, Ubuntu dùng sudo, Oracle Linux/Red Hat dùng wheel. Không truyền tên group đoán từ trình duyệt.</div>
+      </> : <>
+        <div className="form-grid">
+          <label>Mẫu cấu hình<select value={preset} onChange={(event) => applyPreset(event.target.value as keyof typeof firewallPresets)}><option value="ssh">SSH · TCP 22</option><option value="rdp">Remote Desktop · TCP 3389</option><option value="http">HTTP · TCP 80</option><option value="https">HTTPS · TCP 443</option><option value="dns">DNS · UDP 53</option><option value="custom">Tùy chỉnh</option></select></label>
+          <label>Tên rule<input value={firewallName} onChange={(event) => setFirewallName(event.target.value)} maxLength={128} required /></label>
+        </div>
+        <div className="form-grid">
+          <label>Hướng<select name="direction" defaultValue="in" disabled={scope === "linux"}><option value="in">Inbound</option>{scope === "windows" ? <option value="out">Outbound</option> : null}</select></label>
+          <label>Hành động<select name="rule_action" defaultValue="allow"><option value="allow">Allow</option><option value="deny">Block / Drop</option>{scope === "linux" ? <option value="reject">Reject</option> : null}</select></label>
+        </div>
+        <div className="form-grid">
+          <label>Protocol<select value={firewallProtocol} onChange={(event) => setFirewallProtocol(event.target.value)}><option value="tcp">TCP</option><option value="udp">UDP</option></select></label>
+          <label>Local port<input type="number" min={1} max={65535} value={firewallPort} onChange={(event) => setFirewallPort(event.target.value)} required /></label>
+        </div>
+        <div className="form-grid">
+          <label>IP family<select name="family" defaultValue="ipv4"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label>
+          <label>Remote port<input name="remote_port" defaultValue="any" placeholder="any hoặc 1-65535" /></label>
+        </div>
+        <div className="form-grid">
+          <label>Nguồn (CIDR)<input name="source" defaultValue="any" placeholder="10.10.0.0/16 hoặc any" /></label>
+          <label>Đích local (CIDR)<input name="destination" defaultValue="any" placeholder="any" /></label>
+        </div>
+        <div className="resource-help">Agent tự đọc trạng thái thật ngay lúc chạy: Windows chọn Windows Firewall, Ubuntu chọn UFW đang active, Oracle Linux/Red Hat chọn default firewalld zone; nếu máy dùng nftables/iptables Agent chọn đúng filter INPUT theo IP family. Linux common rule giới hạn Inbound để tương thích an toàn với firewalld zone.</div>
+      </>}
+      <label>Lý do / ticket<textarea name="reason" rows={2} minLength={5} maxLength={2000} required placeholder="CHG-1234 · Mô tả mục đích áp dụng hàng loạt" /></label>
+      {error ? <div className="resource-job-state failed"><b>Không thể tạo task</b><span>{error}</span></div> : null}
+    </form>
+  </ModalShell>;
 }
 
 function SystemUnavailable({ message }: { message: string }) {
@@ -3486,7 +3689,26 @@ function AccessView({ token }: { token: string }) {
     <p className="access-note">User LDAP xuất hiện sau lần đăng nhập Domain đầu tiên. Bạn có thể đổi role riêng từng user LDAP tại đây; mật khẩu LDAP vẫn do Active Directory quản lý.</p>
     {showCreate && <ModalShell title="Tạo tài khoản Local" subtitle="Tài khoản mới bắt buộc thiết lập MFA ở lần đăng nhập đầu tiên" close={() => setShowCreate(false)}><form className="resource-form" onSubmit={createLocalUser}><div className="form-grid"><label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label><label>Role<select name="role" defaultValue="viewer">{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><label>Tên hiển thị<input name="display_name" required /></label><label>Mật khẩu ban đầu<input name="password" type="password" autoComplete="new-password" required minLength={14} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowCreate(false)}>Hủy</button><button className="button primary" disabled={busy}>Tạo tài khoản</button></div></form></ModalShell>}
     {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User LDAP: đổi role/trạng thái tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
-    {showLdap && <ModalShell title="Cấu hình LDAP / Active Directory" subtitle="Kết nối LDAPS, ánh xạ thuộc tính và role mặc định cho user đăng nhập lần đầu" close={() => setShowLdap(false)}><form key={JSON.stringify(ldap)} className="resource-form ldap-settings-form" onSubmit={saveLdap}><label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(ldap.enabled)} /> Bật Domain Login</label><div className="form-grid"><label>LDAP Host<input name="host" defaultValue={String(ldap.host ?? "")} placeholder="dc01.company.local" /></label><label>Cổng<input name="port" type="number" min={1} max={65535} defaultValue={Number(ldap.port ?? 636)} /></label></div><label className="check"><input name="use_ssl" type="checkbox" defaultChecked={Boolean(ldap.use_ssl)} /> Dùng LDAPS và xác minh certificate</label><label>Base DN<input name="base_dn" defaultValue={String(ldap.base_dn ?? "")} placeholder="DC=company,DC=local" /></label><label>Bind DN<input name="bind_dn" defaultValue={String(ldap.bind_dn ?? "")} placeholder="CN=svc-dashboard,OU=Service Accounts,..." /></label><label>Bind password<input name="bind_password" type="password" autoComplete="new-password" placeholder={ldap.password_configured ? "Đã lưu · để trống nếu giữ nguyên" : "Mật khẩu service account"} /></label><label>CA certificate cho LDAPS<textarea name="ca_certificate" rows={4} defaultValue={String(ldap.ca_certificate ?? "")} placeholder="-----BEGIN CERTIFICATE-----" /></label><div className="form-grid"><label>Thuộc tính user<input name="user_attribute" defaultValue={String(ldap.user_attribute ?? "sAMAccountName")} /></label><label>Thuộc tính tên<input name="display_attribute" defaultValue={String(ldap.display_attribute ?? "displayName")} /></label></div><div className="form-grid"><label>Nhãn domain<input name="domain_label" defaultValue={String(ldap.domain_label ?? "DOMAIN")} /></label><label>Role mặc định<select name="default_role" defaultValue={String(ldap.default_role ?? "viewer")}>{roles.filter((role) => role.name !== "admin").map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><div className="resource-help">Role mặc định chỉ áp dụng khi user LDAP đăng nhập lần đầu. Role bạn chỉnh riêng ở danh sách người dùng sẽ được giữ nguyên ở các lần đăng nhập sau.</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowLdap(false)}>Hủy</button><button className="button primary" disabled={busy}>Kiểm tra & lưu LDAP</button></div></form></ModalShell>}
+    {showLdap && <ModalShell
+      title="Cấu hình LDAP / Active Directory"
+      subtitle="Kết nối LDAPS, ánh xạ thuộc tính và role mặc định cho user đăng nhập lần đầu"
+      close={() => setShowLdap(false)}
+      className="ldap-settings-modal"
+      footer={<><button type="button" className="button ghost" onClick={() => setShowLdap(false)}>Hủy</button><button type="submit" form="ldap-settings-form" className="button primary" disabled={busy}>Kiểm tra & lưu LDAP</button></>}
+    >
+      <form id="ldap-settings-form" key={JSON.stringify(ldap)} className="resource-form ldap-settings-form" onSubmit={saveLdap}>
+        <label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(ldap.enabled)} /> Bật Domain Login</label>
+        <div className="form-grid"><label>LDAP Host<input name="host" defaultValue={String(ldap.host ?? "")} placeholder="dc01.company.local" /></label><label>Cổng<input name="port" type="number" min={1} max={65535} defaultValue={Number(ldap.port ?? 636)} /></label></div>
+        <label className="check"><input name="use_ssl" type="checkbox" defaultChecked={Boolean(ldap.use_ssl)} /> Dùng LDAPS và xác minh certificate</label>
+        <label>Base DN<input name="base_dn" defaultValue={String(ldap.base_dn ?? "")} placeholder="DC=company,DC=local" /></label>
+        <label>Bind DN<input name="bind_dn" defaultValue={String(ldap.bind_dn ?? "")} placeholder="CN=svc-dashboard,OU=Service Accounts,..." /></label>
+        <label>Bind password<input name="bind_password" type="password" autoComplete="new-password" placeholder={ldap.password_configured ? "Đã lưu · để trống nếu giữ nguyên" : "Mật khẩu service account"} /></label>
+        <label>CA certificate cho LDAPS<textarea name="ca_certificate" rows={4} defaultValue={String(ldap.ca_certificate ?? "")} placeholder="-----BEGIN CERTIFICATE-----" /></label>
+        <div className="form-grid"><label>Thuộc tính user<input name="user_attribute" defaultValue={String(ldap.user_attribute ?? "sAMAccountName")} /></label><label>Thuộc tính tên<input name="display_attribute" defaultValue={String(ldap.display_attribute ?? "displayName")} /></label></div>
+        <div className="form-grid"><label>Nhãn domain<input name="domain_label" defaultValue={String(ldap.domain_label ?? "DOMAIN")} /></label><label>Role mặc định<select name="default_role" defaultValue={String(ldap.default_role ?? "viewer")}>{roles.filter((role) => role.name !== "admin").map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div>
+        <div className="resource-help">Role mặc định chỉ áp dụng khi user LDAP đăng nhập lần đầu. Role bạn chỉnh riêng ở danh sách người dùng sẽ được giữ nguyên ở các lần đăng nhập sau.</div>
+      </form>
+    </ModalShell>}
     {showRoles && <ModalShell title="Roles & quyền hạn" subtitle="Bốn role có sẵn giữ baseline cố định; tạo role riêng để chọn đúng chức năng được phép" close={() => setShowRoles(false)}><div className="role-manager"><aside><button type="button" className={roleEditor === "__new__" ? "active" : ""} onClick={() => setRoleEditor("__new__")}>＋ Tạo role mới</button>{roles.map((role) => <button type="button" key={role.name} className={roleEditor === role.name ? "active" : ""} onClick={() => setRoleEditor(role.name)}><b>{role.displayName}</b><small>{role.system ? "Có sẵn · khóa" : role.name}</small></button>)}</aside><div className="role-editor">{roleEditor === null ? <div className="empty-state">Chọn một role để xem quyền hoặc tạo role tùy chỉnh.</div> : selectedRole?.system ? <><div className="role-editor-head"><div><h3>{selectedRole.displayName}</h3><p>{selectedRole.description}</p></div><span>Role có sẵn</span></div><div className="permission-summary">{permissions.filter((permission) => selectedRole.permissions.includes(permission.id)).map((permission) => <span key={permission.id}>{permission.label}</span>)}</div></> : <form key={roleEditor} className="resource-form" onSubmit={saveRole}><div className="form-grid"><label>Mã role<input name="name" required minLength={2} pattern="[a-z][a-z0-9_-]*" defaultValue={selectedRole?.name ?? ""} disabled={Boolean(selectedRole)} /></label><label>Tên hiển thị<input name="display_name" required defaultValue={selectedRole?.displayName ?? ""} /></label></div><label>Mô tả<textarea name="description" rows={2} defaultValue={selectedRole?.description ?? ""} /></label><div className="permission-groups">{Object.entries(groupedPermissions).map(([group, items]) => <fieldset key={group}><legend>{group}</legend>{items.map((permission) => <label key={permission.id} aria-label={`Cho phép ${permission.label}`}><input type="checkbox" name="permissions" value={permission.id} defaultChecked={selectedRole?.permissions.includes(permission.id) ?? false} /><span><b>{permission.label}</b><small>{permission.description}</small></span></label>)}</fieldset>)}</div><div className="modal-actions">{selectedRole && <button type="button" className="button danger" disabled={busy} onClick={() => void deleteRole(selectedRole)}>Xóa role</button>}<button className="button primary" disabled={busy}>Lưu role</button></div></form>}</div></div></ModalShell>}
   </section>;
 }

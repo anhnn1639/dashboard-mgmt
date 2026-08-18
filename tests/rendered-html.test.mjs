@@ -46,10 +46,27 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
 
 test("resource dialogs fit the viewport and scroll internally", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(styles, /\.resource-modal\s*{[^}]*max-height:\s*calc\(100vh - 16px\)/s);
   assert.match(styles, /\.resource-modal\s*{[^}]*max-height:\s*calc\(100dvh - 16px\)/s);
-  assert.match(styles, /\.resource-modal-body\s*{[^}]*overflow-y:\s*auto/s);
+  assert.match(styles, /\.resource-modal\s*{[^}]*max-height:\s*100%/s);
+  assert.match(styles, /\.resource-modal-body\s*{[^}]*overflow:\s*auto/s);
+  assert.match(styles, /\.resource-modal-footer\s*{[^}]*flex:\s*0 0 auto/s);
+  assert.match(source, /id="ldap-settings-form"/);
+  assert.match(source, /form="ldap-settings-form"/);
+  assert.match(source, /className="ldap-settings-modal"/);
   assert.match(styles, /\.storage-tree\s*{[^}]*overflow:\s*auto/s);
   assert.match(styles, /\.resource-table-scroll\s*{[^}]*overflow:\s*auto/s);
+});
+
+test("Windows and Linux fleets can queue OS-aware common tasks", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /Tạo task chung/);
+  assert.match(source, /\/api\/v1\/bulk-tasks/);
+  assert.match(source, /firewall\.rule\.add\.auto/);
+  assert.match(source, /Windows dùng group Administrators theo SID/);
+  assert.match(source, /Oracle Linux\/Red Hat chọn default firewalld zone/);
+  assert.match(source, /server_ids:\s*servers\.map/);
 });
 
 test("firewall add form uses server capabilities and a viewport-safe scroll region", async () => {

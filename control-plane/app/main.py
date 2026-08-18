@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -257,6 +258,26 @@ class Job(Base):
     server: Mapped[Server] = relationship(back_populates="jobs")
 
 
+class BulkTask(Base):
+    __tablename__ = "bulk_tasks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    os_family: Mapped[str] = mapped_column(String(20), index=True)
+    target_count: Mapped[int] = mapped_column(Integer)
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reason: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+
+
+class BulkTaskItem(Base):
+    __tablename__ = "bulk_task_items"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    bulk_task_id: Mapped[str] = mapped_column(ForeignKey("bulk_tasks.id"), index=True)
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), unique=True, index=True)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -469,6 +490,23 @@ class JobCreateRequest(BaseModel):
     reason: str = Field(min_length=5, max_length=2000)
 
 
+class BulkTaskCreateRequest(BaseModel):
+    os_family: Literal["windows", "linux"]
+    server_ids: list[str] = Field(min_length=1, max_length=100)
+    action: Literal["user.create", "firewall.rule.add.auto"]
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(min_length=5, max_length=2000)
+
+    @field_validator("server_ids")
+    @classmethod
+    def valid_server_ids(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[A-Za-z0-9-]{1,36}", value) for value in values):
+            raise ValueError("Target server ID is invalid")
+        if len(values) != len(set(values)):
+            raise ValueError("Duplicate target servers are not allowed")
+        return values
+
+
 class JobResultRequest(BaseModel):
     status: Literal["succeeded", "failed"]
     exit_code: int
@@ -555,6 +593,7 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "process.kill": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "firewall.rule.add": {"roles": {"admin", "operator"}, "risk": "high"},
+    "firewall.rule.add.auto": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.rule.remove": {"roles": {"admin", "operator"}, "risk": "high"},
     "firewall.rule.reorder": {"roles": {"admin", "operator"}, "risk": "critical"},
     "storage.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
@@ -615,6 +654,7 @@ ACTION_PERMISSIONS: dict[str, str] = {
     "process.kill": "processes.manage",
     "firewall.list": "resources.view",
     "firewall.rule.add": "firewall.manage",
+    "firewall.rule.add.auto": "firewall.manage",
     "firewall.rule.remove": "firewall.manage",
     "firewall.rule.reorder": "firewall.manage",
     "storage.list": "resources.view",
@@ -637,6 +677,7 @@ BUILTIN_ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
     "firewall.rule.add": ("firewall.list",),
+    "firewall.rule.add.auto": ("firewall.list",),
     "firewall.rule.remove": ("firewall.list",),
     "firewall.rule.reorder": ("firewall.list",),
     "service.start": ("service.list",),
@@ -665,6 +706,42 @@ def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) ->
     if action == "firewall.list":
         if parameters:
             raise HTTPException(status_code=422, detail="firewall.list does not accept parameters")
+        return
+    if action == "firewall.rule.add.auto":
+        allowed = {"name", "direction", "action", "protocol", "local_port", "remote_port", "source", "destination", "family"}
+        required = {"name", "direction", "action", "protocol", "local_port", "family"}
+        if set(parameters) - allowed or not required.issubset(parameters):
+            raise HTTPException(status_code=422, detail="Common firewall rule parameters are incomplete")
+        if parameters.get("direction") not in {"in", "out"} or parameters.get("action") not in {"allow", "deny", "reject"} or parameters.get("protocol") not in {"tcp", "udp"}:
+            raise HTTPException(status_code=422, detail="Common firewall direction, action or protocol is invalid")
+        if parameters.get("family") not in {"ipv4", "ipv6"}:
+            raise HTTPException(status_code=422, detail="Common firewall IP family is invalid")
+        for key in ("local_port", "remote_port"):
+            value = parameters.get(key, "any")
+            if str(value).lower() == "any" and key == "remote_port":
+                continue
+            try:
+                port = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail=f"Firewall {key} is invalid") from None
+            if not 1 <= port <= 65535:
+                raise HTTPException(status_code=422, detail=f"Firewall {key} is invalid")
+        name = str(parameters.get("name", "")).strip()
+        if not 1 <= len(name) <= 128 or any(ord(character) < 32 for character in name):
+            raise HTTPException(status_code=422, detail="Firewall rule name is invalid")
+        expected_ip_version = 4 if parameters["family"] == "ipv4" else 6
+        for key in ("source", "destination"):
+            value = str(parameters.get(key, "any")).strip().lower()
+            if value in {"", "any"}:
+                continue
+            try:
+                network = ipaddress.ip_network(value, strict=False)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"Firewall {key} CIDR is invalid") from None
+            if network.version != expected_ip_version:
+                raise HTTPException(status_code=422, detail=f"Firewall {key} does not match the selected IP family")
+        if len(json.dumps(parameters, ensure_ascii=False)) > 10_000:
+            raise HTTPException(status_code=422, detail="Firewall rule parameters are too large")
         return
     if action == "firewall.rule.add":
         allowed = {"backend", "name", "direction", "action", "protocol", "local_port", "remote_port", "source", "destination", "profile", "zone", "family", "table", "chain"}
@@ -2580,6 +2657,112 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
     audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "execution": "direct"})
     db.commit()
     return {"id": job.id, "status": job.status, "risk": job.risk}
+
+
+def bulk_task_json(task: BulkTask, db: Session) -> dict[str, Any]:
+    rows = db.execute(
+        select(BulkTaskItem, Job, Server)
+        .join(Job, Job.id == BulkTaskItem.job_id)
+        .join(Server, Server.id == BulkTaskItem.server_id)
+        .where(BulkTaskItem.bulk_task_id == task.id)
+        .order_by(Server.name)
+    ).all()
+    statuses: dict[str, int] = {}
+    items: list[dict[str, Any]] = []
+    for _, job, server in rows:
+        statuses[job.status] = statuses.get(job.status, 0) + 1
+        items.append({
+            "serverId": server.id,
+            "serverName": server.name,
+            "osFamily": server.os_family,
+            "jobId": job.id,
+            "status": job.status,
+            "exitCode": job.exit_code,
+        })
+    return {
+        "id": task.id,
+        "action": task.action,
+        "osFamily": task.os_family,
+        "targetCount": task.target_count,
+        "summary": task.summary or {},
+        "reason": task.reason,
+        "createdAt": aware(task.created_at).isoformat(),
+        "statuses": statuses,
+        "items": items,
+    }
+
+
+@app.post("/api/v1/bulk-tasks", status_code=201)
+def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    policy = SAFE_ACTIONS.get(payload.action)
+    permission = ACTION_PERMISSIONS.get(payload.action)
+    if not policy or not permission or permission not in platform_role_permissions(db, user.role):
+        raise HTTPException(status_code=403, detail="Role cannot execute this bulk action")
+    server_ids = list(dict.fromkeys(payload.server_ids))
+    if len(server_ids) != len(payload.server_ids):
+        raise HTTPException(status_code=422, detail="Duplicate target servers are not allowed")
+    servers = db.execute(select(Server).where(Server.id.in_(server_ids))).scalars().all()
+    servers_by_id = {server.id: server for server in servers}
+    if len(servers_by_id) != len(server_ids):
+        raise HTTPException(status_code=404, detail="One or more target servers were not found")
+    ordered_servers = [servers_by_id[server_id] for server_id in server_ids]
+    if any(server.os_family != payload.os_family for server in ordered_servers):
+        raise HTTPException(status_code=422, detail="All target servers must belong to the selected Windows or Linux fleet")
+
+    requested = dict(payload.parameters)
+    if payload.action == "user.create":
+        allowed = {"username", "password", "is_admin"}
+        if set(requested) != allowed or not isinstance(requested.get("is_admin"), bool):
+            raise HTTPException(status_code=422, detail="Common user parameters are incomplete")
+        job_parameters = {
+            "username": requested["username"],
+            "password": requested["password"],
+            "groups": [],
+            "is_admin": requested["is_admin"],
+        }
+        summary = {"username": str(requested["username"]), "isAdmin": requested["is_admin"]}
+    else:
+        job_parameters = requested
+        summary = {key: value for key, value in requested.items() if key not in {"password", "secret", "token"}}
+
+    for server in ordered_servers:
+        validate_job_parameters(payload.action, job_parameters, server)
+
+    task = BulkTask(
+        action=payload.action,
+        os_family=payload.os_family,
+        target_count=len(ordered_servers),
+        summary=summary,
+        reason=payload.reason,
+        created_by=user.id,
+    )
+    db.add(task)
+    db.flush()
+    for server in ordered_servers:
+        job = Job(
+            server_id=server.id,
+            action=payload.action,
+            parameters=protect_parameters(job_parameters),
+            reason=payload.reason,
+            status="queued",
+            risk=policy["risk"],
+            created_by=user.id,
+        )
+        db.add(job)
+        db.flush()
+        db.add(BulkTaskItem(bulk_task_id=task.id, server_id=server.id, job_id=job.id))
+        audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "execution": "bulk", "bulk_task_id": task.id})
+    audit(db, user.username, "bulk_task.create", task.id, request, detail={"action": payload.action, "os_family": payload.os_family, "target_count": len(ordered_servers), "execution": "direct"})
+    db.commit()
+    return bulk_task_json(task, db)
+
+
+@app.get("/api/v1/bulk-tasks")
+def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+    query = select(BulkTask).order_by(BulkTask.created_at.desc()).limit(100)
+    if os_family:
+        query = query.where(BulkTask.os_family == os_family)
+    return {"items": [bulk_task_json(task, db) for task in db.execute(query).scalars().all()]}
 
 
 @app.get("/api/v1/jobs")
