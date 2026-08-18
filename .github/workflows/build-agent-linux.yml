@@ -59,6 +59,8 @@ jobs:
           do
             echo "Testing $image"
             docker run --rm -v "$PWD/dist/tram-agent:/opt/test/tram-agent:ro" "$image" /opt/test/tram-agent --help >/dev/null
+            inventory=$(docker run --rm -v "$PWD/dist/tram-agent:/opt/test/tram-agent:ro" "$image" /opt/test/tram-agent diagnose)
+            python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["os_family"] == "linux"; assert data["architecture"] in {"x86_64", "amd64"}; assert data["distribution_id"] in {"ubuntu", "ol", "rhel"}' "$inventory"
           done
           sha256sum dist/tram-agent
 

@@ -17,6 +17,9 @@ PACKAGE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 WINDOWS_MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 LINUX_AGENT_PATH = Path("linux/x86_64/tram-agent")
 LINUX_ELF_MAGIC = b"\x7fELF"
+# Keep bundles reproducible without using the Unix epoch. GNU tar versions on
+# Oracle Linux 7 warn that epoch-dated members are "implausibly old".
+REPRODUCIBLE_ARCHIVE_MTIME = 1_704_067_200
 
 
 def certificate_sha256(pem: str) -> str:
@@ -74,7 +77,7 @@ def _tar_entry(archive: tarfile.TarFile, name: str, content: bytes, mode: int) -
     info = tarfile.TarInfo(name)
     info.size = len(content)
     info.mode = mode
-    info.mtime = 0
+    info.mtime = REPRODUCIBLE_ARCHIVE_MTIME
     info.uid = 0
     info.gid = 0
     info.uname = "root"

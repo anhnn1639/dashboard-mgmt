@@ -68,6 +68,8 @@ WINDOWS_RESERVED_FILENAMES = {
 }
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
+WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
+WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
 ALLOWED_ACTIONS = {
@@ -271,20 +273,23 @@ def management_facts(os_family: str) -> dict[str, Any]:
     import pwd
     users = [{"name": item.pw_name, "uid": item.pw_uid, "home": item.pw_dir, "shell": item.pw_shell} for item in pwd.getpwall() if item.pw_uid == 0 or item.pw_uid >= 1000]
     groups = [{"name": item.gr_name, "gid": item.gr_gid, "members": item.gr_mem} for item in grp.getgrall()]
-    code, output = run(["/usr/bin/lsblk", "--json", "--bytes", "--output", "NAME,PATH,TYPE,FSTYPE,SIZE,MOUNTPOINTS"])
+    lsblk = find_system_command("lsblk")
+    code, output = run([lsblk, "--json", "--bytes", "--output", "NAME,PATH,TYPE,FSTYPE,SIZE,MOUNTPOINTS"]) if lsblk else (127, "")
     try:
         storage = json.loads(output).get("blockdevices", []) if code == 0 else []
     except ValueError:
         storage = []
     logical_volumes: list[dict[str, Any]] = []
-    if Path("/usr/sbin/lvs").exists():
-        lvs_code, lvs_output = run(["/usr/sbin/lvs", "--reportformat", "json", "--units", "b", "--nosuffix", "--options", "lv_path,vg_name,lv_name,lv_size,data_percent"])
+    lvs = find_system_command("lvs")
+    if lvs:
+        lvs_code, lvs_output = run([lvs, "--reportformat", "json", "--units", "b", "--nosuffix", "--options", "lv_path,vg_name,lv_name,lv_size,data_percent"])
         if lvs_code == 0:
             try:
                 logical_volumes = json.loads(lvs_output).get("report", [{}])[0].get("lv", [])
             except (ValueError, IndexError):
                 pass
-    services_code, services_output = run(["/usr/bin/systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+    systemctl = find_system_command("systemctl")
+    services_code, services_output = run([systemctl, "list-unit-files", "--type=service", "--no-legend", "--no-pager"]) if systemctl else (127, "")
     services = [{"name": line.split()[0], "state": line.split()[1] if len(line.split()) > 1 else ""} for line in services_output.splitlines() if services_code == 0 and line.strip()]
     return {"Users": users, "Groups": groups, "Storage": storage, "LogicalVolumes": logical_volumes, "Services": services}
 
@@ -317,8 +322,10 @@ def collect_inventory() -> dict[str, Any]:
 
 def pending_updates(inventory: dict[str, Any]) -> int:
     if inventory["os_family"] == "windows":
-        script = "$s=New-Object -ComObject Microsoft.Update.Session;$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0\");$r.Updates.Count"
-        code, output = powershell(script, timeout=180)
+        # The heartbeat metric must never start a network WUA scan. The full
+        # patch.scan job below owns the online search and its longer timeout.
+        script = "$s=New-Object -ComObject Microsoft.Update.Session;$q=$s.CreateUpdateSearcher();$q.Online=$false;$r=$q.Search(\"IsInstalled=0 and IsHidden=0\");$r.Updates.Count"
+        code, output = powershell(script, timeout=WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS)
     elif inventory["distribution_id"] == "ubuntu":
         code, output = run(["/usr/bin/apt-get", "-s", "upgrade"], timeout=180)
         return sum(1 for line in output.splitlines() if line.startswith("Inst ")) if code == 0 else 0
@@ -2308,14 +2315,17 @@ def delete_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
 def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
     if inventory["os_family"] == "windows":
         script = (
-            "$rows=@();$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
+            "$ProgressPreference='SilentlyContinue';$rows=@();$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
             "$updateSource=if($auPolicy.UseWUServer -eq 1 -and $policy.WUServer){'WSUS'}else{'Microsoft Update'};$updateServer=if($updateSource -eq 'WSUS'){[string]$policy.WUServer}else{''};$serviceStates=@{};$serviceActions=@{};foreach($serviceName in @('wuauserv','bits')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){try{Start-Service -Name $serviceName -ErrorAction Stop;$service.WaitForStatus('Running',[TimeSpan]::FromSeconds(15));$serviceActions[$serviceName]='started'}catch{$serviceActions[$serviceName]=$_.Exception.Message}};$serviceStates[$serviceName]=(Get-Service -Name $serviceName -ErrorAction Stop).Status.ToString()}catch{$serviceStates[$serviceName]='missing'}};"
             "function AddWuaRows([object]$result,[string]$repository,[string]$serviceId=''){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$identity=[string]$u.Identity.UpdateID;if($script:rows|Where-Object{$_.id -eq $identity}){continue};$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=$identity;revision=[int]$u.Identity.RevisionNumber;manager='wua';serviceId=$serviceId;name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
             "$wuaError='';$wuaErrorCode='';$wuaCachedError='';$wuaCachedErrorCode='';$wuaCount=0;$wuaStatus='error';$wuaMode='cached';$r=$null;try{$cachedSession=New-Object -ComObject Microsoft.Update.Session;$cachedSession.ClientApplicationID='TramVanHanhAgent-Cache';$cachedSearcher=$cachedSession.CreateUpdateSearcher();$cachedSearcher.Online=$false;$r=$cachedSearcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='cached';AddWuaRows $r ($updateSource+' (cache cục bộ)')}catch{$wuaCachedError=$_.Exception.Message;$wuaCachedErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff))};if($rows.Count -eq 0){try{$serviceManager=New-Object -ComObject Microsoft.Update.ServiceManager;foreach($updateService in @($serviceManager.Services)){try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSession.ClientApplicationID='TramVanHanhAgent-ServiceCache';$serviceSearcher=$serviceSession.CreateUpdateSearcher();$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$updateService.ServiceID;$serviceSearcher.Online=$false;$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");AddWuaRows $serviceResult (([string]$updateService.Name)+' (cache cục bộ)') ([string]$updateService.ServiceID)}catch{}}}catch{}};if($rows.Count -eq 0){try{$onlineSession=New-Object -ComObject Microsoft.Update.Session;$onlineSession.ClientApplicationID='TramVanHanhAgent-Online';$searcher=$onlineSession.CreateUpdateSearcher();$searcher.Online=$true;$r=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");$wuaStatus='ok';$wuaMode='online';AddWuaRows $r $updateSource}catch{$wuaError=$_.Exception.Message;$wuaErrorCode=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffff));if($rows.Count -gt 0){$wuaStatus='cached';$wuaMode='cached'}}};$wuaCount=[int]$rows.Count;"
             "$ccmError='';$ccmCount=0;$ccmStatus='not_installed';try{$rootCcm=Get-CimInstance -Namespace 'root' -ClassName '__Namespace' -Filter \"Name='ccm'\" -ErrorAction Stop;if($rootCcm){$clientSdk=Get-CimInstance -Namespace 'root\\ccm' -ClassName '__Namespace' -Filter \"Name='ClientSDK'\" -ErrorAction Stop;if($clientSdk){$ccmStatus='ok';$ccm=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});$ccmCount=$ccm.Count;foreach($u in $ccm){$id=[string]$u.UpdateID;if(-not ($rows|Where-Object{$_.id -eq $id})){$article=[string]$u.ArticleID;$version=if($article){'KB'+$article}else{$id};$severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';name=[string]$u.Name;version=$version;architecture='';repository='Microsoft Configuration Manager';severity=$severity;kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}}}}}}catch{$ccmStatus='error';$ccmError=$_.Exception.Message};"
             "$manager=if($ccmCount -gt 0 -and $wuaCount -gt 0){'mixed'}elseif($ccmCount -gt 0){'configmgr'}else{'wua'};$currentScanComplete=[bool]($wuaStatus -eq 'ok' -or $ccmStatus -eq 'ok');[pscustomobject]@{platform='windows';manager=$manager;count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=$currentScanComplete;wuaStatus=$wuaStatus;wuaMode=$wuaMode;wuaCount=$wuaCount;wuaError=$wuaError;wuaErrorCode=$wuaErrorCode;wuaCachedError=$wuaCachedError;wuaCachedErrorCode=$wuaCachedErrorCode;configMgrStatus=$ccmStatus;configMgrCount=$ccmCount;configMgrError=$ccmError;updateSource=$updateSource;updateServer=$updateServer;services=$serviceStates;serviceActions=$serviceActions}}|ConvertTo-Json -Depth 8 -Compress"
         )
-        return powershell(script, timeout=180, output_limit=10_000_000)
+        # Microsoft documents that WUA searches have no fixed completion time
+        # and can vary widely with the update source and network. Three minutes
+        # is too short for a first WSUS/Microsoft Update scan on Server 2022.
+        return powershell(script, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS, output_limit=10_000_000)
     if inventory.get("distribution_id") in {"ubuntu", "debian"}:
         apt = find_system_command("apt") or find_system_command("apt-get")
         if not apt:
@@ -2736,6 +2746,17 @@ def install_pinned_server_ca(config: Config, certificate_pem: str, expected_sha2
     config.save()
 
 
+def http_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        detail = payload.get("detail", "") if isinstance(payload, dict) else ""
+    except (ValueError, TypeError):
+        detail = ""
+    if not detail:
+        detail = response.text.strip()
+    return re.sub(r"[\r\n\t]+", " ", str(detail)).strip()[:500]
+
+
 def bootstrap_enroll(config: Config, package_id: str, package_secret: str) -> None:
     try:
         uuid.UUID(package_id)
@@ -2751,8 +2772,17 @@ def bootstrap_enroll(config: Config, package_id: str, package_secret: str) -> No
         "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(),
         "inventory": collect_inventory(),
     }
-    response = requests.post(config.server_url + "/api/v1/agent-bootstrap/claim", json=payload, verify=config.tls_verify(), timeout=90)
-    response.raise_for_status()
+    try:
+        response = requests.post(config.server_url + "/api/v1/agent-bootstrap/claim", json=payload, verify=config.tls_verify(), timeout=90)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = response.status_code if response is not None else "unknown"
+        detail = http_error_detail(response) if response is not None else ""
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"Bootstrap enrollment failed (HTTP {status}){suffix}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Bootstrap enrollment could not reach {config.server_url}: {exc}") from exc
     persist_enrollment(config, key, response.json())
 
 
@@ -3103,12 +3133,25 @@ def main() -> int:
     enrollment.add_argument("--server-ca", help="PEM CA used to verify a private/internal dashboard certificate")
     bootstrap_parser = sub.add_parser("bootstrap")
     bootstrap_parser.add_argument("--file", required=True, help="One-time bootstrap JSON generated by the dashboard")
+    sub.add_parser("diagnose", help="Print detected platform inventory without enrolling or changing the host")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--once", action="store_true")
     sub.add_parser("service")
     args = parser.parse_args()
     configure_logging(args.log_file)
     config = Config(args.config)
+    if args.command == "diagnose":
+        inventory = collect_inventory()
+        print(json.dumps({
+            "hostname": inventory["hostname"],
+            "os_family": inventory["os_family"],
+            "os_name": inventory["os_name"],
+            "os_version": inventory["os_version"],
+            "distribution_id": inventory["distribution_id"],
+            "architecture": inventory["architecture"],
+            "agent_version": inventory["agent_version"],
+        }, ensure_ascii=False, separators=(",", ":")))
+        return 0
     if args.command == "enroll":
         config.server_url = args.server.rstrip("/")
         if args.server_ca:
@@ -3133,4 +3176,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        LOG.error("%s", exc)
+        raise SystemExit(1) from None

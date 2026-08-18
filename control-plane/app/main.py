@@ -2333,6 +2333,7 @@ def issue_agent_identity(
     request: Request,
     db: Session,
     actor: str,
+    initial_scan_created_by: str,
     allow_rotation: bool,
 ) -> dict[str, Any]:
     try:
@@ -2371,7 +2372,11 @@ def issue_agent_identity(
     db.add(server)
     db.flush()
     if existing is None:
-        queue_initial_server_scan(db, server, actor)
+        # Job.created_by is a 36-character user id. Audit actors intentionally
+        # include a namespace (for example ``bootstrap:<package UUID>``) and
+        # must never be stored in that narrower column. PostgreSQL enforces the
+        # limit even though SQLite-based unit tests do not.
+        queue_initial_server_scan(db, server, initial_scan_created_by)
     action = "agent.certificate.rotate" if replacing_certificate else "agent.enroll"
     audit(db, actor, action, agent_id, request, detail={"os_family": family, "distribution": inventory.distribution_id, "verified": server.verified_os})
     try:
@@ -2503,6 +2508,7 @@ def claim_agent_package(payload: AgentBootstrapClaimRequest, request: Request, d
         request=request,
         db=db,
         actor=f"bootstrap:{record.id}",
+        initial_scan_created_by=record.created_by,
         allow_rotation=False,
     )
     record.used_at = now()
@@ -2526,6 +2532,7 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
         request=request,
         db=db,
         actor=f"agent:{payload.agent_id}",
+        initial_scan_created_by=record.created_by,
         allow_rotation=True,
     )
     record.uses += 1

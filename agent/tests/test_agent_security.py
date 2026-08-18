@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tram_agent.py"
@@ -75,6 +75,27 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(code, 124)
         self.assertIn("timed out after 7 seconds", output)
         self.assertIn("partial output", output)
+
+    def test_bootstrap_http_error_includes_safe_server_detail(self):
+        response = tram_agent.requests.Response()
+        response.status_code = 500
+        response.url = "https://ops.example.com/api/v1/agent-bootstrap/claim"
+        response._content = b'{"detail":"Initial server scan could not be queued"}'
+        csr = MagicMock()
+        csr.public_bytes.return_value = b"test-csr"
+        with tempfile.TemporaryDirectory() as directory:
+            config = tram_agent.Config(str(Path(directory) / "agent.json"))
+            config.server_url = "https://ops.example.com"
+            with patch.object(tram_agent, "create_agent_identity", return_value=(MagicMock(), csr)), patch.object(tram_agent, "collect_inventory", return_value={"os_family": "linux"}), patch.object(tram_agent.requests, "post", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, r"HTTP 500.*Initial server scan"):
+                    tram_agent.bootstrap_enroll(config, "89d17447-bbd7-4f3c-a9a8-6796c9348b1a", "a" * 43)
+
+    def test_windows_pending_update_metric_is_cache_only_and_bounded(self):
+        calls = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **kwargs: (calls.append((script, kwargs)) or (0, "4"))):
+            self.assertEqual(tram_agent.pending_updates({"os_family": "windows"}), 4)
+        self.assertIn("$q.Online=$false", calls[0][0])
+        self.assertEqual(calls[0][1]["timeout"], tram_agent.WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS)
 
     def test_linux_service_allows_netlink_for_inventory_and_firewall(self):
         service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
@@ -577,7 +598,9 @@ trusted
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
         scripts = [call[0] for call in calls]
         self.assertEqual(code, 0)
-        self.assertEqual(calls[0][1]["timeout"], 180)
+        self.assertEqual(calls[0][1]["timeout"], tram_agent.WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
+        self.assertGreater(calls[0][1]["timeout"], 180)
+        self.assertIn("$ProgressPreference='SilentlyContinue'", scripts[0])
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
         self.assertIn("$result.Updates.Item($i)", scripts[0])
         self.assertIn("$searcher.Online=$true", scripts[0])

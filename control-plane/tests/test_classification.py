@@ -50,7 +50,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 (test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -685,6 +685,7 @@ class ClassificationTests(unittest.TestCase):
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
                 self.assertEqual(archive.extractfile("VERSION").read().decode().strip(), app.version)
                 self.assertGreater(len(archive.extractfile("linux/x86_64/tram-agent").read()), 1024 * 512)
+                self.assertTrue(all(member.mtime >= 1_704_067_200 for member in archive.getmembers()))
                 self.assertNotIn("requirements.txt", archive.getnames())
                 self.assertNotIn("tram_agent.py", archive.getnames())
                 bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
@@ -704,6 +705,12 @@ class ClassificationTests(unittest.TestCase):
             claimed = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
             self.assertEqual(claimed.status_code, 201, claimed.text)
             self.assertEqual(claimed.json()["agent_endpoint"], "https://ops.company.example:9443/api/v1/agent")
+            with SessionLocal() as db:
+                package = db.get(AgentBootstrapPackage, bootstrap["package_id"])
+                initial_jobs = db.execute(select(Job).where(Job.server_id == linux_id)).scalars().all()
+                self.assertEqual(len(initial_jobs), len(INITIAL_SERVER_SCAN_ACTIONS))
+                self.assertTrue(all(job.created_by == package.created_by for job in initial_jobs))
+                self.assertTrue(all(len(job.created_by) <= 36 for job in initial_jobs))
             replay = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
             self.assertEqual(replay.status_code, 401)
 
