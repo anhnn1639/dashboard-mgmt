@@ -1,12 +1,13 @@
-fastapi==0.116.1
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.35.0
 sqlalchemy==2.0.43
 psycopg[binary]==3.2.9
 pydantic-settings==2.10.1
-PyJWT==2.10.1
+PyJWT==2.13.0
 argon2-cffi==25.1.0
-cryptography==45.0.6
-python-multipart==0.0.20
+cryptography==50.0.0
+python-multipart==0.0.32
 httpx==0.28.1
 ldap3==2.9.1
 pyotp==2.9.0

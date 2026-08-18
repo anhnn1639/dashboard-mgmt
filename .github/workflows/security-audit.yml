@@ -49,6 +49,7 @@ jobs:
           python -m pip_audit -r control-plane/requirements.txt
           python -m pip_audit -r agent/requirements.txt
       - name: Scan Python code for high-severity security defects
+        if: ${{ always() }}
         run: bandit -r control-plane/app agent/tram_agent.py --severity-level high --confidence-level high
 
   node-security:
