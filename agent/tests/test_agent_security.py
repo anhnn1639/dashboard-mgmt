@@ -551,6 +551,25 @@ trusted
         self.assertEqual(regions[-1]["startBytes"], 53687091200)
         self.assertEqual(regions[-1]["sizeBytes"], 53686042624)
 
+    def test_oracle_linux_7_storage_falls_back_to_lsblk_pairs(self):
+        pairs = '\n'.join([
+            'NAME="sda" KNAME="sda" PKNAME="" TYPE="disk" FSTYPE="" LABEL="" UUID="" SIZE="107374182400" MOUNTPOINT="" MODEL="Virtual Disk" RO="0" RM="0" PTTYPE="gpt"',
+            'NAME="sda1" KNAME="sda1" PKNAME="sda" TYPE="part" FSTYPE="xfs" LABEL="root" UUID="abc" SIZE="107373133824" MOUNTPOINT="/" MODEL="" RO="0" RM="0" PTTYPE=""',
+        ])
+        def fake_run(command, **_kwargs):
+            if "--json" in command:
+                return 1, "/usr/bin/lsblk: unrecognized option '--json'"
+            if "--pairs" in command:
+                return 0, pairs
+            return 0, ""
+        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: "/usr/bin/lsblk" if name == "lsblk" else None), patch.object(tram_agent, "run", side_effect=fake_run):
+            code, output = tram_agent.linux_storage_scan()
+        self.assertEqual(code, 0)
+        parsed = json.loads(output)
+        self.assertEqual(parsed["disks"][0]["path"], "/dev/sda")
+        self.assertEqual(parsed["disks"][0]["children"][0]["path"], "/dev/sda1")
+        self.assertEqual(parsed["disks"][0]["children"][0]["mountpoints"], ["/"])
+
     def test_windows_storage_scan_reports_ordered_free_segments_and_resize_limits(self):
         scripts = []
         with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{"disks":[]}'))):
@@ -594,26 +613,29 @@ trusted
 
     def test_windows_update_scan_indexes_the_com_collection(self):
         calls = []
-        with patch.object(tram_agent, "powershell", side_effect=lambda script, **kwargs: (calls.append((script, kwargs)) or (0, '{"updates":[]}'))):
+        def fake_powershell(script, **kwargs):
+            calls.append((script, kwargs))
+            if "CCM_SoftwareUpdate" in script:
+                return 0, "[]"
+            if "Microsoft.Update.AutoUpdate" in script:
+                return 0, ""
+            return 0, '{"platform":"windows","manager":"wua","updates":[],"diagnostics":{"currentScanComplete":true}}'
+        with patch.object(tram_agent, "powershell", side_effect=fake_powershell):
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
         scripts = [call[0] for call in calls]
         self.assertEqual(code, 0)
-        self.assertEqual(calls[0][1]["timeout"], tram_agent.WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
-        self.assertGreater(calls[0][1]["timeout"], 180)
-        self.assertIn("$ProgressPreference='SilentlyContinue'", scripts[0])
-        self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
-        self.assertIn("$result.Updates.Item($i)", scripts[0])
-        self.assertIn("$searcher.Online=$true", scripts[0])
-        self.assertIn("$cachedSearcher.Online=$false", scripts[0])
-        self.assertLess(scripts[0].index("$cachedSearcher.Online=$false"), scripts[0].index("$searcher.Online=$true"))
-        self.assertIn("Start-Service -Name $serviceName", scripts[0])
-        self.assertIn("$cachedSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
-        self.assertIn("$onlineSession=New-Object -ComObject Microsoft.Update.Session", scripts[0])
-        self.assertIn("Microsoft.Update.ServiceManager", scripts[0])
-        self.assertIn("$serviceSearcher.ServerSelection=3", scripts[0])
-        self.assertIn("$serviceSearcher.ServiceID", scripts[0])
-        self.assertIn("currentScanComplete", scripts[0])
-        self.assertIn("0x{0:X8}", scripts[0])
+        cached = next((call for call in calls if "$searcher.Online=$false" in call[0]), None)
+        online = next((call for call in calls if "$searcher.Online=$true" in call[0]), None)
+        self.assertIsNotNone(cached)
+        self.assertIsNotNone(online)
+        self.assertEqual(cached[1]["timeout"], 60)
+        self.assertEqual(online[1]["timeout"], tram_agent.WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
+        self.assertIn("$ProgressPreference='SilentlyContinue'", cached[0])
+        self.assertIn('Search("IsInstalled=0 and IsHidden=0")', cached[0])
+        self.assertIn("$result.Updates.Item($i)", cached[0])
+        self.assertIn("Microsoft.Update.ServiceManager", cached[0])
+        self.assertIn("Microsoft.Update.AutoUpdate", "\n".join(scripts))
+        self.assertLess(scripts.index(cached[0]), scripts.index(online[0]))
         self.assertIn("root\\ccm\\ClientSDK", scripts[0])
         self.assertIn("CCM_SoftwareUpdate", scripts[0])
         self.assertNotIn("foreach($u in $r.Updates)", scripts[0])

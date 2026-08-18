@@ -741,7 +741,7 @@ textarea:focus-visible {
 .server-table {
   border-collapse: collapse;
   width: 100%;
-  min-width: 900px;
+  min-width: 980px;
 }
 .server-table th {
   color: #536176;
@@ -1985,6 +1985,22 @@ textarea:focus-visible {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
   gap: 13px;
+}
+.server-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.server-row-actions .danger {
+  color: #ff8d96;
+  border-color: rgba(255, 105, 116, .25);
+}
+.share-button {
+  width: auto;
+  min-width: 72px;
+  padding: 5px 8px;
+  color: #83b6f5;
+  white-space: nowrap;
 }
 .access-workspace {
   min-width: 0;
@@ -4631,7 +4647,34 @@ textarea:focus-visible {
   color: #76a9ef;
 }
 .process-list .resource-table {
-  min-width: 420px;
+  min-width: 680px;
+}
+.table-sort {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.table-sort:hover {
+  color: #a9c8ef;
+}
+.live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid #2b3a4d;
+  border-radius: 6px;
+  color: #8fa3bb;
+  white-space: nowrap;
+}
+.live-toggle input {
+  accent-color: #4c8ce8;
 }
 .update-detail-row td {
   color: #879ab2;
@@ -4725,6 +4768,57 @@ textarea:focus-visible {
 }
 .ldap-settings-form .resource-help {
   overflow-wrap: anywhere;
+}
+.ldap-group-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.ldap-group-list label small {
+  display: block;
+  overflow: hidden;
+  color: #60748f;
+  text-overflow: ellipsis;
+}
+.resource-help.warning {
+  color: #e9bd73;
+  border-color: rgba(224, 165, 71, .35);
+  background: rgba(224, 165, 71, .07);
+}
+.share-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.share-picker fieldset {
+  min-width: 0;
+  max-height: 320px;
+  overflow: auto;
+}
+.share-picker label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 7px 0;
+}
+.share-picker label span,
+.share-picker label b,
+.share-picker label small {
+  display: block;
+  min-width: 0;
+}
+@media (max-width: 720px) {
+  .share-picker {
+    grid-template-columns: 1fr;
+  }
+  .resource-toolbar-actions {
+    width: 100%;
+  }
+  .live-toggle {
+    flex: 1 1 auto;
+  }
 }
 .bulk-task-modal {
   width: min(820px, calc(100vw - 16px));

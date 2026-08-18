@@ -48,7 +48,10 @@ type Server = {
   owner: string;
   tags: string[];
   tunnelOnline: boolean;
+  shares?: { userIds: string[]; groupIds: string[]; count: number };
 };
+
+type PlatformGroupRow = { id: string; name: string; description: string; memberIds: string[]; memberCount: number; createdAt: string };
 
 const navItems = [
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
@@ -225,10 +228,14 @@ function MiniBar({
 function ServerTable({
   servers,
   onSelect,
+  onShare,
+  onDelete,
   selection,
 }: {
   servers: Server[];
   onSelect: (server: Server) => void;
+  onShare?: (server: Server) => void;
+  onDelete?: (server: Server) => void;
   selection?: {
     selectedIds: string[];
     toggle: (serverId: string) => void;
@@ -249,6 +256,7 @@ function ServerTable({
             <th>Bộ nhớ</th>
             <th>Ổ đĩa</th>
             <th>Cập nhật</th>
+            {onShare ? <th>Share</th> : null}
             <th />
           </tr>
         </thead>
@@ -317,17 +325,9 @@ function ServerTable({
                   {server.updates}
                 </span>
               </td>
+              {onShare ? <td><button type="button" className="row-more share-button" onClick={(event) => { event.stopPropagation(); onShare(server); }}>{server.shares?.count ?? 0} user/group</button></td> : null}
               <td>
-                <button
-                  className="row-more"
-                  aria-label={`Mở ${server.name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelect(server);
-                  }}
-                >
-                  •••
-                </button>
+                <div className="server-row-actions"><button className="row-more" aria-label={`Mở ${server.name}`} onClick={(e) => { e.stopPropagation(); onSelect(server); }}>•••</button>{onDelete ? <button className="row-more danger" aria-label={`Xóa ${server.name}`} title="Xóa máy chủ" onClick={(event) => { event.stopPropagation(); onDelete(server); }}>−</button> : null}</div>
               </td>
             </tr>
           ))}
@@ -355,6 +355,7 @@ export function OpsConsole() {
   const [loading, setLoading] = useState(true);
   const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
   const [bulkTaskOpen, setBulkTaskOpen] = useState(false);
+  const [serverManagement, setServerManagement] = useState<{ server: Server; mode: "share" | "delete" } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -1016,6 +1017,8 @@ export function OpsConsole() {
               <ServerTable
                 servers={visibleServers}
                 onSelect={openServer}
+                onShare={currentUser.role === "admin" && currentUser.permissions.includes("servers.manage") ? (server) => setServerManagement({ server, mode: "share" }) : undefined}
+                onDelete={scope && currentUser.role === "admin" && currentUser.permissions.includes("servers.manage") ? (server) => setServerManagement({ server, mode: "delete" }) : undefined}
                 selection={scope ? {
                   selectedIds: selectedServerIds,
                   toggle: (serverId) => setSelectedServerIds((current) => current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId]),
@@ -1058,6 +1061,8 @@ export function OpsConsole() {
           token={token}
         />
       )}
+      {serverManagement?.mode === "share" && <ServerShareModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} saved={(shares) => { setServers((current) => current.map((server) => server.id === serverManagement.server.id ? { ...server, shares } : server)); setServerManagement(null); notify("Đã cập nhật phạm vi nhìn thấy máy chủ."); }} />}
+      {serverManagement?.mode === "delete" && <ServerDeleteModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} deleted={() => { setServers((current) => current.filter((server) => server.id !== serverManagement.server.id)); setSelectedServerIds((current) => current.filter((id) => id !== serverManagement.server.id)); setServerManagement(null); notify("Đã xóa máy chủ khỏi danh sách và ngừng chấp nhận Agent cũ."); }} />}
       {toast && (
         <div className="toast">
           <span>✓</span>
@@ -1066,6 +1071,48 @@ export function OpsConsole() {
       )}
     </main>
   );
+}
+
+function ServerShareModal({ server, token, close, saved }: { server: Server; token: string; close: () => void; saved: (shares: { userIds: string[]; groupIds: string[]; count: number }) => void }) {
+  const [users, setUsers] = useState<Array<{ id: string; username: string; displayName: string; enabled: boolean }>>([]);
+  const [groups, setGroups] = useState<PlatformGroupRow[]>([]);
+  const [userIds, setUserIds] = useState<string[]>(server.shares?.userIds ?? []);
+  const [groupIds, setGroupIds] = useState<string[]>(server.shares?.groupIds ?? []);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const headers = { Authorization: `Bearer ${token}` };
+    Promise.all([fetch("/api/v1/users", { headers }), fetch("/api/v1/platform-groups", { headers })])
+      .then(async ([usersResponse, groupsResponse]) => {
+        if (!usersResponse.ok || !groupsResponse.ok) throw new Error("Không thể đọc user/group để chia sẻ");
+        setUsers((await usersResponse.json()).items ?? []);
+        setGroups((await groupsResponse.json()).items ?? []);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "Không thể tải dữ liệu share"))
+      .finally(() => setBusy(false));
+  }, [token]);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError("");
+    const response = await fetch(`/api/v1/servers/${server.id}/shares`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ user_ids: userIds, group_ids: groupIds }) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) saved({ userIds: data.userIds ?? [], groupIds: data.groupIds ?? [], count: Number(data.count ?? 0) });
+    else { setError(data.detail ?? "Không thể cập nhật share"); setBusy(false); }
+  }
+  return <ModalShell title={`Share ${server.name}`} subtitle="Administrator thấy toàn bộ; các tài khoản khác chỉ thấy máy chủ được gán trực tiếp hoặc qua group" close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<div className="share-picker"><fieldset><legend>Người dùng</legend>{users.filter((user) => user.enabled).map((user) => <label key={user.id} aria-label={`Share cho ${user.username}`}><input type="checkbox" checked={userIds.includes(user.id)} onChange={() => setUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /><span><b>{user.displayName || user.username}</b><small>{user.username}</small></span></label>)}</fieldset><fieldset><legend>Groups của trạm vận hành</legend>{groups.map((group) => <label key={group.id} aria-label={`Share cho group ${group.name}`}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => setGroupIds((current) => current.includes(group.id) ? current.filter((id) => id !== group.id) : [...current, group.id])} /><span><b>{group.name}</b><small>{group.memberCount} thành viên</small></span></label>)}</fieldset></div><div className="resource-help">Không chọn ai nghĩa là máy chủ chỉ hiển thị với Administrator.</div><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang xử lý…" : "Lưu share"}</button></div></form></ModalShell>;
+}
+
+function ServerDeleteModal({ server, token, close, deleted }: { server: Server; token: string; close: () => void; deleted: () => void }) {
+  const [confirmation, setConfirmation] = useState("");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError("");
+    const response = await fetch(`/api/v1/servers/${server.id}`, { method: "DELETE", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ confirmation, reason }) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) deleted(); else { setError(data.detail ?? "Không thể xóa máy chủ"); setBusy(false); }
+  }
+  return <ModalShell title={`Xóa ${server.name}`} subtitle="Máy chủ biến mất khỏi fleet và certificate Agent hiện tại bị từ chối; lịch sử audit/job vẫn được giữ" close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<label>Lý do<input value={reason} onChange={(event) => setReason(event.target.value)} minLength={3} maxLength={500} required /></label><label>Gõ <b>DELETE</b><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button danger" disabled={busy || confirmation !== "DELETE" || reason.trim().length < 3}>Xóa máy chủ</button></div></form></ModalShell>;
 }
 
 type BulkTaskResponse = {
@@ -1100,9 +1147,9 @@ function BulkTaskModal({
 }) {
   const [action, setAction] = useState<"user.create" | "firewall.rule.add.auto">("user.create");
   const [preset, setPreset] = useState<keyof typeof firewallPresets>(scope === "windows" ? "rdp" : "ssh");
-  const [firewallName, setFirewallName] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].name);
-  const [firewallProtocol, setFirewallProtocol] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].protocol);
-  const [firewallPort, setFirewallPort] = useState(firewallPresets[scope === "windows" ? "rdp" : "ssh"].port);
+  const [firewallName, setFirewallName] = useState<string>(firewallPresets[scope === "windows" ? "rdp" : "ssh"].name);
+  const [firewallProtocol, setFirewallProtocol] = useState<string>(firewallPresets[scope === "windows" ? "rdp" : "ssh"].protocol);
+  const [firewallPort, setFirewallPort] = useState<string>(firewallPresets[scope === "windows" ? "rdp" : "ssh"].port);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<BulkTaskResponse | null>(null);
@@ -3649,33 +3696,43 @@ function AgentPackagesView({ token }: { token: string }) {
   );
 }
 
-type PlatformUserRow = { id: string; username: string; displayName: string; role: string; source: "local" | "ldap"; enabled: boolean; createdAt: string };
+type PlatformUserRow = { id: string; username: string; displayName: string; role: string; source: "local" | "ldap"; enabled: boolean; createdAt: string; groupIds: string[] };
 type PlatformRoleRow = { name: string; displayName: string; description: string; permissions: string[]; system: boolean };
 type PermissionRow = { id: string; group: string; label: string; description: string };
 
 function AccessView({ token }: { token: string }) {
   const [users, setUsers] = useState<PlatformUserRow[]>([]);
   const [roles, setRoles] = useState<PlatformRoleRow[]>([]);
+  const [groups, setGroups] = useState<PlatformGroupRow[]>([]);
   const [permissions, setPermissions] = useState<PermissionRow[]>([]);
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [editingUser, setEditingUser] = useState<PlatformUserRow | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showLdap, setShowLdap] = useState(false);
   const [showRoles, setShowRoles] = useState(false);
+  const [showGroups, setShowGroups] = useState(false);
+  const [groupEditor, setGroupEditor] = useState<string | null>(null);
   const [roleEditor, setRoleEditor] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [messageError, setMessageError] = useState(false);
-  const [ldap, setLdap] = useState<Record<string, string | number | boolean>>({ enabled: false, port: 636, use_ssl: true, user_attribute: "sAMAccountName", display_attribute: "displayName", domain_label: "DOMAIN", default_role: "viewer" });
+  const [ldap, setLdap] = useState<Record<string, unknown>>({ enabled: false, port: 636, use_ssl: true, user_attribute: "sAMAccountName", display_attribute: "displayName", domain_label: "DOMAIN", default_role: "viewer", allowed_group_dns: [] });
+  const [ldapDirectoryGroups, setLdapDirectoryGroups] = useState<Array<{ dn: string; name: string }>>([]);
   const selectedRole = roles.find((role) => role.name === roleEditor) ?? null;
+  const selectedGroup = groups.find((group) => group.id === groupEditor) ?? null;
+  const ldapAllowedGroupDns = Array.isArray(ldap.allowed_group_dns) ? ldap.allowed_group_dns.map(String) : [];
+  const ldapGroupOptionMap = new Map(ldapDirectoryGroups.map((group) => [group.dn, group.name]));
+  for (const dn of ldapAllowedGroupDns) if (!ldapGroupOptionMap.has(dn)) ldapGroupOptionMap.set(dn, dn);
+  const ldapGroupOptions = Array.from(ldapGroupOptionMap, ([dn, name]) => ({ dn, name }));
   const groupedPermissions = useMemo(() => permissions.reduce<Record<string, PermissionRow[]>>((groups, permission) => ({ ...groups, [permission.group]: [...(groups[permission.group] ?? []), permission] }), {}), [permissions]);
   const loadAccess = useCallback(async () => {
     try {
       const headers = { Authorization: `Bearer ${token}` };
-      const [usersResponse, rolesResponse, ldapResponse] = await Promise.all([
+      const [usersResponse, rolesResponse, groupsResponse, ldapResponse] = await Promise.all([
         fetch("/api/v1/users", { headers }),
         fetch("/api/v1/roles", { headers }),
+        fetch("/api/v1/platform-groups", { headers }),
         fetch("/api/v1/settings/ldap", { headers }),
       ]);
       const denied = usersResponse.status === 403;
@@ -3690,6 +3747,8 @@ function AccessView({ token }: { token: string }) {
         setRoles([]);
         setPermissions([]);
       }
+      if (groupsResponse.ok) setGroups((await groupsResponse.json()).items ?? []);
+      else setGroups([]);
       if (ldapResponse.ok) {
         const ldapData = await ldapResponse.json();
         setLdap((current) => ({ ...current, ...ldapData }));
@@ -3720,8 +3779,11 @@ function AccessView({ token }: { token: string }) {
     if (password) payload.password = password;
     const response = await fetch(`/api/v1/users/${editingUser.id}`, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
     const data = await response.json().catch(() => ({}));
-    if (response.ok) { showResult(editingUser.source === "ldap" ? "Đã cập nhật role/trạng thái user LDAP." : "Đã cập nhật tài khoản Local."); setEditingUser(null); await loadAccess(); }
-    else showResult(data.detail ?? "Không thể cập nhật tài khoản", true);
+    const profileUnchanged = response.status === 422 && data.detail === "Không có thay đổi hợp lệ";
+    const groupResponse = await fetch(`/api/v1/users/${editingUser.id}/groups`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ member_ids: form.getAll("platform_groups") }) });
+    const groupData = await groupResponse.json().catch(() => ({}));
+    if ((response.ok || profileUnchanged) && groupResponse.ok) { showResult(editingUser.source === "ldap" ? "Đã cập nhật role/trạng thái/group của user LDAP." : "Đã cập nhật tài khoản Local và group."); setEditingUser(null); await loadAccess(); }
+    else showResult((!response.ok && !profileUnchanged ? data.detail : groupData.detail) ?? "Không thể cập nhật tài khoản", true);
     setBusy(false);
   }
   async function deleteUsers() {
@@ -3735,11 +3797,34 @@ function AccessView({ token }: { token: string }) {
   }
   async function saveLdap(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); const form = new FormData(event.currentTarget);
-    const payload = { enabled: form.get("enabled") === "on", host: form.get("host"), port: Number(form.get("port")), use_ssl: form.get("use_ssl") === "on", base_dn: form.get("base_dn"), bind_dn: form.get("bind_dn"), bind_password: form.get("bind_password"), ca_certificate: form.get("ca_certificate"), user_attribute: form.get("user_attribute"), display_attribute: form.get("display_attribute"), domain_label: form.get("domain_label"), default_role: form.get("default_role") };
+    const payload = { enabled: form.get("enabled") === "on", host: form.get("host"), port: Number(form.get("port")), use_ssl: form.get("use_ssl") === "on", base_dn: form.get("base_dn"), bind_dn: form.get("bind_dn"), bind_password: form.get("bind_password"), ca_certificate: form.get("ca_certificate"), user_attribute: form.get("user_attribute"), display_attribute: form.get("display_attribute"), domain_label: form.get("domain_label"), default_role: form.get("default_role"), allowed_group_dns: form.getAll("allowed_group_dns") };
     const response = await fetch("/api/v1/settings/ldap", { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
     const data = await response.json().catch(() => ({}));
     if (response.ok) { setLdap((current) => ({ ...current, ...data })); showResult("Đã lưu cấu hình LDAP."); setShowLdap(false); }
     else showResult(data.detail ?? "Không thể lưu LDAP", true);
+    setBusy(false);
+  }
+  async function scanLdapDirectoryGroups() {
+    setBusy(true);
+    const response = await fetch("/api/v1/settings/ldap/groups", { headers: { Authorization: `Bearer ${token}` } });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { setLdapDirectoryGroups(data.items ?? []); showResult(`Đã quét ${String(data.items?.length ?? 0)} group LDAP.`); }
+    else showResult(data.detail ?? "Không thể quét group LDAP", true);
+    setBusy(false);
+  }
+  async function savePlatformGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); const form = new FormData(event.currentTarget); const creating = groupEditor === "__new__";
+    const payload = { name: form.get("name"), description: form.get("description"), member_ids: form.getAll("members") };
+    const response = await fetch(creating ? "/api/v1/platform-groups" : `/api/v1/platform-groups/${groupEditor}`, { method: creating ? "POST" : "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult(creating ? "Đã tạo group của trạm vận hành." : "Đã cập nhật group và thành viên."); await loadAccess(); setGroupEditor(String(data.id)); }
+    else showResult(data.detail ?? "Không thể lưu group", true);
+    setBusy(false);
+  }
+  async function deletePlatformGroup(group: PlatformGroupRow) {
+    if (!window.confirm(`Xóa group ${group.name}? Các share qua group này cũng bị gỡ.`)) return; setBusy(true);
+    const response = await fetch(`/api/v1/platform-groups/${group.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult("Đã xóa group."); setGroupEditor(null); await loadAccess(); } else showResult(data.detail ?? "Không thể xóa group", true);
     setBusy(false);
   }
   async function saveRole(event: FormEvent<HTMLFormElement>) {
@@ -3759,12 +3844,12 @@ function AccessView({ token }: { token: string }) {
     setBusy(false);
   }
   return <section className="panel view-panel access-workspace">
-    <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và LDAP dùng chung MFA; role tùy chỉnh được lưu trong PostgreSQL và kiểm tra tại API.</p></div>{!forbidden && <div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div>}</div>
+    <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và LDAP dùng chung MFA; group dùng để cấp quyền nhìn thấy máy chủ theo đội vận hành.</p></div>{!forbidden && <div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" onClick={() => { setGroupEditor(null); setShowGroups(true); }}>Groups</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div>}</div>
     {message && <p className={`settings-message${messageError ? " error" : ""}`}>{message}</p>}
     <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`}>{user.source === "ldap" ? "LDAP / AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng trong PostgreSQL."}</div>}</div>
     <p className="access-note">User LDAP xuất hiện sau lần đăng nhập Domain đầu tiên. Bạn có thể đổi role riêng từng user LDAP tại đây; mật khẩu LDAP vẫn do Active Directory quản lý.</p>
     {showCreate && <ModalShell title="Tạo tài khoản Local" subtitle="Tài khoản mới bắt buộc thiết lập MFA ở lần đăng nhập đầu tiên" close={() => setShowCreate(false)}><form className="resource-form" onSubmit={createLocalUser}><div className="form-grid"><label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label><label>Role<select name="role" defaultValue="viewer">{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><label>Tên hiển thị<input name="display_name" required /></label><label>Mật khẩu ban đầu<input name="password" type="password" autoComplete="new-password" required minLength={14} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowCreate(false)}>Hủy</button><button className="button primary" disabled={busy}>Tạo tài khoản</button></div></form></ModalShell>}
-    {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User LDAP: đổi role/trạng thái tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
+    {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User LDAP: đổi role, trạng thái và group tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, group, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}:${editingUser.groupIds?.join(",")}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><fieldset><legend>Groups của trạm vận hành</legend><div className="choice-grid">{groups.map((group) => <label key={group.id}><input type="checkbox" name="platform_groups" value={group.id} defaultChecked={editingUser.groupIds?.includes(group.id)} />{group.name}</label>)}</div></fieldset><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
     {showLdap && <ModalShell
       title="Cấu hình LDAP / Active Directory"
       subtitle="Kết nối LDAPS, ánh xạ thuộc tính và role mặc định cho user đăng nhập lần đầu"
@@ -3782,9 +3867,11 @@ function AccessView({ token }: { token: string }) {
         <label>CA certificate cho LDAPS<textarea name="ca_certificate" rows={4} defaultValue={String(ldap.ca_certificate ?? "")} placeholder="-----BEGIN CERTIFICATE-----" /></label>
         <div className="form-grid"><label>Thuộc tính user<input name="user_attribute" defaultValue={String(ldap.user_attribute ?? "sAMAccountName")} /></label><label>Thuộc tính tên<input name="display_attribute" defaultValue={String(ldap.display_attribute ?? "displayName")} /></label></div>
         <div className="form-grid"><label>Nhãn domain<input name="domain_label" defaultValue={String(ldap.domain_label ?? "DOMAIN")} /></label><label>Role mặc định<select name="default_role" defaultValue={String(ldap.default_role ?? "viewer")}>{roles.filter((role) => role.name !== "admin").map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div>
-        <div className="resource-help">Role mặc định chỉ áp dụng khi user LDAP đăng nhập lần đầu. Role bạn chỉnh riêng ở danh sách người dùng sẽ được giữ nguyên ở các lần đăng nhập sau.</div>
+        <fieldset><legend>Group LDAP được phép đăng nhập</legend><div className="ldap-group-toolbar"><span>{ldapAllowedGroupDns.length ? `${ldapAllowedGroupDns.length} group đã chọn` : "Chưa giới hạn group"}</span><button type="button" className="button ghost compact" disabled={busy} onClick={() => void scanLdapDirectoryGroups()}>Quét groups</button></div><div className="choice-grid ldap-group-list">{ldapGroupOptions.map((group) => <label key={group.dn} title={group.dn}><input type="checkbox" name="allowed_group_dns" value={group.dn} defaultChecked={ldapAllowedGroupDns.includes(group.dn)} />{group.name}<small>{group.dn}</small></label>)}</div></fieldset>
+        <div className={`resource-help${ldapAllowedGroupDns.length ? "" : " warning"}`}>{ldapAllowedGroupDns.length ? "Chỉ thành viên trực tiếp hoặc lồng nhau của các group đã chọn mới đăng nhập được. " : "Chưa chọn group: LDAP vẫn cho phép user trong toàn Base DN đăng nhập. Hãy quét và chọn ít nhất một group vận hành. "}Role mặc định chỉ áp dụng khi user LDAP đăng nhập lần đầu; role chỉnh riêng vẫn được giữ.</div>
       </form>
     </ModalShell>}
+    {showGroups && <ModalShell title="Groups của trạm vận hành" subtitle="Tạo group, chọn thành viên và dùng group để share máy chủ" close={() => setShowGroups(false)}><div className="role-manager"><aside><button type="button" className={groupEditor === "__new__" ? "active" : ""} onClick={() => setGroupEditor("__new__")}>＋ Tạo group mới</button>{groups.map((group) => <button type="button" key={group.id} className={groupEditor === group.id ? "active" : ""} onClick={() => setGroupEditor(group.id)}><b>{group.name}</b><small>{group.memberCount} thành viên</small></button>)}</aside><div className="role-editor">{groupEditor === null ? <div className="empty-state">Chọn group để sửa thành viên hoặc tạo group mới.</div> : <form key={groupEditor} className="resource-form" onSubmit={savePlatformGroup}><label>Tên group<input name="name" required minLength={2} maxLength={80} defaultValue={selectedGroup?.name ?? ""} /></label><label>Mô tả<textarea name="description" rows={2} defaultValue={selectedGroup?.description ?? ""} /></label><fieldset><legend>Thành viên Local và LDAP</legend><div className="choice-grid">{users.map((user) => <label key={user.id}><input type="checkbox" name="members" value={user.id} defaultChecked={selectedGroup?.memberIds.includes(user.id) ?? false} /><span>{user.displayName || user.username}<small>{user.username} · {user.source.toUpperCase()}</small></span></label>)}</div></fieldset><div className="modal-actions">{selectedGroup && <button type="button" className="button danger" disabled={busy} onClick={() => void deletePlatformGroup(selectedGroup)}>Xóa group</button>}<button className="button primary" disabled={busy}>Lưu group</button></div></form>}</div></div></ModalShell>}
     {showRoles && <ModalShell title="Roles & quyền hạn" subtitle="Bốn role có sẵn giữ baseline cố định; tạo role riêng để chọn đúng chức năng được phép" close={() => setShowRoles(false)}><div className="role-manager"><aside><button type="button" className={roleEditor === "__new__" ? "active" : ""} onClick={() => setRoleEditor("__new__")}>＋ Tạo role mới</button>{roles.map((role) => <button type="button" key={role.name} className={roleEditor === role.name ? "active" : ""} onClick={() => setRoleEditor(role.name)}><b>{role.displayName}</b><small>{role.system ? "Có sẵn · khóa" : role.name}</small></button>)}</aside><div className="role-editor">{roleEditor === null ? <div className="empty-state">Chọn một role để xem quyền hoặc tạo role tùy chỉnh.</div> : selectedRole?.system ? <><div className="role-editor-head"><div><h3>{selectedRole.displayName}</h3><p>{selectedRole.description}</p></div><span>Role có sẵn</span></div><div className="permission-summary">{permissions.filter((permission) => selectedRole.permissions.includes(permission.id)).map((permission) => <span key={permission.id}>{permission.label}</span>)}</div></> : <form key={roleEditor} className="resource-form" onSubmit={saveRole}><div className="form-grid"><label>Mã role<input name="name" required minLength={2} pattern="[a-z][a-z0-9_-]*" defaultValue={selectedRole?.name ?? ""} disabled={Boolean(selectedRole)} /></label><label>Tên hiển thị<input name="display_name" required defaultValue={selectedRole?.displayName ?? ""} /></label></div><label>Mô tả<textarea name="description" rows={2} defaultValue={selectedRole?.description ?? ""} /></label><div className="permission-groups">{Object.entries(groupedPermissions).map(([group, items]) => <fieldset key={group}><legend>{group}</legend>{items.map((permission) => <label key={permission.id} aria-label={`Cho phép ${permission.label}`}><input type="checkbox" name="permissions" value={permission.id} defaultChecked={selectedRole?.permissions.includes(permission.id) ?? false} /><span><b>{permission.label}</b><small>{permission.description}</small></span></label>)}</fieldset>)}</div><div className="modal-actions">{selectedRole && <button type="button" className="button danger" disabled={busy} onClick={() => void deleteRole(selectedRole)}>Xóa role</button>}<button className="button primary" disabled={busy}>Lưu role</button></div></form>}</div></div></ModalShell>}
   </section>;
 }

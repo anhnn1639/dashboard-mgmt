@@ -121,8 +121,10 @@ class ClassificationTests(unittest.TestCase):
             protected_paths = (
                 "/api/v1/me",
                 "/api/v1/users",
+                "/api/v1/platform-groups",
                 "/api/v1/roles",
                 "/api/v1/settings/ldap",
+                "/api/v1/settings/ldap/groups",
                 "/api/v1/servers",
                 "/api/v1/jobs",
                 "/api/v1/audit",
@@ -136,6 +138,29 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 401, path)
                 self.assertEqual(response.headers.get("cache-control"), "no-store")
                 self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+
+    def test_server_visibility_comes_only_from_direct_or_group_share(self):
+        with TestClient(app) as client:
+            admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            viewer_id = str(uuid.uuid4())
+            server_id = str(uuid.uuid4())
+            with SessionLocal() as db:
+                db.add(User(id=viewer_id, username=f"viewer-{viewer_id[:8]}", password_hash="!test", display_name="Scoped Viewer", role="viewer", enabled=True))
+                db.add(Server(id=server_id, name=f"shared-{server_id[:8]}", os_family="linux", os_name="Oracle Linux", status="online"))
+                db.commit()
+                viewer = db.get(User, viewer_id)
+                viewer_headers = {"Authorization": f"Bearer {issue_jwt(viewer)}"}
+            self.assertEqual(client.get("/api/v1/servers", headers=viewer_headers).json()["items"], [])
+            group_response = client.post("/api/v1/platform-groups", headers=admin_headers, json={"name": f"Ops {server_id[:8]}", "description": "Oracle operations", "member_ids": [viewer_id]})
+            self.assertEqual(group_response.status_code, 201, group_response.text)
+            share_response = client.put(f"/api/v1/servers/{server_id}/shares", headers=admin_headers, json={"user_ids": [], "group_ids": [group_response.json()["id"]]})
+            self.assertEqual(share_response.status_code, 200, share_response.text)
+            visible = client.get("/api/v1/servers", headers=viewer_headers)
+            self.assertEqual([item["id"] for item in visible.json()["items"]], [server_id])
+            self.assertEqual(client.get(f"/api/v1/servers/{server_id}", headers=viewer_headers).status_code, 200)
+            deleted = client.request("DELETE", f"/api/v1/servers/{server_id}", headers=admin_headers, json={"confirmation": "DELETE", "reason": "Không còn sử dụng"})
+            self.assertEqual(deleted.status_code, 200, deleted.text)
+            self.assertEqual(client.get(f"/api/v1/servers/{server_id}", headers=viewer_headers).status_code, 404)
 
     def test_every_browser_api_route_is_public_by_design_or_has_authentication(self):
         public_routes = {

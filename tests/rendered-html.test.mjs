@@ -141,8 +141,25 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
   assert.match(source, /đổi role riêng từng user LDAP/);
   assert.match(source, /Roles & quyền hạn/);
   assert.match(source, /permission-groups/);
+  assert.match(source, /Groups của trạm vận hành/);
+  assert.match(source, /allowed_group_dns/);
+  assert.match(source, /Quét groups/);
+  assert.match(source, /platform-groups/);
   assert.match(source, /method: "PATCH"/);
   assert.match(source, /method: "DELETE"/);
+});
+
+test("process resources and server visibility controls are operable", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
+  assert.match(resources, /cpuPercent/);
+  assert.match(resources, /memoryBytes/);
+  assert.match(resources, /Realtime 5s/);
+  assert.match(resources, /Đã khóa \/ disable/);
+  assert.match(resources, /Unlock tài khoản/);
+  assert.match(source, /Share \$\{server\.name\}/);
+  assert.match(source, /Xóa máy chủ/);
+  assert.match(source, /servers\.manage/);
 });
 
 test("viewer navigation is permission-aware and stale admin hashes are replaced", async () => {

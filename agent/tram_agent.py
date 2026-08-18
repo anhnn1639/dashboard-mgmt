@@ -68,7 +68,7 @@ WINDOWS_RESERVED_FILENAMES = {
 }
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
-WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
+WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 240
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
@@ -1614,7 +1614,7 @@ def linux_account_rows() -> dict[str, Any]:
 
 
 def windows_account_rows() -> tuple[int, str]:
-    script = "$groups=@(Get-LocalGroup|Sort-Object Name|ForEach-Object{$g=$_;$members=@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue|ForEach-Object{$_.Name.Split('\\')[-1]});[pscustomobject]@{name=$g.Name;members=$members;protected=($g.SID.Value -like 'S-1-5-32-*')}});$membership=@{};foreach($g in $groups){foreach($m in $g.members){if(-not $membership.ContainsKey($m)){$membership[$m]=@()};$membership[$m]+=,$g.name}};$admin=(Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue).Name;$default=(Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction SilentlyContinue).Name;$users=@(Get-LocalUser|Sort-Object Name|ForEach-Object{$rid=[int]$_.SID.Value.Split('-')[-1];[pscustomobject]@{name=$_.Name;enabled=$_.Enabled;locked=$false;lastLogon=$_.LastLogon;passwordExpires=$_.PasswordExpires;passwordLastSet=$_.PasswordLastSet;accountExpires=$_.AccountExpires;groups=@($membership[$_.Name]);isAdmin=(@($membership[$_.Name]) -contains $admin);protected=($rid -in @(500,501,503,504))}});[pscustomobject]@{users=$users;groups=$groups;adminGroups=@($admin);defaultGroups=@($default)}|ConvertTo-Json -Depth 6 -Compress"
+    script = "$groups=@(Get-LocalGroup|Sort-Object Name|ForEach-Object{$g=$_;$members=@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue|ForEach-Object{$_.Name.Split('\\')[-1]});[pscustomobject]@{name=$g.Name;members=$members;protected=($g.SID.Value -like 'S-1-5-32-*')}});$membership=@{};foreach($g in $groups){foreach($m in $g.members){if(-not $membership.ContainsKey($m)){$membership[$m]=@()};$membership[$m]+=,$g.name}};$lockouts=@{};Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction SilentlyContinue|ForEach-Object{$lockouts[$_.SID]=[bool]$_.Lockout};$admin=(Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue).Name;$default=(Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction SilentlyContinue).Name;$users=@(Get-LocalUser|Sort-Object Name|ForEach-Object{$rid=[int]$_.SID.Value.Split('-')[-1];[pscustomobject]@{name=$_.Name;enabled=$_.Enabled;locked=[bool]$lockouts[$_.SID.Value];lastLogon=$_.LastLogon;passwordExpires=$_.PasswordExpires;passwordLastSet=$_.PasswordLastSet;accountExpires=$_.AccountExpires;groups=@($membership[$_.Name]);isAdmin=(@($membership[$_.Name]) -contains $admin);protected=($rid -in @(500,501,503,504))}});[pscustomobject]@{users=$users;groups=$groups;adminGroups=@($admin);defaultGroups=@($default)}|ConvertTo-Json -Depth 6 -Compress"
     return powershell(script, output_limit=5_000_000)
 
 
@@ -1705,6 +1705,7 @@ def update_local_user(parameters: dict[str, Any], windows: bool) -> tuple[int, s
     groups = require_groups(parameters)
     password = validate_password(str(parameters.get("password", "")), optional=True)
     enabled = bool(parameters.get("enabled", True))
+    unlock = bool(parameters.get("unlock", False))
     is_admin = bool(parameters.get("is_admin", False))
     account_expires = str(parameters.get("account_expires", "")).strip()
     if account_expires and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", account_expires):
@@ -1720,6 +1721,8 @@ def update_local_user(parameters: dict[str, Any], windows: bool) -> tuple[int, s
         if password:
             statements.append(f"$p=ConvertTo-SecureString {ps_quote(password)} -AsPlainText -Force;Set-LocalUser -Name {ps_quote(username)} -Password $p -ErrorAction Stop")
         statements.append(("Enable-LocalUser" if enabled else "Disable-LocalUser") + f" -Name {ps_quote(username)} -ErrorAction Stop")
+        if unlock:
+            statements.append(f"$u=[ADSI]('WinNT://'+$env:COMPUTERNAME+{ps_quote('/' + username + ',user')});$u.IsAccountLocked=$false;$u.SetInfo()")
         if account_expires:
             statements.append(f"Set-LocalUser -Name {ps_quote(username)} -AccountExpires ([datetime]{ps_quote(account_expires)}) -ErrorAction Stop")
         elif "account_expires" in parameters:
@@ -1737,6 +1740,8 @@ def update_local_user(parameters: dict[str, Any], windows: bool) -> tuple[int, s
         return 127, "usermod/gpasswd is not installed"
     commands = [[gpasswd, "-a", username, group] for group in sorted(desired - current)]
     commands += [[gpasswd, "-d", username, group] for group in sorted((current - desired) - {primary})]
+    if unlock and not enabled:
+        raise ValueError("Unlock requires the account to be enabled")
     commands.append([usermod, "--unlock" if enabled else "--lock", username])
     if account_expires:
         commands.append([usermod, "--expiredate", account_expires, username])
@@ -1806,6 +1811,55 @@ def normalize_mountpoints(value: Any) -> list[str]:
     return [str(value)] if value else []
 
 
+def legacy_lsblk_devices(lsblk: str) -> tuple[int, list[dict[str, Any]] | str]:
+    """Read util-linux 2.23 era lsblk output used by RHEL/Oracle Linux 7."""
+    column_sets = (
+        "NAME,KNAME,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM,PTTYPE",
+        "NAME,KNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM",
+    )
+    output = ""
+    code = 1
+    selected_columns: list[str] = []
+    for columns in column_sets:
+        code, output = run([lsblk, "--pairs", "--bytes", "--output", columns], output_limit=10_000_000)
+        if code == 0:
+            selected_columns = columns.lower().split(",")
+            break
+    if code != 0:
+        return code, output
+    flat: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        try:
+            fields = dict(token.split("=", 1) for token in shlex.split(line) if "=" in token)
+        except ValueError:
+            continue
+        lowered = {key.lower(): value for key, value in fields.items()}
+        if not lowered.get("name"):
+            continue
+        lowered["path"] = "/dev/" + str(lowered.get("kname") or lowered["name"])
+        lowered["mountpoints"] = [lowered.get("mountpoint")] if lowered.get("mountpoint") else []
+        lowered["children"] = []
+        flat.append(lowered)
+    if not flat:
+        return 2, "lsblk returned no block devices"
+    by_name = {str(item.get("kname") or item.get("name")): item for item in flat}
+    disks = [item for item in flat if item.get("type") == "disk"]
+    for item in flat:
+        if item in disks:
+            continue
+        parent_name = str(item.get("pkname") or "")
+        if not parent_name and "pkname" not in selected_columns:
+            name = str(item.get("kname") or item.get("name") or "")
+            candidates = [candidate for candidate in by_name if candidate != name and name.startswith(candidate)]
+            parent_name = max(candidates, key=len, default="")
+        parent = by_name.get(parent_name)
+        if parent is not None:
+            parent.setdefault("children", []).append(item)
+        else:
+            disks.append(item)
+    return 0, disks
+
+
 def linux_storage_scan() -> tuple[int, str]:
     lsblk = find_system_command("lsblk")
     if not lsblk:
@@ -1815,12 +1869,16 @@ def linux_storage_scan() -> tuple[int, str]:
     if code != 0:
         fallback = "NAME,KNAME,PATH,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS,MODEL,RO,RM,PTTYPE"
         code, output = run([lsblk, "--json", "--bytes", "--tree", "--output", fallback], output_limit=10_000_000)
-    if code != 0:
-        return code, output
-    try:
-        devices = json.loads(output).get("blockdevices", [])
-    except (AttributeError, ValueError):
-        return 2, "lsblk returned invalid JSON"
+    if code == 0:
+        try:
+            devices = json.loads(output).get("blockdevices", [])
+        except (AttributeError, ValueError):
+            return 2, "lsblk returned invalid JSON"
+    else:
+        legacy_code, legacy_result = legacy_lsblk_devices(lsblk)
+        if legacy_code != 0:
+            return legacy_code, str(legacy_result)
+        devices = legacy_result
     pvs = lvm_report("pvs", "pv_name,vg_name,pv_size,pv_free")
     vgs = lvm_report("vgs", "vg_name,vg_size,vg_free,pv_count,lv_count")
     lvs = lvm_report("lvs", "lv_path,lv_name,vg_name,lv_size,data_percent,devices")
@@ -2312,7 +2370,7 @@ def delete_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     return code, output
 
 
-def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
+def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
     if inventory["os_family"] == "windows":
         script = (
             "$ProgressPreference='SilentlyContinue';$rows=@();$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
@@ -2366,6 +2424,87 @@ def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
             name, architecture = package_arch, ""
         rows.append({"id": package_arch, "name": name, "version": version, "currentVersion": "", "architecture": architecture, "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{package_arch} → {version} từ {repository}"})
     return 0, json.dumps({"platform": "linux", "manager": Path(tool).name, "updates": rows}, ensure_ascii=False, separators=(",", ":"))
+
+
+def windows_update_query(*, online: bool, timeout: int) -> tuple[int, str]:
+    online_literal = "$true" if online else "$false"
+    mode = "online" if online else "cached"
+    script = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$rows=@();"
+        "$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};"
+        "try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
+        "$source=if($auPolicy.UseWUServer -eq 1 -and $policy.WUServer){'WSUS'}else{'Microsoft Update'};"
+        "foreach($serviceName in @('wuauserv','bits')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){Start-Service -Name $serviceName -ErrorAction Stop}}catch{}};"
+        "function AddRows([object]$result,[string]$repository,[string]$serviceId=''){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$id=[string]$u.Identity.UpdateID;if($script:rows|Where-Object{$_.id -eq $id}){continue};$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=$id;revision=[int]$u.Identity.RevisionNumber;manager='wua';serviceId=$serviceId;name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
+        "$session=New-Object -ComObject Microsoft.Update.Session;$session.ClientApplicationID='TramVanHanhAgent-" + mode + "';$searcher=$session.CreateUpdateSearcher();$searcher.Online=" + online_literal + ";$result=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $result $source;"
+        + ("" if online else "try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;foreach($service in @($manager.Services)){try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSearcher=$serviceSession.CreateUpdateSearcher();$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$service.ServiceID;$serviceSearcher.Online=$false;$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $serviceResult ([string]$service.Name) ([string]$service.ServiceID)}catch{}}}catch{};")
+        + "[pscustomobject]@{platform='windows';manager='wua';count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=" + online_literal + ";wuaStatus='" + mode + "';wuaMode='" + mode + "';wuaCount=[int]$rows.Count;updateSource=$source}}|ConvertTo-Json -Depth 8 -Compress"
+    )
+    return powershell(script, timeout=timeout, output_limit=10_000_000)
+
+
+def windows_configmgr_updates() -> list[dict[str, Any]]:
+    script = "$ErrorActionPreference='Stop';$rows=@();try{$updates=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});foreach($u in $updates){$article=[string]$u.ArticleID;$id=[string]$u.UpdateID;$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';serviceId='';name=[string]$u.Name;version=if($article){'KB'+$article}else{$id};architecture='';repository='Microsoft Configuration Manager';severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}};$rows|ConvertTo-Json -Depth 6 -Compress}catch{'[]'}"
+    code, output = powershell(script, timeout=45, output_limit=5_000_000)
+    if code != 0:
+        return []
+    try:
+        return json_rows(output)
+    except (TypeError, ValueError):
+        return []
+
+
+def scan_windows_updates() -> tuple[int, str]:
+    configmgr_rows = windows_configmgr_updates()
+    cache_code, cache_output = windows_update_query(online=False, timeout=60)
+    cache: dict[str, Any] = {}
+    if cache_code == 0:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = json.loads(cache_output)
+            if isinstance(parsed, dict):
+                cache = parsed
+    wua_rows = [item for item in cache.get("updates", []) if isinstance(item, dict)]
+    online_code = 0
+    online_output = ""
+    if not wua_rows:
+        # DetectNow uses the update source selected by Windows policy. The
+        # bounded online query then reads the same WUA catalogue as Settings.
+        powershell("$ErrorActionPreference='SilentlyContinue';$au=New-Object -ComObject Microsoft.Update.AutoUpdate;$au.DetectNow()", timeout=30)
+        online_code, online_output = windows_update_query(online=True, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
+        if online_code == 0:
+            with contextlib.suppress(TypeError, ValueError):
+                parsed = json.loads(online_output)
+                if isinstance(parsed, dict):
+                    cache = parsed
+                    wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
+        else:
+            # An online WUA search can continue in wuauserv after the client
+            # timeout. Re-read the local catalogue so completed detections are
+            # still returned instead of failing the entire dashboard job.
+            retry_code, retry_output = windows_update_query(online=False, timeout=60)
+            if retry_code == 0:
+                with contextlib.suppress(TypeError, ValueError):
+                    parsed = json.loads(retry_output)
+                    if isinstance(parsed, dict):
+                        cache = parsed
+                        wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
+    merged: dict[str, dict[str, Any]] = {str(item.get("id")): item for item in [*wua_rows, *configmgr_rows] if item.get("id")}
+    diagnostics = cache.get("diagnostics") if isinstance(cache.get("diagnostics"), dict) else {}
+    diagnostics.update({
+        "currentScanComplete": online_code == 0 if not wua_rows else bool(diagnostics.get("currentScanComplete", True)),
+        "wuaCount": len(wua_rows),
+        "wuaError": "" if online_code == 0 else (online_output or f"WUA scan exited with code {online_code}")[:1000],
+        "configMgrCount": len(configmgr_rows),
+        "configMgrStatus": "ok" if configmgr_rows else "not_installed_or_empty",
+    })
+    manager = "mixed" if wua_rows and configmgr_rows else "configmgr" if configmgr_rows else "wua"
+    return 0, json.dumps({"platform": "windows", "manager": manager, "count": len(merged), "updates": list(merged.values()), "diagnostics": diagnostics}, ensure_ascii=False, separators=(",", ":"))
+
+
+def scan_updates(inventory: dict[str, Any]) -> tuple[int, str]:
+    if inventory["os_family"] == "windows":
+        return scan_windows_updates()
+    return _scan_updates_monolithic(inventory)
 
 
 def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
@@ -2633,8 +2772,33 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
     if action == "logs.read":
         return read_logs(parameters, windows)
     if action == "process.list":
-        rows = [{"pid": p.info["pid"], "name": p.info["name"], "created": p.info.get("create_time"), "username": p.info.get("username")} for p in psutil.process_iter(["pid", "name", "create_time", "username"]) if p.info.get("name")]
-        rows.sort(key=lambda item: (str(item["name"]).casefold(), int(item["pid"])))
+        processes: list[psutil.Process] = []
+        for process in psutil.process_iter(["pid", "name", "create_time", "username"]):
+            try:
+                if process.info.get("name"):
+                    process.cpu_percent(interval=None)
+                    processes.append(process)
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        # A short sample gives meaningful per-process CPU without making the
+        # dashboard wait for the next scheduled Agent collection.
+        time.sleep(0.35)
+        rows = []
+        for process in processes:
+            try:
+                memory = process.memory_info()
+                rows.append({
+                    "pid": process.pid,
+                    "name": process.info["name"],
+                    "created": process.info.get("create_time"),
+                    "username": process.info.get("username"),
+                    "cpuPercent": round(process.cpu_percent(interval=None), 2),
+                    "memoryPercent": round(process.memory_percent(), 2),
+                    "memoryBytes": int(memory.rss),
+                })
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        rows.sort(key=lambda item: (-float(item["cpuPercent"]), -int(item["memoryBytes"]), int(item["pid"])))
         return 0, json.dumps(rows[:2000], ensure_ascii=False)
     if action == "process.kill":
         return kill_processes(parameters)

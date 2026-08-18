@@ -36,7 +36,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from ldap3 import ALL, SUBTREE, Connection, Server as LDAPServer, Tls
+from ldap3 import ALL, BASE, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -178,6 +178,46 @@ class PlatformRole(Base):
     system: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+class PlatformGroup(Base):
+    __tablename__ = "platform_groups"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class PlatformGroupMember(Base):
+    __tablename__ = "platform_group_members"
+    group_id: Mapped[str] = mapped_column(ForeignKey("platform_groups.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class ServerUserShare(Base):
+    __tablename__ = "server_user_shares"
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    granted_by: Mapped[str] = mapped_column(String(36))
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class ServerGroupShare(Base):
+    __tablename__ = "server_group_shares"
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), primary_key=True)
+    group_id: Mapped[str] = mapped_column(ForeignKey("platform_groups.id"), primary_key=True)
+    granted_by: Mapped[str] = mapped_column(String(36))
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class ServerRetirement(Base):
+    __tablename__ = "server_retirements"
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), primary_key=True)
+    retired_by: Mapped[str] = mapped_column(String(36), index=True)
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    retired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
 
 
 class MFACredential(Base):
@@ -404,6 +444,26 @@ class PlatformRoleUpdateRequest(BaseModel):
     permissions: list[str] = Field(default_factory=list, max_length=64)
 
 
+class PlatformGroupRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=80, pattern=r"^[A-Za-z0-9À-ỹ_.@ -]+$")
+    description: str = Field(default="", max_length=1000)
+    member_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class PlatformGroupMembersRequest(BaseModel):
+    member_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class ServerSharesRequest(BaseModel):
+    user_ids: list[str] = Field(default_factory=list, max_length=500)
+    group_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class ServerDeleteRequest(BaseModel):
+    confirmation: str = Field(pattern=r"^DELETE$")
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class LDAPConfigRequest(BaseModel):
     enabled: bool = False
     host: str = Field(default="", max_length=255)
@@ -417,6 +477,15 @@ class LDAPConfigRequest(BaseModel):
     display_attribute: str = Field(default="displayName", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     domain_label: str = Field(default="DOMAIN", pattern=r"^[A-Za-z0-9_.-]{1,15}$")
     default_role: str = Field(default="viewer", min_length=1, max_length=30, pattern=r"^[a-z][a-z0-9_-]*$")
+    allowed_group_dns: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("allowed_group_dns")
+    @classmethod
+    def valid_allowed_group_dns(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if len(set(value.casefold() for value in normalized)) != len(normalized) or any(not value or len(value) > 512 or any(ord(character) < 32 for character in value) for value in normalized):
+            raise ValueError("LDAP group DN list is invalid or contains duplicates")
+        return normalized
 
 
 class EnrollmentTokenRequest(BaseModel):
@@ -622,6 +691,7 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
 
 PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     "servers.view": {"group": "Máy chủ", "label": "Xem danh sách máy chủ", "description": "Xem inventory, tình trạng và trang chi tiết máy chủ."},
+    "servers.manage": {"group": "Máy chủ", "label": "Xóa và chia sẻ máy chủ", "description": "Ẩn/ngừng Agent và gán quyền nhìn thấy máy chủ cho user/group."},
     "resources.view": {"group": "Máy chủ", "label": "Xem tài nguyên vận hành", "description": "Quét và xem Services, tài khoản, firewall, disk, process, update và network."},
     "sessions.launch": {"group": "Phiên truy cập", "label": "Mở SSH / Remote Desktop", "description": "Khởi tạo phiên quản trị qua tunnel mTLS của Agent."},
     "recordings.view": {"group": "Phiên truy cập", "label": "Xem recording", "description": "Xem danh sách và phát lại recording SSH/RDP."},
@@ -685,7 +755,7 @@ ACTION_PERMISSIONS: dict[str, str] = {
 ALL_PLATFORM_PERMISSIONS = set(PERMISSION_CATALOG)
 BUILTIN_ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
     "admin": {"display_name": "Administrator", "description": "Toàn quyền quản trị website và máy chủ.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS)},
-    "operator": {"display_name": "Operator", "description": "Vận hành máy chủ, phiên truy cập và file; không quản trị danh tính website.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"audit.view", "users.manage", "ldap.manage", "roles.manage", "agents.manage", "recordings.delete"})},
+    "operator": {"display_name": "Operator", "description": "Vận hành các máy chủ được chia sẻ, phiên truy cập và file; không quản trị danh tính website.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"audit.view", "users.manage", "ldap.manage", "roles.manage", "agents.manage", "recordings.delete", "servers.manage"})},
     "viewer": {"display_name": "Viewer", "description": "Chỉ xem fleet và dữ liệu tài nguyên; không thực hiện thay đổi.", "permissions": ["logs.view", "resources.view", "servers.view"]},
     "auditor": {"display_name": "Auditor", "description": "Xem fleet, log, audit, file và recording; không thay đổi máy chủ.", "permissions": ["audit.view", "files.view", "logs.view", "recordings.view", "servers.view"]},
 }
@@ -1368,7 +1438,17 @@ def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
     try:
         with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=10) as service:
             attribute = config.get("user_attribute", "sAMAccountName")
-            service.search(config["base_dn"], f"({attribute}={escape_filter_chars(username)})", search_scope=SUBTREE, attributes=[config.get("display_attribute", "displayName")], size_limit=2)
+            allowed_group_dns = [str(value).strip() for value in config.get("allowed_group_dns", []) if str(value).strip()]
+            membership_filter = ""
+            if allowed_group_dns:
+                # AD's matching-rule-in-chain includes direct and nested group
+                # membership, so adding a user to an approved operations group
+                # is sufficient without opening login to the whole directory.
+                clauses = "".join(f"(memberOf:1.2.840.113556.1.4.1941:={escape_filter_chars(group_dn)})" for group_dn in allowed_group_dns)
+                membership_filter = f"(|{clauses})"
+            user_filter = f"({attribute}={escape_filter_chars(username)})"
+            search_filter = f"(&{user_filter}{membership_filter})" if membership_filter else user_filter
+            service.search(config["base_dn"], search_filter, search_scope=SUBTREE, attributes=[config.get("display_attribute", "displayName")], size_limit=2)
             if len(service.entries) != 1:
                 return None
             entry = service.entries[0]
@@ -1477,6 +1557,8 @@ def verify_agent_identity(headers: Mapping[str, str], method: str, path: str, db
     server = db.get(Server, agent_id)
     if not server or not server.cert_fingerprint or not hmac.compare_digest(server.cert_fingerprint, fingerprint):
         raise HTTPException(status_code=401, detail="Unknown agent certificate")
+    if db.get(ServerRetirement, agent_id) is not None or server.status == "retired":
+        raise HTTPException(status_code=403, detail="Agent was removed by an Administrator")
     common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     if len(common_names) != 1 or common_names[0].value != agent_id:
         raise HTTPException(status_code=401, detail="Certificate subject mismatch")
@@ -1898,14 +1980,37 @@ def me(user: User = Depends(current_user), db: Session = Depends(db_session)):
     return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "permissions": sorted(platform_role_permissions(db, user.role))}
 
 
-def platform_user_json(user: User) -> dict[str, Any]:
-    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "source": "ldap" if user.password_hash == "!LDAP" else "local", "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat()}
+def platform_user_json(user: User, db: Session | None = None) -> dict[str, Any]:
+    group_ids = [] if db is None else list(db.execute(select(PlatformGroupMember.group_id).where(PlatformGroupMember.user_id == user.id)).scalars().all())
+    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "source": "ldap" if user.password_hash == "!LDAP" else "local", "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat(), "groupIds": group_ids}
+
+
+def platform_group_json(db: Session, group: PlatformGroup) -> dict[str, Any]:
+    member_ids = list(db.execute(select(PlatformGroupMember.user_id).where(PlatformGroupMember.group_id == group.id).order_by(PlatformGroupMember.user_id)).scalars().all())
+    return {"id": group.id, "name": group.name, "description": group.description, "memberIds": member_ids, "memberCount": len(member_ids), "createdAt": aware(group.created_at).isoformat()}
+
+
+def validate_member_ids(db: Session, member_ids: list[str]) -> list[str]:
+    normalized = list(dict.fromkeys(member_ids))
+    if len(normalized) != len(member_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id) for user_id in normalized):
+        raise HTTPException(status_code=422, detail="Danh sách thành viên không hợp lệ hoặc bị trùng")
+    existing = set(db.execute(select(User.id).where(User.id.in_(normalized))).scalars().all()) if normalized else set()
+    if existing != set(normalized):
+        raise HTTPException(status_code=404, detail="Có thành viên không còn tồn tại")
+    return normalized
+
+
+def replace_platform_group_members(db: Session, group_id: str, member_ids: list[str]) -> None:
+    normalized = validate_member_ids(db, member_ids)
+    db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.group_id == group_id))
+    for user_id in normalized:
+        db.add(PlatformGroupMember(group_id=group_id, user_id=user_id))
 
 
 @app.get("/api/v1/users")
 def list_users(_: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
     users = db.execute(select(User).order_by(User.username)).scalars().all()
-    return {"items": [platform_user_json(item) for item in users]}
+    return {"items": [platform_user_json(item, db) for item in users]}
 
 
 @app.post("/api/v1/users", status_code=201)
@@ -1918,7 +2023,7 @@ def create_platform_user(payload: PlatformUserCreateRequest, request: Request, a
     db.flush()
     audit(db, actor.username, "identity.local.create", user.id, request, detail={"username": user.username, "role": user.role})
     db.commit()
-    return {**platform_user_json(user), "mfaEnrollmentRequired": True}
+    return {**platform_user_json(user, db), "mfaEnrollmentRequired": True}
 
 
 @app.patch("/api/v1/users/{user_id}")
@@ -1952,7 +2057,7 @@ def update_platform_user(user_id: str, payload: PlatformUserUpdateRequest, reque
         raise HTTPException(status_code=422, detail="Không có thay đổi hợp lệ")
     audit(db, actor.username, "identity.user.update", user.id, request, detail={"username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local", "changes": changes})
     db.commit()
-    return platform_user_json(user)
+    return platform_user_json(user, db)
 
 
 @app.delete("/api/v1/users")
@@ -1974,10 +2079,81 @@ def delete_platform_users(payload: PlatformUsersDeleteRequest, request: Request,
     if referenced:
         raise HTTPException(status_code=409, detail="Có tài khoản đã phát sinh yêu cầu recording; hãy khóa tài khoản thay vì xóa để giữ toàn vẹn audit")
     db.execute(delete(MFACredential).where(MFACredential.user_id.in_(user_ids)))
+    db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.user_id.in_(user_ids)))
+    db.execute(delete(ServerUserShare).where(ServerUserShare.user_id.in_(user_ids)))
     db.execute(delete(User).where(User.id.in_(user_ids)))
     audit(db, actor.username, "identity.user.delete", "platform-users", request, detail={"users": [{"id": user.id, "username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local"} for user in users]})
     db.commit()
     return {"deleted": len(users)}
+
+
+@app.get("/api/v1/platform-groups")
+def list_platform_groups(_: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    groups = db.execute(select(PlatformGroup).order_by(PlatformGroup.name)).scalars().all()
+    return {"items": [platform_group_json(db, group) for group in groups]}
+
+
+@app.post("/api/v1/platform-groups", status_code=201)
+def create_platform_group(payload: PlatformGroupRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    name = payload.name.strip()
+    if db.execute(select(PlatformGroup).where(func.lower(PlatformGroup.name) == name.lower())).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Tên group đã tồn tại")
+    group = PlatformGroup(name=name, description=payload.description.strip(), created_by=actor.id)
+    db.add(group)
+    db.flush()
+    replace_platform_group_members(db, group.id, payload.member_ids)
+    audit(db, actor.username, "identity.group.create", group.id, request, detail={"name": group.name, "member_count": len(payload.member_ids)})
+    db.commit()
+    return platform_group_json(db, group)
+
+
+@app.put("/api/v1/platform-groups/{group_id}")
+def update_platform_group(group_id: str, payload: PlatformGroupRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    group = db.get(PlatformGroup, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group không tồn tại")
+    name = payload.name.strip()
+    duplicate = db.execute(select(PlatformGroup).where(func.lower(PlatformGroup.name) == name.lower(), PlatformGroup.id != group.id)).scalar_one_or_none()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Tên group đã tồn tại")
+    group.name = name
+    group.description = payload.description.strip()
+    replace_platform_group_members(db, group.id, payload.member_ids)
+    audit(db, actor.username, "identity.group.update", group.id, request, detail={"name": group.name, "member_count": len(payload.member_ids)})
+    db.commit()
+    return platform_group_json(db, group)
+
+
+@app.put("/api/v1/users/{user_id}/groups")
+def update_platform_user_groups(user_id: str, payload: PlatformGroupMembersRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Tài khoản không tồn tại")
+    group_ids = list(dict.fromkeys(payload.member_ids))
+    if len(group_ids) != len(payload.member_ids):
+        raise HTTPException(status_code=422, detail="Danh sách group bị trùng")
+    groups = db.execute(select(PlatformGroup.id).where(PlatformGroup.id.in_(group_ids))).scalars().all() if group_ids else []
+    if set(groups) != set(group_ids):
+        raise HTTPException(status_code=404, detail="Có group không còn tồn tại")
+    db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.user_id == user.id))
+    for group_id in group_ids:
+        db.add(PlatformGroupMember(group_id=group_id, user_id=user.id))
+    audit(db, actor.username, "identity.user.groups", user.id, request, detail={"group_ids": group_ids})
+    db.commit()
+    return platform_user_json(user, db)
+
+
+@app.delete("/api/v1/platform-groups/{group_id}")
+def delete_platform_group(group_id: str, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    group = db.get(PlatformGroup, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group không tồn tại")
+    db.execute(delete(ServerGroupShare).where(ServerGroupShare.group_id == group.id))
+    db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.group_id == group.id))
+    db.delete(group)
+    audit(db, actor.username, "identity.group.delete", group.id, request, detail={"name": group.name})
+    db.commit()
+    return {"deleted": group_id}
 
 
 @app.get("/api/v1/roles")
@@ -2039,6 +2215,30 @@ def get_ldap_config(_: User = Depends(require_permission("ldap.manage")), db: Se
     return config
 
 
+@app.get("/api/v1/settings/ldap/groups")
+def scan_ldap_groups(query: str = "", _: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
+    if len(query) > 80 or any(ord(character) < 32 for character in query):
+        raise HTTPException(status_code=422, detail="Từ khóa tìm group không hợp lệ")
+    config = read_ldap_config(db, include_secret=True)
+    if not config.get("host") or not config.get("base_dn"):
+        raise HTTPException(status_code=409, detail="Hãy cấu hình LDAP Host và Base DN trước khi quét group")
+    try:
+        tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if config.get("use_ssl", True) else None
+        ldap_server = LDAPServer(config["host"], port=int(config.get("port", 636)), use_ssl=bool(config.get("use_ssl", True)), tls=tls, get_info=ALL, connect_timeout=8)
+        with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=15) as service:
+            term = escape_filter_chars(query.strip())
+            group_filter = f"(&(objectClass=group)(|(cn=*{term}*)(name=*{term}*)))" if term else "(objectClass=group)"
+            service.search(config["base_dn"], group_filter, search_scope=SUBTREE, attributes=["cn", "name"], size_limit=200)
+            items = []
+            for entry in service.entries:
+                name_value = getattr(entry, "cn", None) or getattr(entry, "name", None)
+                items.append({"dn": entry.entry_dn, "name": str(name_value.value) if name_value and name_value.value else entry.entry_dn})
+            items.sort(key=lambda item: item["name"].casefold())
+            return {"items": items}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Không thể quét group LDAP. Kiểm tra kết nối và quyền đọc directory của Bind DN.") from exc
+
+
 @app.put("/api/v1/settings/ldap")
 def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
     if payload.enabled and (not payload.host or not payload.base_dn):
@@ -2050,33 +2250,121 @@ def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User 
         try:
             tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=payload.ca_certificate or None) if payload.use_ssl else None
             ldap_server = LDAPServer(payload.host, port=payload.port, use_ssl=payload.use_ssl, tls=tls, get_info=ALL, connect_timeout=8)
-            with Connection(ldap_server, user=payload.bind_dn or None, password=bind_password or None, auto_bind=True, receive_timeout=10):
-                pass
+            with Connection(ldap_server, user=payload.bind_dn or None, password=bind_password or None, auto_bind=True, receive_timeout=10) as service:
+                for group_dn in payload.allowed_group_dns:
+                    if not service.search(group_dn, "(objectClass=group)", search_scope=BASE, attributes=["distinguishedName"], size_limit=1) or len(service.entries) != 1:
+                        raise ValueError(f"LDAP group không tồn tại hoặc Bind DN không đọc được: {group_dn}")
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Không thể bind LDAP. Kiểm tra host, certificate LDAPS, Bind DN và mật khẩu.") from exc
     serialized = payload.model_dump(exclude={"bind_password"})
     if bind_password:
         serialized["bind_password_encrypted"] = job_fernet().encrypt(bind_password.encode()).decode()
     db.merge(SystemSetting(key="ldap_config", value=json.dumps(serialized, separators=(",", ":"))))
-    audit(db, user.username, "settings.ldap.update", payload.host, request, detail={"enabled": payload.enabled, "use_ssl": payload.use_ssl})
+    audit(db, user.username, "settings.ldap.update", payload.host, request, detail={"enabled": payload.enabled, "use_ssl": payload.use_ssl, "allowed_group_count": len(payload.allowed_group_dns)})
     db.commit()
     return {**serialized, "password_configured": bool(bind_password)}
 
 
+def retired_server_ids(db: Session) -> set[str]:
+    return set(db.execute(select(ServerRetirement.server_id)).scalars().all())
+
+
+def visible_server_ids(db: Session, user: User) -> set[str]:
+    active_ids = set(db.execute(select(Server.id)).scalars().all()) - retired_server_ids(db)
+    if user.role == "admin":
+        return active_ids
+    direct = set(db.execute(select(ServerUserShare.server_id).where(ServerUserShare.user_id == user.id)).scalars().all())
+    group_ids = set(db.execute(select(PlatformGroupMember.group_id).where(PlatformGroupMember.user_id == user.id)).scalars().all())
+    grouped = set(db.execute(select(ServerGroupShare.server_id).where(ServerGroupShare.group_id.in_(group_ids))).scalars().all()) if group_ids else set()
+    return active_ids & (direct | grouped)
+
+
+def visible_server(db: Session, user: User, server_id: str) -> Server:
+    server = db.get(Server, server_id)
+    if not server or server_id not in visible_server_ids(db, user):
+        raise HTTPException(status_code=404, detail="Server not found")
+    return server
+
+
+def require_server_admin(user: User) -> None:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được xóa hoặc chia sẻ máy chủ")
+
+
+def server_shares_json(db: Session, server_id: str) -> dict[str, Any]:
+    user_ids = list(db.execute(select(ServerUserShare.user_id).where(ServerUserShare.server_id == server_id).order_by(ServerUserShare.user_id)).scalars().all())
+    group_ids = list(db.execute(select(ServerGroupShare.group_id).where(ServerGroupShare.server_id == server_id).order_by(ServerGroupShare.group_id)).scalars().all())
+    return {"userIds": user_ids, "groupIds": group_ids, "count": len(user_ids) + len(group_ids)}
+
+
 @app.get("/api/v1/servers")
-def list_servers(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+def list_servers(os_family: Literal["windows", "linux"] | None = None, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     query = select(Server).order_by(Server.os_family, Server.name)
     if os_family:
         query = query.where(Server.os_family == os_family)
-    return {"items": [server_json(item) for item in db.execute(query).scalars().all()]}
+    allowed = visible_server_ids(db, user)
+    query = query.where(Server.id.in_(allowed))
+    items = []
+    for item in db.execute(query).scalars().all():
+        serialized = server_json(item)
+        if user.role == "admin":
+            serialized["shares"] = server_shares_json(db, item.id)
+        items.append(serialized)
+    return {"items": items}
 
 
 @app.get("/api/v1/servers/{server_id}")
-def get_server(server_id: str, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    server = db.get(Server, server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+def get_server(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+    server = visible_server(db, user, server_id)
     return {**server_json(server), "inventory": server.inventory}
+
+
+@app.get("/api/v1/servers/{server_id}/shares")
+def get_server_shares(server_id: str, user: User = Depends(require_permission("servers.manage")), db: Session = Depends(db_session)):
+    require_server_admin(user)
+    server = visible_server(db, user, server_id)
+    return {"serverId": server.id, **server_shares_json(db, server.id)}
+
+
+@app.put("/api/v1/servers/{server_id}/shares")
+def update_server_shares(server_id: str, payload: ServerSharesRequest, request: Request, user: User = Depends(require_permission("servers.manage")), db: Session = Depends(db_session)):
+    require_server_admin(user)
+    server = visible_server(db, user, server_id)
+    user_ids = list(dict.fromkeys(payload.user_ids))
+    group_ids = list(dict.fromkeys(payload.group_ids))
+    if len(user_ids) != len(payload.user_ids) or len(group_ids) != len(payload.group_ids):
+        raise HTTPException(status_code=422, detail="Danh sách share bị trùng")
+    if set(db.execute(select(User.id).where(User.id.in_(user_ids))).scalars().all()) != set(user_ids):
+        raise HTTPException(status_code=404, detail="Có user share không còn tồn tại")
+    if set(db.execute(select(PlatformGroup.id).where(PlatformGroup.id.in_(group_ids))).scalars().all()) != set(group_ids):
+        raise HTTPException(status_code=404, detail="Có group share không còn tồn tại")
+    db.execute(delete(ServerUserShare).where(ServerUserShare.server_id == server.id))
+    db.execute(delete(ServerGroupShare).where(ServerGroupShare.server_id == server.id))
+    for user_id in user_ids:
+        db.add(ServerUserShare(server_id=server.id, user_id=user_id, granted_by=user.id))
+    for group_id in group_ids:
+        db.add(ServerGroupShare(server_id=server.id, group_id=group_id, granted_by=user.id))
+    audit(db, user.username, "server.share.update", server.id, request, detail={"user_ids": user_ids, "group_ids": group_ids})
+    db.commit()
+    return {"serverId": server.id, **server_shares_json(db, server.id)}
+
+
+@app.delete("/api/v1/servers/{server_id}")
+def delete_server(server_id: str, payload: ServerDeleteRequest, request: Request, user: User = Depends(require_permission("servers.manage")), db: Session = Depends(db_session)):
+    require_server_admin(user)
+    server = visible_server(db, user, server_id)
+    active_session = db.execute(select(RemoteSession).where(RemoteSession.server_id == server.id, RemoteSession.status.in_(["waiting", "launched", "active"])).limit(1)).scalar_one_or_none()
+    active_job = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "dispatched").limit(1)).scalar_one_or_none()
+    if active_session or active_job:
+        raise HTTPException(status_code=409, detail="Máy chủ đang có phiên hoặc tác vụ hoạt động; hãy kết thúc trước khi xóa")
+    db.execute(update(Job).where(Job.server_id == server.id, Job.status == "queued").values(status="failed", finished_at=now(), exit_code=410, output="Server retired by Administrator"))
+    db.execute(delete(ServerUserShare).where(ServerUserShare.server_id == server.id))
+    db.execute(delete(ServerGroupShare).where(ServerGroupShare.server_id == server.id))
+    db.add(ServerRetirement(server_id=server.id, retired_by=user.id, reason=payload.reason.strip()))
+    server.status = "retired"
+    audit(db, user.username, "server.delete", server.id, request, detail={"name": server.name, "reason": payload.reason.strip(), "retained_for_audit": True})
+    db.commit()
+    return {"deleted": server.id, "retainedForAudit": True}
 
 
 def log_sources_setting_key(server_id: str) -> str:
@@ -2148,18 +2436,14 @@ def validate_log_sources(server: Server, sources: list[str]) -> list[str]:
 
 
 @app.get("/api/v1/servers/{server_id}/log-sources")
-def get_server_log_sources(server_id: str, _: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
-    server = db.get(Server, server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+def get_server_log_sources(server_id: str, user: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
+    server = visible_server(db, user, server_id)
     return {"sources": configured_log_sources(db, server)}
 
 
 @app.put("/api/v1/servers/{server_id}/log-sources")
 def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
-    server = db.get(Server, server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = visible_server(db, user, server_id)
     sources = validate_log_sources(server, payload.sources)
     db.merge(SystemSetting(key=log_sources_setting_key(server.id), value=json.dumps(sources, ensure_ascii=False, separators=(",", ":"))))
     audit(db, user.username, "logs.sources.update", server.id, request, detail={"sources": sources})
@@ -2192,8 +2476,7 @@ def can_view_job_output(user: User, action: str, db: Session) -> bool:
 
 @app.get("/api/v1/servers/{server_id}/jobs")
 def list_server_jobs(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    if not db.get(Server, server_id):
-        raise HTTPException(status_code=404, detail="Server not found")
+    visible_server(db, user, server_id)
     jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
     return {
         "items": [
@@ -2221,9 +2504,8 @@ def file_transfer_json(transfer: FileTransfer) -> dict[str, Any]:
 
 
 @app.get("/api/v1/servers/{server_id}/files")
-def list_server_files(server_id: str, _: User = Depends(require_permission("files.view")), db: Session = Depends(db_session)):
-    if not db.get(Server, server_id):
-        raise HTTPException(status_code=404, detail="Server not found")
+def list_server_files(server_id: str, user: User = Depends(require_permission("files.view")), db: Session = Depends(db_session)):
+    visible_server(db, user, server_id)
     if expire_file_payloads(db):
         db.commit()
     transfers = db.execute(select(FileTransfer).where(FileTransfer.server_id == server_id).order_by(FileTransfer.created_at.desc()).limit(100)).scalars().all()
@@ -2239,9 +2521,7 @@ async def upload_server_file(
     user: User = Depends(require_permission("files.manage")),
     db: Session = Depends(db_session),
 ):
-    server = db.get(Server, server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = visible_server(db, user, server_id)
     try:
         filename = normalize_upload_name(file.filename)
     except ValueError as exc:
@@ -2772,9 +3052,7 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
     required_permission = ACTION_PERMISSIONS.get(payload.action)
     if not required_permission or required_permission not in platform_role_permissions(db, user.role):
         raise HTTPException(status_code=403, detail="Role cannot execute this action")
-    server = db.get(Server, payload.server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = visible_server(db, user, payload.server_id)
     parameters = dict(payload.parameters)
     if payload.action == "logs.read":
         parameters = {"limit": 500, "sources": configured_log_sources(db, server)}
@@ -2787,7 +3065,7 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
     return {"id": job.id, "status": job.status, "risk": job.risk}
 
 
-def bulk_task_json(task: BulkTask, db: Session) -> dict[str, Any]:
+def bulk_task_json(task: BulkTask, db: Session, allowed_server_ids: set[str] | None = None) -> dict[str, Any]:
     rows = db.execute(
         select(BulkTaskItem, Job, Server)
         .join(Job, Job.id == BulkTaskItem.job_id)
@@ -2798,6 +3076,8 @@ def bulk_task_json(task: BulkTask, db: Session) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     items: list[dict[str, Any]] = []
     for _, job, server in rows:
+        if allowed_server_ids is not None and server.id not in allowed_server_ids:
+            continue
         statuses[job.status] = statuses.get(job.status, 0) + 1
         items.append({
             "serverId": server.id,
@@ -2811,7 +3091,7 @@ def bulk_task_json(task: BulkTask, db: Session) -> dict[str, Any]:
         "id": task.id,
         "action": task.action,
         "osFamily": task.os_family,
-        "targetCount": task.target_count,
+        "targetCount": len(items) if allowed_server_ids is not None else task.target_count,
         "summary": task.summary or {},
         "reason": task.reason,
         "createdAt": aware(task.created_at).isoformat(),
@@ -2829,6 +3109,9 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
     server_ids = list(dict.fromkeys(payload.server_ids))
     if len(server_ids) != len(payload.server_ids):
         raise HTTPException(status_code=422, detail="Duplicate target servers are not allowed")
+    allowed_server_ids = visible_server_ids(db, user)
+    if not set(server_ids).issubset(allowed_server_ids):
+        raise HTTPException(status_code=404, detail="One or more target servers were not found")
     servers = db.execute(select(Server).where(Server.id.in_(server_ids))).scalars().all()
     servers_by_id = {server.id: server for server in servers}
     if len(servers_by_id) != len(server_ids):
@@ -2890,12 +3173,14 @@ def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: Use
     query = select(BulkTask).order_by(BulkTask.created_at.desc()).limit(100)
     if os_family:
         query = query.where(BulkTask.os_family == os_family)
-    return {"items": [bulk_task_json(task, db) for task in db.execute(query).scalars().all()]}
+    allowed = visible_server_ids(db, _)
+    items = [bulk_task_json(task, db, allowed) for task in db.execute(query).scalars().all()]
+    return {"items": [item for item in items if item["items"]]}
 
 
 @app.get("/api/v1/jobs")
 def list_jobs(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    jobs = db.execute(select(Job).order_by(Job.created_at.desc()).limit(200)).scalars().all()
+    jobs = db.execute(select(Job).where(Job.server_id.in_(visible_server_ids(db, user))).order_by(Job.created_at.desc()).limit(200)).scalars().all()
     return {"items": [job_json(job, include_output=can_view_job_output(user, job.action, db)) for job in jobs]}
 
 
@@ -2927,8 +3212,8 @@ def list_audit(before: datetime | None = None, _: User = Depends(require_permiss
 
 
 @app.get("/api/v1/sessions")
-def list_sessions(_: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
-    rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
+def list_sessions(user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
+    rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).where(RemoteSession.server_id.in_(visible_server_ids(db, user))).order_by(RemoteSession.started_at.desc()).limit(200)).all()
     items = []
     for item, server_name in rows:
         paths, recording_status = recording_probe(item.id)
@@ -3104,7 +3389,7 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
 @app.get("/api/v1/sessions/{session_id}/recording")
 def read_recording(session_id: str, request: Request, user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
     session = db.get(RemoteSession, session_id)
-    if not session:
+    if not session or session.server_id not in visible_server_ids(db, user):
         raise HTTPException(status_code=404, detail="Session not found")
     path = recording_file(session.id)
     if not path:
@@ -3116,9 +3401,7 @@ def read_recording(session_id: str, request: Request, user: User = Depends(requi
 
 @app.post("/api/v1/sessions/launch")
 async def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
-    server = db.get(Server, payload.server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = visible_server(db, user, payload.server_id)
     if payload.protocol == "rdp" and server.os_family != "windows":
         raise HTTPException(status_code=400, detail="RDP is reserved for Windows servers")
     if payload.protocol == "ssh" and server.os_family != "linux":
