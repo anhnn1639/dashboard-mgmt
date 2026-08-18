@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn và MSI bundle mới nhất: `0.7.6`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn, Linux executable và MSI bundle mới nhất: `0.8.0`. Gói Linux mới là self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd vẫn giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -39,6 +39,9 @@
 - Agent/dashboard 0.7.4 đọc Windows Update cache trước bằng COM session độc lập để lấy đúng danh sách Windows Settings đã lưu ngay cả khi LocalSystem timeout nguồn online; chỉ quét online khi cache rỗng. Agent đánh thức `wuauserv`/BITS nếu service đang dừng nhưng không bị Disabled, ghi lại hành động trong diagnostics, và lúc cài cũng đối chiếu chính catalog cache rồi kiểm tra kết quả download trước khi install.
 - Agent/dashboard 0.7.5 chạy job dài trong worker đơn tách khỏi vòng check-in nên Windows Update không còn chặn heartbeat/làm Agent trông như crash; check-in 10 giây chỉ dispatch một job, job đang chạy được báo về API và job bị gián đoạn do restart được requeue. Windows Update cache được dò thêm trên mọi WUA service đã đăng ký, giữ `ServiceID` để cài đúng nguồn và giới hạn lần quét online 180 giây. Tab Updates chỉ hiển thị patch, không còn hai card diagnostics WUA/ConfigMgr.
 - Agent/dashboard 0.7.6 sửa modal LDAP theo đúng viewport kể cả khi dashboard đang dùng CSS zoom: header/footer cố định, body cuộn theo kích thước thực của overlay, có fallback `vh`/`dvh` và form tự rơi về một cột trên màn hình nhỏ. Danh sách Windows/Linux có checkbox và nút **Tạo task chung** để tạo user hoặc firewall rule cho tối đa 100 máy cùng OS. PostgreSQL lưu `bulk_tasks`/`bulk_task_items`, mỗi máy có job riêng, password chỉ tồn tại ở tham số job đã mã hóa; RBAC/MFA/allowlist/audit vẫn áp dụng.
+- Agent/dashboard 0.8.0 thay installer Linux phụ thuộc pip bằng executable PyInstaller tự chứa runtime/dependency. Binary build bằng runtime đã pin checksum có baseline glibc 2.17 và đã chạy thành công trong container Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Installer từ chối OS/architecture ngoài allowlist, không gọi `apt`, `dnf`, `yum` hoặc `pip`; OpenSSH/ClamAV là capability của hệ điều hành nên chỉ cảnh báo/fail-closed thay vì âm thầm tải từ Internet.
+- API 0.8.0 tắt hoàn toàn Swagger/ReDoc/OpenAPI (`/api/docs`, `/api/openapi.json`, `/api/redoc` đều 404), giảm setup status public xuống bốn trường không nhạy cảm và bắt buộc setup token tối thiểu 32 ký tự cho cài đặt mới. PostgreSQL lưu bộ đếm throttle đăng nhập/MFA theo IP và identity đã HMAC; API bật Trusted Host, no-store/nosniff/frame deny, còn Caddy bật CSP/HSTS/referrer policy và Nginx ẩn version.
+- Route audit tự động xác nhận mọi browser API ngoài allowlist public đều phụ thuộc xác thực; route Agent tiếp tục dùng certificate/chữ ký/replay protection. Role Viewer đọc `/api/v1/me` rồi chỉ render các workspace được cấp quyền; URL hash admin cũ như `#/access` tự chuyển sang trang đầu tiên được phép nên không còn làm trang đen/crash. Dependency Python có advisory đã nâng lên FastAPI 0.141.1, Starlette 1.6.0, PyJWT 2.13.0, cryptography 50.0.0 và python-multipart 0.0.32.
 - Firewall task chung dùng action allowlist `firewall.rule.add.auto`: Agent đọc backend trực tiếp ngay trước khi chạy rồi chọn Windows Firewall profile Any, UFW đang active, default firewalld zone hoặc filter INPUT/OUTPUT thật của nftables/iptables theo IP family. UI Linux giới hạn Inbound để tương thích firewalld zone; `deny` được ánh xạ đúng sang Block/Drop native thay vì sinh verdict nftables/firewalld không hợp lệ. Tạo user tự đọc Administrators theo SID trên Windows, `sudo` trên Ubuntu và `wheel` trên Oracle Linux/Red Hat, không nhận tên group đoán từ trình duyệt.
 - Mỗi server mới enroll tự được xếp hàng một lượt quét inventory, Disk, Services, Users, Groups, Firewall, Processes, Network, log sources/500 dòng log và Updates. Job chạy tuần tự qua worker nhưng Agent vẫn heartbeat/tunnel bình thường; kết quả job gửi lặp là idempotent và không tạo auto-refresh trùng.
 - Recording được dò theo UUID với hậu tố `-`, `.`, `_` hoặc file UUID trực tiếp, không còn khóa cứng vào một mẫu tên. API mount recording read-write nhưng chỉ xóa qua yêu cầu PostgreSQL: admin tạo yêu cầu không được tự duyệt, admin thứ hai claim yêu cầu rồi mới xóa cả graphical recording và typescript; toàn bộ request/approve/failure được audit. `recording-init` dùng directory mode `2770` để shared GID của API có thể thực thi xóa đã duyệt. File vốn chưa từng được guacd tạo ở phiên cũ không thể khôi phục và UI sẽ ghi rõ `Không tìm thấy file` thay vì chờ vô hạn.
@@ -68,16 +71,23 @@
 ## MSI artifact
 
 - File: `agent/windows/TramVanHanhAgent.msi`
-- Kích thước: `14,069,760` bytes.
-- Phiên bản MSI: `0.7.6`.
-- SHA-256: `DCB7D5E1C5678EC5E2BBADAF342872113ED4804C153AE1D9E868BF4D0A277C30`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `f25a2cbc9fe10b6ad586521df04e338c9a906fb4` trên GitHub Actions run `32115991304`; ProductVersion `0.7.6`, kích thước `14,069,760` bytes và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Kích thước: `14,393,344` bytes.
+- Phiên bản MSI: `0.8.0`.
+- SHA-256: `A9D9505EB96A0AB220AE0321597BDCE5AB6B6420421AE739729F15084409E125`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `827c0782a6d4bcabf6b95e30e87b6bf96b24d4cb` trên GitHub Actions run `32124986027`; ProductVersion `0.8.0`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
   - `WINDOWS_SIGNING_PASSWORD`
 - Artifact hiện tại **chưa ký Authenticode** vì chưa có code-signing certificate. Trước production phải ký lại, thay MSI trong repo, kiểm tra `Get-AuthenticodeSignature`, rồi rebuild API. Không đặt PFX/private signing key trên dashboard.
 - Administrative extraction `msiexec /a` trên laptop phát triển bị Windows Installer/sandbox treo; đúng process thử nghiệm đã được dừng và không cài service lên laptop. Phải cài/reboot/uninstall MSI trên Windows Server staging.
+
+## Linux artifact
+
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,573,440` bytes.
+- Phiên bản: `0.8.0`; SHA-256 `90B62F3A8CAC402EBFB986F4CC146185D036EF456F4849A5EDDF03E7F9A9A72E`.
+- GitHub Actions run `32124986056` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 trước build rồi chạy binary trên đủ sáu image OS được hỗ trợ. Artifact sinh từ source commit `827c0782a6d4bcabf6b95e30e87b6bf96b24d4cb`.
+- `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
 
@@ -136,10 +146,10 @@ docker compose -f compose.yaml -f compose.test.yaml ps
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=150 caddy api dashboard clamav guacamole guacd
 ```
 
-Riêng bản workspace/tunnel hiện tại chỉ cần recreate `api` và `dashboard`:
+Riêng bản 0.8.0 phải recreate `api`, `dashboard` và `caddy` để nhận artifact, RBAC UI và security headers mới:
 
 ```bash
-docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard caddy
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api guacamole guacd
 ```
 
@@ -164,11 +174,11 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.7.6 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đã enroll nâng cấp thủ công lên 0.8.0 như sau, không enroll lại và không thay certificate/config hiện có. Không chạy lại `.run` một lần của máy mới; copy executable đã bundle cùng unit systemd rồi restart:
 
 ```bash
 cd /home/system/dashboard-mgmt
-sudo install -m 0750 agent/tram_agent.py /opt/tram-agent/tram_agent.py
+sudo install -m 0755 agent/linux/x86_64/tram-agent /opt/tram-agent/tram-agent
 sudo install -m 0644 agent/VERSION /opt/tram-agent/VERSION
 sudo install -m 0644 agent/tram-agent.service /etc/systemd/system/tram-agent.service
 sudo systemctl daemon-reload
@@ -216,7 +226,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.6`, Linux available và Windows MSI 0.7.6 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.0`, Linux available và Windows MSI 0.8.0 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -227,7 +237,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.6`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận service running, agent `0.8.0`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -250,19 +260,19 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `33/33`, gồm batch task PostgreSQL tạo đúng một job đã mã hóa cho mỗi target, validation firewall common không nhận command/CIDR sai family; cùng recording retention 180 ngày/config API/safe active-session guard, auto-scan khi enroll, active-job heartbeat/requeue/idempotent result, audit retention 30 ngày/hash anchor/API detail-pagination, job trực tiếp và auto-refresh cho Firewall/Services/Users/Groups/Disk/Process/Updates, validation payload/OS scope/storage schema/log source, custom role có enforcement thật, đổi role riêng user LDAP và cấm mật khẩu LDAP, recording diagnostics/delete, output theo RBAC, direct Guacamole route, configured domain, bundle generation, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `48/48`, gồm auto-detect firewall trên Windows/Ubuntu/Oracle Linux/Red Hat và ánh xạ native Block/Drop; parser PowerShell trên Windows, timeout không làm crash Agent, WUA default/multi-service cache + online + Configuration Manager scan/install, ServiceID-bound install, Windows storage physical segment/Shrink live guard, storage free-region parser, selected-only apt/dnf version pin, stale update guard, protected process, source log allowlist, account built-in membership, severity word matching; cùng toàn bộ quoted nft comment, firewall capabilities/order/reorder/rollback/stale guard, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
+- Control plane `37/37`, gồm guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline; cùng toàn bộ batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, direct jobs/refresh, validation OS/payload, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Agent security `49/49`, gồm installer Linux không gọi package manager/pip và dùng executable self-contained; cùng auto-detect firewall, Windows Update worker/cache/scan/install, storage live guard, selected-only update, protected process/log/account validation, nft comment/order/rollback, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
-- Render test workspace `9/9` pass, gồm shell, Windows/Linux fleet, modal LDAP/resource nằm trong viewport với footer cố định/cuộn nội bộ, UI task chung OS-aware, form firewall theo capabilities, tìm kiếm/filter rule, UI recording deletion/180-day retention, Updates chỉ hiển thị patch, nút Extend luôn hiển thị, audit detail/retention và giao diện Local/LDAP/custom role.
+- Render test workspace `11/11` pass, thêm điều hướng permission-aware cho Viewer và nội dung bộ cài Linux offline; các kiểm tra shell/fleet/modal/task/firewall/recording/storage/update/user-role trước đó vẫn pass.
 - Kiểm tra browser local bằng dữ liệu mẫu pass: cây Disk mở đúng cấp; modal hiển thị footer ở desktop và cuộn nội bộ tại `390x700`; Services/Users giữ bố cục; log tô toàn dòng error đỏ và warning vàng. Route dữ liệu mẫu và dev server đã gỡ/dừng trước commit.
 - Render trực quan modal thêm firewall pass trên Windows profile, Ubuntu/UFW, Oracle Linux/firewalld zone và Red Hat/iptables INPUT/OUTPUT. DOM đo ở 1024x600 và 390x700 xác nhận modal nằm trọn viewport, không có tràn ngang, body có thanh cuộn riêng và footer luôn hiển thị.
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions build MSI 0.7.6 run `32115991304` pass từ source commit `f25a2cb`; ProductVersion đọc trực tiếp từ MSI là `0.7.6`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions: security audit run `32124986042` pass pip-audit, Bandit high/high, pnpm production audit và Caddy adapt; Linux build run `32124986056` pass đủ sáu image OS; MSI 0.8.0 run `32124986027` pass và ProductVersion đọc trực tiếp là `0.8.0`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
