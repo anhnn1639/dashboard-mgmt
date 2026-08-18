@@ -2,7 +2,7 @@
 
 import Guacamole from "guacamole-common-js";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AccountsResourceTab, LogsResourceTab, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
+import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -2879,7 +2879,7 @@ function AuditView({ token }: { token: string }) {
   const [auditBusy, setAuditBusy] = useState(false);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [deletionRequests, setDeletionRequests] = useState<RecordingDeletionRequest[]>([]);
-  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string; permissions: string[] } | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [tab, setTab] = useState<"events" | "recordings">("events");
   const [selectedRecording, setSelectedRecording] =
@@ -3030,7 +3030,7 @@ function AuditView({ token }: { token: string }) {
           </div>
         ) : (
           <div className="recording-management">
-            {currentUser?.role === "admin" && (
+            {currentUser?.permissions?.includes("recordings.delete") && (
               <div className="recording-actions">
                 <label><input type="checkbox" checked={selectableSessions.length > 0 && selectableSessions.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableSessions.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableSessions.map((session) => session.id))} /> Chọn tất cả video khả dụng</label>
                 <span>{selectedRecordingIds.length} video đang chọn</span>
@@ -3038,7 +3038,7 @@ function AuditView({ token }: { token: string }) {
               </div>
             )}
             {recordingMessage && <div className="recording-message">{recordingMessage}</div>}
-            {currentUser?.role === "admin" && deletionRequests.some((item) => item.status === "pending") && (
+            {currentUser?.permissions?.includes("recordings.delete") && deletionRequests.some((item) => item.status === "pending") && (
               <div className="recording-approval-list">
                 <h3>Yêu cầu xóa đang chờ quản trị viên thứ hai</h3>
                 {deletionRequests.filter((item) => item.status === "pending").map((item) => (
@@ -3053,7 +3053,7 @@ function AuditView({ token }: { token: string }) {
             {sessions.length ? (
               sessions.map((session) => (
                 <div key={session.id}>
-                  {currentUser?.role === "admin" ? <input type="checkbox" checked={selectedRecordingIds.includes(session.id)} disabled={!session.recordingAvailable || pendingSessionIds.has(session.id)} aria-label={`Chọn recording ${session.serverName}`} onChange={() => toggleRecording(session.id)} /> : <span />}
+                  {currentUser?.permissions?.includes("recordings.delete") ? <input type="checkbox" checked={selectedRecordingIds.includes(session.id)} disabled={!session.recordingAvailable || pendingSessionIds.has(session.id)} aria-label={`Chọn recording ${session.serverName}`} onChange={() => toggleRecording(session.id)} /> : <span />}
                   <span className="play">▶</span>
                   <p>
                     <b>
@@ -3334,254 +3334,115 @@ function AgentPackagesView({ token }: { token: string }) {
   );
 }
 
+type PlatformUserRow = { id: string; username: string; displayName: string; role: string; source: "local" | "ldap"; enabled: boolean; createdAt: string };
+type PlatformRoleRow = { name: string; displayName: string; description: string; permissions: string[]; system: boolean };
+type PermissionRow = { id: string; group: string; label: string; description: string };
+
 function AccessView({ token }: { token: string }) {
-  const [users, setUsers] = useState<
-    Array<{
-      id: string;
-      username: string;
-      displayName: string;
-      role: string;
-      enabled: boolean;
-      createdAt: string;
-    }>
-  >([]);
+  const [users, setUsers] = useState<PlatformUserRow[]>([]);
+  const [roles, setRoles] = useState<PlatformRoleRow[]>([]);
+  const [permissions, setPermissions] = useState<PermissionRow[]>([]);
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
+  const [editingUser, setEditingUser] = useState<PlatformUserRow | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showLdap, setShowLdap] = useState(false);
+  const [showRoles, setShowRoles] = useState(false);
+  const [roleEditor, setRoleEditor] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
-  const [ldap, setLdap] = useState<Record<string, string | number | boolean>>({
-    enabled: false,
-    port: 636,
-    use_ssl: true,
-    user_attribute: "sAMAccountName",
-    display_attribute: "displayName",
-    domain_label: "DOMAIN",
-    default_role: "viewer",
-  });
+  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  useEffect(() => {
-    fetch("/api/v1/users", { headers: { Authorization: `Bearer ${token}` } })
-      .then((response) => {
-        if (response.status === 403) setForbidden(true);
-        return response.ok ? response.json() : Promise.reject();
-      })
-      .then((data) => setUsers(data.items ?? []))
-      .catch(() => setUsers([]));
-    fetch("/api/v1/settings/ldap", {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((response) => (response.ok ? response.json() : Promise.reject()))
-      .then((data) => setLdap((current) => ({ ...current, ...data })))
-      .catch(() => undefined);
-  }, [token]);
-  async function saveLdap(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const payload = {
-      enabled: form.get("enabled") === "on",
-      host: form.get("host"),
-      port: Number(form.get("port")),
-      use_ssl: form.get("use_ssl") === "on",
-      base_dn: form.get("base_dn"),
-      bind_dn: form.get("bind_dn"),
-      bind_password: form.get("bind_password"),
-      ca_certificate: form.get("ca_certificate"),
-      user_attribute: form.get("user_attribute"),
-      display_attribute: form.get("display_attribute"),
-      domain_label: form.get("domain_label"),
-      default_role: form.get("default_role"),
-    };
-    const response = await fetch("/api/v1/settings/ldap", {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    setMessage(
-      response.ok
-        ? "Đã lưu cấu hình LDAP."
-        : (data.detail ?? "Không thể lưu LDAP"),
-    );
-    if (response.ok) setLdap((current) => ({ ...current, ...data }));
-  }
-  async function createLocalUser(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const formElement = event.currentTarget;
-    const form = new FormData(formElement);
-    const response = await fetch("/api/v1/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ username: form.get("username"), display_name: form.get("display_name"), password: form.get("password"), role: form.get("role") }),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setMessage(data.detail ?? "Không thể tạo tài khoản Local");
-      return;
+  const [messageError, setMessageError] = useState(false);
+  const [ldap, setLdap] = useState<Record<string, string | number | boolean>>({ enabled: false, port: 636, use_ssl: true, user_attribute: "sAMAccountName", display_attribute: "displayName", domain_label: "DOMAIN", default_role: "viewer" });
+  const selectedRole = roles.find((role) => role.name === roleEditor) ?? null;
+  const groupedPermissions = useMemo(() => permissions.reduce<Record<string, PermissionRow[]>>((groups, permission) => ({ ...groups, [permission.group]: [...(groups[permission.group] ?? []), permission] }), {}), [permissions]);
+  const loadAccess = useCallback(async () => {
+    const headers = { Authorization: `Bearer ${token}` };
+    const [usersResponse, rolesResponse, ldapResponse] = await Promise.all([
+      fetch("/api/v1/users", { headers }),
+      fetch("/api/v1/roles", { headers }),
+      fetch("/api/v1/settings/ldap", { headers }),
+    ]);
+    setForbidden(usersResponse.status === 403);
+    if (usersResponse.ok) setUsers((await usersResponse.json()).items ?? []);
+    if (rolesResponse.ok) {
+      const data = await rolesResponse.json();
+      setRoles(data.items ?? []);
+      setPermissions(data.permissionCatalog ?? []);
     }
-    setUsers((current) => [...current, data].sort((a, b) => a.username.localeCompare(b.username)));
-    setMessage("Đã tạo tài khoản Local. Người dùng sẽ phải quét MFA ở lần đăng nhập đầu tiên.");
-    formElement.reset();
+    if (ldapResponse.ok) {
+      const ldapData = await ldapResponse.json();
+      setLdap((current) => ({ ...current, ...ldapData }));
+    }
+  }, [token]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadAccess(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadAccess]);
+  function showResult(text: string, error = false) { setMessage(text); setMessageError(error); }
+  async function createLocalUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    const response = await fetch("/api/v1/users", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ username: form.get("username"), display_name: form.get("display_name"), password: form.get("password"), role: form.get("role") }) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult("Đã tạo tài khoản Local; MFA sẽ bắt buộc ở lần đăng nhập đầu tiên."); setShowCreate(false); await loadAccess(); }
+    else showResult(data.detail ?? "Không thể tạo tài khoản Local", true);
+    setBusy(false);
   }
-  return (
-    <div className="access-grid">
-      <section className="panel view-panel">
-        <div className="panel-head">
-          <div>
-            <h2>Người dùng Local & Domain</h2>
-            <p>
-              Danh tính đăng nhập thành công được lưu trong PostgreSQL và bắt
-              buộc MFA.
-            </p>
-          </div>
-        </div>
-        <div className="role-list">
-          {users.length ? (
-            users.map((user) => (
-              <article key={user.id}>
-                <span>{user.role.slice(0, 2).toUpperCase()}</span>
-                <p>
-                  <b>{user.displayName || user.username}</b>
-                  <small>
-                    {user.username} · tạo{" "}
-                    {new Date(user.createdAt).toLocaleDateString("vi-VN")}
-                  </small>
-                </p>
-                <em>{user.enabled ? user.role : "đã khóa"}</em>
-              </article>
-            ))
-          ) : (
-            <div className="empty-state">
-              {forbidden
-                ? "Chỉ admin được xem danh sách người dùng."
-                : "Chưa có người dùng trong database."}
-            </div>
-          )}
-        </div>
-      </section>
-      <aside className="panel ldap-panel">
-        <h2>Tạo tài khoản Local</h2>
-        <form onSubmit={createLocalUser}>
-          <div className="form-grid">
-            <label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label>
-            <label>Vai trò<select name="role"><option value="admin">admin</option><option value="operator">operator</option><option value="viewer">viewer</option><option value="auditor">auditor</option></select></label>
-          </div>
-          <label>Tên hiển thị<input name="display_name" required /></label>
-          <label>Mật khẩu ban đầu<input name="password" type="password" required minLength={14} /></label>
-          <button className="button primary">Tạo user và bắt buộc MFA</button>
-        </form>
-        <hr />
-        <h2>Kết nối LDAP / Active Directory</h2>
-        <form key={JSON.stringify(ldap)} onSubmit={saveLdap}>
-          <label className="check">
-            <input
-              name="enabled"
-              type="checkbox"
-              defaultChecked={Boolean(ldap.enabled)}
-            />{" "}
-            Bật Domain Login
-          </label>
-          <div className="form-grid">
-            <label>
-              LDAP Host
-              <input
-                name="host"
-                required
-                defaultValue={String(ldap.host ?? "")}
-                placeholder="dc01.company.local"
-              />
-            </label>
-            <label>
-              Cổng
-              <input
-                name="port"
-                type="number"
-                defaultValue={Number(ldap.port ?? 636)}
-              />
-            </label>
-          </div>
-          <label className="check">
-            <input
-              name="use_ssl"
-              type="checkbox"
-              defaultChecked={Boolean(ldap.use_ssl)}
-            />{" "}
-            Dùng LDAPS và xác minh certificate
-          </label>
-          <label>
-            Base DN
-            <input
-              name="base_dn"
-              required
-              defaultValue={String(ldap.base_dn ?? "")}
-              placeholder="DC=company,DC=local"
-            />
-          </label>
-          <label>
-            Bind DN
-            <input
-              name="bind_dn"
-              defaultValue={String(ldap.bind_dn ?? "")}
-              placeholder="CN=svc-dashboard,OU=Service Accounts,..."
-            />
-          </label>
-          <label>
-            Bind password
-            <input
-              name="bind_password"
-              type="password"
-              placeholder={
-                ldap.password_configured
-                  ? "Đã lưu · để trống nếu giữ nguyên"
-                  : "Mật khẩu service account"
-              }
-            />
-          </label>
-          <label>
-            CA certificate cho LDAPS (tùy chọn)
-            <textarea name="ca_certificate" rows={4} defaultValue={String(ldap.ca_certificate ?? "")} placeholder="-----BEGIN CERTIFICATE-----" />
-          </label>
-          <div className="form-grid">
-            <label>
-              Thuộc tính user
-              <input
-                name="user_attribute"
-                defaultValue={String(ldap.user_attribute ?? "sAMAccountName")}
-              />
-            </label>
-            <label>
-              Thuộc tính tên
-              <input
-                name="display_attribute"
-                defaultValue={String(ldap.display_attribute ?? "displayName")}
-              />
-            </label>
-          </div>
-          <div className="form-grid">
-            <label>
-              Nhãn domain
-              <input
-                name="domain_label"
-                defaultValue={String(ldap.domain_label ?? "DOMAIN")}
-              />
-            </label>
-            <label>
-              Role mặc định
-              <select
-                name="default_role"
-                defaultValue={String(ldap.default_role ?? "viewer")}
-              >
-                <option value="viewer">viewer</option>
-                <option value="operator">operator</option>
-                <option value="auditor">auditor</option>
-              </select>
-            </label>
-          </div>
-          {message && <p className="settings-message">{message}</p>}
-          <button className="button primary">Lưu cấu hình LDAP</button>
-        </form>
-      </aside>
-    </div>
-  );
+  async function updateUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); if (!editingUser) return; setBusy(true);
+    const form = new FormData(event.currentTarget); const password = String(form.get("password") ?? "");
+    const payload: Record<string, unknown> = { display_name: form.get("display_name"), role: form.get("role"), enabled: form.get("enabled") === "on" };
+    if (password) payload.password = password;
+    const response = await fetch(`/api/v1/users/${editingUser.id}`, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult(editingUser.source === "ldap" ? "Đã cập nhật role/trạng thái user LDAP." : "Đã cập nhật tài khoản Local."); setEditingUser(null); await loadAccess(); }
+    else showResult(data.detail ?? "Không thể cập nhật tài khoản", true);
+    setBusy(false);
+  }
+  async function deleteUsers() {
+    if (!selectedUserIds.length || !window.confirm(`Xóa ${selectedUserIds.length} tài khoản khỏi website? User LDAP chỉ bị xóa mapping local, không bị xóa trong Active Directory.`)) return;
+    setBusy(true);
+    const response = await fetch("/api/v1/users", { method: "DELETE", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ user_ids: selectedUserIds }) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult(`Đã xóa ${String(data.deleted ?? selectedUserIds.length)} tài khoản.`); setSelectedUserIds([]); await loadAccess(); }
+    else showResult(data.detail ?? "Không thể xóa tài khoản", true);
+    setBusy(false);
+  }
+  async function saveLdap(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); const form = new FormData(event.currentTarget);
+    const payload = { enabled: form.get("enabled") === "on", host: form.get("host"), port: Number(form.get("port")), use_ssl: form.get("use_ssl") === "on", base_dn: form.get("base_dn"), bind_dn: form.get("bind_dn"), bind_password: form.get("bind_password"), ca_certificate: form.get("ca_certificate"), user_attribute: form.get("user_attribute"), display_attribute: form.get("display_attribute"), domain_label: form.get("domain_label"), default_role: form.get("default_role") };
+    const response = await fetch("/api/v1/settings/ldap", { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { setLdap((current) => ({ ...current, ...data })); showResult("Đã lưu cấu hình LDAP."); setShowLdap(false); }
+    else showResult(data.detail ?? "Không thể lưu LDAP", true);
+    setBusy(false);
+  }
+  async function saveRole(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); const form = new FormData(event.currentTarget); const creating = roleEditor === "__new__";
+    const payload = { name: form.get("name"), display_name: form.get("display_name"), description: form.get("description"), permissions: form.getAll("permissions") };
+    const response = await fetch(creating ? "/api/v1/roles" : `/api/v1/roles/${roleEditor}`, { method: creating ? "POST" : "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult(creating ? "Đã tạo role tùy chỉnh." : "Đã lưu quyền của role."); await loadAccess(); setRoleEditor(String(data.name)); }
+    else showResult(data.detail ?? "Không thể lưu role", true);
+    setBusy(false);
+  }
+  async function deleteRole(role: PlatformRoleRow) {
+    if (role.system || !window.confirm(`Xóa role ${role.displayName}?`)) return; setBusy(true);
+    const response = await fetch(`/api/v1/roles/${role.name}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); const data = await response.json().catch(() => ({}));
+    if (response.ok) { showResult("Đã xóa role."); setRoleEditor(null); await loadAccess(); }
+    else showResult(data.detail ?? "Không thể xóa role", true);
+    setBusy(false);
+  }
+  return <section className="panel view-panel access-workspace">
+    <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và LDAP dùng chung MFA; role tùy chỉnh được lưu trong PostgreSQL và kiểm tra tại API.</p></div><div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div></div>
+    {message && <p className={`settings-message${messageError ? " error" : ""}`}>{message}</p>}
+    <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`}>{user.source === "ldap" ? "LDAP / AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng trong PostgreSQL."}</div>}</div>
+    <p className="access-note">User LDAP xuất hiện sau lần đăng nhập Domain đầu tiên. Bạn có thể đổi role riêng từng user LDAP tại đây; mật khẩu LDAP vẫn do Active Directory quản lý.</p>
+    {showCreate && <ModalShell title="Tạo tài khoản Local" subtitle="Tài khoản mới bắt buộc thiết lập MFA ở lần đăng nhập đầu tiên" close={() => setShowCreate(false)}><form className="resource-form" onSubmit={createLocalUser}><div className="form-grid"><label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label><label>Role<select name="role" defaultValue="viewer">{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><label>Tên hiển thị<input name="display_name" required /></label><label>Mật khẩu ban đầu<input name="password" type="password" autoComplete="new-password" required minLength={14} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowCreate(false)}>Hủy</button><button className="button primary" disabled={busy}>Tạo tài khoản</button></div></form></ModalShell>}
+    {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User LDAP: đổi role/trạng thái tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
+    {showLdap && <ModalShell title="Cấu hình LDAP / Active Directory" subtitle="Kết nối LDAPS, ánh xạ thuộc tính và role mặc định cho user đăng nhập lần đầu" close={() => setShowLdap(false)}><form key={JSON.stringify(ldap)} className="resource-form ldap-settings-form" onSubmit={saveLdap}><label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(ldap.enabled)} /> Bật Domain Login</label><div className="form-grid"><label>LDAP Host<input name="host" defaultValue={String(ldap.host ?? "")} placeholder="dc01.company.local" /></label><label>Cổng<input name="port" type="number" min={1} max={65535} defaultValue={Number(ldap.port ?? 636)} /></label></div><label className="check"><input name="use_ssl" type="checkbox" defaultChecked={Boolean(ldap.use_ssl)} /> Dùng LDAPS và xác minh certificate</label><label>Base DN<input name="base_dn" defaultValue={String(ldap.base_dn ?? "")} placeholder="DC=company,DC=local" /></label><label>Bind DN<input name="bind_dn" defaultValue={String(ldap.bind_dn ?? "")} placeholder="CN=svc-dashboard,OU=Service Accounts,..." /></label><label>Bind password<input name="bind_password" type="password" autoComplete="new-password" placeholder={ldap.password_configured ? "Đã lưu · để trống nếu giữ nguyên" : "Mật khẩu service account"} /></label><label>CA certificate cho LDAPS<textarea name="ca_certificate" rows={4} defaultValue={String(ldap.ca_certificate ?? "")} placeholder="-----BEGIN CERTIFICATE-----" /></label><div className="form-grid"><label>Thuộc tính user<input name="user_attribute" defaultValue={String(ldap.user_attribute ?? "sAMAccountName")} /></label><label>Thuộc tính tên<input name="display_attribute" defaultValue={String(ldap.display_attribute ?? "displayName")} /></label></div><div className="form-grid"><label>Nhãn domain<input name="domain_label" defaultValue={String(ldap.domain_label ?? "DOMAIN")} /></label><label>Role mặc định<select name="default_role" defaultValue={String(ldap.default_role ?? "viewer")}>{roles.filter((role) => role.name !== "admin").map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><div className="resource-help">Role mặc định chỉ áp dụng khi user LDAP đăng nhập lần đầu. Role bạn chỉnh riêng ở danh sách người dùng sẽ được giữ nguyên ở các lần đăng nhập sau.</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowLdap(false)}>Hủy</button><button className="button primary" disabled={busy}>Kiểm tra & lưu LDAP</button></div></form></ModalShell>}
+    {showRoles && <ModalShell title="Roles & quyền hạn" subtitle="Bốn role có sẵn giữ baseline cố định; tạo role riêng để chọn đúng chức năng được phép" close={() => setShowRoles(false)}><div className="role-manager"><aside><button type="button" className={roleEditor === "__new__" ? "active" : ""} onClick={() => setRoleEditor("__new__")}>＋ Tạo role mới</button>{roles.map((role) => <button type="button" key={role.name} className={roleEditor === role.name ? "active" : ""} onClick={() => setRoleEditor(role.name)}><b>{role.displayName}</b><small>{role.system ? "Có sẵn · khóa" : role.name}</small></button>)}</aside><div className="role-editor">{roleEditor === null ? <div className="empty-state">Chọn một role để xem quyền hoặc tạo role tùy chỉnh.</div> : selectedRole?.system ? <><div className="role-editor-head"><div><h3>{selectedRole.displayName}</h3><p>{selectedRole.description}</p></div><span>Role có sẵn</span></div><div className="permission-summary">{permissions.filter((permission) => selectedRole.permissions.includes(permission.id)).map((permission) => <span key={permission.id}>{permission.label}</span>)}</div></> : <form key={roleEditor} className="resource-form" onSubmit={saveRole}><div className="form-grid"><label>Mã role<input name="name" required minLength={2} pattern="[a-z][a-z0-9_-]*" defaultValue={selectedRole?.name ?? ""} disabled={Boolean(selectedRole)} /></label><label>Tên hiển thị<input name="display_name" required defaultValue={selectedRole?.displayName ?? ""} /></label></div><label>Mô tả<textarea name="description" rows={2} defaultValue={selectedRole?.description ?? ""} /></label><div className="permission-groups">{Object.entries(groupedPermissions).map(([group, items]) => <fieldset key={group}><legend>{group}</legend>{items.map((permission) => <label key={permission.id} aria-label={`Cho phép ${permission.label}`}><input type="checkbox" name="permissions" value={permission.id} defaultChecked={selectedRole?.permissions.includes(permission.id) ?? false} /><span><b>{permission.label}</b><small>{permission.description}</small></span></label>)}</fieldset>)}</div><div className="modal-actions">{selectedRole && <button type="button" className="button danger" disabled={busy} onClick={() => void deleteRole(selectedRole)}>Xóa role</button>}<button className="button primary" disabled={busy}>Lưu role</button></div></form>}</div></div></ModalShell>}
+  </section>;
 }
 
 function SessionModal({

@@ -106,9 +106,20 @@ test("storage resize and Windows Update diagnostics stay explicit", async () => 
   assert.match(resources, /Thứ tự vật lý các phân vùng/);
   assert.match(resources, /type === "unallocated"/);
   assert.match(resources, /Shrink không di chuyển phần đang chắn/);
-  assert.match(resources, /Quét online thất bại; đang hiển thị/);
+  assert.match(resources, /Đang hiển thị.*update Windows đã lưu trong cache cục bộ/);
   assert.match(resources, /Máy không cài ConfigMgr client; đây không phải lỗi/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);
+});
+
+test("platform users, LDAP assignments and custom roles are editable", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /Tạo tài khoản Local/);
+  assert.match(source, /Cấu hình LDAP \/ Active Directory/);
+  assert.match(source, /đổi role riêng từng user LDAP/);
+  assert.match(source, /Roles & quyền hạn/);
+  assert.match(source, /permission-groups/);
+  assert.match(source, /method: "PATCH"/);
+  assert.match(source, /method: "DELETE"/);
 });

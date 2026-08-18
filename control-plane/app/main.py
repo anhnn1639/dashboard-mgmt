@@ -162,6 +162,17 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class PlatformRole(Base):
+    __tablename__ = "platform_roles"
+    name: Mapped[str] = mapped_column(String(30), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(Text, default="")
+    permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    system: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
 class MFACredential(Base):
     __tablename__ = "mfa_credentials"
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
@@ -330,7 +341,31 @@ class PlatformUserCreateRequest(BaseModel):
     username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
     display_name: str = Field(min_length=1, max_length=160)
     password: str = Field(min_length=14, max_length=1024)
-    role: Literal["admin", "operator", "viewer", "auditor"] = "viewer"
+    role: str = Field(default="viewer", min_length=1, max_length=30, pattern=r"^[a-z][a-z0-9_-]*$")
+
+
+class PlatformUserUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    role: str | None = Field(default=None, min_length=1, max_length=30, pattern=r"^[a-z][a-z0-9_-]*$")
+    enabled: bool | None = None
+    password: str | None = Field(default=None, min_length=14, max_length=1024)
+
+
+class PlatformUsersDeleteRequest(BaseModel):
+    user_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class PlatformRoleRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=30, pattern=r"^[a-z][a-z0-9_-]*$")
+    display_name: str = Field(min_length=2, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    permissions: list[str] = Field(default_factory=list, max_length=64)
+
+
+class PlatformRoleUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=2, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    permissions: list[str] = Field(default_factory=list, max_length=64)
 
 
 class LDAPConfigRequest(BaseModel):
@@ -345,7 +380,7 @@ class LDAPConfigRequest(BaseModel):
     user_attribute: str = Field(default="sAMAccountName", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     display_attribute: str = Field(default="displayName", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     domain_label: str = Field(default="DOMAIN", pattern=r"^[A-Za-z0-9_.-]{1,15}$")
-    default_role: Literal["viewer", "operator", "auditor"] = "viewer"
+    default_role: str = Field(default="viewer", min_length=1, max_length=30, pattern=r"^[a-z][a-z0-9_-]*$")
 
 
 class EnrollmentTokenRequest(BaseModel):
@@ -523,6 +558,75 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "storage.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical"},
+}
+
+PERMISSION_CATALOG: dict[str, dict[str, str]] = {
+    "servers.view": {"group": "Máy chủ", "label": "Xem danh sách máy chủ", "description": "Xem inventory, tình trạng và trang chi tiết máy chủ."},
+    "resources.view": {"group": "Máy chủ", "label": "Xem tài nguyên vận hành", "description": "Quét và xem Services, tài khoản, firewall, disk, process, update và network."},
+    "sessions.launch": {"group": "Phiên truy cập", "label": "Mở SSH / Remote Desktop", "description": "Khởi tạo phiên quản trị qua tunnel mTLS của Agent."},
+    "recordings.view": {"group": "Phiên truy cập", "label": "Xem recording", "description": "Xem danh sách và phát lại recording SSH/RDP."},
+    "recordings.delete": {"group": "Phiên truy cập", "label": "Xóa recording", "description": "Xóa recording theo luồng kiểm soát và audit hiện hành."},
+    "services.manage": {"group": "Vận hành", "label": "Điều khiển Services", "description": "Start, Stop và Restart service."},
+    "accounts.manage": {"group": "Vận hành", "label": "Quản lý tài khoản máy chủ", "description": "Tạo, sửa, khóa, xóa user/group trên máy chủ được quản trị."},
+    "firewall.manage": {"group": "Vận hành", "label": "Quản lý Firewall", "description": "Thêm, xóa và sắp xếp firewall rule."},
+    "storage.manage": {"group": "Vận hành", "label": "Quản lý Disk", "description": "Extend, Shrink, tạo và xóa partition/LVM/volume."},
+    "processes.manage": {"group": "Vận hành", "label": "Kill process", "description": "Dừng process đã chọn sau khi Agent đối chiếu PID."},
+    "updates.manage": {"group": "Vận hành", "label": "Cài bản cập nhật", "description": "Cài đúng các gói update được chọn."},
+    "logs.view": {"group": "Vận hành", "label": "Xem và cấu hình log", "description": "Đọc tối đa 500 dòng và chọn nguồn log cho từng máy chủ."},
+    "files.view": {"group": "Vận hành", "label": "Xem lịch sử truyền file", "description": "Xem metadata, trạng thái quét và kết quả giao file."},
+    "files.manage": {"group": "Vận hành", "label": "Gửi file", "description": "Quét malware và gửi file tới Agent."},
+    "system.reboot": {"group": "Vận hành", "label": "Khởi động lại máy chủ", "description": "Lên lịch reboot máy chủ từ Agent."},
+    "audit.view": {"group": "Quản trị website", "label": "Xem nhật ký kiểm toán", "description": "Đọc audit log và chuỗi hash liên kết."},
+    "users.manage": {"group": "Quản trị website", "label": "Quản lý người dùng", "description": "Tạo, sửa role/mật khẩu/trạng thái và xóa tài khoản website."},
+    "ldap.manage": {"group": "Quản trị website", "label": "Cấu hình LDAP", "description": "Thay đổi kết nối LDAP/Active Directory và role mặc định."},
+    "roles.manage": {"group": "Quản trị website", "label": "Quản lý role", "description": "Tạo, sửa và xóa role tùy chỉnh."},
+    "agents.manage": {"group": "Quản trị website", "label": "Quản lý Agent", "description": "Tạo token/bộ cài Agent và thay đổi URL dashboard."},
+}
+
+ACTION_PERMISSIONS: dict[str, str] = {
+    "inventory.collect": "resources.view",
+    "service.list": "resources.view",
+    "service.restart": "services.manage",
+    "service.start": "services.manage",
+    "service.stop": "services.manage",
+    "user.create": "accounts.manage",
+    "user.update": "accounts.manage",
+    "user.disable": "accounts.manage",
+    "user.enable": "accounts.manage",
+    "user.delete": "accounts.manage",
+    "user.password.reset": "accounts.manage",
+    "group.create": "accounts.manage",
+    "group.delete": "accounts.manage",
+    "user.add_group": "accounts.manage",
+    "group.remove_user": "accounts.manage",
+    "user.list": "resources.view",
+    "group.list": "resources.view",
+    "patch.scan": "resources.view",
+    "patch.install": "updates.manage",
+    "logs.sources": "logs.view",
+    "logs.read": "logs.view",
+    "process.list": "resources.view",
+    "process.kill": "processes.manage",
+    "firewall.list": "resources.view",
+    "firewall.rule.add": "firewall.manage",
+    "firewall.rule.remove": "firewall.manage",
+    "firewall.rule.reorder": "firewall.manage",
+    "storage.list": "resources.view",
+    "storage.extend": "storage.manage",
+    "storage.shrink": "storage.manage",
+    "storage.create": "storage.manage",
+    "storage.delete": "storage.manage",
+    "network.list": "resources.view",
+    "system.reboot": "system.reboot",
+    "file.deliver": "files.manage",
+}
+
+ALL_PLATFORM_PERMISSIONS = set(PERMISSION_CATALOG)
+BUILTIN_ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "admin": {"display_name": "Administrator", "description": "Toàn quyền quản trị website và máy chủ.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS)},
+    "operator": {"display_name": "Operator", "description": "Vận hành máy chủ, phiên truy cập và file; không quản trị danh tính website.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"audit.view", "users.manage", "ldap.manage", "roles.manage", "agents.manage", "recordings.delete"})},
+    "viewer": {"display_name": "Viewer", "description": "Chỉ xem fleet và dữ liệu tài nguyên; không thực hiện thay đổi.", "permissions": ["logs.view", "resources.view", "servers.view"]},
+    "auditor": {"display_name": "Auditor", "description": "Xem fleet, log, audit, file và recording; không thay đổi máy chủ.", "permissions": ["audit.view", "files.view", "logs.view", "recordings.view", "servers.view"]},
 }
 
 AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
@@ -1004,7 +1108,10 @@ def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
         return None
     user = db.execute(select(User).where(User.username == canonical)).scalar_one_or_none()
     if user is None:
-        user = User(username=canonical, password_hash="!LDAP", display_name=display_name, role=config.get("default_role", "viewer"))
+        default_role = str(config.get("default_role", "viewer"))
+        if db.get(PlatformRole, default_role) is None:
+            default_role = "viewer"
+        user = User(username=canonical, password_hash="!LDAP", display_name=display_name, role=default_role)
         db.add(user)
         db.flush()
     else:
@@ -1025,10 +1132,58 @@ def current_user(authorization: str | None = Header(default=None), db: Session =
     return user
 
 
-def require_role(*roles: str):
-    def dependency(user: User = Depends(current_user)) -> User:
-        if user.role not in roles:
-            raise HTTPException(status_code=403, detail="Insufficient permission")
+def ensure_builtin_roles(db: Session) -> None:
+    for name, definition in BUILTIN_ROLE_DEFINITIONS.items():
+        role = db.get(PlatformRole, name)
+        if role is None:
+            db.add(PlatformRole(name=name, display_name=definition["display_name"], description=definition["description"], permissions=definition["permissions"], system=True))
+            continue
+        role.display_name = definition["display_name"]
+        role.description = definition["description"]
+        role.permissions = definition["permissions"]
+        role.system = True
+
+
+def platform_role_permissions(db: Session, role_name: str) -> set[str]:
+    role = db.get(PlatformRole, role_name)
+    if role is not None:
+        return {str(permission) for permission in role.permissions or [] if permission in PERMISSION_CATALOG}
+    fallback = BUILTIN_ROLE_DEFINITIONS.get(role_name, {})
+    return set(fallback.get("permissions", []))
+
+
+def validate_platform_role(db: Session, role_name: str, *, ldap_default: bool = False) -> PlatformRole:
+    role = db.get(PlatformRole, role_name)
+    if role is None and role_name in BUILTIN_ROLE_DEFINITIONS:
+        ensure_builtin_roles(db)
+        db.flush()
+        role = db.get(PlatformRole, role_name)
+    if role is None:
+        raise HTTPException(status_code=422, detail="Role không tồn tại")
+    if ldap_default and role.name == "admin":
+        raise HTTPException(status_code=422, detail="Role mặc định LDAP không được là admin; hãy gán admin riêng cho từng user sau lần đăng nhập đầu tiên")
+    return role
+
+
+def normalize_permissions(values: list[str]) -> list[str]:
+    normalized = list(dict.fromkeys(values))
+    unknown = sorted(set(normalized) - ALL_PLATFORM_PERMISSIONS)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Permission không hợp lệ: {', '.join(unknown)}")
+    return sorted(normalized)
+
+
+def platform_role_json(role: PlatformRole) -> dict[str, Any]:
+    return {"name": role.name, "displayName": role.display_name, "description": role.description, "permissions": sorted(role.permissions or []), "system": role.system, "createdAt": aware(role.created_at).isoformat(), "updatedAt": aware(role.updated_at).isoformat()}
+
+
+def require_permission(permission: str):
+    if permission not in PERMISSION_CATALOG:
+        raise RuntimeError(f"Unknown platform permission: {permission}")
+
+    def dependency(user: User = Depends(current_user), db: Session = Depends(db_session)) -> User:
+        if permission not in platform_role_permissions(db, user.role):
+            raise HTTPException(status_code=403, detail="Role hiện tại không có quyền thực hiện chức năng này")
         return user
     return dependency
 
@@ -1249,6 +1404,7 @@ def startup() -> None:
         if factory is None:
             return
         with factory() as db:
+            ensure_builtin_roles(db)
             retire_legacy_pending_jobs(db)
             expire_file_payloads(db)
             prune_audit_events(db)
@@ -1337,6 +1493,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
         Base.metadata.create_all(candidate)
         candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
         with candidate_factory() as db:
+            ensure_builtin_roles(db)
             admin = db.execute(select(User).where(User.role == "admin", User.enabled.is_(True)).limit(1)).scalar_one_or_none()
             if admin is None:
                 duplicate = db.execute(select(User).where(User.username == payload.admin.username)).scalar_one_or_none()
@@ -1421,41 +1578,158 @@ def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = 
 
 
 @app.get("/api/v1/me")
-def me(user: User = Depends(current_user)):
-    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role}
+def me(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "permissions": sorted(platform_role_permissions(db, user.role))}
+
+
+def platform_user_json(user: User) -> dict[str, Any]:
+    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "source": "ldap" if user.password_hash == "!LDAP" else "local", "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat()}
 
 
 @app.get("/api/v1/users")
-def list_users(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def list_users(_: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
     users = db.execute(select(User).order_by(User.username)).scalars().all()
-    return {"items": [{"id": item.id, "username": item.username, "displayName": item.display_name, "role": item.role, "enabled": item.enabled, "createdAt": aware(item.created_at).isoformat()} for item in users]}
+    return {"items": [platform_user_json(item) for item in users]}
 
 
 @app.post("/api/v1/users", status_code=201)
-def create_platform_user(payload: PlatformUserCreateRequest, request: Request, actor: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def create_platform_user(payload: PlatformUserCreateRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
     if db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Tên đăng nhập đã tồn tại")
+    validate_platform_role(db, payload.role)
     user = User(username=payload.username, display_name=payload.display_name, password_hash=password_hasher.hash(payload.password), role=payload.role)
     db.add(user)
     db.flush()
     audit(db, actor.username, "identity.local.create", user.id, request, detail={"username": user.username, "role": user.role})
     db.commit()
-    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat(), "mfaEnrollmentRequired": True}
+    return {**platform_user_json(user), "mfaEnrollmentRequired": True}
+
+
+@app.patch("/api/v1/users/{user_id}")
+def update_platform_user(user_id: str, payload: PlatformUserUpdateRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Tài khoản không tồn tại")
+    changes: dict[str, Any] = {}
+    if payload.role is not None and payload.role != user.role:
+        validate_platform_role(db, payload.role)
+        if user.role == "admin" and user.enabled and db.execute(select(func.count()).select_from(User).where(User.role == "admin", User.enabled.is_(True), User.id != user.id)).scalar_one() == 0:
+            raise HTTPException(status_code=409, detail="Không thể đổi role của quản trị viên cuối cùng")
+        changes["role"] = {"from": user.role, "to": payload.role}
+        user.role = payload.role
+    if payload.enabled is not None and payload.enabled != user.enabled:
+        if not payload.enabled and user.id == actor.id:
+            raise HTTPException(status_code=409, detail="Không thể tự khóa tài khoản đang đăng nhập")
+        if not payload.enabled and user.role == "admin" and db.execute(select(func.count()).select_from(User).where(User.role == "admin", User.enabled.is_(True), User.id != user.id)).scalar_one() == 0:
+            raise HTTPException(status_code=409, detail="Không thể khóa quản trị viên cuối cùng")
+        changes["enabled"] = payload.enabled
+        user.enabled = payload.enabled
+    if payload.display_name is not None and payload.display_name.strip() != user.display_name:
+        user.display_name = payload.display_name.strip()
+        changes["display_name"] = True
+    if payload.password:
+        if user.password_hash == "!LDAP":
+            raise HTTPException(status_code=422, detail="Mật khẩu LDAP phải đổi tại Active Directory; website chỉ cho đổi role của user LDAP")
+        user.password_hash = password_hasher.hash(payload.password)
+        changes["password"] = "changed"
+    if not changes:
+        raise HTTPException(status_code=422, detail="Không có thay đổi hợp lệ")
+    audit(db, actor.username, "identity.user.update", user.id, request, detail={"username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local", "changes": changes})
+    db.commit()
+    return platform_user_json(user)
+
+
+@app.delete("/api/v1/users")
+def delete_platform_users(payload: PlatformUsersDeleteRequest, request: Request, actor: User = Depends(require_permission("users.manage")), db: Session = Depends(db_session)):
+    user_ids = list(dict.fromkeys(payload.user_ids))
+    if len(user_ids) != len(payload.user_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id) for user_id in user_ids):
+        raise HTTPException(status_code=422, detail="Danh sách tài khoản không hợp lệ hoặc bị trùng")
+    if actor.id in user_ids:
+        raise HTTPException(status_code=409, detail="Không thể tự xóa tài khoản đang đăng nhập")
+    users = db.execute(select(User).where(User.id.in_(user_ids))).scalars().all()
+    if len(users) != len(user_ids):
+        raise HTTPException(status_code=404, detail="Có tài khoản không còn tồn tại")
+    deleting_admins = sum(1 for user in users if user.role == "admin" and user.enabled)
+    remaining_admins = db.execute(select(func.count()).select_from(User).where(User.role == "admin", User.enabled.is_(True), User.id.not_in(user_ids))).scalar_one()
+    if deleting_admins and remaining_admins == 0:
+        raise HTTPException(status_code=409, detail="Không thể xóa quản trị viên cuối cùng")
+    referenced = set(db.execute(select(RecordingDeletionRequest.requested_by).where(RecordingDeletionRequest.requested_by.in_(user_ids))).scalars().all())
+    referenced.update(item for item in db.execute(select(RecordingDeletionRequest.approved_by).where(RecordingDeletionRequest.approved_by.in_(user_ids))).scalars().all() if item)
+    if referenced:
+        raise HTTPException(status_code=409, detail="Có tài khoản đã phát sinh yêu cầu recording; hãy khóa tài khoản thay vì xóa để giữ toàn vẹn audit")
+    db.execute(delete(MFACredential).where(MFACredential.user_id.in_(user_ids)))
+    db.execute(delete(User).where(User.id.in_(user_ids)))
+    audit(db, actor.username, "identity.user.delete", "platform-users", request, detail={"users": [{"id": user.id, "username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local"} for user in users]})
+    db.commit()
+    return {"deleted": len(users)}
+
+
+@app.get("/api/v1/roles")
+def list_platform_roles(_: User = Depends(current_user), db: Session = Depends(db_session)):
+    ensure_builtin_roles(db)
+    db.commit()
+    roles = db.execute(select(PlatformRole).order_by(PlatformRole.system.desc(), PlatformRole.name)).scalars().all()
+    return {"items": [platform_role_json(role) for role in roles], "permissionCatalog": [{"id": permission, **detail} for permission, detail in PERMISSION_CATALOG.items()]}
+
+
+@app.post("/api/v1/roles", status_code=201)
+def create_platform_role(payload: PlatformRoleRequest, request: Request, actor: User = Depends(require_permission("roles.manage")), db: Session = Depends(db_session)):
+    if db.get(PlatformRole, payload.name):
+        raise HTTPException(status_code=409, detail="Tên role đã tồn tại")
+    role = PlatformRole(name=payload.name, display_name=payload.display_name.strip(), description=payload.description.strip(), permissions=normalize_permissions(payload.permissions), system=False)
+    db.add(role)
+    db.flush()
+    audit(db, actor.username, "identity.role.create", role.name, request, detail={"permissions": role.permissions})
+    db.commit()
+    return platform_role_json(role)
+
+
+@app.put("/api/v1/roles/{role_name}")
+def update_platform_role(role_name: str, payload: PlatformRoleUpdateRequest, request: Request, actor: User = Depends(require_permission("roles.manage")), db: Session = Depends(db_session)):
+    role = db.get(PlatformRole, role_name)
+    if not role:
+        raise HTTPException(status_code=404, detail="Role không tồn tại")
+    if role.system:
+        raise HTTPException(status_code=409, detail="Role có sẵn được khóa để luôn giữ baseline an toàn; hãy tạo role tùy chỉnh")
+    role.display_name = payload.display_name.strip()
+    role.description = payload.description.strip()
+    role.permissions = normalize_permissions(payload.permissions)
+    audit(db, actor.username, "identity.role.update", role.name, request, detail={"permissions": role.permissions})
+    db.commit()
+    return platform_role_json(role)
+
+
+@app.delete("/api/v1/roles/{role_name}")
+def delete_platform_role(role_name: str, request: Request, actor: User = Depends(require_permission("roles.manage")), db: Session = Depends(db_session)):
+    role = db.get(PlatformRole, role_name)
+    if not role:
+        raise HTTPException(status_code=404, detail="Role không tồn tại")
+    if role.system:
+        raise HTTPException(status_code=409, detail="Không thể xóa role có sẵn")
+    if db.execute(select(User).where(User.role == role.name).limit(1)).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Role đang được gán cho người dùng; hãy đổi role của họ trước")
+    if read_ldap_config(db).get("default_role") == role.name:
+        raise HTTPException(status_code=409, detail="Role đang là mặc định LDAP; hãy đổi cấu hình LDAP trước")
+    db.delete(role)
+    audit(db, actor.username, "identity.role.delete", role.name, request)
+    db.commit()
+    return {"deleted": role_name}
 
 
 @app.get("/api/v1/settings/ldap")
-def get_ldap_config(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def get_ldap_config(_: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
     config = read_ldap_config(db)
     config.pop("bind_password", None)
     return config
 
 
 @app.put("/api/v1/settings/ldap")
-def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
     if payload.enabled and (not payload.host or not payload.base_dn):
         raise HTTPException(status_code=400, detail="LDAP host và Base DN là bắt buộc")
     current = read_ldap_config(db, include_secret=True)
     bind_password = payload.bind_password or current.get("bind_password", "")
+    validate_platform_role(db, payload.default_role, ldap_default=True)
     if payload.enabled:
         try:
             tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=payload.ca_certificate or None) if payload.use_ssl else None
@@ -1474,7 +1748,7 @@ def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User 
 
 
 @app.get("/api/v1/servers")
-def list_servers(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def list_servers(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     query = select(Server).order_by(Server.os_family, Server.name)
     if os_family:
         query = query.where(Server.os_family == os_family)
@@ -1482,7 +1756,7 @@ def list_servers(os_family: Literal["windows", "linux"] | None = None, _: User =
 
 
 @app.get("/api/v1/servers/{server_id}")
-def get_server(server_id: str, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def get_server(server_id: str, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -1523,7 +1797,7 @@ def validate_log_sources(server: Server, sources: list[str]) -> list[str]:
 
 
 @app.get("/api/v1/servers/{server_id}/log-sources")
-def get_server_log_sources(server_id: str, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def get_server_log_sources(server_id: str, _: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -1531,7 +1805,7 @@ def get_server_log_sources(server_id: str, _: User = Depends(current_user), db: 
 
 
 @app.put("/api/v1/servers/{server_id}/log-sources")
-def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
+def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -1560,20 +1834,19 @@ def job_json(job: Job, *, include_output: bool = False) -> dict[str, Any]:
     return payload
 
 
-def can_view_job_output(user: User, action: str) -> bool:
-    if action == "file.deliver":
-        return user.role in {"admin", "operator", "auditor"}
-    return user.role in SAFE_ACTIONS.get(action, {}).get("roles", set())
+def can_view_job_output(user: User, action: str, db: Session) -> bool:
+    permission = "files.view" if action == "file.deliver" else ACTION_PERMISSIONS.get(action)
+    return bool(permission and permission in platform_role_permissions(db, user.role))
 
 
 @app.get("/api/v1/servers/{server_id}/jobs")
-def list_server_jobs(server_id: str, user: User = Depends(current_user), db: Session = Depends(db_session)):
+def list_server_jobs(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     if not db.get(Server, server_id):
         raise HTTPException(status_code=404, detail="Server not found")
     jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
     return {
         "items": [
-            job_json(job, include_output=can_view_job_output(user, job.action))
+            job_json(job, include_output=can_view_job_output(user, job.action, db))
             for job in jobs
         ]
     }
@@ -1597,7 +1870,7 @@ def file_transfer_json(transfer: FileTransfer) -> dict[str, Any]:
 
 
 @app.get("/api/v1/servers/{server_id}/files")
-def list_server_files(server_id: str, _: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+def list_server_files(server_id: str, _: User = Depends(require_permission("files.view")), db: Session = Depends(db_session)):
     if not db.get(Server, server_id):
         raise HTTPException(status_code=404, detail="Server not found")
     if expire_file_payloads(db):
@@ -1612,7 +1885,7 @@ async def upload_server_file(
     request: Request,
     file: UploadFile = File(...),
     reason: str = Form(..., min_length=5, max_length=2000),
-    user: User = Depends(require_role("admin", "operator")),
+    user: User = Depends(require_permission("files.manage")),
     db: Session = Depends(db_session),
 ):
     server = db.get(Server, server_id)
@@ -1673,7 +1946,7 @@ async def upload_server_file(
 
 
 @app.post("/api/v1/enrollment-tokens", status_code=201)
-def create_enrollment_token(payload: EnrollmentTokenRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def create_enrollment_token(payload: EnrollmentTokenRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     raw = "tvo_" + secrets.token_urlsafe(32)
     record = EnrollmentToken(token_hash=token_digest(raw), label=payload.label, expected_os_family=payload.expected_os_family, max_uses=payload.max_uses, expires_at=now() + timedelta(hours=payload.expires_hours), created_by=user.id)
     db.add(record)
@@ -1767,7 +2040,7 @@ def issue_agent_identity(
 
 
 @app.get("/api/v1/agent-packages/status")
-def agent_package_status(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def agent_package_status(_: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
     return {
         "dashboardUrl": dashboard_url,
@@ -1781,7 +2054,7 @@ def agent_package_status(_: User = Depends(require_role("admin")), db: Session =
 
 
 @app.put("/api/v1/settings/dashboard-url")
-def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     request_host = request.url.hostname
     requested_host = urlsplit(payload.dashboard_url).hostname
     if request_host and request_host not in {"testserver", "localhost", "127.0.0.1"} and requested_host != request_host:
@@ -1798,7 +2071,7 @@ def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, u
 
 
 @app.post("/api/v1/agent-packages")
-def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
     ca_certificate, ca_fingerprint = read_agent_server_ca()
     bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
@@ -2106,11 +2379,12 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
 
 
 @app.post("/api/v1/jobs", status_code=201)
-def create_job(payload: JobCreateRequest, request: Request, user: User = Depends(require_role("admin", "operator", "viewer")), db: Session = Depends(db_session)):
+def create_job(payload: JobCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
     policy = SAFE_ACTIONS.get(payload.action)
     if not policy:
         raise HTTPException(status_code=400, detail="Action is not allowlisted")
-    if user.role not in policy["roles"]:
+    required_permission = ACTION_PERMISSIONS.get(payload.action)
+    if not required_permission or required_permission not in platform_role_permissions(db, user.role):
         raise HTTPException(status_code=403, detail="Role cannot execute this action")
     server = db.get(Server, payload.server_id)
     if not server:
@@ -2128,13 +2402,13 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
 
 
 @app.get("/api/v1/jobs")
-def list_jobs(user: User = Depends(current_user), db: Session = Depends(db_session)):
+def list_jobs(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     jobs = db.execute(select(Job).order_by(Job.created_at.desc()).limit(200)).scalars().all()
-    return {"items": [job_json(job, include_output=can_view_job_output(user, job.action)) for job in jobs]}
+    return {"items": [job_json(job, include_output=can_view_job_output(user, job.action, db)) for job in jobs]}
 
 
 @app.get("/api/v1/audit")
-def list_audit(before: datetime | None = None, _: User = Depends(require_role("admin", "auditor")), db: Session = Depends(db_session)):
+def list_audit(before: datetime | None = None, _: User = Depends(require_permission("audit.view")), db: Session = Depends(db_session)):
     query = select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(500)
     if before is not None:
         query = query.where(AuditEvent.occurred_at < aware(before))
@@ -2161,7 +2435,7 @@ def list_audit(before: datetime | None = None, _: User = Depends(require_role("a
 
 
 @app.get("/api/v1/sessions")
-def list_sessions(_: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+def list_sessions(_: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
     rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).order_by(RemoteSession.started_at.desc()).limit(200)).all()
     items = []
     for item, server_name in rows:
@@ -2250,13 +2524,13 @@ def recording_deletion_json(item: RecordingDeletionRequest, db: Session) -> dict
 
 
 @app.get("/api/v1/recording-deletion-requests")
-def list_recording_deletion_requests(_: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def list_recording_deletion_requests(_: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
     rows = db.execute(select(RecordingDeletionRequest).order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
     return {"items": [recording_deletion_json(item, db) for item in rows]}
 
 
 @app.post("/api/v1/recording-deletion-requests", status_code=201)
-def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, request: Request, user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
     session_ids = list(dict.fromkeys(payload.session_ids))
     if len(session_ids) != len(payload.session_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", item) for item in session_ids):
         raise HTTPException(status_code=400, detail="Danh sách recording không hợp lệ hoặc bị trùng")
@@ -2278,7 +2552,7 @@ def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, r
 
 
 @app.post("/api/v1/recording-deletion-requests/{deletion_id}/approve")
-def approve_recording_deletion_request(deletion_id: str, request: Request, user: User = Depends(require_role("admin")), db: Session = Depends(db_session)):
+def approve_recording_deletion_request(deletion_id: str, request: Request, user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
     deletion = db.get(RecordingDeletionRequest, deletion_id)
     if not deletion:
         raise HTTPException(status_code=404, detail="Yêu cầu xóa recording không tồn tại")
@@ -2312,7 +2586,7 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
 
 
 @app.get("/api/v1/sessions/{session_id}/recording")
-def read_recording(session_id: str, request: Request, user: User = Depends(require_role("admin", "operator", "auditor")), db: Session = Depends(db_session)):
+def read_recording(session_id: str, request: Request, user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
     session = db.get(RemoteSession, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2325,7 +2599,7 @@ def read_recording(session_id: str, request: Request, user: User = Depends(requi
 
 
 @app.post("/api/v1/sessions/launch")
-async def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_role("admin", "operator")), db: Session = Depends(db_session)):
+async def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
     server = db.get(Server, payload.server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")

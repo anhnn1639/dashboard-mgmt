@@ -53,7 +53,7 @@ function formatBytes(value: unknown) {
   return `${(amount / 1024 ** index).toFixed(index > 2 ? 1 : 0)} ${units[index]}`;
 }
 
-function ModalShell({
+export function ModalShell({
   title,
   subtitle,
   close,

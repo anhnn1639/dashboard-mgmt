@@ -90,6 +90,38 @@ class ClassificationTests(unittest.TestCase):
         family, verification = classify_os(Inventory(hostname="ol-01", os_family="linux", os_name="Oracle Linux Server 8.10", distribution_id="ol"))
         self.assertEqual((family, verification), ("linux", "verified"))
 
+    def test_custom_role_and_per_user_ldap_role_are_enforced(self):
+        role_name = f"ldapops_{uuid.uuid4().hex[:8]}"
+        ldap_username = f"TEST\\ldap-{uuid.uuid4().hex[:8]}"
+        with TestClient(app) as client:
+            admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            roles = client.get("/api/v1/roles", headers=admin_headers)
+            self.assertEqual(roles.status_code, 200, roles.text)
+            self.assertTrue({"admin", "operator", "viewer", "auditor"}.issubset({item["name"] for item in roles.json()["items"]}))
+            self.assertIn("users.manage", {item["id"] for item in roles.json()["permissionCatalog"]})
+            created_role = client.post("/api/v1/roles", headers=admin_headers, json={"name": role_name, "display_name": "LDAP Operations", "description": "Recording only", "permissions": ["servers.view", "recordings.view"]})
+            self.assertEqual(created_role.status_code, 201, created_role.text)
+            with SessionLocal() as db:
+                ldap_user = User(username=ldap_username, password_hash="!LDAP", display_name="LDAP Test User", role="viewer")
+                db.add(ldap_user)
+                db.commit()
+                ldap_user_id = ldap_user.id
+                ldap_token = issue_jwt(ldap_user)
+            updated = client.patch(f"/api/v1/users/{ldap_user_id}", headers=admin_headers, json={"role": role_name})
+            self.assertEqual(updated.status_code, 200, updated.text)
+            self.assertEqual(updated.json()["source"], "ldap")
+            self.assertEqual(updated.json()["role"], role_name)
+            password_change = client.patch(f"/api/v1/users/{ldap_user_id}", headers=admin_headers, json={"password": "not-allowed-password-123"})
+            self.assertEqual(password_change.status_code, 422, password_change.text)
+            ldap_headers = {"Authorization": f"Bearer {ldap_token}"}
+            self.assertEqual(client.get("/api/v1/audit", headers=ldap_headers).status_code, 403)
+            expanded_role = client.put(f"/api/v1/roles/{role_name}", headers=admin_headers, json={"display_name": "LDAP Operations", "description": "Recording and audit", "permissions": ["servers.view", "recordings.view", "audit.view"]})
+            self.assertEqual(expanded_role.status_code, 200, expanded_role.text)
+            self.assertEqual(client.get("/api/v1/audit", headers=ldap_headers).status_code, 200)
+            self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 409)
+            self.assertEqual(client.patch(f"/api/v1/users/{ldap_user_id}", headers=admin_headers, json={"role": "viewer"}).status_code, 200)
+            self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 200)
+
     def test_resource_mutations_have_matching_automatic_refreshes(self):
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.extend"], ("storage.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.shrink"], ("storage.list",))

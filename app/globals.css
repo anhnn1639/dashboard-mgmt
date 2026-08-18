@@ -1943,6 +1943,160 @@ textarea:focus-visible {
   grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
   gap: 13px;
 }
+.access-workspace {
+  min-width: 0;
+  padding: 20px;
+}
+.access-head {
+  gap: 16px;
+}
+.access-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.access-table-scroll {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid #26364a;
+  border-radius: 9px;
+}
+.access-table {
+  min-width: 760px;
+}
+.access-table td small {
+  margin-top: 4px;
+  color: #61738b;
+}
+.identity-source {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #9cb5d6;
+  background: rgba(80, 131, 196, .1);
+  font-size: 9px;
+}
+.identity-source.ldap {
+  color: #b59bea;
+  background: rgba(145, 99, 213, .1);
+}
+.access-note {
+  margin: 12px 0 0;
+  color: #6d829d;
+  font-size: 9px;
+  line-height: 1.55;
+}
+.role-manager {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 440px;
+}
+.role-manager > aside {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  padding-right: 12px;
+  border-right: 1px solid #26364a;
+}
+.role-manager > aside button {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: #8fa2ba;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.role-manager > aside button:hover,
+.role-manager > aside button.active {
+  border-color: #304865;
+  color: #d7e5f6;
+  background: #14243a;
+}
+.role-manager > aside b,
+.role-manager > aside small {
+  display: block;
+}
+.role-manager > aside small {
+  margin-top: 3px;
+  color: #60738d;
+  font-size: 8px;
+}
+.role-editor {
+  min-width: 0;
+}
+.role-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.role-editor-head h3,
+.role-editor-head p {
+  margin: 0;
+}
+.role-editor-head p {
+  margin-top: 5px;
+  color: #70839c;
+  font-size: 9px;
+}
+.role-editor-head > span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: #7f93aa;
+  background: #172234;
+  font-size: 8px;
+}
+.permission-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 18px;
+}
+.permission-summary span {
+  padding: 6px 8px;
+  border: 1px solid #2d425b;
+  border-radius: 6px;
+  color: #9ab1cd;
+  background: #0d1825;
+  font-size: 9px;
+}
+.permission-groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  max-height: 44vh;
+  overflow: auto;
+  padding-right: 4px;
+}
+.permission-groups fieldset {
+  align-content: start;
+}
+.permission-groups label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 7px 0;
+  color: #95a8c0;
+}
+.permission-groups label + label {
+  border-top: 1px solid #1e2c3e;
+}
+.permission-groups b,
+.permission-groups small {
+  display: block;
+}
+.permission-groups small {
+  margin-top: 3px;
+  color: #60728a;
+  font-size: 8px;
+  line-height: 1.45;
+}
 .role-list article {
   display: grid;
   grid-template-columns: 35px 1fr auto;
@@ -4031,6 +4185,11 @@ textarea:focus-visible {
   color: #ffc2c7;
   background: #3d1c25;
 }
+.resource-icon-button.danger {
+  border-color: #693841;
+  color: #ffc2c7;
+  background: #3d1c25;
+}
 .resource-icon-button.settings {
   color: #b8cae3;
   background: #172436;
@@ -4386,7 +4545,8 @@ textarea:focus-visible {
   font-size: 9px;
 }
 .state-pill.running,
-.state-pill.active {
+.state-pill.active,
+.state-pill.success {
   color: #64d9ae;
   background: rgba(83, 211, 165, .09);
 }
@@ -4548,7 +4708,8 @@ textarea:focus-visible {
   font-size: 10px;
 }
 .resource-form input:not([type="checkbox"]),
-.resource-form select {
+.resource-form select,
+.resource-form textarea {
   width: 100%;
   min-height: 41px;
   border: 1px solid #2b3c52;
@@ -4556,6 +4717,7 @@ textarea:focus-visible {
   color: #d1dceb;
   background: #0a131e;
   padding: 8px 10px;
+  resize: vertical;
 }
 .resource-form-grid {
   display: grid;
@@ -4636,6 +4798,18 @@ textarea:focus-visible {
 }
 
 @media (max-width: 900px) {
+  .role-manager {
+    grid-template-columns: 1fr;
+  }
+  .role-manager > aside {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 0 0 12px;
+    border-right: 0;
+    border-bottom: 1px solid #26364a;
+  }
+  .permission-groups {
+    grid-template-columns: 1fr;
+  }
   .firewall-filter-bar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -4673,6 +4847,19 @@ textarea:focus-visible {
   }
 }
 @media (max-width: 560px) {
+  .access-workspace {
+    padding: 13px;
+  }
+  .access-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .access-actions {
+    width: 100%;
+  }
+  .role-manager > aside {
+    grid-template-columns: 1fr;
+  }
   .resource-modal-backdrop {
     padding: 5px;
   }
