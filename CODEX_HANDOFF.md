@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn mới nhất: `0.7.3`; MSI bundle `0.7.3` đang chờ workflow của source commit hiện tại trước khi thay artifact `0.7.2`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn và MSI bundle mới nhất: `0.7.3`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -59,10 +59,10 @@
 ## MSI artifact
 
 - File: `agent/windows/TramVanHanhAgent.msi`
-- Kích thước: `13,647,872` bytes.
-- Phiên bản MSI: `0.7.2`.
-- SHA-256: `11B7E63FE8692097A86D11779E3926E418E98199EC5A323F04A72177D54A4038`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `d2b1b98` trên GitHub Actions run `32043508096`; ProductVersion `0.7.2` và SHA-256 đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Kích thước: `13,651,968` bytes.
+- Phiên bản MSI: `0.7.3`.
+- SHA-256: `1BC8CD078F9AA1738830CE9585689E0AF87C0349ECE68B75209C21227E32C840`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `60f80db` trên GitHub Actions run `32087754572`; ProductVersion `0.7.3` và SHA-256 đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -155,7 +155,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đang cài agent thủ công cập nhật 0.7.2 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
+Endpoint Linux đang cài agent thủ công cập nhật 0.7.3 như sau, không enroll lại và không thay certificate/config hiện có. Bắt buộc giữ/cài unit systemd có `AF_NETLINK` và chạy `daemon-reload`; chỉ copy Python trên endpoint cũ hơn 0.6.3 sẽ không sửa lỗi netlink:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -207,7 +207,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.2`, Linux available và Windows MSI 0.7.2 available.
+- Sau khi bundle artifact mới, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.7.3`, Linux available và Windows MSI 0.7.3 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -218,7 +218,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.2`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
+2. Tải Linux `.run`, cài Ubuntu staging; xác nhận service running, agent `0.7.3`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -235,8 +235,8 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline. Khi mở SSH, xác nhận API có log `agent stream prepared`; nếu còn lỗi Guacamole, lấy đồng thời log `api guacamole guacd` để tách lỗi credential/host-key/recording.
 10. Test uninstall/upgrade MSI và xác nhận không để lộ claim/private key trong log.
 11. Trên Windows, Ubuntu, Red Hat và Oracle Linux staging, quét từng tab mới; xác nhận danh sách là dữ liệu thật của endpoint, action mutation tự sinh job quét lại và UI cập nhật sau check-in kế tiếp.
-12. Với Disk, chỉ test extend/create/delete trên disk dữ liệu staging đã snapshot/backup; kiểm tra boot/root/system không chọn được, capacity vượt giới hạn bị chặn và filesystem/mount/fstab sau reboot đúng như UI.
-13. Chọn đúng một update trong danh sách và xác nhận chỉ gói/version đó được cài; không có luồng update-all.
+12. Với Disk, chỉ test extend/shrink/create/delete trên disk dữ liệu staging đã snapshot/backup; xác nhận segment Unallocated đúng offset, EFI/MSR/Recovery/OEM bị khóa, capacity vượt giới hạn bị chặn và filesystem/mount/fstab sau reboot đúng như UI. Không dùng Shrink để cố di chuyển Recovery.
+13. Chọn đúng một update trong danh sách và xác nhận chỉ gói/version đó được cài; không có luồng update-all. Trên Windows, xác nhận trạng thái WUA là `ok`; `cached` chỉ là dữ liệu cục bộ cũ. Nếu còn `0x80072EE2`, sửa outbound firewall/proxy/WSUS của LocalSystem rồi quét lại, không coi 0 dòng là “đã cập nhật hết”.
 
 ## Kiểm thử local đã đạt
 
@@ -252,7 +252,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions build MSI 0.7.2 run `32043508096` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.2`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions build MSI 0.7.3 run `32087754572` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.3`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
@@ -262,7 +262,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Windows yêu cầu unallocated space liền kề. Với layout 100 GiB hiện tại, partition Recovery nằm sau C: nên `Extend` của C: hiện mờ và giải thích nguyên nhân; ứng dụng không tự di chuyển/xóa Recovery.
 - Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
 - PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
-- Không đổi Agent/MSI; production vẫn dùng Agent `0.7.2`. Chỉ cần rebuild `api` và `dashboard`.
+- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.7.3` ở phần trên.
 - Sửa nhận diện LV khi `lsblk` trả `/dev/mapper/<vg>-<lv>` nhưng `lvs` trả `/dev/<vg>/<lv>`: dashboard ánh xạ đúng quy tắc escape dấu gạch ngang của device-mapper, nên root LV hiện lại nút Extend và dùng đúng path do `lvs` cung cấp cho Agent.
 - Unallocated Windows không phải partition nên không hỗ trợ kéo-thả. Nếu Recovery nằm giữa C: và vùng trống, Windows native chỉ extend sau khi Recovery được di chuyển hoặc xóa/tạo lại trong maintenance window có backup; dashboard chỉ báo khóa, không tự làm thao tác phá hủy này.
 
