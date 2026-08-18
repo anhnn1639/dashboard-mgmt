@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn mới nhất: `0.7.6`; MSI bundle trong repository vẫn là `0.7.5` cho tới khi tải artifact của workflow source 0.7.6 ở commit kế tiếp. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
+- Agent nguồn và MSI bundle mới nhất: `0.7.6`. Endpoint Linux phải nâng cấp Python/VERSION, đồng thời vẫn giữ unit systemd 0.6.3+ có `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -69,9 +69,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `14,069,760` bytes.
-- Phiên bản MSI: `0.7.5`.
-- SHA-256: `A315495E6BDF72A76779A97E506136F22700B7A7B2FE16F49096747F560E718B`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `90874a5` trên GitHub Actions run `32108654462`; ProductVersion `0.7.5`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.7.6`.
+- SHA-256: `DCB7D5E1C5678EC5E2BBADAF342872113ED4804C153AE1D9E868BF4D0A277C30`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `f25a2cbc9fe10b6ad586521df04e338c9a906fb4` trên GitHub Actions run `32115991304`; ProductVersion `0.7.6`, kích thước `14,069,760` bytes và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -262,7 +262,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions build MSI 0.7.5 run `32108654462` pass; ProductVersion đọc trực tiếp từ MSI là `0.7.5`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions build MSI 0.7.6 run `32115991304` pass từ source commit `f25a2cb`; ProductVersion đọc trực tiếp từ MSI là `0.7.6`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Ưu tiên sau smoke test
 
