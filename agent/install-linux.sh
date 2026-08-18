@@ -48,6 +48,22 @@ if [ ! -s "$artifact" ]; then
   exit 1
 fi
 
+identity_state="new"
+identity_files="/etc/tram-agent/agent.json /etc/tram-agent/agent.crt /etc/tram-agent/agent.key /etc/tram-agent/agent-ca.crt /etc/tram-agent/server-ca.crt"
+identity_file_count=0
+for identity_file in $identity_files; do
+  if [ -s "$identity_file" ]; then
+    identity_file_count=$((identity_file_count + 1))
+  fi
+done
+if [ "$identity_file_count" -eq 5 ]; then
+  identity_state="enrolled"
+elif [ "$identity_file_count" -ne 0 ]; then
+  echo "Existing Agent identity is incomplete; installation stopped before changing the service." >&2
+  echo "Do not delete /etc/tram-agent automatically. Restore its certificate/key backup or retire the old server in the dashboard before a deliberate clean enrollment." >&2
+  exit 1
+fi
+
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 install -d -m 0700 /var/lib/tram-agent/inbox
 systemctl stop tram-agent.service >/dev/null 2>&1 || true
@@ -70,7 +86,11 @@ if ! command -v clamscan >/dev/null 2>&1; then
   echo "WARNING: endpoint ClamAV is missing. Secure file delivery remains fail-closed until an approved scanner and signatures are installed." >&2
 fi
 
-if [ -n "$bootstrap_source" ]; then
+if [ "$identity_state" = "enrolled" ]; then
+  systemctl enable tram-agent.service
+  systemctl restart tram-agent.service
+  echo "Existing Agent identity preserved; Agent upgraded and restarted without bootstrap enrollment."
+elif [ -n "$bootstrap_source" ]; then
   if [ ! -f "$bootstrap_source" ]; then
     echo "Bootstrap file does not exist" >&2
     exit 1

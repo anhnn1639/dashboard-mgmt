@@ -114,6 +114,17 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertIn("linux/x86_64/tram-agent", installer)
         self.assertIn("ExecStart=/opt/tram-agent/tram-agent", service)
 
+    def test_linux_installer_preserves_a_complete_existing_identity(self):
+        installer = (MODULE_PATH.parent / "install-linux.sh").read_text(encoding="utf-8")
+        for identity_file in ("agent.json", "agent.crt", "agent.key", "agent-ca.crt", "server-ca.crt"):
+            self.assertIn(f"/etc/tram-agent/{identity_file}", installer)
+        self.assertIn('identity_state="enrolled"', installer)
+        self.assertIn('if [ "$identity_state" = "enrolled" ]', installer)
+        upgrade_branch = installer.split('if [ "$identity_state" = "enrolled" ]', 1)[1].split("elif", 1)[0]
+        self.assertIn("systemctl restart tram-agent.service", upgrade_branch)
+        self.assertNotIn("bootstrap --file", upgrade_branch)
+        self.assertIn("Existing Agent identity is incomplete", installer)
+
     def test_system_command_falls_back_to_standard_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             command = Path(directory) / "iptables"
