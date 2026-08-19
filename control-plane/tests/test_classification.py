@@ -636,18 +636,21 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(tuple(initial_actions), INITIAL_SERVER_SCAN_ACTIONS)
 
             issued = x509.load_pem_x509_certificate(enroll.json()["certificate"].encode())
-            checkin_payload = {"agent_id": agent_id, "agent_version": "0.1.0", "inventory": None, "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}}
+            checkin_payload = {"agent_id": agent_id, "agent_version": "0.1.0", "active_job_ids": [], "inventory": None, "metrics": {"cpu_percent": 12, "memory_percent": 40, "disk_percent": 30, "uptime_seconds": 3600, "pending_updates": 2, "services_running": 80, "alerts": 0}}
             checkin_body, checkin_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
             checkin = client.post("/api/v1/agent/checkin", headers=checkin_headers, content=checkin_body)
             self.assertEqual(checkin.status_code, 200, checkin.text)
-            self.assertEqual(checkin.json()["checkin_interval_seconds"], 10)
-            self.assertEqual(len(checkin.json()["jobs"]), 1)
-            checkin_payload["active_job_id"] = checkin.json()["jobs"][0]["id"]
+            self.assertEqual(checkin.json()["checkin_interval_seconds"], 5)
+            self.assertEqual(checkin.json()["max_concurrent_jobs"], 4)
+            self.assertEqual(len(checkin.json()["jobs"]), 4)
+            checkin_payload["active_job_ids"] = [job["id"] for job in checkin.json()["jobs"]]
+            checkin_payload["active_job_id"] = checkin_payload["active_job_ids"][0]
             active_body, active_headers = signed_agent_request(agent_key, issued, "/api/v1/agent/checkin", checkin_payload)
             active_checkin = client.post("/api/v1/agent/checkin", headers=active_headers, content=active_body)
             self.assertEqual(active_checkin.status_code, 200, active_checkin.text)
             self.assertEqual(active_checkin.json()["jobs"], [])
             checkin_payload.pop("active_job_id")
+            checkin_payload["active_job_ids"] = []
 
             rotation_token = client.post("/api/v1/enrollment-tokens", headers=headers, json={"label": "windows-rotation", "expected_os_family": "windows"})
             replacement_key = ec.generate_private_key(ec.SECP256R1())

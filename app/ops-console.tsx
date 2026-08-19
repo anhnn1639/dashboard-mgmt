@@ -356,6 +356,27 @@ export function OpsConsole() {
   const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
   const [bulkTaskOpen, setBulkTaskOpen] = useState(false);
   const [serverManagement, setServerManagement] = useState<{ server: Server; mode: "share" | "delete" } | null>(null);
+  const loadServers = useCallback(async (showLoading = false) => {
+    if (!token) return;
+    if (showLoading) setLoading(true);
+    try {
+      const response = await fetch("/api/v1/servers", {
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 401) {
+        window.sessionStorage.removeItem("tram_ops_token");
+        setToken("");
+        throw new Error("Unauthorized");
+      }
+      if (!response.ok) throw new Error("Unable to load servers");
+      const data = await response.json();
+      if (Array.isArray(data.items)) setServers(data.items);
+    } catch {
+      // The 15-second background refresh keeps the last known fleet visible on transient failures.
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
 
   useEffect(() => {
     let mounted = true;
@@ -419,40 +440,15 @@ export function OpsConsole() {
 
   useEffect(() => {
     if (!token) return;
-    let mounted = true;
-    const loadServers = () =>
-      fetch("/api/v1/servers", {
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-      })
-        .then((response) => {
-          if (response.status === 401) {
-            window.sessionStorage.removeItem("tram_ops_token");
-            setToken("");
-            throw new Error("Unauthorized");
-          }
-          return response.ok
-            ? response.json()
-            : Promise.reject(new Error("Unable to load servers"));
-        })
-        .then((data) => {
-          if (mounted && Array.isArray(data.items)) setServers(data.items);
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (mounted) setLoading(false);
-        });
-    void loadServers();
+    const initial = window.setTimeout(() => void loadServers(), 0);
     const timer = window.setInterval(() => {
       void loadServers();
     }, 15_000);
     return () => {
-      mounted = false;
+      window.clearTimeout(initial);
       window.clearInterval(timer);
     };
-  }, [token]);
+  }, [loadServers, token]);
 
   useEffect(() => {
     if (token && !currentUser) return;
@@ -796,9 +792,10 @@ export function OpsConsole() {
             <div className="head-actions">
               <button
                 className="button ghost"
-                onClick={() => window.location.reload()}
+                onClick={() => void loadServers(true)}
+                disabled={loading}
               >
-                ↻ Làm mới
+                {loading ? "Đang tải…" : "↻ Làm mới"}
               </button>
             </div>
           </div>}

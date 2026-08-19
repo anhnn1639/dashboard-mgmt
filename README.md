@@ -238,11 +238,11 @@ Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` t
 | Xóa user/group | `userdel` / `groupdel` | `userdel` / `groupdel` | `Remove-LocalUser` / `Remove-LocalGroup` |
 | Tạo group | `groupadd` | `groupadd` | `New-LocalGroup` |
 | Firewall | UFW allow/deny/delete | chỉ đọc ở bản hiện tại | `New/Remove-NetFirewallRule` |
-| Mở rộng storage | `lvextend --resizefs` | `lvextend --resizefs` | `Resize-Partition` tới `SizeMax` |
+| Mở rộng storage | `lvextend --resizefs` | `lvextend --resizefs` | DiskPart `extend` trên vùng Unallocated liền kề |
 
 Tác vụ đặc quyền được tạo ở trạng thái `queued` và Agent nhận ở lần check-in kế tiếp. API không còn endpoint approve; RBAC, MFA, validation tham số và audit vẫn bắt buộc.
 
-Nút **Extend** luôn hiển thị trên partition/LV. Nút chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn: Windows cần vùng unallocated liền kề partition, còn Linux LVM cần dung lượng trống trong Volume Group. Root LV được phép extend nhưng vẫn bị khóa xóa; partition boot/root trực tiếp không được tự động extend. Ứng dụng không tự di chuyển partition Recovery của Windows.
+Nút **Extend** luôn hiển thị trên partition/LV. Nút chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn: Windows cần vùng unallocated liền kề partition, còn Linux LVM cần dung lượng trống trong Volume Group. Windows Extend/Shrink dùng DiskPart native giống Disk Management, yêu cầu đúng dung lượng đã nhập và xác minh kích thước partition sau thao tác; Shrink chỉ áp dụng cho NTFS có drive letter. Root LV được phép extend nhưng vẫn bị khóa xóa; partition boot/root trực tiếp không được tự động extend. Ứng dụng không tự di chuyển partition Recovery của Windows.
 
 Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA, cấu hình, agent, job vận hành, file, phiên SSH/RDP và recording) được ghi vào `audit_events` trong PostgreSQL với actor, IP nguồn, kết quả, tham số an toàn và chuỗi hash. Giao diện audit phân trang 500 bản ghi mỗi lần. Bản ghi quá 30 ngày được dọn lúc API khởi động và mỗi giờ; hash cuối của phần đã xóa được giữ trong `system_settings.audit_retention_anchor` để duy trì dấu vết liên kết.
 

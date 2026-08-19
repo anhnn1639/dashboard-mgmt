@@ -126,7 +126,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(resources, /Thứ tự vật lý các phân vùng/);
   assert.match(resources, /type === "unallocated"/);
   assert.match(resources, /Shrink không di chuyển phần đang chắn/);
-  assert.match(resources, /Agent sẽ truy vấn SizeMin trực tiếp từ Windows/);
+  assert.match(resources, /Agent dùng DiskPart giống Disk Management/);
   assert.match(resources, /Logical Volumes/);
   assert.match(resources, /Extend LV/);
   assert.match(resources, /resizeProtected: Boolean\(node\.resizeProtected\)/);
@@ -140,6 +140,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);
+  assert.match(source, /loadServers\(true\)/);
 });
 
 test("platform users, LDAP assignments and custom roles are editable", async () => {

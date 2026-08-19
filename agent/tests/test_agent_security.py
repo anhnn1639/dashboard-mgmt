@@ -48,7 +48,7 @@ class AgentSecurityTests(unittest.TestCase):
         scripts = []
         with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}"))):
             tram_agent.windows_storage_scan()
-            tram_agent.shrink_storage({"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3}, True)
+            tram_agent.windows_partition_after_resize(0, 3)
             tram_agent.scan_updates({"os_family": "windows"})
         parser = "$tokens=$null;$errors=$null;[System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors)|Out-Null;if($errors.Count){$errors|ForEach-Object{$_.Message};exit 1}"
         for script in scripts:
@@ -608,28 +608,40 @@ trusted
         self.assertIn("endOffsetBytes=([int64]$p.Offset+[int64]$p.Size)", scripts[0])
         self.assertIn("shrinkableBytes", scripts[0])
         self.assertIn("shrinkSupported", scripts[0])
+        self.assertIn("adjacentUnallocatedBytes", scripts[0])
+        self.assertIn("$part.extendableBytes=[int64]$next.sizeBytes", scripts[0])
         self.assertIn("sizeQuerySucceeded", scripts[0])
         self.assertIn("largestFreeExtentBytes", scripts[0])
         self.assertIn("system|reserved|recovery|oem|unknown", scripts[0])
 
-    def test_windows_shrink_rechecks_live_minimum_and_rejects_special_partitions(self):
-        scripts = []
-        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, '{}'))):
+    def test_windows_shrink_uses_diskpart_and_verifies_the_result(self):
+        scan = {"disks": [{"number": 0, "partitions": [{"partitionNumber": 3, "driveLetter": "C", "filesystem": "NTFS", "sizeBytes": 20 * 1024**3, "shrinkSupported": True, "resizeProtected": False}]}]}
+        diskpart_inputs = []
+        after = json.dumps({"diskNumber": 0, "partitionNumber": 3, "driveLetter": "C", "sizeBytes": 19 * 1024**3})
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "run_with_input", side_effect=lambda command, input_value, **_: (diskpart_inputs.append((command, input_value)) or (0, "DiskPart succeeded"))), patch.object(tram_agent, "powershell", return_value=(0, after)):
             code, _ = tram_agent.shrink_storage(
                 {"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3},
                 True,
             )
         self.assertEqual(code, 0)
-        self.assertIn("Get-PartitionSupportedSize", scripts[0])
-        self.assertIn("SizeMin", scripts[0])
-        self.assertIn("Resize-Partition", scripts[0])
-        self.assertIn("recovery", scripts[0].lower())
-        self.assertNotIn("$p.IsBoot -or $p.IsSystem", scripts[0])
+        self.assertEqual(diskpart_inputs[0][0], ["diskpart.exe"])
+        self.assertIn("select volume C", diskpart_inputs[0][1])
+        self.assertIn("shrink desired=1024 minimum=1024", diskpart_inputs[0][1])
         with self.assertRaisesRegex(ValueError, "Windows NTFS"):
             tram_agent.shrink_storage(
                 {"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3},
                 False,
             )
+
+    def test_windows_extend_uses_the_immediately_adjacent_extent(self):
+        scan = {"disks": [{"number": 0, "partitions": [{"partitionNumber": 3, "driveLetter": "C", "filesystem": "NTFS", "sizeBytes": 90 * 1024**3, "extendableBytes": 10 * 1024**3, "adjacentUnallocatedBytes": 10 * 1024**3, "resizeProtected": False}]}]}
+        diskpart_inputs = []
+        after = json.dumps({"diskNumber": 0, "partitionNumber": 3, "driveLetter": "C", "sizeBytes": 100 * 1024**3})
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "run_with_input", side_effect=lambda command, input_value, **_: (diskpart_inputs.append(input_value) or (0, "DiskPart succeeded"))), patch.object(tram_agent, "powershell", return_value=(0, after)):
+            code, output = tram_agent.extend_storage({"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "add_bytes": 10 * 1024**3}, True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("select volume C", diskpart_inputs[0])
+        self.assertIn("extend size=10240", diskpart_inputs[0])
 
     def test_powershell_clixml_errors_are_readable(self):
         raw = '#< CLIXML\n<Objs><S S="Error">Exception from HRESULT: 0x80072EE2_x000D__x000A_At line:1 char:1</S></Objs>'

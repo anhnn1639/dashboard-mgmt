@@ -563,8 +563,16 @@ class CheckinRequest(BaseModel):
     agent_id: str
     agent_version: str
     active_job_id: str | None = Field(default=None, max_length=36)
+    active_job_ids: list[str] = Field(default_factory=list, max_length=4)
     inventory: Inventory | None = None
     metrics: Metrics
+
+    @field_validator("active_job_ids")
+    @classmethod
+    def valid_active_job_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(not re.fullmatch(r"[A-Za-z0-9-]{1,36}", value) for value in values):
+            raise ValueError("Agent active job IDs are invalid")
+        return values
 
 
 class JobCreateRequest(BaseModel):
@@ -688,6 +696,9 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical"},
 }
+
+MAX_CONCURRENT_AGENT_JOBS = 4
+PARALLEL_AGENT_READ_ACTIONS = {action for action, policy in SAFE_ACTIONS.items() if policy["risk"] == "low"}
 
 PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     "servers.view": {"group": "Máy chủ", "label": "Xem danh sách máy chủ", "description": "Xem inventory, tình trạng và trang chi tiết máy chủ."},
@@ -2945,23 +2956,41 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
     if payload.metrics.services_running is not None:
         server.services_running = payload.metrics.services_running
     server.alerts = payload.metrics.alerts
-    jobs: list[Job] = []
-    if payload.active_job_id:
-        active_job = db.get(Job, payload.active_job_id)
-        if not active_job or active_job.server_id != server.id or active_job.status != "dispatched":
+    supports_parallel_jobs = "active_job_ids" in payload.model_fields_set
+    active_job_ids = payload.active_job_ids if supports_parallel_jobs else ([payload.active_job_id] if payload.active_job_id else [])
+    if payload.active_job_id and active_job_ids and payload.active_job_id not in active_job_ids:
+        raise HTTPException(status_code=409, detail="Agent primary active job is missing from the active job list")
+    dispatched = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "dispatched")).scalars().all()
+    dispatched_by_id = {job.id: job for job in dispatched}
+    for active_job_id in active_job_ids:
+        if active_job_id not in dispatched_by_id:
             raise HTTPException(status_code=409, detail="Agent active job does not match control-plane state")
-    else:
-        interrupted = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "dispatched")).scalars().all()
-        for job in interrupted:
-            job.status = "queued"
-            job.started_at = None
-            if job.action == "file.deliver":
-                parameters = reveal_parameters(job.parameters)
-                transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
-                if transfer and transfer.server_id == server.id:
-                    transfer.status = "queued"
-            audit(db, f"agent:{server.id}", "job.interrupted.requeued", job.id, request, detail={"action": job.action})
-        jobs = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "queued").order_by(Job.created_at).limit(1)).scalars().all()
+    for job in dispatched:
+        if job.id in active_job_ids:
+            continue
+        job.status = "queued"
+        job.started_at = None
+        if job.action == "file.deliver":
+            parameters = reveal_parameters(job.parameters)
+            transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
+            if transfer and transfer.server_id == server.id:
+                transfer.status = "queued"
+        audit(db, f"agent:{server.id}", "job.interrupted.requeued", job.id, request, detail={"action": job.action})
+
+    jobs: list[Job] = []
+    capacity = (MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1) - len(active_job_ids)
+    if capacity > 0:
+        active_mutation = any(dispatched_by_id[job_id].action not in PARALLEL_AGENT_READ_ACTIONS for job_id in active_job_ids)
+        queued = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "queued").order_by(Job.created_at).limit(100)).scalars().all()
+        for queued_job in queued:
+            is_read = queued_job.action in PARALLEL_AGENT_READ_ACTIONS
+            if not is_read and active_mutation:
+                continue
+            jobs.append(queued_job)
+            if not is_read:
+                active_mutation = True
+            if len(jobs) >= capacity:
+                break
     for job in jobs:
         job.status = "dispatched"
         job.started_at = now()
@@ -2971,7 +3000,7 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
             if transfer and transfer.server_id == server.id:
                 transfer.status = "transferring"
     db.commit()
-    return {"server_time": now().isoformat(), "checkin_interval_seconds": 10, "inventory_interval_seconds": 1800, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
+    return {"server_time": now().isoformat(), "checkin_interval_seconds": 5 if supports_parallel_jobs else 10, "inventory_interval_seconds": 1800, "max_concurrent_jobs": MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
 
 
 @app.post("/api/v1/agent/jobs/{job_id}/result")

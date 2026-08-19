@@ -107,6 +107,7 @@ type StorageNode = {
   sizeBytes?: number;
   freeBytes?: number;
   extendableBytes?: number;
+  adjacentUnallocatedBytes?: number;
   shrinkableBytes?: number;
   shrinkSupported?: boolean;
   sizeQuerySucceeded?: boolean;
@@ -191,6 +192,7 @@ function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
     sizeBytes: bytes(value.sizeBytes),
     freeBytes: bytes(value.freeBytes),
     extendableBytes: bytes(value.extendableBytes),
+    adjacentUnallocatedBytes: bytes(value.adjacentUnallocatedBytes),
     shrinkableBytes: bytes(value.shrinkableBytes),
     shrinkSupported: value.shrinkSupported === true,
     sizeQuerySucceeded: value.sizeQuerySucceeded === true,
@@ -247,6 +249,7 @@ type StorageTarget = {
   diskNumber?: number;
   partitionNumber?: number;
   extendableBytes?: number;
+  adjacentUnallocatedBytes?: number;
   shrinkableBytes?: number;
   shrinkSupported?: boolean;
   sizeQuerySucceeded?: boolean;
@@ -316,6 +319,7 @@ export function StorageResourceTab({
         diskNumber: Number(disk.number),
         partitionNumber: Number(node.partitionNumber),
         extendableBytes: bytes(node.extendableBytes),
+        adjacentUnallocatedBytes: bytes(node.adjacentUnallocatedBytes),
         shrinkableBytes: bytes(node.shrinkableBytes),
         shrinkSupported: node.shrinkSupported,
         sizeQuerySucceeded: node.sizeQuerySucceeded,
@@ -368,7 +372,7 @@ export function StorageResourceTab({
     const shrinkCapacity = bytes(target?.shrinkableBytes);
     const resizeProtected = Boolean(target?.resizeProtected);
     const canExtend = Boolean(target && extendCapacity >= 1024 ** 2 && !resizeProtected);
-    const canShrink = Boolean(target?.kind === "windows_partition" && target.filesystem?.toUpperCase() === "NTFS" && !resizeProtected && (shrinkCapacity >= 16 * 1024 ** 2 || (target.shrinkSupported && target.sizeQuerySucceeded === false)));
+    const canShrink = Boolean(target?.kind === "windows_partition" && target.filesystem?.toUpperCase() === "NTFS" && !resizeProtected && target.shrinkSupported);
     const extendReason = !target
       ? ""
       : resizeProtected
@@ -386,11 +390,9 @@ export function StorageResourceTab({
         ? target.resizeReason || "Partition hệ thống này được bảo vệ."
         : target.filesystem?.toUpperCase() !== "NTFS"
           ? "Windows chỉ hỗ trợ Shrink an toàn cho volume NTFS."
-          : target.sizeQuerySucceeded === false && target.shrinkSupported
-            ? `Windows chưa trả dung lượng Shrink trong lần quét${target.resizeQueryError ? ` (${target.resizeQueryError})` : ""}; Agent sẽ hỏi lại SizeMin ngay khi thực thi giống Disk Management.`
-          : shrinkCapacity < 16 * 1024 ** 2
-            ? "Windows xác nhận dung lượng có thể Shrink hiện nhỏ hơn 16 MiB; file không thể di chuyển có thể đang nằm cuối volume."
-            : `Có thể Shrink tối đa ${formatBytes(shrinkCapacity)} theo trạng thái vừa quét.`;
+          : shrinkCapacity >= 16 * 1024 ** 2
+            ? `Có thể Shrink tối đa ${formatBytes(shrinkCapacity)} theo trạng thái vừa quét; Windows sẽ kiểm tra lại khi thực thi.`
+            : `Disk Management sẽ xác định lại dung lượng Shrink tối đa ngay lúc thực thi${target.resizeQueryError ? `; lần quét trước trả về ${target.resizeQueryError}` : ""}.`;
     const unallocated = node.type === "unallocated";
     const displayName = unallocated
       ? "Unallocated"
@@ -579,11 +581,11 @@ export function StorageResourceTab({
         </form>
       </ModalShell>}
 
-      {modal === "shrink" && selected?.kind === "windows_partition" && <ModalShell title={`Shrink ${selected.label}`} subtitle={selected.sizeQuerySucceeded ? `Có thể thu nhỏ tối đa theo lần quét này: ${formatBytes(selected.shrinkableBytes)}` : "Agent sẽ truy vấn SizeMin trực tiếp từ Windows ngay trước khi Shrink"} close={() => setModal(null)}>
+      {modal === "shrink" && selected?.kind === "windows_partition" && <ModalShell title={`Shrink ${selected.label}`} subtitle={bytes(selected.shrinkableBytes) >= 16 * 1024 ** 2 ? `Windows đang báo có thể thu nhỏ tối đa ${formatBytes(selected.shrinkableBytes)}; Agent vẫn kiểm tra lại khi chạy` : "Agent dùng DiskPart giống Disk Management và xác định giới hạn thật ngay lúc chạy"} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitShrink}>
-          <label>Dung lượng cần thu nhỏ (GiB)<input name="size_gb" type="number" min="0.016" step="0.001" max={selected.sizeQuerySucceeded ? (bytes(selected.shrinkableBytes) / 1024 ** 3).toFixed(3) : undefined} required /></label>
+          <label>Dung lượng cần thu nhỏ (GiB)<input name="size_gb" type="number" min="0.016" step="0.001" max={bytes(selected.shrinkableBytes) >= 16 * 1024 ** 2 ? (bytes(selected.shrinkableBytes) / 1024 ** 3).toFixed(3) : undefined} required /></label>
           <div className="resource-help">Vùng Unallocated mới sẽ xuất hiện ngay bên phải volume này. Shrink không di chuyển Recovery hay bất kỳ partition nào, vì vậy không thể dùng Shrink để đưa vùng trống ở cuối Disk vượt qua Recovery về sát ổ C:.</div>
-          <div className="danger-panel">Hãy bảo đảm đã có backup và không có tác vụ ghi dữ liệu lớn. Agent sẽ đọc lại SizeMin ngay trước khi resize và dừng nếu dung lượng an toàn đã thay đổi.</div>
+          <div className="danger-panel">Hãy bảo đảm đã có backup và không có tác vụ ghi dữ liệu lớn. Agent dùng DiskPart native, yêu cầu đúng dung lượng đã nhập và kiểm tra lại kích thước volume sau thao tác.</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Shrink</button></div>
         </form>
       </ModalShell>}
@@ -867,6 +869,7 @@ export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queu
   const installAllowed = latestAttemptMatches && (!isWindows || (scanState.latestComplete && !showingPrevious));
   const source = String(diagnostics.sourceLabel ?? diagnostics.updateSource ?? "Windows Update");
   const issue = updateDiagnosticText(diagnostics.policyIssue || diagnostics.wuaError);
+  const lastSuccessfulSearch = updateDate(diagnostics.lastSearchSuccessDate);
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const activeSelected = installAllowed ? selected.filter((id) => rows.some((row) => row.id === id)) : [];
@@ -882,7 +885,7 @@ export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queu
   return <section className="resource-tab updates-resource-tab">
     <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật đang hiển thị · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!activeSelected.length || busy || !installAllowed} title={installAllowed ? "" : "Chỉ cài đặt sau một lần quét Windows Update hoàn tất"} onClick={() => void install()}>Cập nhật ({activeSelected.length})</button></div></div>
     <PendingState job={job} />
-    {isWindows && !scanState.latestComplete && <div className="update-scan-status warning"><div><b>Chưa thể kết luận máy có 0 bản cập nhật</b><span>Lần quét hiện tại chưa hoàn tất; danh sách cũ nếu có chỉ dùng để tham khảo và không được phép cài.</span></div><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>Lần Windows quét thành công</dt><dd>{updateDate(diagnostics.lastSearchSuccessDate)}</dd></div><div><dt>Trạng thái</dt><dd>{String(diagnostics.wuaStatus ?? "chưa hoàn tất")}</dd></div></dl>{issue && <small title={String(diagnostics.policyIssue || diagnostics.wuaError)}>{issue}</small>}{showingPrevious && scanState.display && <small>Đang hiển thị dữ liệu hoàn tất gần nhất lúc {updateDate(scanState.display.createdAt)}.</small>}</div>}
+    {isWindows && !scanState.latestComplete && <div className="update-scan-status warning"><div><b>Chưa thể kết luận máy có 0 bản cập nhật</b><span>Lần quét hiện tại chưa hoàn tất; danh sách cũ nếu có chỉ dùng để tham khảo và không được phép cài.</span></div><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>Lần Windows quét thành công</dt><dd>{lastSuccessfulSearch}</dd></div><div><dt>Trạng thái</dt><dd>{String(diagnostics.wuaStatus ?? "chưa hoàn tất")}</dd></div></dl>{issue && <small title={String(diagnostics.policyIssue || diagnostics.wuaError)}>{issue}</small>}{lastSuccessfulSearch !== "chưa có" && <small>Windows Settings vẫn có thể hiển thị các gói đã phát hiện, tải hoặc đánh dấu Pending install từ lần quét {lastSuccessfulSearch}; khi máy không tới được WSUS/Microsoft Update, Agent không thể xác minh lại danh sách đó là trạng thái hiện tại.</small>}{showingPrevious && scanState.display && <small>Đang hiển thị dữ liệu hoàn tất gần nhất lúc {updateDate(scanState.display.createdAt)}.</small>}</div>}
     <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" disabled={!installAllowed} checked={rows.length > 0 && rows.every((item) => activeSelected.includes(item.id))} onChange={() => setSelected(rows.every((item) => activeSelected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={!installAllowed} checked={activeSelected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
   </section>;
 }

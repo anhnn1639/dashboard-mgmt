@@ -69,10 +69,12 @@ WINDOWS_RESERVED_FILENAMES = {
 }
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
+MAX_CONCURRENT_JOBS = 4
 WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
+MUTATION_JOB_LOCK = threading.Lock()
 ALLOWED_ACTIONS = {
     "inventory.collect", "service.list", "service.restart", "service.start", "service.stop",
     "user.create", "user.update", "user.disable", "user.enable", "user.delete", "user.password.reset",
@@ -81,6 +83,10 @@ ALLOWED_ACTIONS = {
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend", "storage.shrink",
     "storage.create", "storage.delete",
     "firewall.rule.add", "firewall.rule.add.auto", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
+}
+READ_ONLY_ACTIONS = {
+    "inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "logs.sources", "logs.read",
+    "process.list", "firewall.list", "storage.list", "network.list",
 }
 
 
@@ -165,10 +171,17 @@ def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: 
     return completed.returncode, output[-output_limit:]
 
 
-def run_with_input(command: list[str], input_value: str, timeout: int = 120) -> tuple[int, str]:
-    completed = subprocess.run(command, input=input_value, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+def run_with_input(command: list[str], input_value: str, timeout: int = 120, output_limit: int = 100_000) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(command, input=input_value, text=True, capture_output=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        detail = "\n".join(part.strip() for part in (stdout, stderr) if part and part.strip())
+        message = f"Command timed out after {timeout} seconds"
+        return 124, (f"{message}\n{detail}" if detail else message)[-output_limit:]
     output = completed.stdout.strip() if completed.returncode == 0 else "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
-    return completed.returncode, output[-100_000:]
+    return completed.returncode, output[-output_limit:]
 
 
 def powershell(script: str, timeout: int = 120, output_limit: int = 100_000) -> tuple[int, str]:
@@ -2078,12 +2091,12 @@ def windows_storage_scan() -> tuple[int, str]:
         "$extendable=if($supported -and -not $special -and $filesystem -match '^(?i:NTFS|ReFS)$'){[math]::Max(0,[int64]$supported.SizeMax-[int64]$p.Size)}else{0};"
         "$shrinkable=if($supported -and -not $special -and $filesystem -eq 'NTFS'){[math]::Max(0,[int64]$p.Size-[int64]$supported.SizeMin)}else{0};"
         "[pscustomobject]@{id=($d.Number.ToString()+':'+$p.PartitionNumber.ToString());diskNumber=[int]$d.Number;partitionNumber=[int]$p.PartitionNumber;driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};"
-        "type=$type;offsetBytes=[int64]$p.Offset;endOffsetBytes=([int64]$p.Offset+[int64]$p.Size);sizeBytes=[int64]$p.Size;extendableBytes=[int64]$extendable;shrinkableBytes=[int64]$shrinkable;shrinkSupported=[bool](-not $special -and $filesystem -eq 'NTFS');sizeQuerySucceeded=[bool]($null -ne $supported);resizeQueryError=$resizeQueryError;"
+        "type=$type;offsetBytes=[int64]$p.Offset;endOffsetBytes=([int64]$p.Offset+[int64]$p.Size);sizeBytes=[int64]$p.Size;extendableBytes=[int64]$extendable;adjacentUnallocatedBytes=[int64]0;shrinkableBytes=[int64]$shrinkable;shrinkSupported=[bool](-not $special -and $filesystem -eq 'NTFS' -and $p.DriveLetter);sizeQuerySucceeded=[bool]($null -ne $supported);resizeQueryError=$resizeQueryError;"
         "filesystem=$filesystem;label=if($v){[string]$v.FileSystemLabel}else{''};freeBytes=if($v){[int64]$v.SizeRemaining}else{0};health=if($v){$v.HealthStatus.ToString()}else{''};"
         "path=$p.AccessPaths|Select-Object -First 1;protected=[bool]($p.IsBoot -or $p.IsSystem -or $special);resizeProtected=$special;resizeReason=if($special){'EFI, MSR, Recovery và OEM không được resize'}elseif($filesystem -notmatch '^(?i:NTFS|ReFS)$'){'Extend chỉ hỗ trợ NTFS/ReFS; Shrink chỉ hỗ trợ NTFS'}else{''}}});"
         "$segments=@();$cursor=[int64]0;foreach($part in $realParts){$offset=[int64]$part.offsetBytes;$gap=$offset-$cursor;if($gap -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=$offset;sizeBytes=$gap;freeBytes=$gap;protected=$true;resizeProtected=$true}};$segments+=,$part;$cursor=[math]::Max($cursor,[int64]$part.endOffsetBytes)};"
         "$tail=[int64]$d.Size-$cursor;if($tail -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=[int64]$d.Size;sizeBytes=$tail;freeBytes=$tail;protected=$true;resizeProtected=$true}};"
-        "for($i=0;$i -lt ($segments.Count-1);$i++){$part=$segments[$i];$next=$segments[$i+1];if($part.partitionNumber -and $next.type -eq 'unallocated' -and -not $part.resizeProtected -and $part.filesystem -match '^(?i:NTFS|ReFS)$' -and -not $part.sizeQuerySucceeded){$part.extendableBytes=[int64]$next.sizeBytes}};"
+        "for($i=0;$i -lt ($segments.Count-1);$i++){$part=$segments[$i];$next=$segments[$i+1];if($part.partitionNumber -and $next.type -eq 'unallocated' -and -not $part.resizeProtected -and $part.filesystem -match '^(?i:NTFS|ReFS)$'){$part.adjacentUnallocatedBytes=[int64]$next.sizeBytes;$part.extendableBytes=[int64]$next.sizeBytes}};"
         "$unallocated=[int64](($segments|Where-Object{$_.type -eq 'unallocated'}|Measure-Object -Property sizeBytes -Sum).Sum);"
         "[pscustomobject]@{id=[string]$d.UniqueId;number=[int]$d.Number;name=[string]$d.FriendlyName;model=[string]$d.Model;serial=[string]$d.SerialNumber;sizeBytes=[int64]$d.Size;partitionTable=$d.PartitionStyle.ToString();"
         "health=$d.HealthStatus.ToString();operationalStatus=($d.OperationalStatus -join ', ');readOnly=[bool]$d.IsReadOnly;system=[bool]$d.IsSystem;boot=[bool]$d.IsBoot;unallocatedBytes=$unallocated;largestFreeExtentBytes=[int64]$d.LargestFreeExtent;partitions=@($segments)}});"
@@ -2114,6 +2127,68 @@ def storage_int(parameters: dict[str, Any], key: str, minimum: int = 1, maximum:
     if not minimum <= value <= maximum:
         raise ValueError(f"Invalid {key}")
     return value
+
+
+def find_windows_storage_partition(scan: dict[str, Any], disk_number: int, partition_number: int) -> dict[str, Any] | None:
+    for disk in scan.get("disks", []):
+        if byte_value(disk.get("number")) != disk_number:
+            continue
+        for partition in disk.get("partitions", []):
+            if byte_value(partition.get("partitionNumber")) == partition_number:
+                return partition
+    return None
+
+
+def windows_partition_after_resize(disk_number: int, partition_number: int) -> tuple[int, dict[str, Any] | str]:
+    script = (
+        f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;"
+        "[pscustomobject]@{diskNumber=[int]$p.DiskNumber;partitionNumber=[int]$p.PartitionNumber;"
+        "driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};sizeBytes=[int64]$p.Size}|ConvertTo-Json -Compress"
+    )
+    code, output = powershell(script, timeout=180)
+    if code != 0:
+        return code, output
+    try:
+        parsed = json.loads(output)
+    except (TypeError, ValueError):
+        return 2, output or "Windows returned an invalid partition state after resize"
+    return (0, parsed) if isinstance(parsed, dict) else (2, output or "Windows returned an invalid partition state after resize")
+
+
+def run_windows_diskpart_resize(
+    disk_number: int,
+    partition_number: int,
+    drive_letter: str,
+    before_bytes: int,
+    requested_bytes: int,
+    operation: str,
+) -> tuple[int, str]:
+    requested_mib = requested_bytes // 1024**2
+    if requested_mib < 1:
+        raise ValueError("Windows Disk Management requires at least 1 MiB")
+    actual_requested_bytes = requested_mib * 1024**2
+    commands = [f"select volume {drive_letter}"] if drive_letter else [f"select disk {disk_number}", f"select partition {partition_number}"]
+    if operation == "extend":
+        commands.append(f"extend size={requested_mib}")
+    elif operation == "shrink":
+        if not drive_letter:
+            raise ValueError("Windows Shrink requires a mounted NTFS volume with a drive letter")
+        commands.append(f"shrink desired={requested_mib} minimum={requested_mib}")
+    else:
+        raise ValueError("Invalid Windows resize operation")
+    code, native_output = run_with_input(["diskpart.exe"], "\r\n".join([*commands, "exit", ""]), timeout=1800)
+    if code != 0:
+        return code, native_output
+    state_code, state = windows_partition_after_resize(disk_number, partition_number)
+    if state_code != 0 or not isinstance(state, dict):
+        return state_code or 2, str(state)
+    after_bytes = byte_value(state.get("sizeBytes"))
+    changed_bytes = after_bytes - before_bytes if operation == "extend" else before_bytes - after_bytes
+    if changed_bytes < actual_requested_bytes:
+        detail = native_output[-4000:] if native_output else "DiskPart returned without changing the requested amount"
+        return 2, f"Windows did not {operation} the selected volume by {requested_mib} MiB\n{detail}"
+    state.update({"requestedBytes": requested_bytes, "appliedBytes": changed_bytes, "operation": operation})
+    return 0, json.dumps(state, ensure_ascii=False, separators=(",", ":"))
 
 
 def linux_mount_path(value: Any) -> str:
@@ -2189,8 +2264,23 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
             raise ValueError("Invalid Windows storage target")
         disk_number = storage_int(parameters, "disk_number", 0, 4096)
         partition_number = storage_int(parameters, "partition_number", 1, 4096)
-        script = f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$s=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$target=[int64]$p.Size+{add_bytes};if($target -gt [int64]$s.SizeMax){{throw 'Requested size exceeds live contiguous capacity'}};Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -Size $target -Confirm:$false -ErrorAction Stop;Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number}|Select DiskNumber,PartitionNumber,DriveLetter,Size|ConvertTo-Json -Compress"
-        return powershell(script, timeout=1800)
+        scan = parsed_storage_scan(True)
+        partition = find_windows_storage_partition(scan, disk_number, partition_number)
+        if not partition or partition.get("resizeProtected"):
+            raise ValueError("Windows partition changed or is protected")
+        if str(partition.get("filesystem", "")).upper() not in {"NTFS", "REFS"}:
+            raise ValueError("Windows Extend supports only NTFS/ReFS volumes")
+        contiguous_bytes = byte_value(partition.get("adjacentUnallocatedBytes") or partition.get("extendableBytes"))
+        if add_bytes > contiguous_bytes:
+            raise ValueError("Requested size exceeds live contiguous unallocated space")
+        return run_windows_diskpart_resize(
+            disk_number,
+            partition_number,
+            str(partition.get("driveLetter") or "").upper(),
+            byte_value(partition.get("sizeBytes")),
+            add_bytes,
+            "extend",
+        )
     scan = parsed_storage_scan(False)
     if kind == "linux_lv":
         path = str(parameters.get("path", ""))
@@ -2243,19 +2333,23 @@ def shrink_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     shrink_bytes = storage_int(parameters, "shrink_bytes", 16 * 1024**2)
     disk_number = storage_int(parameters, "disk_number", 0, 4096)
     partition_number = storage_int(parameters, "partition_number", 1, 4096)
-    script = (
-        f"$p=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;"
-        "$v=$p|Get-Volume -ErrorAction Stop;$type=[string]$p.Type;"
-        "if($p.IsHidden -or $type -match '(?i)system|reserved|recovery|oem|unknown'){throw 'EFI, MSR, Recovery and OEM partitions cannot be shrunk'};"
-        "if([string]$v.FileSystem -ne 'NTFS'){throw 'Only NTFS partitions can be shrunk safely'};"
-        f"$s=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber {partition_number} -ErrorAction Stop;$target=[int64]$p.Size-{shrink_bytes};"
-        "if($target -lt [int64]$s.SizeMin){throw 'Requested shrink exceeds the live supported capacity; scan again'};"
-        f"Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} -Size $target -Confirm:$false -ErrorAction Stop;"
-        f"$after=Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number};"
-        "[pscustomobject]@{diskNumber=[int]$after.DiskNumber;partitionNumber=[int]$after.PartitionNumber;driveLetter=[string]$after.DriveLetter;sizeBytes=[int64]$after.Size;unallocatedCreatedBytes="
-        f"[int64]{shrink_bytes}}}|ConvertTo-Json -Compress"
+    scan = parsed_storage_scan(True)
+    partition = find_windows_storage_partition(scan, disk_number, partition_number)
+    if not partition or partition.get("resizeProtected"):
+        raise ValueError("EFI, MSR, Recovery and OEM partitions cannot be shrunk")
+    if str(partition.get("filesystem", "")).upper() != "NTFS":
+        raise ValueError("Only NTFS partitions can be shrunk safely")
+    drive_letter = str(partition.get("driveLetter") or "").upper()
+    if not drive_letter or not partition.get("shrinkSupported"):
+        raise ValueError("Windows Shrink requires a mounted NTFS volume with a drive letter")
+    return run_windows_diskpart_resize(
+        disk_number,
+        partition_number,
+        drive_letter,
+        byte_value(partition.get("sizeBytes")),
+        shrink_bytes,
+        "shrink",
     )
-    return powershell(script, timeout=1800)
 
 
 def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
@@ -3208,9 +3302,15 @@ def post_result(config: Config, job_id: str, exit_code: int, output: str) -> Non
 def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
     LOG.info("job %s action=%s", job["id"], job["action"])
     try:
-        if job["action"] == "file.deliver":
-            return deliver_file(config, job.get("parameters", {}), inventory)
-        return execute_job(job["action"], job.get("parameters", {}), inventory)
+        def execute() -> tuple[int, str]:
+            if job["action"] == "file.deliver":
+                return deliver_file(config, job.get("parameters", {}), inventory)
+            return execute_job(job["action"], job.get("parameters", {}), inventory)
+
+        if job["action"] in READ_ONLY_ACTIONS:
+            return execute()
+        with MUTATION_JOB_LOCK:
+            return execute()
     except Exception as exc:
         LOG.exception("job failed")
         return 1, f"{type(exc).__name__}: {exc}"
@@ -3223,19 +3323,19 @@ def loop(config: Config, once: bool = False) -> None:
     inventory = collect_inventory()
     expensive_metrics_pending = False
     backoff = config.interval
-    active_job: dict[str, Any] | None = None
-    active_future: Future[tuple[int, str]] | None = None
-    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tram-job")
+    active_jobs: dict[str, tuple[dict[str, Any], Future[tuple[int, str]]]] = {}
+    worker = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="tram-job")
     if not once:
         threading.Thread(target=tunnel_control_loop, args=(config,), name="tram-tunnel-control", daemon=True).start()
     try:
         while True:
             try:
-                if active_job is not None and active_future is not None and active_future.done():
+                for job_id, (active_job, active_future) in list(active_jobs.items()):
+                    if not active_future.done():
+                        continue
                     exit_code, output = active_future.result()
-                    post_result(config, active_job["id"], exit_code, output)
-                    active_job = None
-                    active_future = None
+                    post_result(config, job_id, exit_code, output)
+                    del active_jobs[job_id]
 
                 ensure_server_ca(config)
                 timestamp = time.time()
@@ -3243,13 +3343,16 @@ def loop(config: Config, once: bool = False) -> None:
                 if send_inventory:
                     inventory = collect_inventory()
                 include_expensive = expensive_metrics_pending and not send_inventory
-                payload = {
+                active_job_ids = list(active_jobs)
+                payload: dict[str, Any] = {
                     "agent_id": config.agent_id,
                     "agent_version": AGENT_VERSION,
-                    "active_job_id": active_job["id"] if active_job else None,
+                    "active_job_id": active_job_ids[0] if active_job_ids else None,
                     "inventory": inventory if send_inventory else None,
                     "metrics": collect_metrics(inventory, include_expensive=include_expensive),
                 }
+                if not once:
+                    payload["active_job_ids"] = active_job_ids
                 url = config.agent_endpoint + "/checkin"
                 body, headers = signed_request(config, "POST", url, payload)
                 response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
@@ -3261,13 +3364,16 @@ def loop(config: Config, once: bool = False) -> None:
                 elif include_expensive:
                     expensive_metrics_pending = False
                 jobs = data.get("jobs", [])
-                if active_job is None and jobs:
-                    active_job = jobs[0]
-                    if once:
-                        exit_code, output = execute_dispatched_job(config, active_job, inventory)
-                        post_result(config, active_job["id"], exit_code, output)
-                        return
-                    active_future = worker.submit(execute_dispatched_job, config, active_job, inventory)
+                if once and jobs:
+                    one_job = jobs[0]
+                    exit_code, output = execute_dispatched_job(config, one_job, inventory)
+                    post_result(config, one_job["id"], exit_code, output)
+                    return
+                for job in jobs:
+                    job_id = str(job.get("id", ""))
+                    if not job_id or job_id in active_jobs or len(active_jobs) >= MAX_CONCURRENT_JOBS:
+                        continue
+                    active_jobs[job_id] = (job, worker.submit(execute_dispatched_job, config, job, inventory))
                 backoff = config.interval
                 if once:
                     return
