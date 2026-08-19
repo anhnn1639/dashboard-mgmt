@@ -4685,6 +4685,57 @@ textarea:focus-visible {
   color: #b4c3d5;
   line-height: 1.5;
 }
+.update-scan-status {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(246, 183, 88, .32);
+  border-radius: 8px;
+  color: #d7b476;
+  background: rgba(246, 183, 88, .07);
+}
+.update-scan-status b,
+.update-scan-status span,
+.update-scan-status small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.update-scan-status b {
+  margin-bottom: 3px;
+  color: #f1c77d;
+}
+.update-scan-status span,
+.update-scan-status small {
+  color: #a98c5f;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.update-scan-status dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+.update-scan-status dl > div {
+  min-width: 0;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(8, 15, 23, .35);
+}
+.update-scan-status dt {
+  margin-bottom: 3px;
+  color: #75664f;
+  font-size: 8px;
+  text-transform: uppercase;
+}
+.update-scan-status dd {
+  margin: 0;
+  overflow: hidden;
+  color: #cfb180;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .log-viewer {
   max-height: 620px;
   overflow: auto;
@@ -4818,6 +4869,9 @@ textarea:focus-visible {
   }
   .live-toggle {
     flex: 1 1 auto;
+  }
+  .update-scan-status dl {
+    grid-template-columns: 1fr;
   }
 }
 .bulk-task-modal {

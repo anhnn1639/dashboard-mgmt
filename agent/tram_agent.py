@@ -68,7 +68,7 @@ WINDOWS_RESERVED_FILENAMES = {
 }
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
-WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 240
+WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
@@ -2426,19 +2426,84 @@ def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
     return 0, json.dumps({"platform": "linux", "manager": Path(tool).name, "updates": rows}, ensure_ascii=False, separators=(",", ":"))
 
 
-def windows_update_query(*, online: bool, timeout: int) -> tuple[int, str]:
-    online_literal = "$true" if online else "$false"
-    mode = "online" if online else "cached"
+def windows_update_environment() -> dict[str, Any]:
     script = (
-        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$rows=@();"
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
         "$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};"
         "try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
-        "$source=if($auPolicy.UseWUServer -eq 1 -and $policy.WUServer){'WSUS'}else{'Microsoft Update'};"
+        "$registered=@();try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;$registered=@($manager.Services|ForEach-Object{[pscustomobject]@{name=[string]$_.Name;serviceId=[string]$_.ServiceID;isManaged=[bool]$_.IsManaged;isDefault=[bool]$_.IsDefaultAUService;offersWindowsUpdates=[bool]$_.OffersWindowsUpdates}})}catch{};"
+        "$lastSearch='';$lastInstall='';try{$results=(New-Object -ComObject Microsoft.Update.AutoUpdate).Results;if($results.LastSearchSuccessDate -and $results.LastSearchSuccessDate.Year -gt 1901){$lastSearch=$results.LastSearchSuccessDate.ToUniversalTime().ToString('o')};if($results.LastInstallationSuccessDate -and $results.LastInstallationSuccessDate.Year -gt 1901){$lastInstall=$results.LastInstallationSuccessDate.ToUniversalTime().ToString('o')}}catch{};"
+        "$states=@{};foreach($serviceName in @('wuauserv','bits','usosvc')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;$states[$serviceName]=[pscustomobject]@{status=$service.Status.ToString();startType=$service.StartType.ToString()}}catch{$states[$serviceName]=[pscustomobject]@{status='missing';startType='missing'}}};"
+        "[pscustomobject]@{useWUServer=if($null -ne $auPolicy -and $null -ne $auPolicy.UseWUServer){[int]$auPolicy.UseWUServer}else{$null};wsusServer=if($null -ne $policy){[string]$policy.WUServer}else{''};wsusStatusServer=if($null -ne $policy){[string]$policy.WUStatusServer}else{''};doNotConnectInternet=if($null -ne $policy -and $null -ne $policy.DoNotConnectToWindowsUpdateInternetLocations){[int]$policy.DoNotConnectToWindowsUpdateInternetLocations}else{0};auOptions=if($null -ne $auPolicy -and $null -ne $auPolicy.AUOptions){[int]$auPolicy.AUOptions}else{$null};lastSearchSuccessDate=$lastSearch;lastInstallationSuccessDate=$lastInstall;registeredServices=@($registered);services=$states}|ConvertTo-Json -Depth 7 -Compress"
+    )
+    code, output = powershell(script, timeout=30, output_limit=1_000_000)
+    environment: dict[str, Any] = {}
+    if code == 0:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = json.loads(output)
+            if isinstance(parsed, dict):
+                environment = parsed
+    if not environment:
+        environment = {"environmentError": (output or f"Windows Update environment exited with code {code}")[:1000]}
+
+    use_wsus = environment.get("useWUServer")
+    wsus_server = str(environment.get("wsusServer") or "").strip()
+    blocks_internet = environment.get("doNotConnectInternet") == 1
+    policy_issue = ""
+    if use_wsus == 1 and not wsus_server:
+        source_mode = "invalid_policy"
+        policy_issue = "Windows policy enables WSUS but does not define WUServer."
+    elif use_wsus == 1:
+        source_mode = "wsus"
+    elif blocks_internet:
+        source_mode = "invalid_policy"
+        policy_issue = (
+            "Windows policy blocks public Windows Update but UseWUServer=1 is not enabled. "
+            "Apply a complete WSUS policy before scanning again."
+        )
+    elif environment.get("environmentError"):
+        source_mode = "default"
+        policy_issue = "Agent could not read the Windows Update source; the Windows default source will be used."
+    else:
+        source_mode = "windows_update"
+        if wsus_server:
+            policy_issue = "WUServer is present but UseWUServer is not enabled; Windows is using public Windows Update."
+    environment.update({
+        "sourceMode": source_mode,
+        "sourceLabel": "WSUS" if source_mode == "wsus" else "Windows Update" if source_mode == "windows_update" else "Windows policy",
+        "policyIssue": policy_issue,
+    })
+    return environment
+
+
+def windows_update_cache_is_fresh(environment: dict[str, Any], maximum_age_seconds: int = 900) -> bool:
+    value = str(environment.get("lastSearchSuccessDate") or "")
+    if not value:
+        return False
+    try:
+        last_search = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if last_search.tzinfo is None:
+        last_search = last_search.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - last_search.astimezone(UTC)).total_seconds()
+    return 0 <= age <= maximum_age_seconds
+
+
+def windows_update_query(*, online: bool, timeout: int, source_mode: str = "default") -> tuple[int, str]:
+    if source_mode not in {"default", "windows_update", "wsus"}:
+        raise ValueError("Invalid Windows Update source mode")
+    online_literal = "$true" if online else "$false"
+    mode = "online" if online else "cached"
+    server_selection = {"default": 0, "wsus": 1, "windows_update": 2}[source_mode]
+    source_label = {"default": "Windows configured source", "wsus": "WSUS", "windows_update": "Windows Update"}[source_mode]
+    script = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$rows=@();"
         "foreach($serviceName in @('wuauserv','bits')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){Start-Service -Name $serviceName -ErrorAction Stop}}catch{}};"
         "function AddRows([object]$result,[string]$repository,[string]$serviceId=''){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$id=[string]$u.Identity.UpdateID;if($script:rows|Where-Object{$_.id -eq $id}){continue};$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=$id;revision=[int]$u.Identity.RevisionNumber;manager='wua';serviceId=$serviceId;name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
-        "$session=New-Object -ComObject Microsoft.Update.Session;$session.ClientApplicationID='TramVanHanhAgent-" + mode + "';$searcher=$session.CreateUpdateSearcher();$searcher.Online=" + online_literal + ";$result=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $result $source;"
+        "$session=New-Object -ComObject Microsoft.Update.Session;$session.ClientApplicationID='TramVanHanhAgent-" + mode + "';$searcher=$session.CreateUpdateSearcher();$searcher.ServerSelection=" + str(server_selection) + ";$searcher.Online=" + online_literal + ";$result=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $result '" + source_label + "';"
         + ("" if online else "try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;foreach($service in @($manager.Services)){try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSearcher=$serviceSession.CreateUpdateSearcher();$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$service.ServiceID;$serviceSearcher.Online=$false;$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $serviceResult ([string]$service.Name) ([string]$service.ServiceID)}catch{}}}catch{};")
-        + "[pscustomobject]@{platform='windows';manager='wua';count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=" + online_literal + ";wuaStatus='" + mode + "';wuaMode='" + mode + "';wuaCount=[int]$rows.Count;updateSource=$source}}|ConvertTo-Json -Depth 8 -Compress"
+        + "[pscustomobject]@{platform='windows';manager='wua';count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=" + online_literal + ";wuaStatus='" + mode + "';wuaMode='" + mode + "';wuaCount=[int]$rows.Count;updateSource='" + source_label + "';serverSelection=" + str(server_selection) + "}}|ConvertTo-Json -Depth 8 -Compress"
     )
     return powershell(script, timeout=timeout, output_limit=10_000_000)
 
@@ -2455,8 +2520,11 @@ def windows_configmgr_updates() -> list[dict[str, Any]]:
 
 
 def scan_windows_updates() -> tuple[int, str]:
+    environment = windows_update_environment()
+    source_mode = str(environment.get("sourceMode") or "default")
+    query_source = source_mode if source_mode in {"wsus", "windows_update"} else "default"
     configmgr_rows = windows_configmgr_updates()
-    cache_code, cache_output = windows_update_query(online=False, timeout=60)
+    cache_code, cache_output = windows_update_query(online=False, timeout=60, source_mode=query_source)
     cache: dict[str, Any] = {}
     if cache_code == 0:
         with contextlib.suppress(TypeError, ValueError):
@@ -2464,24 +2532,32 @@ def scan_windows_updates() -> tuple[int, str]:
             if isinstance(parsed, dict):
                 cache = parsed
     wua_rows = [item for item in cache.get("updates", []) if isinstance(item, dict)]
-    online_code = 0
+    online_code: int | None = None
     online_output = ""
-    if not wua_rows:
+    cache_is_fresh = cache_code == 0 and windows_update_cache_is_fresh(environment)
+    if source_mode == "invalid_policy":
+        online_status = "skipped_invalid_policy"
+    elif cache_is_fresh:
+        online_code = 0
+        online_status = "fresh_cache"
+    else:
         # DetectNow uses the update source selected by Windows policy. The
-        # bounded online query then reads the same WUA catalogue as Settings.
+        # bounded online query reads the selected WSUS or public catalogue.
         powershell("$ErrorActionPreference='SilentlyContinue';$au=New-Object -ComObject Microsoft.Update.AutoUpdate;$au.DetectNow()", timeout=30)
-        online_code, online_output = windows_update_query(online=True, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
+        online_code, online_output = windows_update_query(online=True, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS, source_mode=query_source)
         if online_code == 0:
+            online_status = "complete"
             with contextlib.suppress(TypeError, ValueError):
                 parsed = json.loads(online_output)
                 if isinstance(parsed, dict):
                     cache = parsed
                     wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
         else:
+            online_status = "timeout" if online_code == 124 else "error"
             # An online WUA search can continue in wuauserv after the client
             # timeout. Re-read the local catalogue so completed detections are
             # still returned instead of failing the entire dashboard job.
-            retry_code, retry_output = windows_update_query(online=False, timeout=60)
+            retry_code, retry_output = windows_update_query(online=False, timeout=60, source_mode=query_source)
             if retry_code == 0:
                 with contextlib.suppress(TypeError, ValueError):
                     parsed = json.loads(retry_output)
@@ -2490,10 +2566,19 @@ def scan_windows_updates() -> tuple[int, str]:
                         wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
     merged: dict[str, dict[str, Any]] = {str(item.get("id")): item for item in [*wua_rows, *configmgr_rows] if item.get("id")}
     diagnostics = cache.get("diagnostics") if isinstance(cache.get("diagnostics"), dict) else {}
+    current_scan_complete = online_status in {"complete", "fresh_cache"}
+    if configmgr_rows and not wua_rows:
+        current_scan_complete = True
     diagnostics.update({
-        "currentScanComplete": online_code == 0 if not wua_rows else bool(diagnostics.get("currentScanComplete", True)),
+        **environment,
+        "currentScanComplete": current_scan_complete,
         "wuaCount": len(wua_rows),
-        "wuaError": "" if online_code == 0 else (online_output or f"WUA scan exited with code {online_code}")[:1000],
+        "wuaStatus": online_status,
+        "wuaMode": "cache" if online_status == "fresh_cache" else "online",
+        "wuaError": "" if current_scan_complete else (online_output or environment.get("policyIssue") or f"WUA scan exited with code {online_code}")[:1000],
+        "cacheStatus": "ok" if cache_code == 0 else "error",
+        "cacheCount": len(wua_rows),
+        "onlineTimeoutSeconds": WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS,
         "configMgrCount": len(configmgr_rows),
         "configMgrStatus": "ok" if configmgr_rows else "not_installed_or_empty",
     })
@@ -2514,7 +2599,8 @@ def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tu
     scan_code, scan_output = scan_updates(inventory)
     if scan_code != 0:
         return scan_code, scan_output
-    available = {str(item.get("id")): item for item in json.loads(scan_output).get("updates", []) if isinstance(item, dict)}
+    scan_payload = json.loads(scan_output)
+    available = {str(item.get("id")): item for item in scan_payload.get("updates", []) if isinstance(item, dict)}
     selected: list[dict[str, Any]] = []
     for requested in raw:
         identifier = str(requested.get("id", ""))
@@ -2530,6 +2616,9 @@ def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tu
             encoded = base64.b64encode(json.dumps([str(item["id"]) for item in selected]).encode()).decode()
             script = f"$wanted=@([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json);$updates=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{{$_.ComplianceState -eq 0 -and $wanted -contains [string]$_.UpdateID}});if($updates.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$result=Invoke-CimMethod -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdatesManager -MethodName InstallUpdates -Arguments @{{CCMUpdates=[ciminstance[]]$updates}} -ErrorAction Stop;[pscustomobject]@{{manager='configmgr';returnValue=[int]$result.ReturnValue;count=$updates.Count}}|ConvertTo-Json -Compress"
             return powershell(script, timeout=7200)
+        diagnostics = scan_payload.get("diagnostics") if isinstance(scan_payload.get("diagnostics"), dict) else {}
+        if diagnostics.get("currentScanComplete") is False:
+            raise ValueError("Windows Update scan is incomplete; resolve the update source or policy and scan again")
         service_ids = {str(item.get("serviceId", "")) for item in selected}
         if len(service_ids) != 1:
             raise ValueError("Select Windows updates from one update service per operation")

@@ -1,4 +1,4 @@
-# Bàn giao Codex — 18/08/2026
+# Bàn giao Codex — 19/08/2026
 
 ## Repository và trạng thái
 
@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent nguồn, Linux executable và Windows MSI mới nhất đều là `0.8.2`. Gói Linux là self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd vẫn giữ `AF_NETLINK`.
+- Agent nguồn đã tăng lên `0.8.3` để sửa Windows Update. Trong commit nguồn đầu tiên, Linux executable và Windows MSI track trong repo vẫn là `0.8.2`; không deploy/generate package từ commit trung gian này. Phải chờ workflow build xong và commit bundle hai artifact `0.8.3`. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -46,6 +46,7 @@
 - Windows Update 0.8.2 tách ConfigMgr, WUA cache, `DetectNow` và WUA online thành các PowerShell process có timeout độc lập. Kết quả cache/ConfigMgr không bị mất khi online WUA bị treo; timeout online được trả thành diagnostics và Agent đọc lại cache thay vì làm cả job `failed`.
 - PostgreSQL 0.8.2 có platform group/membership, server user/group share và server retirement. Chỉ role `admin` thấy toàn bộ fleet và được share/xóa; user khác chỉ thấy server được gán trực tiếp hoặc qua group, kiểm tra lại ở API server/job/file/session/bulk chứ không chỉ ẩn UI. Xóa server là retire có audit: ẩn fleet, từ chối certificate Agent cũ và giữ lịch sử. LDAP cấu hình được tối đa 20 group DN, có nút quét group và login dùng AD matching-rule-in-chain cho cả membership trực tiếp/lồng nhau; role riêng của user LDAP vẫn giữ nguyên.
 - Installer Linux 0.8.2 nhận diện đủ bộ identity hiện hữu (`agent.json`, certificate, private key và hai CA) trước khi dừng service. Khi chạy `.run` mới trên máy đã enroll, installer giữ nguyên identity, chỉ thay binary/unit rồi restart giống MSI Windows; không còn gọi bootstrap và nhận HTTP 409. Identity thiếu một phần bị chặn trước khi thay đổi service để tránh tự xóa khóa hoặc tạo máy trùng.
+- Windows Update 0.8.3 đọc policy, WUA services, nguồn mặc định và thời điểm scan thành công trước khi quét. Agent buộc `ServerSelection=1` cho WSUS hoặc `ServerSelection=2` cho Windows Update public; policy nửa vời `WUServer` + `DoNotConnectToWindowsUpdateInternetLocations=1` nhưng thiếu `UseWUServer=1` bị báo ngay, không treo rồi kết luận sai 0 update. Cache chỉ được coi là hiện tại trong 15 phút; full scan có tối đa 900 giây và vẫn chạy ngoài heartbeat. Payload luôn phân biệt complete/fresh-cache/timeout/invalid-policy; UI giữ kết quả hoàn tất gần nhất, khóa cài từ dữ liệu cũ và hiển thị nguồn/lần scan/thông báo gọn. Agent cũng từ chối cài WUA khi lần đối chiếu mới chưa hoàn tất.
 - API 0.8.0 tắt hoàn toàn Swagger/ReDoc/OpenAPI (`/api/docs`, `/api/openapi.json`, `/api/redoc` đều 404), giảm setup status public xuống bốn trường không nhạy cảm và bắt buộc setup token tối thiểu 32 ký tự cho cài đặt mới. PostgreSQL lưu bộ đếm throttle đăng nhập/MFA theo IP và identity đã HMAC; API bật Trusted Host, no-store/nosniff/frame deny, còn Caddy bật CSP/HSTS/referrer policy và Nginx ẩn version.
 - Route audit tự động xác nhận mọi browser API ngoài allowlist public đều phụ thuộc xác thực; route Agent tiếp tục dùng certificate/chữ ký/replay protection. Role Viewer đọc `/api/v1/me` rồi chỉ render các workspace được cấp quyền; URL hash admin cũ như `#/access` tự chuyển sang trang đầu tiên được phép nên không còn làm trang đen/crash. Dependency Python có advisory đã nâng lên FastAPI 0.141.1, Starlette 1.6.0, PyJWT 2.13.0, cryptography 50.0.0 và python-multipart 0.0.32.
 - Firewall task chung dùng action allowlist `firewall.rule.add.auto`: Agent đọc backend trực tiếp ngay trước khi chạy rồi chọn Windows Firewall profile Any, UFW đang active, default firewalld zone hoặc filter INPUT/OUTPUT thật của nftables/iptables theo IP family. UI Linux giới hạn Inbound để tương thích firewalld zone; `deny` được ánh xạ đúng sang Block/Drop native thay vì sinh verdict nftables/firewalld không hợp lệ. Tạo user tự đọc Administrators theo SID trên Windows, `sudo` trên Ubuntu và `wheel` trên Oracle Linux/Red Hat, không nhận tên group đoán từ trình duyệt.
@@ -261,6 +262,12 @@ Kết quả mong đợi:
 
 Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.test.yaml`.
 
+## Chẩn đoán Windows Update ngày 19/08/2026
+
+- Máy được gọi là **có WSUS** đang có `WUServer=http://wsus.sbsi.vn:8530`, `DoNotConnectToWindowsUpdateInternetLocations=1` và target group, nhưng khóa `AU\UseWUServer=1` không tồn tại. WUA báo default service là Windows Update public và `IsManaged=false`; như vậy public source bị policy chặn trong khi WSUS chưa được kích hoạt. Phải sửa GPO WSUS trung tâm để sinh `UseWUServer=1`, bảo đảm endpoint tới `wsus.sbsi.vn:8530`, chạy `gpupdate /force` rồi quét lại. Không sửa registry local thủ công nếu khóa do domain GPO quản lý.
+- Máy **không WSUS** không có khóa WUServer, dùng direct WinHTTP và WUA báo lần search thành công gần nhất `28/07/2026`; các patch trong Windows Settings là dữ liệu orchestration/cache từ lần đó. WUA online hiện treo quá timeout, nên chưa có căn cứ kết luận 0 update. Cần kiểm tra outbound/proxy/DNS/TLS của tài khoản LocalSystem tới Windows Update và WindowsUpdateClient event sau lần quét mới. BITS `Stopped/Manual` tự nó không phải lỗi vì đây là trigger-start service.
+- Agent 0.8.3 sẽ đưa đúng hai trạng thái này lên banner gọn trong tab Updates. Chỉ khi `currentScanComplete=true` mới cho chọn/cài patch; lần quét chưa hoàn tất không ghi đè ý nghĩa của kết quả hoàn tất gần nhất.
+
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
@@ -288,7 +295,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `38/38`, gồm direct/group server share, retire ẩn server và từ chối Agent cũ, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline; cùng toàn bộ batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, direct jobs/refresh, validation OS/payload, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `53/53`, gồm upgrade Linux giữ nguyên identity hiện hữu, Oracle/RHEL 7 `lsblk --pairs` fallback, process CPU/RAM, bootstrap HTTP detail, Windows Update heartbeat cache-only/timeout, installer Linux không gọi package manager/pip và dùng executable self-contained; cùng auto-detect firewall, Windows Update worker/cache/scan/install, storage live guard, selected-only update, protected process/log/account validation, nft comment/order/rollback, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
+- Agent security `58/58`, gồm nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, cache freshness, khóa cài từ scan chưa hoàn tất; cùng upgrade Linux giữ nguyên identity hiện hữu, Oracle/RHEL 7 `lsblk --pairs` fallback, process CPU/RAM, bootstrap HTTP detail, Windows Update heartbeat cache-only/timeout, installer Linux không gọi package manager/pip và dùng executable self-contained; auto-detect firewall, storage live guard, selected-only update, protected process/log/account validation, nft comment/order/rollback, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.

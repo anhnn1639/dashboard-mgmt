@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -631,7 +632,8 @@ trusted
             if "Microsoft.Update.AutoUpdate" in script:
                 return 0, ""
             return 0, '{"platform":"windows","manager":"wua","updates":[],"diagnostics":{"currentScanComplete":true}}'
-        with patch.object(tram_agent, "powershell", side_effect=fake_powershell):
+        environment = {"sourceMode": "windows_update", "sourceLabel": "Windows Update", "policyIssue": "", "lastSearchSuccessDate": ""}
+        with patch.object(tram_agent, "windows_update_environment", return_value=environment), patch.object(tram_agent, "powershell", side_effect=fake_powershell):
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
         scripts = [call[0] for call in calls]
         self.assertEqual(code, 0)
@@ -642,14 +644,62 @@ trusted
         self.assertEqual(cached[1]["timeout"], 60)
         self.assertEqual(online[1]["timeout"], tram_agent.WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS)
         self.assertIn("$ProgressPreference='SilentlyContinue'", cached[0])
+        self.assertIn("$searcher.ServerSelection=2", cached[0])
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', cached[0])
         self.assertIn("$result.Updates.Item($i)", cached[0])
         self.assertIn("Microsoft.Update.ServiceManager", cached[0])
         self.assertIn("Microsoft.Update.AutoUpdate", "\n".join(scripts))
         self.assertLess(scripts.index(cached[0]), scripts.index(online[0]))
-        self.assertIn("root\\ccm\\ClientSDK", scripts[0])
-        self.assertIn("CCM_SoftwareUpdate", scripts[0])
-        self.assertNotIn("foreach($u in $r.Updates)", scripts[0])
+        configmgr = next(script for script in scripts if "CCM_SoftwareUpdate" in script)
+        self.assertIn("root\\ccm\\ClientSDK", configmgr)
+        self.assertNotIn("foreach($u in $r.Updates)", configmgr)
+
+    def test_windows_update_environment_detects_incomplete_wsus_policy(self):
+        payload = json.dumps({
+            "useWUServer": None,
+            "wsusServer": "http://wsus.example.test:8530",
+            "doNotConnectInternet": 1,
+            "registeredServices": [],
+        })
+        with patch.object(tram_agent, "powershell", return_value=(0, payload)):
+            environment = tram_agent.windows_update_environment()
+        self.assertEqual(environment["sourceMode"], "invalid_policy")
+        self.assertIn("UseWUServer=1", environment["policyIssue"])
+        self.assertEqual(environment["wsusServer"], "http://wsus.example.test:8530")
+
+    def test_windows_update_scan_skips_online_query_for_invalid_policy(self):
+        environment = {
+            "sourceMode": "invalid_policy",
+            "sourceLabel": "Windows policy",
+            "policyIssue": "Apply a complete WSUS policy before scanning again.",
+            "lastSearchSuccessDate": "",
+        }
+        cached = json.dumps({"platform": "windows", "updates": [], "diagnostics": {"currentScanComplete": False}})
+        queries = []
+        with patch.object(tram_agent, "windows_update_environment", return_value=environment), \
+             patch.object(tram_agent, "windows_configmgr_updates", return_value=[]), \
+             patch.object(tram_agent, "windows_update_query", side_effect=lambda **kwargs: (queries.append(kwargs) or (0, cached))):
+            code, output = tram_agent.scan_windows_updates()
+        parsed = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(queries, [{"online": False, "timeout": 60, "source_mode": "default"}])
+        self.assertFalse(parsed["diagnostics"]["currentScanComplete"])
+        self.assertEqual(parsed["diagnostics"]["wuaStatus"], "skipped_invalid_policy")
+
+    def test_windows_update_query_pins_the_selected_source(self):
+        scripts = []
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}"))):
+            tram_agent.windows_update_query(online=True, timeout=30, source_mode="wsus")
+            tram_agent.windows_update_query(online=True, timeout=30, source_mode="windows_update")
+        self.assertIn("$searcher.ServerSelection=1", scripts[0])
+        self.assertIn("AddRows $result 'WSUS'", scripts[0])
+        self.assertIn("$searcher.ServerSelection=2", scripts[1])
+        self.assertIn("AddRows $result 'Windows Update'", scripts[1])
+
+    def test_windows_update_cache_freshness_is_bounded(self):
+        current = datetime.now(UTC).isoformat()
+        self.assertTrue(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": current}))
+        self.assertFalse(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": "2026-01-01T00:00:00+00:00"}))
 
     def test_windows_update_install_reuses_cached_catalog_and_checks_download(self):
         scan = json.dumps({"updates": [
@@ -665,6 +715,15 @@ trusted
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', scripts[0])
         self.assertIn("Start-Service -Name $serviceName", scripts[0])
         self.assertIn("$download.ResultCode -notin 2,3", scripts[0])
+
+    def test_windows_update_install_rejects_an_incomplete_wua_scan(self):
+        scan = json.dumps({
+            "updates": [{"id": "wua-update-id", "revision": 4, "name": "Cached update", "version": "KB5012345", "manager": "wua", "serviceId": ""}],
+            "diagnostics": {"currentScanComplete": False},
+        })
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)):
+            with self.assertRaisesRegex(ValueError, "scan is incomplete"):
+                tram_agent.install_updates({"updates": [{"id": "wua-update-id", "version": "KB5012345"}]}, {"os_family": "windows"})
 
     def test_configmgr_update_install_uses_client_sdk(self):
         scan = json.dumps({"updates": [

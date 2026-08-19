@@ -2006,6 +2006,7 @@ function ServerDrawer({
   const latestSuccessfulReadJob = currentReadAction
     ? jobs.find((job) => job.action === currentReadAction && job.status === "succeeded")
     : undefined;
+  const successfulUpdateScanJobs = jobs.filter((job) => job.action === "patch.scan" && job.status === "succeeded");
   const latestUserJob = jobs.find((job) => job.action === "user.list");
   const latestSuccessfulUserJob = jobs.find((job) => job.action === "user.list" && job.status === "succeeded");
   const latestGroupJob = jobs.find((job) => job.action === "group.list");
@@ -2553,7 +2554,7 @@ function ServerDrawer({
               )}
 
               {activeTab === "updates" && (
-                <UpdatesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "processes" && (

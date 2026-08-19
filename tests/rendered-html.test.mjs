@@ -129,6 +129,10 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.doesNotMatch(resources, /Windows Update API/);
   assert.doesNotMatch(resources, /Configuration Manager/);
   assert.match(resources, /objectArray\(payload\.updates\)/);
+  assert.match(resources, /diagnostics\.currentScanComplete === true/);
+  assert.match(resources, /Chưa thể kết luận máy có 0 bản cập nhật/);
+  assert.match(resources, /Đang hiển thị dữ liệu hoàn tất gần nhất/);
+  assert.match(source, /successfulUpdateScanJobs/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);

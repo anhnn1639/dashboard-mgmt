@@ -782,21 +782,66 @@ export function ProcessesResourceTab({ output, job, serverName, busy, refresh, q
 
 export type UpdateRow = { id: string; revision?: number; name: string; version?: string; currentVersion?: string; architecture?: string; repository?: string; severity?: string; sizeBytes?: number; description?: string; kb?: string[]; rebootRequired?: boolean };
 
-export function UpdatesResourceTab({ output, job, serverName, busy, refresh, queue }: { output?: string; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
-  const payload = useMemo(() => parseObject(output), [output]);
+function updateScanComplete(payload: Record<string, unknown>) {
+  const diagnostics = parseObject(JSON.stringify(payload.diagnostics ?? {}));
+  return payload.platform === "windows"
+    ? diagnostics.currentScanComplete === true
+    : diagnostics.currentScanComplete !== false;
+}
+
+function updateDiagnosticText(value: unknown) {
+  const text = String(value ?? "").trim();
+  return text.length > 260 ? `${text.slice(0, 260)}…` : text;
+}
+
+function updateDate(value: unknown) {
+  const date = new Date(String(value ?? ""));
+  return Number.isNaN(date.getTime()) ? "chưa có" : date.toLocaleString("vi-VN");
+}
+
+export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queue }: { scans: OperationJob[]; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
+  const scanState = useMemo(() => {
+    const succeeded = scans.filter((scan) => scan.status === "succeeded");
+    const latest = succeeded[0];
+    const latestPayload = parseObject(latest?.output);
+    const latestRows = objectArray(latestPayload.updates);
+    const latestComplete = updateScanComplete(latestPayload);
+    const previousComplete = succeeded.find((scan) => updateScanComplete(parseObject(scan.output)));
+    const display = latest && (latestComplete || latestRows.length > 0) ? latest : previousComplete;
+    return {
+      latest,
+      latestPayload,
+      latestComplete,
+      display,
+      payload: parseObject(display?.output),
+    };
+  }, [scans]);
+  const payload = scanState.payload;
   const rows = objectArray(payload.updates) as UpdateRow[];
+  const diagnostics = parseObject(JSON.stringify(scanState.latestPayload.diagnostics ?? {}));
+  const isWindows = scanState.latestPayload.platform === "windows";
+  const showingPrevious = Boolean(scanState.display && scanState.latest && scanState.display.id !== scanState.latest.id);
+  const latestAttemptMatches = !job || job.id === scanState.latest?.id;
+  const installAllowed = latestAttemptMatches && (!isWindows || (scanState.latestComplete && !showingPrevious));
+  const source = String(diagnostics.sourceLabel ?? diagnostics.updateSource ?? "Windows Update");
+  const issue = updateDiagnosticText(diagnostics.policyIssue || diagnostics.wuaError);
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const activeSelected = installAllowed ? selected.filter((id) => rows.some((row) => row.id === id)) : [];
   async function install() {
-    const updates = rows.filter((item) => selected.includes(item.id)).map((item) => ({ id: item.id, version: item.version ?? "", revision: item.revision ?? 0 }));
+    if (!installAllowed) return;
+    const updates = rows.filter((item) => activeSelected.includes(item.id)).map((item) => ({ id: item.id, version: item.version ?? "", revision: item.revision ?? 0 }));
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  const emptyMessage = "Chưa có bản cập nhật khả dụng hoặc chưa quét dữ liệu; nhấn Quét lại.";
+  const emptyMessage = isWindows && !scanState.latestComplete
+    ? "Chưa xác định được danh sách bản cập nhật vì lần quét gần nhất chưa hoàn tất."
+    : "Không có bản cập nhật khả dụng trong lần quét hoàn tất gần nhất.";
   return <section className="resource-tab updates-resource-tab">
-    <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật khả dụng · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!selected.length || busy} onClick={() => void install()}>Cập nhật ({selected.length})</button></div></div>
+    <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật đang hiển thị · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!activeSelected.length || busy || !installAllowed} title={installAllowed ? "" : "Chỉ cài đặt sau một lần quét Windows Update hoàn tất"} onClick={() => void install()}>Cập nhật ({activeSelected.length})</button></div></div>
     <PendingState job={job} />
-    <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" checked={rows.length > 0 && rows.every((item) => selected.includes(item.id))} onChange={() => setSelected(rows.every((item) => selected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
+    {isWindows && !scanState.latestComplete && <div className="update-scan-status warning"><div><b>Chưa thể kết luận máy có 0 bản cập nhật</b><span>Lần quét hiện tại chưa hoàn tất; danh sách cũ nếu có chỉ dùng để tham khảo và không được phép cài.</span></div><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>Lần Windows quét thành công</dt><dd>{updateDate(diagnostics.lastSearchSuccessDate)}</dd></div><div><dt>Trạng thái</dt><dd>{String(diagnostics.wuaStatus ?? "chưa hoàn tất")}</dd></div></dl>{issue && <small title={String(diagnostics.policyIssue || diagnostics.wuaError)}>{issue}</small>}{showingPrevious && scanState.display && <small>Đang hiển thị dữ liệu hoàn tất gần nhất lúc {updateDate(scanState.display.createdAt)}.</small>}</div>}
+    <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" disabled={!installAllowed} checked={rows.length > 0 && rows.every((item) => activeSelected.includes(item.id))} onChange={() => setSelected(rows.every((item) => activeSelected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={!installAllowed} checked={activeSelected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
   </section>;
 }
 
