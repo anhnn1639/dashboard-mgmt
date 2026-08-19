@@ -339,15 +339,20 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
 - GitHub Actions cho 0.8.5: security audit run `32214194350` pass; Linux build run `32214194334` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32214194352` pass và ProductVersion đọc trực tiếp là `0.8.5`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
+## Sites
+
+- `.openai/hosting.json` đã gắn với private Sites project `appgprj_6a852d7a7310819194555fde1d13573f` để không tạo trùng project ở lần sau.
+- Project chưa được publish. Production vẫn là Docker/Nginx tại domain vận hành; việc đẩy toàn bộ source sang repository riêng của Sites cần quản trị viên xác nhận riêng trước khi thực hiện.
+
 ## Ưu tiên sau smoke test
 
 ### Cập nhật Extend và audit retention 2026-08-17
 
 - Dashboard luôn hiển thị nút `Extend` trên partition/LV. Nút bật khi Agent báo tối thiểu 1 MiB có thể mở rộng; root LV Linux được extend nhưng vẫn khóa xóa, còn partition boot/root trực tiếp tiếp tục được bảo vệ.
-- Windows yêu cầu unallocated space liền kề. Với layout 100 GiB hiện tại, partition Recovery nằm sau C: nên `Extend` của C: hiện mờ và giải thích nguyên nhân; ứng dụng không tự di chuyển/xóa Recovery.
+- Windows yêu cầu unallocated space liền kề ngay bên phải. Với layout hiện tại `C: -> 10 GiB Unallocated -> Recovery -> 10 GiB Unallocated`, `Extend` của C: phải bật với đúng 10 GiB đầu tiên; 10 GiB sau Recovery không được cộng vào capacity. Ứng dụng không tự di chuyển/xóa Recovery.
 - Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
 - PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
-- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.7.5` ở phần trên.
+- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.8.5` ở phần trên.
 - Sửa nhận diện LV khi `lsblk` trả `/dev/mapper/<vg>-<lv>` nhưng `lvs` trả `/dev/<vg>/<lv>`: dashboard ánh xạ đúng quy tắc escape dấu gạch ngang của device-mapper, nên root LV hiện lại nút Extend và dùng đúng path do `lvs` cung cấp cho Agent.
 - Unallocated Windows không phải partition nên không hỗ trợ kéo-thả. Nếu Recovery nằm giữa C: và vùng trống, Windows native chỉ extend sau khi Recovery được di chuyển hoặc xóa/tạo lại trong maintenance window có backup; dashboard chỉ báo khóa, không tự làm thao tác phá hủy này.
 
