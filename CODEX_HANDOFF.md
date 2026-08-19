@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source, Linux executable và Windows MSI bundle trong repo đều là `0.8.5`. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
+- Agent source, Linux executable và Windows MSI bundle trong repo đều là `0.8.6`. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -51,6 +51,7 @@
 - Agent/dashboard/API 0.8.5 sửa trường hợp bố cục đã nhận đúng `C: → 10 GiB Unallocated → Recovery → 10 GiB Unallocated` nhưng Extend/Shrink vẫn bị khóa. Capacity Extend lấy trực tiếp segment Unallocated nằm ngay bên phải thay vì để `Get-PartitionSupportedSize` stale ghi đè; Extend và Shrink chạy DiskPart native (`extend`, `shrink desired/minimum`) giống Disk Management, chỉ nhận target allowlist, kiểm tra lại layout trước khi chạy và đối chiếu kích thước partition sau kết quả. Shrink NTFS có drive letter vẫn mở modal khi lần scan không trả được SizeMin; native Windows quyết định giới hạn thực tại thời điểm chạy.
 - Agent 0.8.5 hỗ trợ tối đa bốn job đồng thời cho các tác vụ đọc; mutation vẫn khóa tuần tự và control plane chỉ dispatch tối đa một mutation để tránh các thay đổi hệ thống chạy đè nhau. Check-in của Agent mới là 5 giây, báo toàn bộ `active_job_ids`, giữ tương thích Agent cũ chỉ báo một job; process realtime, disk/log/update scan không còn phải đợi một job đọc dài hoàn tất. Nút **Làm mới** của danh sách Linux/Windows chỉ refetch `/api/v1/servers`, giữ nguyên route/tab/filter thay vì reload toàn trang.
 - Banner Windows Update 0.8.5 giải thích rõ Windows Settings có thể vẫn hiển thị các gói đã phát hiện/tải/Pending install từ lần search cũ. Khi máy không có Internet và không tới WSUS, WUA online timeout là đúng; Agent không biến timeout thành kết luận 0 update và không cho cài danh sách chưa xác minh.
+- Agent/dashboard 0.8.6 sửa lỗi `lvextend` trên cả Ubuntu và Oracle Linux khi số GiB thập phân đổi sang byte không chia hết cho sector 512. UI làm tròn xuống theo 512 byte trước khi gửi; Agent tiếp tục căn chỉnh và kiểm tra lại dung lượng VG live trước khi chạy `lvextend --resizefs`. Linux partition Extend căn theo logical sector của disk và tạo LV mới cũng căn 512 byte, nên không còn `Size is not a multiple of 512` hoặc `Invalid argument for --size`.
 - API 0.8.0 tắt hoàn toàn Swagger/ReDoc/OpenAPI (`/api/docs`, `/api/openapi.json`, `/api/redoc` đều 404), giảm setup status public xuống bốn trường không nhạy cảm và bắt buộc setup token tối thiểu 32 ký tự cho cài đặt mới. PostgreSQL lưu bộ đếm throttle đăng nhập/MFA theo IP và identity đã HMAC; API bật Trusted Host, no-store/nosniff/frame deny, còn Caddy bật CSP/HSTS/referrer policy và Nginx ẩn version.
 - Route audit tự động xác nhận mọi browser API ngoài allowlist public đều phụ thuộc xác thực; route Agent tiếp tục dùng certificate/chữ ký/replay protection. Role Viewer đọc `/api/v1/me` rồi chỉ render các workspace được cấp quyền; URL hash admin cũ như `#/access` tự chuyển sang trang đầu tiên được phép nên không còn làm trang đen/crash. Dependency Python có advisory đã nâng lên FastAPI 0.141.1, Starlette 1.6.0, PyJWT 2.13.0, cryptography 50.0.0 và python-multipart 0.0.32.
 - Firewall task chung dùng action allowlist `firewall.rule.add.auto`: Agent đọc backend trực tiếp ngay trước khi chạy rồi chọn Windows Firewall profile Any, UFW đang active, default firewalld zone hoặc filter INPUT/OUTPUT thật của nftables/iptables theo IP family. UI Linux giới hạn Inbound để tương thích firewalld zone; `deny` được ánh xạ đúng sang Block/Drop native thay vì sinh verdict nftables/firewalld không hợp lệ. Tạo user tự đọc Administrators theo SID trên Windows, `sudo` trên Ubuntu và `wheel` trên Oracle Linux/Red Hat, không nhận tên group đoán từ trình duyệt.
@@ -83,9 +84,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `14,446,592` bytes.
-- Phiên bản MSI: `0.8.5`.
-- SHA-256: `00EAE23D951D7C0E5C2D44B7F43048A6A54779FAA55003E41365FE96E9E640EC`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `beb3f7f54a6adcd11afe5df2268034be3df94ca9` trên GitHub Actions run `32214194352`; ProductVersion `0.8.5`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.8.6`.
+- SHA-256: `74ED592FA719279B356F0D7AE86B86FF436A54C2E1A673E5EE3367955D0E1227`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `2fb7ddbab46bd84d9d0ce184ff5084fff4e6ef00` trên GitHub Actions run `32216084287`; ProductVersion `0.8.6`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -95,9 +96,9 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; kích thước `16,630,192` bytes.
-- Phiên bản: `0.8.5`; SHA-256 `B432545CA96BA389AD131D03D5EF756C9ACC072991C4F86C0C5B670B029637A0`.
-- GitHub Actions run `32214194334` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `beb3f7f54a6adcd11afe5df2268034be3df94ca9`.
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,630,248` bytes.
+- Phiên bản: `0.8.6`; SHA-256 `BF8B7BCF759032BC082D2DE57B963F5E56BE83956B85A4878AD48876955A747B`.
+- GitHub Actions run `32216084226` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `2fb7ddbab46bd84d9d0ce184ff5084fff4e6ef00`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
@@ -208,6 +209,15 @@ docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
 ```
 
+Từ 0.8.5 lên 0.8.6 phải rebuild/recreate API và dashboard để API phát artifact 0.8.6 và giao diện căn sector trước khi gửi dung lượng; sau đó nâng Agent Linux lên 0.8.6 rồi quét lại Disk trước khi thử Extend:
+
+```bash
+git pull --ff-only origin main
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard
+docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent-assets/VERSION
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
+```
+
 API tự tạo các bảng PostgreSQL mới khi khởi động; không có migration làm thay đổi hoặc xóa dữ liệu bảng hiện hữu.
 
 Máy đã tạo `guacd`/`guacamole` trước bản sửa Docker DNS phải recreate đúng hai container để endpoint nhận alias mới:
@@ -231,7 +241,7 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 recording-in
 
 `guacd` phải chạy UID/GID `1000`; log phiên SSH mới không còn `Host key does not match` hoặc `Creation of recording/typescript failed: Permission denied`. Không dùng nút reconnect của phiên cũ vì relay mỗi phiên là một lần.
 
-Endpoint Linux đã enroll nâng cấp thủ công lên 0.8.5 như sau, không enroll lại và không thay certificate/config hiện có. Không chạy lại `.run` một lần của máy mới; copy executable đã bundle cùng unit systemd rồi restart:
+Endpoint Linux đã enroll nâng cấp thủ công lên 0.8.6 như sau, không enroll lại và không thay certificate/config hiện có. Không chạy lại `.run` một lần của máy mới; copy executable đã bundle cùng unit systemd rồi restart:
 
 ```bash
 cd /home/system/dashboard-mgmt
@@ -285,7 +295,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.5`, Linux available và Windows MSI 0.8.5 available.
+- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.6`, Linux available và Windows MSI 0.8.6 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -302,7 +312,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.5 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.5`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.6 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.6`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -326,7 +336,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Kiểm thử local đã đạt
 
 - Control plane `39/39`, gồm Viewer first-login nhận QR MFA cùng direct/group server share, retire ẩn server và từ chối Agent cũ, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline; cùng toàn bộ batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, direct jobs/refresh, validation OS/payload, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `60/60`, gồm Windows DiskPart Extend/Shrink theo adjacent extent và kiểm tra kích thước sau thao tác, OL7 partition geometry/adjacency từ `parted`, Windows resize offsets và CLIXML cleanup; cùng nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, cache freshness, khóa cài từ scan chưa hoàn tất; upgrade Linux giữ nguyên identity hiện hữu, Oracle/RHEL 7 `lsblk --pairs` fallback, process CPU/RAM, bootstrap HTTP detail, Windows Update heartbeat cache-only/timeout, installer Linux không gọi package manager/pip và dùng executable self-contained; auto-detect firewall, storage live guard, selected-only update, protected process/log/account validation, nft comment/order/rollback, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
+- Agent security `61/61`, gồm căn dung lượng LVM thập phân xuống sector 512 đúng các số lỗi thực tế của Ubuntu/Oracle Linux, Windows DiskPart Extend/Shrink theo adjacent extent và kiểm tra kích thước sau thao tác, OL7 partition geometry/adjacency từ `parted`, Windows resize offsets và CLIXML cleanup; cùng nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, cache freshness, khóa cài từ scan chưa hoàn tất; upgrade Linux giữ nguyên identity hiện hữu, Oracle/RHEL 7 `lsblk --pairs` fallback, process CPU/RAM, bootstrap HTTP detail, Windows Update heartbeat cache-only/timeout, installer Linux không gọi package manager/pip và dùng executable self-contained; auto-detect firewall, storage live guard, selected-only update, protected process/log/account validation, nft comment/order/rollback, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
@@ -337,7 +347,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions cho 0.8.5: security audit run `32214194350` pass; Linux build run `32214194334` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32214194352` pass và ProductVersion đọc trực tiếp là `0.8.5`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions cho 0.8.6: security audit run `32216084262` pass; Linux build run `32216084226` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32216084287` pass và ProductVersion đọc trực tiếp là `0.8.6`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Sites
 
@@ -352,7 +362,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Windows yêu cầu unallocated space liền kề ngay bên phải. Với layout hiện tại `C: -> 10 GiB Unallocated -> Recovery -> 10 GiB Unallocated`, `Extend` của C: phải bật với đúng 10 GiB đầu tiên; 10 GiB sau Recovery không được cộng vào capacity. Ứng dụng không tự di chuyển/xóa Recovery.
 - Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
 - PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
-- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.8.5` ở phần trên.
+- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.8.6` ở phần trên.
 - Sửa nhận diện LV khi `lsblk` trả `/dev/mapper/<vg>-<lv>` nhưng `lvs` trả `/dev/<vg>/<lv>`: dashboard ánh xạ đúng quy tắc escape dấu gạch ngang của device-mapper, nên root LV hiện lại nút Extend và dùng đúng path do `lvs` cung cấp cho Agent.
 - Unallocated Windows không phải partition nên không hỗ trợ kéo-thả. Nếu Recovery nằm giữa C: và vùng trống, Windows native chỉ extend sau khi Recovery được di chuyển hoặc xóa/tạo lại trong maintenance window có backup; dashboard chỉ báo khóa, không tự làm thao tác phá hủy này.
 
