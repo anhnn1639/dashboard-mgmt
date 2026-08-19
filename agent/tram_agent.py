@@ -70,6 +70,7 @@ WINDOWS_RESERVED_FILENAMES = {
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
 MAX_CONCURRENT_JOBS = 4
+LINUX_BLOCK_SECTOR_BYTES = 512
 WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 ACTIVE_TUNNELS: set[str] = set()
@@ -2129,6 +2130,15 @@ def storage_int(parameters: dict[str, Any], key: str, minimum: int = 1, maximum:
     return value
 
 
+def align_linux_storage_bytes(value: int, unit_bytes: int = LINUX_BLOCK_SECTOR_BYTES) -> int:
+    if unit_bytes <= 0:
+        raise ValueError("Invalid Linux storage sector size")
+    aligned = value - (value % unit_bytes)
+    if aligned < unit_bytes:
+        raise ValueError("Requested Linux storage size is below one sector")
+    return aligned
+
+
 def find_windows_storage_partition(scan: dict[str, Any], disk_number: int, partition_number: int) -> dict[str, Any] | None:
     for disk in scan.get("disks", []):
         if byte_value(disk.get("number")) != disk_number:
@@ -2285,23 +2295,30 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     if kind == "linux_lv":
         path = str(parameters.get("path", ""))
         logical = next((item for item in scan.get("logicalVolumes", []) if item.get("path") == path), None)
-        if not logical or add_bytes > byte_value(logical.get("extendableBytes")) or not DEVICE_RE.fullmatch(path):
+        if not logical or not DEVICE_RE.fullmatch(path):
+            raise ValueError("Logical Volume changed or has insufficient free space")
+        aligned_add_bytes = align_linux_storage_bytes(add_bytes)
+        if aligned_add_bytes > byte_value(logical.get("extendableBytes")):
             raise ValueError("Logical Volume changed or has insufficient free space")
         binary = find_system_command("lvextend")
         if not binary:
             return 127, "lvextend is not installed"
-        return run([binary, "--resizefs", "--size", f"+{add_bytes}B", path], timeout=1800)
+        return run([binary, "--resizefs", "--size", f"+{aligned_add_bytes}B", path], timeout=1800)
     if kind != "linux_partition":
         raise ValueError("Invalid Linux storage target")
     path = str(parameters.get("path", ""))
     node, disk = find_linux_storage_node(scan, path)
-    if not node or not disk or node.get("type") != "part" or node.get("resizeProtected") or add_bytes > byte_value(node.get("extendableBytes")):
+    if not node or not disk or node.get("type") != "part" or node.get("resizeProtected"):
         raise ValueError("Partition changed, is protected or has insufficient contiguous space")
     number = byte_value(node.get("partitionNumber"))
     if not number:
         raise ValueError("Partition number is unavailable")
-    start = byte_value(node.get("startSector")) * byte_value(node.get("logicalSectorBytes"))
-    new_end = start + byte_value(node.get("sizeBytes")) + add_bytes - 1
+    logical_sector_bytes = byte_value(node.get("logicalSectorBytes")) or LINUX_BLOCK_SECTOR_BYTES
+    aligned_add_bytes = align_linux_storage_bytes(add_bytes, logical_sector_bytes)
+    if aligned_add_bytes > byte_value(node.get("extendableBytes")):
+        raise ValueError("Partition changed, is protected or has insufficient contiguous space")
+    start = byte_value(node.get("startSector")) * logical_sector_bytes
+    new_end = start + byte_value(node.get("sizeBytes")) + aligned_add_bytes - 1
     parted = find_system_command("parted")
     if not parted:
         return 127, "parted is not installed"
@@ -2378,12 +2395,13 @@ def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
         if not GROUP_RE.fullmatch(vg_name) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", name):
             raise ValueError("Invalid Logical Volume name")
         vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
-        if not vg or size_bytes > byte_value(vg.get("freeBytes")):
+        aligned_size_bytes = align_linux_storage_bytes(size_bytes)
+        if not vg or aligned_size_bytes > byte_value(vg.get("freeBytes")):
             raise ValueError("Volume Group changed or has insufficient free space")
         lvcreate = find_system_command("lvcreate")
         if not lvcreate:
             return 127, "lvcreate is not installed"
-        code, output = run([lvcreate, "--yes", "--size", f"{size_bytes}B", "--name", name, vg_name], timeout=900)
+        code, output = run([lvcreate, "--yes", "--size", f"{aligned_size_bytes}B", "--name", name, vg_name], timeout=900)
         if code != 0:
             return code, output
         return format_and_mount_linux(f"/dev/{vg_name}/{name}", parameters)

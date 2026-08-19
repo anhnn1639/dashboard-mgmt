@@ -127,6 +127,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(resources, /type === "unallocated"/);
   assert.match(resources, /Shrink không di chuyển phần đang chắn/);
   assert.match(resources, /Agent dùng DiskPart giống Disk Management/);
+  assert.equal((resources.match(/\/ 512\) \* 512/g) || []).length, 2);
   assert.match(resources, /Logical Volumes/);
   assert.match(resources, /Extend LV/);
   assert.match(resources, /resizeProtected: Boolean\(node\.resizeProtected\)/);

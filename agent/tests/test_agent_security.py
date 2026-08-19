@@ -643,6 +643,28 @@ trusted
         self.assertIn("select volume C", diskpart_inputs[0])
         self.assertIn("extend size=10240", diskpart_inputs[0])
 
+    def test_linux_lv_extend_aligns_decimal_gib_sizes_to_512_bytes(self):
+        scan = {
+            "logicalVolumes": [
+                {"path": "/dev/ol/u01", "extendableBytes": 7_516_160},
+                {"path": "/dev/ubuntu-vg/ubuntu-lv", "extendableBytes": 85_899_264},
+            ]
+        }
+        commands = []
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/lvextend"), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+            oracle_code, _ = tram_agent.extend_storage(
+                {"kind": "linux_lv", "path": "/dev/ol/u01", "add_bytes": 7_516_192},
+                False,
+            )
+            ubuntu_code, _ = tram_agent.extend_storage(
+                {"kind": "linux_lv", "path": "/dev/ubuntu-vg/ubuntu-lv", "add_bytes": 85_899_345},
+                False,
+            )
+        self.assertEqual(oracle_code, 0)
+        self.assertEqual(ubuntu_code, 0)
+        self.assertEqual(commands[0], ["/usr/sbin/lvextend", "--resizefs", "--size", "+7516160B", "/dev/ol/u01"])
+        self.assertEqual(commands[1], ["/usr/sbin/lvextend", "--resizefs", "--size", "+85899264B", "/dev/ubuntu-vg/ubuntu-lv"])
+
     def test_powershell_clixml_errors_are_readable(self):
         raw = '#< CLIXML\n<Objs><S S="Error">Exception from HRESULT: 0x80072EE2_x000D__x000A_At line:1 char:1</S></Objs>'
         cleaned = tram_agent.clean_powershell_output(raw)

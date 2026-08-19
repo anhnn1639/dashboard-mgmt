@@ -430,7 +430,7 @@ export function StorageResourceTab({
     event.preventDefault();
     if (!selected) return;
     const form = new FormData(event.currentTarget);
-    const addBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3);
+    const addBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3 / 512) * 512;
     const parameters: Record<string, unknown> = { kind: selected.kind, add_bytes: addBytes };
     if (selected.path) parameters.path = selected.path;
     if (selected.diskNumber !== undefined) parameters.disk_number = selected.diskNumber;
@@ -457,7 +457,7 @@ export function StorageResourceTab({
   async function submitCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const sizeBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3);
+    const sizeBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3 / 512) * 512;
     const parameters: Record<string, unknown> = { kind: createKind, size_bytes: sizeBytes };
     if (createKind === "windows_partition") {
       parameters.disk_number = Number(form.get("disk_number"));
