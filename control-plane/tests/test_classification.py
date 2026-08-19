@@ -285,6 +285,35 @@ class ClassificationTests(unittest.TestCase):
                     db.delete(stored)
                     db.commit()
 
+    def test_viewer_first_login_receives_an_mfa_qr(self):
+        username = f"viewer-mfa-{uuid.uuid4().hex[:8]}"
+        password = "Viewer-MFA-Test-Password-123!"
+        user_id = ""
+        try:
+            with TestClient(app) as client:
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                created = client.post("/api/v1/users", headers=admin_headers, json={
+                    "username": username,
+                    "display_name": "Viewer MFA Test",
+                    "password": password,
+                    "role": "viewer",
+                })
+                self.assertEqual(created.status_code, 201, created.text)
+                user_id = created.json()["id"]
+                login = client.post("/api/v1/auth/login", json={"username": username, "password": password, "source": "local"})
+                self.assertEqual(login.status_code, 200, login.text)
+                payload = login.json()
+                self.assertTrue(payload["setup_required"])
+                self.assertEqual(payload["user"]["role"], "viewer")
+                self.assertTrue(payload["qr_svg"].startswith("data:image/svg+xml;base64,"))
+        finally:
+            if user_id:
+                with SessionLocal() as db:
+                    stored = db.get(User, user_id)
+                    if stored:
+                        db.delete(stored)
+                        db.commit()
+
     def test_resource_mutations_have_matching_automatic_refreshes(self):
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.extend"], ("storage.list",))
         self.assertEqual(AUTO_REFRESH_ACTIONS["storage.shrink"], ("storage.list",))

@@ -5,6 +5,7 @@ import base64
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import getpass
+import html
 import hashlib
 import hmac
 import http.client
@@ -172,7 +173,25 @@ def run_with_input(command: list[str], input_value: str, timeout: int = 120) -> 
 
 def powershell(script: str, timeout: int = 120, output_limit: int = 100_000) -> tuple[int, str]:
     encoded = base64.b64encode(script.encode("utf-16le")).decode()
-    return run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], timeout=timeout, sensitive=True, output_limit=output_limit)
+    code, output = run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], timeout=timeout, sensitive=True, output_limit=output_limit)
+    return code, clean_powershell_output(output)[-output_limit:]
+
+
+def clean_powershell_output(output: str) -> str:
+    """Turn PowerShell's CLIXML stderr envelope into a readable error."""
+    if "#< CLIXML" not in output:
+        return output
+    errors = re.findall(r'<S\s+S="Error">(.*?)</S>', output, flags=re.DOTALL)
+    values = errors or [output.replace("#< CLIXML", "")]
+
+    def decode(value: str) -> str:
+        decoded = html.unescape(value)
+        decoded = re.sub(r"_x([0-9A-Fa-f]{4})_", lambda match: chr(int(match.group(1), 16)), decoded)
+        decoded = re.sub(r"\s+", " ", decoded).strip()
+        return decoded
+
+    readable = [decode(value) for value in values]
+    return "\n".join(dict.fromkeys(value for value in readable if value)) or "PowerShell command failed"
 
 
 def parse_os_release() -> dict[str, str]:
@@ -1782,17 +1801,22 @@ def lvm_report(command: str, columns: str) -> list[dict[str, Any]]:
     return []
 
 
-def parted_free_regions(disk: str) -> list[dict[str, int]]:
+def parted_disk_layout(disk: str) -> dict[str, Any]:
     binary = find_system_command("parted")
     if not binary or not DEVICE_RE.fullmatch(disk):
-        return []
+        return {"partitionTable": "", "freeRegions": [], "partitions": {}}
     code, output = run([binary, "--machine", "--script", disk, "unit", "B", "print", "free"], output_limit=1_000_000)
     if code != 0:
-        return []
+        return {"partitionTable": "", "freeRegions": [], "partitions": {}}
+    table = ""
     regions: list[dict[str, int]] = []
+    partitions: dict[int, dict[str, int]] = {}
     for line in output.splitlines():
         fields = line.rstrip(";").split(":")
-        if len(fields) < 5 or fields[4].strip().lower() != "free":
+        if len(fields) >= 6 and fields[0] == disk:
+            table = fields[5].strip().lower()
+            continue
+        if len(fields) < 4:
             continue
         try:
             start = int(fields[1].rstrip("B"))
@@ -1800,9 +1824,30 @@ def parted_free_regions(disk: str) -> list[dict[str, int]]:
             size = int(fields[3].rstrip("B"))
         except ValueError:
             continue
-        if size >= 4 * 1024 * 1024:
-            regions.append({"startBytes": start, "endBytes": end, "sizeBytes": size})
-    return regions
+        if len(fields) >= 5 and fields[4].strip().lower() == "free":
+            if size >= 4 * 1024 * 1024:
+                regions.append({"startBytes": start, "endBytes": end, "sizeBytes": size})
+            continue
+        try:
+            number = int(fields[0])
+        except ValueError:
+            continue
+        if number > 0:
+            partitions[number] = {"startBytes": start, "endBytes": end, "sizeBytes": size}
+    return {"partitionTable": table, "freeRegions": regions, "partitions": partitions}
+
+
+def parted_free_regions(disk: str) -> list[dict[str, int]]:
+    return parted_disk_layout(disk)["freeRegions"]
+
+
+def infer_partition_number(device: dict[str, Any]) -> int:
+    number = byte_value(device.get("partn"))
+    if number:
+        return number
+    name = Path(str(device.get("path") or device.get("kname") or device.get("name") or "")).name
+    match = re.search(r"(?:p)?(\d+)$", name)
+    return int(match.group(1)) if match else 0
 
 
 def normalize_mountpoints(value: Any) -> list[str]:
@@ -1814,6 +1859,8 @@ def normalize_mountpoints(value: Any) -> list[str]:
 def legacy_lsblk_devices(lsblk: str) -> tuple[int, list[dict[str, Any]] | str]:
     """Read util-linux 2.23 era lsblk output used by RHEL/Oracle Linux 7."""
     column_sets = (
+        "NAME,KNAME,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM,PTTYPE,PARTTYPE,PARTN,START,LOG-SEC",
+        "NAME,KNAME,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM,PARTN,START",
         "NAME,KNAME,PKNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM,PTTYPE",
         "NAME,KNAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINT,MODEL,RO,RM",
     )
@@ -1855,7 +1902,7 @@ def legacy_lsblk_devices(lsblk: str) -> tuple[int, list[dict[str, Any]] | str]:
         parent = by_name.get(parent_name)
         if parent is not None:
             parent.setdefault("children", []).append(item)
-        else:
+        elif item.get("type") == "disk":
             disks.append(item)
     return 0, disks
 
@@ -1914,24 +1961,35 @@ def linux_storage_scan() -> tuple[int, str]:
             "extendableBytes": vg_by_name[vg_name]["freeBytes"],
             "dataPercent": str(item.get("data_percent", "")).strip(),
             "devices": str(item.get("devices", "")).strip(),
+            "mapperName": f"{vg_name.replace('-', '--')}-{str(item.get('lv_name', '')).strip().replace('-', '--')}",
             "filesystem": "",
             "mountpoints": [],
         }
         logical_volumes.append(logical)
         vg_by_name[vg_name]["logicalVolumes"].append(path)
     logical_by_path = {item["path"]: item for item in logical_volumes}
-    free_by_disk: dict[str, list[dict[str, int]]] = {}
+    logical_by_mapper_name = {item["mapperName"]: item for item in logical_volumes}
+    layout_by_disk: dict[str, dict[str, Any]] = {}
 
     def decorate(device: dict[str, Any], parent_disk: str = "") -> dict[str, Any]:
         path = str(device.get("path") or ("/dev/" + str(device.get("name", ""))))
         kind = str(device.get("type", ""))
         disk_path = path if kind == "disk" else parent_disk
         if kind == "disk":
-            free_by_disk[path] = parted_free_regions(path)
+            layout_by_disk[path] = parted_disk_layout(path)
         children = [decorate(child, disk_path) for child in device.get("children", []) if isinstance(child, dict)]
+        children.sort(key=lambda child: (byte_value(child.get("offsetBytes")) or 2**63, byte_value(child.get("partitionNumber")) or 2**31, str(child.get("path", ""))))
         mountpoints = normalize_mountpoints(device.get("mountpoints"))
         size = byte_value(device.get("size"))
         filesystem = str(device.get("fstype") or "")
+        partition_number = infer_partition_number(device) if kind == "part" else 0
+        geometry = layout_by_disk.get(disk_path, {}).get("partitions", {}).get(partition_number, {}) if partition_number else {}
+        logical_sector_bytes = byte_value(device.get("log-sec")) or 512
+        offset_bytes = byte_value(geometry.get("startBytes")) if geometry else byte_value(device.get("start")) * logical_sector_bytes
+        end_offset_bytes = byte_value(geometry.get("endBytes")) if geometry else (offset_bytes + size - 1 if size else 0)
+        if geometry:
+            size = byte_value(geometry.get("sizeBytes")) or size
+        resize_protected = str(device.get("ro", "0")) in {"1", "true", "True"} or any(point in {"/boot", "/boot/efi"} for point in mountpoints)
         row: dict[str, Any] = {
             "id": path,
             "name": str(device.get("name", "")),
@@ -1950,39 +2008,43 @@ def linux_storage_scan() -> tuple[int, str]:
             "transport": str(device.get("tran") or ""),
             "readOnly": str(device.get("ro", "0")) in {"1", "true", "True"},
             "removable": str(device.get("rm", "0")) in {"1", "true", "True"},
-            "partitionTable": str(device.get("pttype") or ""),
+            "partitionTable": str(device.get("pttype") or (layout_by_disk.get(path, {}).get("partitionTable") if kind == "disk" else "") or ""),
             "partitionType": str(device.get("parttype") or ""),
-            "partitionNumber": byte_value(device.get("partn")),
-            "startSector": byte_value(device.get("start")),
-            "logicalSectorBytes": byte_value(device.get("log-sec")) or 512,
+            "partitionNumber": partition_number,
+            "startSector": offset_bytes // logical_sector_bytes if logical_sector_bytes else 0,
+            "logicalSectorBytes": logical_sector_bytes,
+            "offsetBytes": offset_bytes,
+            "endOffsetBytes": end_offset_bytes,
             "children": children,
             "extendableBytes": 0,
             "protected": "/" in mountpoints or "/boot" in mountpoints or "/boot/efi" in mountpoints,
+            "resizeProtected": resize_protected,
+            "resizeReason": "Boot/EFI hoặc thiết bị read-only không được resize từ dashboard" if resize_protected else "",
         }
         if kind == "disk":
-            regions = free_by_disk[path]
+            regions = layout_by_disk[path]["freeRegions"]
             row["freeRegions"] = regions
             row["unallocatedBytes"] = sum(region["sizeBytes"] for region in regions)
         if kind == "part" and disk_path:
-            start = row["startSector"] * row["logicalSectorBytes"]
-            end = start + size - 1
-            for region in free_by_disk.get(disk_path, []):
-                if 0 <= region["startBytes"] - end <= 2 * 1024 * 1024:
+            for region in layout_by_disk.get(disk_path, {}).get("freeRegions", []):
+                if 0 <= region["startBytes"] - row["endOffsetBytes"] <= 2 * 1024 * 1024:
                     if filesystem in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
                         row["extendableBytes"] = region["sizeBytes"]
                     break
         pv = pv_by_path.get(path)
         if pv:
             row["lvm"] = {"vgName": str(pv.get("vg_name", "")).strip(), "pvFreeBytes": byte_value(pv.get("pv_free"))}
-        if path in logical_by_path:
-            logical_by_path[path]["filesystem"] = filesystem
-            logical_by_path[path]["uuid"] = row["uuid"]
-            logical_by_path[path]["mountpoints"] = mountpoints
-            logical_by_path[path]["freeBytes"] = row["freeBytes"]
-            logical_by_path[path]["protected"] = row["protected"]
+        logical_match = logical_by_path.get(path) or (logical_by_mapper_name.get(str(device.get("name") or "")) if kind == "lvm" else None)
+        if logical_match:
+            logical_match["filesystem"] = filesystem
+            logical_match["uuid"] = row["uuid"]
+            logical_match["mountpoints"] = mountpoints
+            logical_match["freeBytes"] = row["freeBytes"]
+            logical_match["protected"] = row["protected"]
+            logical_match["resizeProtected"] = row["resizeProtected"]
         return row
 
-    decorated = [decorate(device) for device in devices if isinstance(device, dict)]
+    decorated = [decorate(device) for device in devices if isinstance(device, dict) and str(device.get("type", "")) == "disk"]
     candidates: list[dict[str, Any]] = []
 
     def collect_candidates(row: dict[str, Any]) -> None:
@@ -2010,17 +2072,18 @@ def linux_storage_scan() -> tuple[int, str]:
 def windows_storage_scan() -> tuple[int, str]:
     script = (
         "$minimumGap=[int64](16MB);$disks=@(Get-Disk|Sort-Object Number|ForEach-Object{$d=$_;"
-        "$realParts=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue|Sort-Object Offset|ForEach-Object{$p=$_;$v=$null;$supported=$null;"
-        "try{$v=Get-Volume -Partition $p -ErrorAction Stop}catch{};try{$supported=Get-PartitionSupportedSize -DiskNumber $d.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop}catch{};"
+        "$realParts=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue|Sort-Object Offset|ForEach-Object{$p=$_;$v=$null;$supported=$null;$resizeQueryError='';"
+        "try{$v=Get-Volume -Partition $p -ErrorAction Stop}catch{};try{$supported=Get-PartitionSupportedSize -DiskNumber $d.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop}catch{$resizeQueryError=$_.Exception.Message};"
         "$type=[string]$p.Type;$filesystem=if($v){[string]$v.FileSystem}else{''};$special=[bool]($p.IsHidden -or $type -match '(?i)system|reserved|recovery|oem|unknown');"
         "$extendable=if($supported -and -not $special -and $filesystem -match '^(?i:NTFS|ReFS)$'){[math]::Max(0,[int64]$supported.SizeMax-[int64]$p.Size)}else{0};"
         "$shrinkable=if($supported -and -not $special -and $filesystem -eq 'NTFS'){[math]::Max(0,[int64]$p.Size-[int64]$supported.SizeMin)}else{0};"
         "[pscustomobject]@{id=($d.Number.ToString()+':'+$p.PartitionNumber.ToString());diskNumber=[int]$d.Number;partitionNumber=[int]$p.PartitionNumber;driveLetter=if($p.DriveLetter){$p.DriveLetter.ToString()}else{''};"
-        "type=$type;offsetBytes=[int64]$p.Offset;endOffsetBytes=[int64]$p.Offset+[int64]$p.Size;sizeBytes=[int64]$p.Size;extendableBytes=[int64]$extendable;shrinkableBytes=[int64]$shrinkable;"
+        "type=$type;offsetBytes=[int64]$p.Offset;endOffsetBytes=([int64]$p.Offset+[int64]$p.Size);sizeBytes=[int64]$p.Size;extendableBytes=[int64]$extendable;shrinkableBytes=[int64]$shrinkable;shrinkSupported=[bool](-not $special -and $filesystem -eq 'NTFS');sizeQuerySucceeded=[bool]($null -ne $supported);resizeQueryError=$resizeQueryError;"
         "filesystem=$filesystem;label=if($v){[string]$v.FileSystemLabel}else{''};freeBytes=if($v){[int64]$v.SizeRemaining}else{0};health=if($v){$v.HealthStatus.ToString()}else{''};"
         "path=$p.AccessPaths|Select-Object -First 1;protected=[bool]($p.IsBoot -or $p.IsSystem -or $special);resizeProtected=$special;resizeReason=if($special){'EFI, MSR, Recovery và OEM không được resize'}elseif($filesystem -notmatch '^(?i:NTFS|ReFS)$'){'Extend chỉ hỗ trợ NTFS/ReFS; Shrink chỉ hỗ trợ NTFS'}else{''}}});"
         "$segments=@();$cursor=[int64]0;foreach($part in $realParts){$offset=[int64]$part.offsetBytes;$gap=$offset-$cursor;if($gap -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=$offset;sizeBytes=$gap;freeBytes=$gap;protected=$true;resizeProtected=$true}};$segments+=,$part;$cursor=[math]::Max($cursor,[int64]$part.endOffsetBytes)};"
         "$tail=[int64]$d.Size-$cursor;if($tail -ge $minimumGap){$segments+=,[pscustomobject]@{id=('free:'+$d.Number+':'+$cursor);type='unallocated';name='Unallocated';offsetBytes=$cursor;endOffsetBytes=[int64]$d.Size;sizeBytes=$tail;freeBytes=$tail;protected=$true;resizeProtected=$true}};"
+        "for($i=0;$i -lt ($segments.Count-1);$i++){$part=$segments[$i];$next=$segments[$i+1];if($part.partitionNumber -and $next.type -eq 'unallocated' -and -not $part.resizeProtected -and $part.filesystem -match '^(?i:NTFS|ReFS)$' -and -not $part.sizeQuerySucceeded){$part.extendableBytes=[int64]$next.sizeBytes}};"
         "$unallocated=[int64](($segments|Where-Object{$_.type -eq 'unallocated'}|Measure-Object -Property sizeBytes -Sum).Sum);"
         "[pscustomobject]@{id=[string]$d.UniqueId;number=[int]$d.Number;name=[string]$d.FriendlyName;model=[string]$d.Model;serial=[string]$d.SerialNumber;sizeBytes=[int64]$d.Size;partitionTable=$d.PartitionStyle.ToString();"
         "health=$d.HealthStatus.ToString();operationalStatus=($d.OperationalStatus -join ', ');readOnly=[bool]$d.IsReadOnly;system=[bool]$d.IsSystem;boot=[bool]$d.IsBoot;unallocatedBytes=$unallocated;largestFreeExtentBytes=[int64]$d.LargestFreeExtent;partitions=@($segments)}});"
@@ -2142,7 +2205,7 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
         raise ValueError("Invalid Linux storage target")
     path = str(parameters.get("path", ""))
     node, disk = find_linux_storage_node(scan, path)
-    if not node or not disk or node.get("type") != "part" or node.get("protected") or add_bytes > byte_value(node.get("extendableBytes")):
+    if not node or not disk or node.get("type") != "part" or node.get("resizeProtected") or add_bytes > byte_value(node.get("extendableBytes")):
         raise ValueError("Partition changed, is protected or has insufficient contiguous space")
     number = byte_value(node.get("partitionNumber"))
     if not number:

@@ -562,25 +562,40 @@ trusted
         self.assertEqual(len(regions), 2)
         self.assertEqual(regions[-1]["startBytes"], 53687091200)
         self.assertEqual(regions[-1]["sizeBytes"], 53686042624)
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/parted"), patch.object(tram_agent, "run", return_value=(0, output)):
+            layout = tram_agent.parted_disk_layout("/dev/sda")
+        self.assertEqual(layout["partitionTable"], "gpt")
+        self.assertEqual(layout["partitions"][1]["startBytes"], 1073741824)
 
     def test_oracle_linux_7_storage_falls_back_to_lsblk_pairs(self):
         pairs = '\n'.join([
-            'NAME="sda" KNAME="sda" PKNAME="" TYPE="disk" FSTYPE="" LABEL="" UUID="" SIZE="107374182400" MOUNTPOINT="" MODEL="Virtual Disk" RO="0" RM="0" PTTYPE="gpt"',
-            'NAME="sda1" KNAME="sda1" PKNAME="sda" TYPE="part" FSTYPE="xfs" LABEL="root" UUID="abc" SIZE="107373133824" MOUNTPOINT="/" MODEL="" RO="0" RM="0" PTTYPE=""',
+            'NAME="sda" KNAME="sda" PKNAME="" TYPE="disk" FSTYPE="" LABEL="" UUID="" SIZE="107374182400" MOUNTPOINT="" MODEL="Virtual Disk" RO="0" RM="0" PTTYPE=""',
+            'NAME="sda2" KNAME="sda2" PKNAME="sda" TYPE="part" FSTYPE="LVM2_member" LABEL="" UUID="pv" SIZE="106030956544" MOUNTPOINT="" MODEL="" RO="0" RM="0" PTTYPE=""',
+            'NAME="sda1" KNAME="sda1" PKNAME="sda" TYPE="part" FSTYPE="xfs" LABEL="boot" UUID="abc" SIZE="1073741824" MOUNTPOINT="/boot" MODEL="" RO="0" RM="0" PTTYPE=""',
+            'NAME="dm-0" KNAME="dm-0" PKNAME="" TYPE="lvm" FSTYPE="xfs" LABEL="root" UUID="lv" SIZE="100000000000" MOUNTPOINT="/" MODEL="" RO="0" RM="0" PTTYPE=""',
         ])
+        parted = "BYT;\n/dev/sda:107374182400B:scsi:512:4096:gpt:Disk;\n1:1048576B:1074790399B:1073741824B:xfs:boot:boot;\n2:1074790400B:107105746943B:106030956544B:::lvm;\n:107105746944B:107374182399B:268435456B:free;"
         def fake_run(command, **_kwargs):
             if "--json" in command:
                 return 1, "/usr/bin/lsblk: unrecognized option '--json'"
             if "--pairs" in command:
                 return 0, pairs
+            if command[0] == "/usr/sbin/parted":
+                return 0, parted
             return 0, ""
-        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: "/usr/bin/lsblk" if name == "lsblk" else None), patch.object(tram_agent, "run", side_effect=fake_run):
+        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: {"lsblk": "/usr/bin/lsblk", "parted": "/usr/sbin/parted"}.get(name)), patch.object(tram_agent, "run", side_effect=fake_run):
             code, output = tram_agent.linux_storage_scan()
         self.assertEqual(code, 0)
         parsed = json.loads(output)
+        self.assertEqual(len(parsed["disks"]), 1)
         self.assertEqual(parsed["disks"][0]["path"], "/dev/sda")
+        self.assertEqual(parsed["disks"][0]["partitionTable"], "gpt")
         self.assertEqual(parsed["disks"][0]["children"][0]["path"], "/dev/sda1")
-        self.assertEqual(parsed["disks"][0]["children"][0]["mountpoints"], ["/"])
+        self.assertEqual(parsed["disks"][0]["children"][0]["mountpoints"], ["/boot"])
+        self.assertTrue(parsed["disks"][0]["children"][0]["resizeProtected"])
+        self.assertEqual(parsed["disks"][0]["children"][1]["path"], "/dev/sda2")
+        self.assertEqual(parsed["disks"][0]["children"][1]["partitionNumber"], 2)
+        self.assertEqual(parsed["disks"][0]["children"][1]["extendableBytes"], 268435456)
 
     def test_windows_storage_scan_reports_ordered_free_segments_and_resize_limits(self):
         scripts = []
@@ -590,7 +605,10 @@ trusted
         self.assertIn("Sort-Object Offset", scripts[0])
         self.assertIn("type='unallocated'", scripts[0])
         self.assertIn("offsetBytes", scripts[0])
+        self.assertIn("endOffsetBytes=([int64]$p.Offset+[int64]$p.Size)", scripts[0])
         self.assertIn("shrinkableBytes", scripts[0])
+        self.assertIn("shrinkSupported", scripts[0])
+        self.assertIn("sizeQuerySucceeded", scripts[0])
         self.assertIn("largestFreeExtentBytes", scripts[0])
         self.assertIn("system|reserved|recovery|oem|unknown", scripts[0])
 
@@ -606,11 +624,18 @@ trusted
         self.assertIn("SizeMin", scripts[0])
         self.assertIn("Resize-Partition", scripts[0])
         self.assertIn("recovery", scripts[0].lower())
+        self.assertNotIn("$p.IsBoot -or $p.IsSystem", scripts[0])
         with self.assertRaisesRegex(ValueError, "Windows NTFS"):
             tram_agent.shrink_storage(
                 {"kind": "windows_partition", "disk_number": 0, "partition_number": 3, "shrink_bytes": 1024**3},
                 False,
             )
+
+    def test_powershell_clixml_errors_are_readable(self):
+        raw = '#< CLIXML\n<Objs><S S="Error">Exception from HRESULT: 0x80072EE2_x000D__x000A_At line:1 char:1</S></Objs>'
+        cleaned = tram_agent.clean_powershell_output(raw)
+        self.assertEqual(cleaned, "Exception from HRESULT: 0x80072EE2 At line:1 char:1")
+        self.assertNotIn("CLIXML", cleaned)
 
     def test_update_install_uses_only_selected_apt_packages(self):
         scan = json.dumps({"platform": "linux", "manager": "apt", "updates": [

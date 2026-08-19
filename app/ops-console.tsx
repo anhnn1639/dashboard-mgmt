@@ -1722,11 +1722,12 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
               : "Nhập mã 6 số hiện tại từ ứng dụng xác thực."}
           </p>
           {mfa.setup_required && mfa.qr_svg && (
-            <object
+            // QR is an API-provided data URI; image optimization cannot process it.
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
               className="mfa-qr"
-              data={mfa.qr_svg}
-              type="image/svg+xml"
-              aria-label="QR thiết lập MFA"
+              src={mfa.qr_svg}
+              alt="QR thiết lập MFA"
             />
           )}
           <label>
@@ -2051,6 +2052,7 @@ function ServerDrawer({
     nextAction: string,
     parameters: Record<string, unknown>,
     reason: string,
+    announce = true,
   ) {
     const response = await fetch("/api/v1/jobs", {
       method: "POST",
@@ -2067,7 +2069,7 @@ function ServerDrawer({
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail ?? "Không thể tạo tác vụ");
-    notify(`Đã gửi tác vụ ${nextAction} tới Agent · ${data.status}.`);
+    if (announce) notify(`Đã gửi tác vụ ${nextAction} tới Agent · ${data.status}.`);
     await loadJobs();
     return data as { id: string; status: string; risk: string };
   }
@@ -2082,7 +2084,7 @@ function ServerDrawer({
         await queueJob("logs.sources", {}, `Quét nguồn log từ ${server.name}`);
         await queueJob("logs.read", {}, `Đọc 500 dòng log từ ${server.name}`);
       } else if (currentReadAction) {
-        await queueJob(currentReadAction, parameters, `Đọc dữ liệu ${activeTab} từ ${server.name}`);
+        await queueJob(currentReadAction, parameters, `Đọc dữ liệu ${activeTab} từ ${server.name}`, currentReadAction !== "process.list");
       }
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể yêu cầu dữ liệu mới");

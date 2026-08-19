@@ -4533,6 +4533,23 @@ textarea:focus-visible {
 .vg-card b {
   color: #d6e5f8;
 }
+.logical-volume-card > span:last-child {
+  text-align: right;
+}
+.logical-volume-card button {
+  margin-top: 7px;
+  min-height: 28px;
+  border: 1px solid #31527c;
+  border-radius: 6px;
+  color: #9ab8de;
+  background: #101c2a;
+  cursor: pointer;
+}
+.logical-volume-card button:disabled {
+  border-color: #2a3442;
+  color: #59687b;
+  cursor: not-allowed;
+}
 .resource-table-scroll {
   overflow: auto;
   max-height: 610px;

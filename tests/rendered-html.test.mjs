@@ -126,6 +126,10 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(resources, /Thứ tự vật lý các phân vùng/);
   assert.match(resources, /type === "unallocated"/);
   assert.match(resources, /Shrink không di chuyển phần đang chắn/);
+  assert.match(resources, /Agent sẽ truy vấn SizeMin trực tiếp từ Windows/);
+  assert.match(resources, /Logical Volumes/);
+  assert.match(resources, /Extend LV/);
+  assert.match(resources, /resizeProtected: Boolean\(node\.resizeProtected\)/);
   assert.doesNotMatch(resources, /Windows Update API/);
   assert.doesNotMatch(resources, /Configuration Manager/);
   assert.match(resources, /objectArray\(payload\.updates\)/);
@@ -159,11 +163,21 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(resources, /cpuPercent/);
   assert.match(resources, /memoryBytes/);
   assert.match(resources, /Realtime 5s/);
+  assert.match(resources, /refreshRef\.current/);
+  assert.match(resources, /jobRef\.current/);
   assert.match(resources, /Đã khóa \/ disable/);
   assert.match(resources, /Unlock tài khoản/);
   assert.match(source, /Share \$\{server\.name\}/);
   assert.match(source, /Xóa máy chủ/);
   assert.match(source, /servers\.manage/);
+});
+
+test("MFA QR is CSP-compatible for every role", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const caddy = await readFile(new URL("../deploy/Caddyfile", import.meta.url), "utf8");
+  assert.match(source, /<img\s+className="mfa-qr"\s+src=\{mfa\.qr_svg\}/s);
+  assert.doesNotMatch(source, /<object\s+className="mfa-qr"/s);
+  assert.match(caddy, /img-src 'self' data: blob:/);
 });
 
 test("viewer navigation is permission-aware and stale admin hashes are replaced", async () => {

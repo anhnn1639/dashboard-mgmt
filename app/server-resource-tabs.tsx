@@ -1,6 +1,6 @@
 "use client";
 
-import { CSSProperties, FormEvent, Fragment, ReactNode, useEffect, useMemo, useState } from "react";
+import { CSSProperties, FormEvent, Fragment, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 export type QueueOperation = (
   action: string,
@@ -108,6 +108,9 @@ type StorageNode = {
   freeBytes?: number;
   extendableBytes?: number;
   shrinkableBytes?: number;
+  shrinkSupported?: boolean;
+  sizeQuerySucceeded?: boolean;
+  resizeQueryError?: string;
   unallocatedBytes?: number;
   largestFreeExtentBytes?: number;
   offsetBytes?: number;
@@ -189,6 +192,9 @@ function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
     freeBytes: bytes(value.freeBytes),
     extendableBytes: bytes(value.extendableBytes),
     shrinkableBytes: bytes(value.shrinkableBytes),
+    shrinkSupported: value.shrinkSupported === true,
+    sizeQuerySucceeded: value.sizeQuerySucceeded === true,
+    resizeQueryError: storageText(value.resizeQueryError),
     unallocatedBytes: bytes(value.unallocatedBytes),
     largestFreeExtentBytes: bytes(value.largestFreeExtentBytes),
     offsetBytes: bytes(value.offsetBytes),
@@ -242,6 +248,9 @@ type StorageTarget = {
   partitionNumber?: number;
   extendableBytes?: number;
   shrinkableBytes?: number;
+  shrinkSupported?: boolean;
+  sizeQuerySucceeded?: boolean;
+  resizeQueryError?: string;
   filesystem?: string;
   protected?: boolean;
   resizeProtected?: boolean;
@@ -308,6 +317,9 @@ export function StorageResourceTab({
         partitionNumber: Number(node.partitionNumber),
         extendableBytes: bytes(node.extendableBytes),
         shrinkableBytes: bytes(node.shrinkableBytes),
+        shrinkSupported: node.shrinkSupported,
+        sizeQuerySucceeded: node.sizeQuerySucceeded,
+        resizeQueryError: node.resizeQueryError,
         filesystem: node.filesystem,
         protected: Boolean(node.protected),
         resizeProtected: Boolean(node.resizeProtected),
@@ -323,7 +335,10 @@ export function StorageResourceTab({
         path: node.path,
         partitionNumber: Number(node.partitionNumber),
         extendableBytes: bytes(node.extendableBytes),
+        filesystem: node.filesystem,
         protected: Boolean(node.protected),
+        resizeProtected: Boolean(node.resizeProtected),
+        resizeReason: node.resizeReason,
         mounted: Boolean(node.mountpoints?.length),
       };
     }
@@ -336,6 +351,8 @@ export function StorageResourceTab({
         path: logical.path,
         extendableBytes: bytes(logical.extendableBytes),
         protected: Boolean(logical.protected),
+        resizeProtected: Boolean(logical.resizeProtected),
+        resizeReason: logical.resizeReason,
         mounted: Boolean(logical.mountpoints?.length),
       } : null;
     }
@@ -349,10 +366,9 @@ export function StorageResourceTab({
     const isSelected = Boolean(target && selected?.key === target.key);
     const extendCapacity = bytes(target?.extendableBytes);
     const shrinkCapacity = bytes(target?.shrinkableBytes);
-    const protectedPartition = Boolean(target?.protected && target.kind === "linux_partition");
-    const resizeProtected = Boolean(target?.resizeProtected || protectedPartition);
+    const resizeProtected = Boolean(target?.resizeProtected);
     const canExtend = Boolean(target && extendCapacity >= 1024 ** 2 && !resizeProtected);
-    const canShrink = Boolean(target?.kind === "windows_partition" && target.filesystem?.toUpperCase() === "NTFS" && shrinkCapacity >= 16 * 1024 ** 2 && !resizeProtected);
+    const canShrink = Boolean(target?.kind === "windows_partition" && target.filesystem?.toUpperCase() === "NTFS" && !resizeProtected && (shrinkCapacity >= 16 * 1024 ** 2 || (target.shrinkSupported && target.sizeQuerySucceeded === false)));
     const extendReason = !target
       ? ""
       : resizeProtected
@@ -370,8 +386,10 @@ export function StorageResourceTab({
         ? target.resizeReason || "Partition hệ thống này được bảo vệ."
         : target.filesystem?.toUpperCase() !== "NTFS"
           ? "Windows chỉ hỗ trợ Shrink an toàn cho volume NTFS."
+          : target.sizeQuerySucceeded === false && target.shrinkSupported
+            ? `Windows chưa trả dung lượng Shrink trong lần quét${target.resizeQueryError ? ` (${target.resizeQueryError})` : ""}; Agent sẽ hỏi lại SizeMin ngay khi thực thi giống Disk Management.`
           : shrinkCapacity < 16 * 1024 ** 2
-            ? "Windows không xác nhận đủ dung lượng có thể Shrink; file không thể di chuyển có thể đang nằm cuối volume."
+            ? "Windows xác nhận dung lượng có thể Shrink hiện nhỏ hơn 16 MiB; file không thể di chuyển có thể đang nằm cuối volume."
             : `Có thể Shrink tối đa ${formatBytes(shrinkCapacity)} theo trạng thái vừa quét.`;
     const unallocated = node.type === "unallocated";
     const displayName = unallocated
@@ -389,7 +407,7 @@ export function StorageResourceTab({
         <div className={`storage-tree-row ${isSelected ? "selected" : ""}`} style={{ "--tree-depth": depth } as CSSProperties}>
           <span className="storage-tree-toggle">
             {children.length ? <button type="button" onClick={() => toggle(key)} aria-label="Mở cây phân vùng">{expanded.includes(key) ? "⌄" : "›"}</button> : <i />}
-            {target && <input type="checkbox" checked={isSelected} onChange={() => setSelected(isSelected ? null : target)} disabled={target.protected} aria-label={`Chọn ${target.label}`} />}
+            {target && <input type="checkbox" checked={isSelected} onChange={() => setSelected(isSelected ? null : target)} aria-label={`Chọn ${target.label}`} />}
           </span>
           <span className="storage-name"><b>{displayName}</b><small>{unallocated ? "Vùng trống chưa thuộc volume nào" : node.label || node.type || "partition"}{node.protected && !unallocated ? " · được bảo vệ" : ""}</small></span>
           <span>{node.filesystem || "—"}</span>
@@ -545,18 +563,25 @@ export function StorageResourceTab({
           return <div key={vg.name} className={`vg-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Volume Group</span><input aria-label={`Chọn Volume Group ${vg.name}`} type="checkbox" checked={selected?.key === target.key} disabled={target.mounted} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{vg.name}</b><small>{vg.physicalVolumes.join(", ")}</small></span></label><span>{formatBytes(vg.sizeBytes)}<small>{formatBytes(vg.freeBytes)} còn trống</small></span></div>;
         })}
       </div>}
+      {osFamily === "linux" && scan.logicalVolumes.length > 0 && <div className="vg-grid" aria-label="Logical Volumes">
+        {scan.logicalVolumes.map((logical) => {
+          const target: StorageTarget = { key: `lv:${logical.path}`, kind: "linux_lv", label: String(logical.path), path: logical.path, extendableBytes: bytes(logical.extendableBytes), protected: Boolean(logical.protected), resizeProtected: Boolean(logical.resizeProtected), resizeReason: logical.resizeReason, mounted: Boolean(logical.mountpoints?.length) };
+          const canExtend = bytes(target.extendableBytes) >= 1024 ** 2 && !target.resizeProtected;
+          return <div key={logical.path} className={`vg-card logical-volume-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Logical Volume {logical.path}</span><input aria-label={`Chọn Logical Volume ${logical.path}`} type="checkbox" checked={selected?.key === target.key} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{logical.path}</b><small>{logical.filesystem || "LVM"} · {logical.mountpoints?.join(", ") || "chưa mount"}</small></span></label><span>{formatBytes(logical.sizeBytes)}<small>VG còn {formatBytes(logical.extendableBytes)}</small><button type="button" disabled={!canExtend} title={canExtend ? `Có thể Extend tối đa ${formatBytes(logical.extendableBytes)}` : "Volume Group không còn dung lượng trống"} onClick={() => { setSelected(target); setModal("extend"); }}>Extend LV</button></span></div>;
+        })}
+      </div>}
 
       {modal === "extend" && selected && <ModalShell title={`Extend ${selected.label}`} subtitle={`Dung lượng có thể dùng: ${formatBytes(selected.extendableBytes)}`} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitExtend}>
           <label>Dung lượng thêm (GiB)<input name="size_gb" type="number" min="0.001" step="0.001" max={(bytes(selected.extendableBytes) / 1024 ** 3).toFixed(3)} required /></label>
-          <div className="resource-help">Agent sẽ kiểm tra lại vùng trống liên tục/LVM free ngay trước khi mở rộng. Filesystem ext4/xfs và Windows volume được grow cùng partition.</div>
+          <div className="resource-help">{selected.kind === "linux_partition" && selected.filesystem === "LVM2_member" ? "Bước này tăng partition và chạy pvresize để đưa dung lượng vào Volume Group. Sau khi hệ thống tự quét lại, chọn đúng Logical Volume bên dưới và bấm Extend LV để tăng filesystem." : "Agent sẽ kiểm tra lại vùng trống liên tục/LVM free ngay trước khi mở rộng. Filesystem ext4/xfs và Windows volume được grow cùng partition."}</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Extend</button></div>
         </form>
       </ModalShell>}
 
-      {modal === "shrink" && selected?.kind === "windows_partition" && <ModalShell title={`Shrink ${selected.label}`} subtitle={`Có thể thu nhỏ tối đa theo lần quét này: ${formatBytes(selected.shrinkableBytes)}`} close={() => setModal(null)}>
+      {modal === "shrink" && selected?.kind === "windows_partition" && <ModalShell title={`Shrink ${selected.label}`} subtitle={selected.sizeQuerySucceeded ? `Có thể thu nhỏ tối đa theo lần quét này: ${formatBytes(selected.shrinkableBytes)}` : "Agent sẽ truy vấn SizeMin trực tiếp từ Windows ngay trước khi Shrink"} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitShrink}>
-          <label>Dung lượng cần thu nhỏ (GiB)<input name="size_gb" type="number" min="0.016" step="0.001" max={(bytes(selected.shrinkableBytes) / 1024 ** 3).toFixed(3)} required /></label>
+          <label>Dung lượng cần thu nhỏ (GiB)<input name="size_gb" type="number" min="0.016" step="0.001" max={selected.sizeQuerySucceeded ? (bytes(selected.shrinkableBytes) / 1024 ** 3).toFixed(3) : undefined} required /></label>
           <div className="resource-help">Vùng Unallocated mới sẽ xuất hiện ngay bên phải volume này. Shrink không di chuyển Recovery hay bất kỳ partition nào, vì vậy không thể dùng Shrink để đưa vùng trống ở cuối Disk vượt qua Recovery về sát ổ C:.</div>
           <div className="danger-panel">Hãy bảo đảm đã có backup và không có tác vụ ghi dữ liệu lớn. Agent sẽ đọc lại SizeMin ngay trước khi resize và dừng nếu dung lượng an toàn đã thay đổi.</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Shrink</button></div>
@@ -752,11 +777,20 @@ export function ProcessesResourceTab({ output, job, serverName, busy, refresh, q
   const [resourceFilter, setResourceFilter] = useState<"all" | "cpu" | "memory">("all");
   const [sort, setSort] = useState<{ column: "name" | "cpu" | "memory"; direction: "asc" | "desc" }>({ column: "cpu", direction: "desc" });
   const [live, setLive] = useState(true);
+  const refreshRef = useRef(refresh);
+  const busyRef = useRef(busy);
+  const jobRef = useRef(job);
+  useEffect(() => { refreshRef.current = refresh; }, [refresh]);
+  useEffect(() => { busyRef.current = busy; }, [busy]);
+  useEffect(() => { jobRef.current = job; }, [job]);
   useEffect(() => {
-    if (!live || busy) return;
-    const timer = window.setInterval(refresh, 5000);
+    if (!live) return;
+    const timer = window.setInterval(() => {
+      if (busyRef.current || ["queued", "dispatched"].includes(jobRef.current?.status ?? "")) return;
+      refreshRef.current();
+    }, 5000);
     return () => window.clearInterval(timer);
-  }, [busy, live, refresh]);
+  }, [live]);
   const filtered = rows
     .filter((process) => process.name.toLowerCase().includes(search.toLowerCase()))
     .filter((process) => resourceFilter === "all" || (resourceFilter === "cpu" ? Number(process.cpuPercent ?? 0) > 0 : Number(process.memoryBytes ?? 0) > 0))
@@ -777,7 +811,7 @@ export function ProcessesResourceTab({ output, job, serverName, busy, refresh, q
     if (!await queue("process.kill", { processes }, `Kill ${processes.length} process trên ${serverName}`)) return;
     setSelected([]); setConfirm(false);
   }
-  return <section className="resource-tab"><div className="resource-toolbar"><div><h2>Processes</h2><p>{rows.length} process · CPU/RAM lấy trực tiếp từ máy chủ</p></div><div className="resource-toolbar-actions"><input className="resource-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Tìm process…" /><select value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value as typeof resourceFilter)}><option value="all">Tất cả process</option><option value="cpu">Đang dùng CPU</option><option value="memory">Đang dùng RAM</option></select><label className="live-toggle"><input type="checkbox" checked={live} onChange={(event) => setLive(event.target.checked)} />Realtime 5s</label><button className="button ghost" onClick={refresh} disabled={busy}>↻</button><button className="button danger compact" disabled={!selected.length} onClick={() => setConfirm(true)}>Kill ({selected.length})</button></div></div><PendingState job={job} /><div className="resource-table-scroll process-list"><table className="resource-table"><thead><tr><th className="check-column" /><th><button className="table-sort" type="button" onClick={() => changeSort("name")}>Tên process{sortMark("name")}</button></th><th><button className="table-sort" type="button" onClick={() => changeSort("cpu")}>CPU %{sortMark("cpu")}</button></th><th><button className="table-sort" type="button" onClick={() => changeSort("memory")}>RAM{sortMark("memory")}</button></th></tr></thead><tbody>{filtered.map((process) => <tr key={key(process)}><td><input type="checkbox" checked={selected.includes(key(process))} onChange={() => setSelected((current) => current.includes(key(process)) ? current.filter((item) => item !== key(process)) : [...current, key(process)])} /></td><td><b>{process.name}</b><small>PID {process.pid}{process.username ? ` · ${process.username}` : ""}</small></td><td><b>{Number(process.cpuPercent ?? 0).toFixed(1)}%</b></td><td><b>{formatBytes(Number(process.memoryBytes ?? 0))}</b><small>{Number(process.memoryPercent ?? 0).toFixed(1)}%</small></td></tr>)}</tbody></table>{!rows.length && <div className="empty-state">Chưa có dữ liệu process.</div>}</div>{confirm && <ModalShell title={`Kill ${selected.length} process`} subtitle="Agent sẽ đối chiếu PID, tên và thời điểm tạo để tránh kill nhầm PID tái sử dụng" close={() => setConfirm(false)}><div className="resource-form"><div className="danger-panel">{rows.filter((process) => selected.includes(key(process))).map((process) => process.name).join(", ")}</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setConfirm(false)}>Hủy</button><button type="button" className="button danger" disabled={busy} onClick={() => void terminate()}>Kill process</button></div></div></ModalShell>}</section>;
+  return <section className="resource-tab"><div className="resource-toolbar"><div><h2>Processes</h2><p>{rows.length} process · CPU/RAM lấy trực tiếp từ máy chủ{job?.createdAt ? ` · mẫu ${new Date(job.createdAt).toLocaleTimeString("vi-VN")}` : ""}</p></div><div className="resource-toolbar-actions"><input className="resource-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Tìm process…" /><select value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value as typeof resourceFilter)}><option value="all">Tất cả process</option><option value="cpu">Đang dùng CPU</option><option value="memory">Đang dùng RAM</option></select><label className="live-toggle"><input type="checkbox" checked={live} onChange={(event) => setLive(event.target.checked)} />Realtime 5s</label><button className="button ghost" onClick={refresh} disabled={busy}>↻</button><button className="button danger compact" disabled={!selected.length} onClick={() => setConfirm(true)}>Kill ({selected.length})</button></div></div><PendingState job={job} /><div className="resource-table-scroll process-list"><table className="resource-table"><thead><tr><th className="check-column" /><th><button className="table-sort" type="button" onClick={() => changeSort("name")}>Tên process{sortMark("name")}</button></th><th><button className="table-sort" type="button" onClick={() => changeSort("cpu")}>CPU %{sortMark("cpu")}</button></th><th><button className="table-sort" type="button" onClick={() => changeSort("memory")}>RAM{sortMark("memory")}</button></th></tr></thead><tbody>{filtered.map((process) => <tr key={key(process)}><td><input type="checkbox" checked={selected.includes(key(process))} onChange={() => setSelected((current) => current.includes(key(process)) ? current.filter((item) => item !== key(process)) : [...current, key(process)])} /></td><td><b>{process.name}</b><small>PID {process.pid}{process.username ? ` · ${process.username}` : ""}</small></td><td><b>{Number(process.cpuPercent ?? 0).toFixed(1)}%</b></td><td><b>{formatBytes(Number(process.memoryBytes ?? 0))}</b><small>{Number(process.memoryPercent ?? 0).toFixed(1)}%</small></td></tr>)}</tbody></table>{!rows.length && <div className="empty-state">Chưa có dữ liệu process.</div>}</div>{confirm && <ModalShell title={`Kill ${selected.length} process`} subtitle="Agent sẽ đối chiếu PID, tên và thời điểm tạo để tránh kill nhầm PID tái sử dụng" close={() => setConfirm(false)}><div className="resource-form"><div className="danger-panel">{rows.filter((process) => selected.includes(key(process))).map((process) => process.name).join(", ")}</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setConfirm(false)}>Hủy</button><button type="button" className="button danger" disabled={busy} onClick={() => void terminate()}>Kill process</button></div></div></ModalShell>}</section>;
 }
 
 export type UpdateRow = { id: string; revision?: number; name: string; version?: string; currentVersion?: string; architecture?: string; repository?: string; severity?: string; sizeBytes?: number; description?: string; kb?: string[]; rebootRequired?: boolean };
@@ -790,7 +824,15 @@ function updateScanComplete(payload: Record<string, unknown>) {
 }
 
 function updateDiagnosticText(value: unknown) {
-  const text = String(value ?? "").trim();
+  const raw = String(value ?? "").trim();
+  if (/0x80072ee2/i.test(raw)) return "Windows Update hết thời gian chờ khi kết nối nguồn cập nhật (WSUS hoặc Microsoft Update). Hãy kiểm tra route/firewall/DNS/WSUS; website không coi đây là kết quả 0 bản cập nhật.";
+  if (/0x8024401c/i.test(raw)) return "Windows Update không nhận được phản hồi kịp thời từ WSUS. Kiểm tra trạng thái WSUS, proxy và kết nối từ chính máy chủ Windows.";
+  const text = raw
+    .replace(/^#< CLIXML\s*/i, "")
+    .replace(/_x000D__x000A_/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return text.length > 260 ? `${text.slice(0, 260)}…` : text;
 }
 
