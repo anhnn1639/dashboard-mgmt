@@ -585,9 +585,23 @@ class JobCreateRequest(BaseModel):
 class BulkTaskCreateRequest(BaseModel):
     os_family: Literal["windows", "linux"]
     server_ids: list[str] = Field(min_length=1, max_length=100)
-    action: Literal["user.create", "firewall.rule.add.auto"]
+    action: Literal["user.create", "firewall.rule.add.auto", "patch.install"]
     parameters: dict[str, Any] = Field(default_factory=dict)
     reason: str = Field(min_length=5, max_length=2000)
+
+    @field_validator("server_ids")
+    @classmethod
+    def valid_server_ids(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[A-Za-z0-9-]{1,36}", value) for value in values):
+            raise ValueError("Target server ID is invalid")
+        if len(values) != len(set(values)):
+            raise ValueError("Duplicate target servers are not allowed")
+        return values
+
+
+class BulkUpdateCatalogRequest(BaseModel):
+    os_family: Literal["windows", "linux"]
+    server_ids: list[str] = Field(min_length=1, max_length=100)
 
     @field_validator("server_ids")
     @classmethod
@@ -3129,27 +3143,113 @@ def bulk_task_json(task: BulkTask, db: Session, allowed_server_ids: set[str] | N
     }
 
 
+def latest_update_catalog(db: Session, server: Server) -> tuple[Job | None, dict[str, Any], bool]:
+    job = db.execute(
+        select(Job)
+        .where(Job.server_id == server.id, Job.action == "patch.scan")
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if not job or job.status != "succeeded":
+        return job, {}, False
+    try:
+        payload = json.loads(job.output)
+    except (TypeError, ValueError):
+        return job, {}, False
+    if not isinstance(payload, dict):
+        return job, {}, False
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    complete = diagnostics.get("currentScanComplete") is True if payload.get("platform") == "windows" else diagnostics.get("currentScanComplete") is not False
+    return job, payload, complete
+
+
+def update_catalog_rows(payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    updates = payload.get("updates") if isinstance(payload.get("updates"), list) else []
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        identifier = str(item.get("id") or "")
+        version = str(item.get("version") or "")
+        if not identifier or len(identifier) > 300 or len(version) > 300:
+            continue
+        rows[(identifier, version)] = item
+    return rows
+
+
+def bulk_target_servers(payload: BulkUpdateCatalogRequest | BulkTaskCreateRequest, user: User, db: Session) -> list[Server]:
+    server_ids = list(dict.fromkeys(payload.server_ids))
+    if len(server_ids) != len(payload.server_ids):
+        raise HTTPException(status_code=422, detail="Duplicate target servers are not allowed")
+    if not set(server_ids).issubset(visible_server_ids(db, user)):
+        raise HTTPException(status_code=404, detail="One or more target servers were not found")
+    servers = db.execute(select(Server).where(Server.id.in_(server_ids))).scalars().all()
+    servers_by_id = {server.id: server for server in servers}
+    if len(servers_by_id) != len(server_ids):
+        raise HTTPException(status_code=404, detail="One or more target servers were not found")
+    ordered = [servers_by_id[server_id] for server_id in server_ids]
+    if any(server.os_family != payload.os_family for server in ordered):
+        raise HTTPException(status_code=422, detail="All target servers must belong to the selected Windows or Linux fleet")
+    return ordered
+
+
+@app.post("/api/v1/bulk-update/catalog")
+def bulk_update_catalog(payload: BulkUpdateCatalogRequest, user: User = Depends(require_permission("updates.manage")), db: Session = Depends(db_session)):
+    servers = bulk_target_servers(payload, user, db)
+    platform_keys = {(server.os_family, server.os_name, server.os_version, server.architecture) for server in servers}
+    if len(platform_keys) != 1:
+        raise HTTPException(status_code=422, detail="Select servers with the same operating system, version and architecture")
+    catalog_by_server: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+    server_rows: list[dict[str, Any]] = []
+    all_complete = True
+    for server in servers:
+        scan, scan_payload, complete = latest_update_catalog(db, server)
+        catalog_by_server[server.id] = update_catalog_rows(scan_payload) if complete else {}
+        all_complete = all_complete and complete
+        server_rows.append({
+            "id": server.id,
+            "name": server.name,
+            "scanStatus": "complete" if complete else (scan.status if scan else "not_scanned"),
+            "scanAt": aware(scan.created_at).isoformat() if scan else None,
+            "updateCount": len(catalog_by_server[server.id]),
+        })
+    common_keys = set.intersection(*(set(rows) for rows in catalog_by_server.values())) if catalog_by_server and all_complete else set()
+    first_catalog = catalog_by_server[servers[0].id]
+    updates = []
+    for key in sorted(common_keys, key=lambda value: str(first_catalog[value].get("name") or value[0]).casefold()):
+        item = first_catalog[key]
+        updates.append({
+            "id": key[0],
+            "name": str(item.get("name") or key[0]),
+            "version": key[1],
+            "repository": str(item.get("repository") or ""),
+            "severity": str(item.get("severity") or "normal"),
+            "architecture": str(item.get("architecture") or ""),
+            "kb": item.get("kb") if isinstance(item.get("kb"), list) else [],
+            "availableOn": len(servers),
+        })
+    os_family, os_name, os_version, architecture = next(iter(platform_keys))
+    return {
+        "ready": all_complete,
+        "osFamily": os_family,
+        "osName": os_name,
+        "osVersion": os_version,
+        "architecture": architecture,
+        "servers": server_rows,
+        "updates": updates,
+    }
+
+
 @app.post("/api/v1/bulk-tasks", status_code=201)
 def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
     policy = SAFE_ACTIONS.get(payload.action)
     permission = ACTION_PERMISSIONS.get(payload.action)
     if not policy or not permission or permission not in platform_role_permissions(db, user.role):
         raise HTTPException(status_code=403, detail="Role cannot execute this bulk action")
-    server_ids = list(dict.fromkeys(payload.server_ids))
-    if len(server_ids) != len(payload.server_ids):
-        raise HTTPException(status_code=422, detail="Duplicate target servers are not allowed")
-    allowed_server_ids = visible_server_ids(db, user)
-    if not set(server_ids).issubset(allowed_server_ids):
-        raise HTTPException(status_code=404, detail="One or more target servers were not found")
-    servers = db.execute(select(Server).where(Server.id.in_(server_ids))).scalars().all()
-    servers_by_id = {server.id: server for server in servers}
-    if len(servers_by_id) != len(server_ids):
-        raise HTTPException(status_code=404, detail="One or more target servers were not found")
-    ordered_servers = [servers_by_id[server_id] for server_id in server_ids]
-    if any(server.os_family != payload.os_family for server in ordered_servers):
-        raise HTTPException(status_code=422, detail="All target servers must belong to the selected Windows or Linux fleet")
+    ordered_servers = bulk_target_servers(payload, user, db)
 
     requested = dict(payload.parameters)
+    parameters_by_server: dict[str, dict[str, Any]] = {}
     if payload.action == "user.create":
         allowed = {"username", "password", "is_admin"}
         if set(requested) != allowed or not isinstance(requested.get("is_admin"), bool):
@@ -3161,12 +3261,50 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
             "is_admin": requested["is_admin"],
         }
         summary = {"username": str(requested["username"]), "isAdmin": requested["is_admin"]}
-    else:
+        parameters_by_server = {server.id: job_parameters for server in ordered_servers}
+    elif payload.action == "firewall.rule.add.auto":
         job_parameters = requested
         summary = {key: value for key, value in requested.items() if key not in {"password", "secret", "token"}}
+        parameters_by_server = {server.id: job_parameters for server in ordered_servers}
+    else:
+        requested_updates = requested.get("updates")
+        if set(requested) != {"updates"} or not isinstance(requested_updates, list) or not 1 <= len(requested_updates) <= 100:
+            raise HTTPException(status_code=422, detail="Select between 1 and 100 updates")
+        platform_keys = {(server.os_family, server.os_name, server.os_version, server.architecture) for server in ordered_servers}
+        if len(platform_keys) != 1:
+            raise HTTPException(status_code=422, detail="Bulk updates require the same operating system, version and architecture")
+        requested_keys: list[tuple[str, str]] = []
+        for item in requested_updates:
+            if not isinstance(item, dict) or set(item) != {"id", "version"}:
+                raise HTTPException(status_code=422, detail="Bulk update selection is invalid")
+            key = (str(item.get("id") or ""), str(item.get("version") or ""))
+            if not key[0] or len(key[0]) > 300 or len(key[1]) > 300 or key in requested_keys:
+                raise HTTPException(status_code=422, detail="Bulk update selection is invalid or duplicated")
+            requested_keys.append(key)
+        selected_names: list[str] = []
+        for server_index, server in enumerate(ordered_servers):
+            _, scan_payload, complete = latest_update_catalog(db, server)
+            if not complete:
+                raise HTTPException(status_code=409, detail=f"{server.name} does not have a completed current update scan")
+            catalog = update_catalog_rows(scan_payload)
+            if any(key not in catalog for key in requested_keys):
+                raise HTTPException(status_code=409, detail=f"Selected updates are no longer available on {server.name}; reload the catalog")
+            server_updates = []
+            for key in requested_keys:
+                current = catalog[key]
+                server_updates.append({"id": key[0], "version": key[1], "revision": int(current.get("revision") or 0)})
+                if server_index == 0:
+                    selected_names.append(str(current.get("name") or key[0]))
+            parameters_by_server[server.id] = {"updates": server_updates}
+        summary = {
+            "updateCount": len(requested_keys),
+            "updates": selected_names[:20],
+            "osName": ordered_servers[0].os_name,
+            "osVersion": ordered_servers[0].os_version,
+        }
 
     for server in ordered_servers:
-        validate_job_parameters(payload.action, job_parameters, server)
+        validate_job_parameters(payload.action, parameters_by_server[server.id], server)
 
     task = BulkTask(
         action=payload.action,
@@ -3179,6 +3317,7 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
     db.add(task)
     db.flush()
     for server in ordered_servers:
+        job_parameters = parameters_by_server[server.id]
         job = Job(
             server_id=server.id,
             action=payload.action,

@@ -692,7 +692,9 @@ trusted
                 return 0, ""
             return 0, '{"platform":"windows","manager":"wua","updates":[],"diagnostics":{"currentScanComplete":true}}'
         environment = {"sourceMode": "windows_update", "sourceLabel": "Windows Update", "policyIssue": "", "lastSearchSuccessDate": ""}
-        with patch.object(tram_agent, "windows_update_environment", return_value=environment), patch.object(tram_agent, "powershell", side_effect=fake_powershell):
+        with patch.object(tram_agent, "windows_update_environment", return_value=environment), \
+             patch.object(tram_agent, "windows_update_source_probe", return_value={"reachable": True, "status": "reachable", "endpoint": "https://sls.update.microsoft.com/", "error": ""}), \
+             patch.object(tram_agent, "powershell", side_effect=fake_powershell):
             code, _ = tram_agent.scan_updates({"os_family": "windows"})
         scripts = [call[0] for call in calls]
         self.assertEqual(code, 0)
@@ -745,6 +747,43 @@ trusted
         self.assertFalse(parsed["diagnostics"]["currentScanComplete"])
         self.assertEqual(parsed["diagnostics"]["wuaStatus"], "skipped_invalid_policy")
 
+    def test_windows_update_scan_stops_immediately_when_the_source_is_unreachable(self):
+        cached = json.dumps({"platform": "windows", "updates": [], "diagnostics": {"currentScanComplete": False}})
+        for source_mode, status in (("windows_update", "no_internet"), ("wsus", "wsus_unreachable")):
+            with self.subTest(source_mode=source_mode):
+                environment = {
+                    "sourceMode": source_mode,
+                    "sourceLabel": "WSUS" if source_mode == "wsus" else "Windows Update",
+                    "wsusServer": "http://wsus.example.test:8530" if source_mode == "wsus" else "",
+                    "policyIssue": "",
+                    "lastSearchSuccessDate": "",
+                }
+                queries = []
+                with patch.object(tram_agent, "windows_update_environment", return_value=environment), \
+                     patch.object(tram_agent, "windows_configmgr_updates", return_value=[]), \
+                     patch.object(tram_agent, "windows_update_source_probe", return_value={"reachable": False, "status": status, "endpoint": "", "error": "offline"}), \
+                     patch.object(tram_agent, "windows_update_query", side_effect=lambda **kwargs: (queries.append(kwargs) or (0, cached))):
+                    code, output = tram_agent.scan_windows_updates()
+                parsed = json.loads(output)
+                self.assertEqual(code, 0)
+                self.assertEqual(queries, [{"online": False, "timeout": 60, "source_mode": source_mode}])
+                self.assertEqual(parsed["diagnostics"]["wuaStatus"], status)
+                self.assertEqual(parsed["diagnostics"]["connectivityStatus"], status)
+                self.assertFalse(parsed["diagnostics"]["currentScanComplete"])
+
+    def test_windows_update_source_probe_uses_bounded_native_endpoints_and_proxy(self):
+        scripts = []
+        response = json.dumps({"reachable": True, "endpoint": "http://wsus.example.test:8530/ClientWebService/wusserverversion.xml", "httpStatus": 200, "error": ""})
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, response))):
+            result = tram_agent.windows_update_source_probe({"sourceMode": "wsus", "wsusServer": "http://wsus.example.test:8530"})
+        encoded = scripts[0].split("FromBase64String('", 1)[1].split("')", 1)[0]
+        endpoints = json.loads(base64.b64decode(encoded).decode())
+        self.assertTrue(result["reachable"])
+        self.assertIn("/ClientWebService/wusserverversion.xml", endpoints[0])
+        self.assertIn("/Selfupdate/wuident.cab", endpoints[1])
+        self.assertIn("$request.Timeout=5000", scripts[0])
+        self.assertIn("GetSystemWebProxy", scripts[0])
+
     def test_windows_update_query_pins_the_selected_source(self):
         scripts = []
         with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}"))):
@@ -759,6 +798,35 @@ trusted
         current = datetime.now(UTC).isoformat()
         self.assertTrue(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": current}))
         self.assertFalse(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": "2026-01-01T00:00:00+00:00"}))
+
+    def test_ubuntu_update_scan_reports_repository_failure_as_structured_status(self):
+        commands = []
+        def fake_command(name):
+            return f"/usr/bin/{name}" if name in {"apt", "apt-get"} else None
+        with patch.object(tram_agent, "find_system_command", side_effect=fake_command), \
+             patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (100, "Temporary failure resolving archive.ubuntu.com"))):
+            code, output = tram_agent.scan_updates({"os_family": "linux", "distribution_id": "ubuntu", "os_name": "Ubuntu", "os_version": "22.04"})
+        parsed = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("Acquire::http::Timeout=8", commands[0])
+        self.assertEqual(parsed["updates"], [])
+        self.assertFalse(parsed["diagnostics"]["currentScanComplete"])
+        self.assertEqual(parsed["diagnostics"]["repositoryStatus"], "unreachable")
+        self.assertEqual(parsed["diagnostics"]["osVersion"], "22.04")
+
+    def test_oracle_update_scan_refreshes_only_the_configured_release_repositories(self):
+        commands = []
+        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: "/usr/bin/yum" if name == "yum" else None), \
+             patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (1, "Curl error (6): Could not resolve host"))):
+            code, output = tram_agent.scan_updates({"os_family": "linux", "distribution_id": "ol", "os_name": "Oracle Linux Server", "os_version": "7.9"})
+        parsed = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertIn("--setopt=metadata_expire=0", commands[0])
+        self.assertIn("--setopt=skip_if_unavailable=False", commands[0])
+        self.assertEqual(parsed["diagnostics"]["repositoryStatus"], "unreachable")
+        self.assertEqual(parsed["diagnostics"]["osVersion"], "7.9")
+        self.assertIn("installed OS release", parsed["diagnostics"]["applicabilityCriteria"])
 
     def test_windows_update_install_reuses_cached_catalog_and_checks_download(self):
         scan = json.dumps({"updates": [

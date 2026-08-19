@@ -358,6 +358,49 @@ class ClassificationTests(unittest.TestCase):
             self.assertTrue(all(job and job.action == "user.create" and job.status == "queued" for job in jobs))
             self.assertTrue(all(password not in json.dumps(job.parameters) for job in jobs if job))
 
+    def test_bulk_update_catalog_requires_same_platform_and_pins_each_server_revision(self):
+        server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        common_id = "11111111-2222-3333-4444-555555555555"
+        with SessionLocal() as db:
+            for index, server_id in enumerate(server_ids):
+                db.add(Server(id=server_id, name=f"bulk-patch-{index}", os_family="windows", os_name="Microsoft Windows Server 2022 Standard", os_version="10.0.20348", architecture="AMD64"))
+                db.add(Job(
+                    server_id=server_id,
+                    action="patch.scan",
+                    status="succeeded",
+                    risk="low",
+                    reason="automatic inventory",
+                    created_by="system",
+                    output=json.dumps({
+                        "platform": "windows",
+                        "updates": [
+                            {"id": common_id, "revision": index + 4, "name": "2026-08 Cumulative Update", "version": "KB5099999", "repository": "WSUS", "severity": "security"},
+                            {"id": f"host-only-{index}", "revision": 1, "name": f"Only host {index}", "version": f"KB500000{index}"},
+                        ],
+                        "diagnostics": {"currentScanComplete": True},
+                    }),
+                ))
+            db.commit()
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            catalog = client.post("/api/v1/bulk-update/catalog", headers=headers, json={"os_family": "windows", "server_ids": server_ids})
+            self.assertEqual(catalog.status_code, 200, catalog.text)
+            self.assertTrue(catalog.json()["ready"])
+            self.assertEqual([(item["id"], item["version"]) for item in catalog.json()["updates"]], [(common_id, "KB5099999")])
+            created = client.post("/api/v1/bulk-tasks", headers=headers, json={
+                "os_family": "windows",
+                "server_ids": server_ids,
+                "action": "patch.install",
+                "parameters": {"updates": [{"id": common_id, "version": "KB5099999"}]},
+                "reason": "CHG-4096 install the common cumulative update",
+            })
+            self.assertEqual(created.status_code, 201, created.text)
+        with SessionLocal() as db:
+            jobs = db.execute(select(Job).where(Job.server_id.in_(server_ids), Job.action == "patch.install").order_by(Job.server_id)).scalars().all()
+            self.assertEqual(len(jobs), 2)
+            self.assertEqual({job.parameters["updates"][0]["revision"] for job in jobs}, {4, 5})
+            self.assertTrue(all(job.parameters["updates"][0]["id"] == common_id for job in jobs))
+
     def test_common_firewall_payload_rejects_unknown_commands_and_wrong_family(self):
         valid = {"name": "SSH from jump", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 22, "remote_port": "any", "source": "10.64.83.172/32", "destination": "any", "family": "ipv4"}
         validate_firewall_job_parameters("firewall.rule.add.auto", valid)

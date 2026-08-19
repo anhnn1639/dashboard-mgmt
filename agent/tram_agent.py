@@ -2559,12 +2559,39 @@ def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
         # and can vary widely with the update source and network. Three minutes
         # is too short for a first WSUS/Microsoft Update scan on Server 2022.
         return powershell(script, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS, output_limit=10_000_000)
-    if inventory.get("distribution_id") in {"ubuntu", "debian"}:
-        apt = find_system_command("apt") or find_system_command("apt-get")
-        if not apt:
-            return 127, "apt is not installed"
+    distribution_id = str(inventory.get("distribution_id") or "linux").lower()
+    os_name = str(inventory.get("os_name") or distribution_id)
+    os_version = str(inventory.get("os_version") or "")
+    if distribution_id in {"ubuntu", "debian"}:
+        apt_get = find_system_command("apt-get")
+        apt = find_system_command("apt") or apt_get
+        if not apt_get or not apt:
+            return 127, "apt/apt-get is not installed"
+        refresh = [
+            apt_get,
+            "-o", "Acquire::Retries=0",
+            "-o", "Acquire::http::Timeout=8",
+            "-o", "Acquire::https::Timeout=8",
+            "-o", "Acquire::ftp::Timeout=8",
+            "-o", "APT::Update::Error-Mode=any",
+            "update",
+        ]
+        refresh_code, refresh_output = run(refresh, timeout=45, output_limit=5_000_000)
+        if refresh_code != 0:
+            repository_status = linux_repository_error_status(refresh_code, refresh_output)
+            diagnostics = {
+                "currentScanComplete": False,
+                "repositoryStatus": repository_status,
+                "repositoryLabel": "APT repositories",
+                "repositoryError": refresh_output[:1000],
+                "distributionId": distribution_id,
+                "osName": os_name,
+                "osVersion": os_version,
+                "applicabilityCriteria": "configured repositories for the installed OS release",
+            }
+            return 0, json.dumps({"platform": "linux", "manager": "apt", "count": 0, "updates": [], "diagnostics": diagnostics}, ensure_ascii=False, separators=(",", ":"))
         command = [apt, "list", "--upgradable"] if Path(apt).name == "apt" else [apt, "-s", "upgrade"]
-        code, output = run(command, timeout=300, output_limit=5_000_000)
+        code, output = run(command, timeout=120, output_limit=5_000_000)
         if code != 0:
             return code, output
         rows: list[dict[str, Any]] = []
@@ -2581,13 +2608,40 @@ def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
                 if match:
                     name, current, version, repository = match.groups()
                     rows.append({"id": name, "name": name, "version": version, "currentVersion": current or "", "architecture": "", "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{name} {current or ''} → {version}"})
-        return 0, json.dumps({"platform": "linux", "manager": "apt", "updates": rows}, ensure_ascii=False, separators=(",", ":"))
+        diagnostics = {
+            "currentScanComplete": True,
+            "repositoryStatus": "complete",
+            "repositoryLabel": "APT repositories",
+            "distributionId": distribution_id,
+            "osName": os_name,
+            "osVersion": os_version,
+            "applicabilityCriteria": "configured repositories for the installed OS release",
+        }
+        return 0, json.dumps({"platform": "linux", "manager": "apt", "count": len(rows), "updates": rows, "diagnostics": diagnostics}, ensure_ascii=False, separators=(",", ":"))
     tool = find_system_command("dnf") or find_system_command("yum")
     if not tool:
         return 127, "dnf/yum is not installed"
-    code, output = run([tool, "--quiet", "check-update"], timeout=300, output_limit=5_000_000)
+    manager = Path(tool).name
+    command = [tool, "--quiet"]
+    if manager == "dnf":
+        command.extend(["--refresh", "--setopt=timeout=8", "--setopt=retries=1"])
+    else:
+        command.extend(["--setopt=timeout=8", "--setopt=retries=1", "--setopt=metadata_expire=0", "--setopt=skip_if_unavailable=False"])
+    command.append("check-update")
+    code, output = run(command, timeout=60, output_limit=5_000_000)
     if code not in {0, 100}:
-        return code, output
+        repository_status = linux_repository_error_status(code, output)
+        diagnostics = {
+            "currentScanComplete": False,
+            "repositoryStatus": repository_status,
+            "repositoryLabel": f"{manager.upper()} repositories",
+            "repositoryError": output[:1000],
+            "distributionId": distribution_id,
+            "osName": os_name,
+            "osVersion": os_version,
+            "applicabilityCriteria": "configured repositories for the installed OS release",
+        }
+        return 0, json.dumps({"platform": "linux", "manager": manager, "count": 0, "updates": [], "diagnostics": diagnostics}, ensure_ascii=False, separators=(",", ":"))
     rows = []
     for line in output.splitlines():
         fields = line.split()
@@ -2598,7 +2652,29 @@ def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
         if not name:
             name, architecture = package_arch, ""
         rows.append({"id": package_arch, "name": name, "version": version, "currentVersion": "", "architecture": architecture, "repository": repository, "severity": "security" if "security" in repository.lower() else "normal", "sizeBytes": 0, "description": f"{package_arch} → {version} từ {repository}"})
-    return 0, json.dumps({"platform": "linux", "manager": Path(tool).name, "updates": rows}, ensure_ascii=False, separators=(",", ":"))
+    diagnostics = {
+        "currentScanComplete": True,
+        "repositoryStatus": "complete",
+        "repositoryLabel": f"{manager.upper()} repositories",
+        "distributionId": distribution_id,
+        "osName": os_name,
+        "osVersion": os_version,
+        "applicabilityCriteria": "configured repositories for the installed OS release",
+    }
+    return 0, json.dumps({"platform": "linux", "manager": manager, "count": len(rows), "updates": rows, "diagnostics": diagnostics}, ensure_ascii=False, separators=(",", ":"))
+
+
+def linux_repository_error_status(code: int, output: str) -> str:
+    if code == 124:
+        return "timeout"
+    if re.search(
+        r"(?i)(temporary failure resolving|could not resolve|failed to fetch|connection (?:timed out|refused)|"
+        r"network is unreachable|no route to host|couldn(?:'|’)t connect|cannot initiate the connection|"
+        r"cannot download|curl error \((?:6|7|28)\))",
+        output,
+    ):
+        return "unreachable"
+    return "error"
 
 
 def windows_update_environment() -> dict[str, Any]:
@@ -2607,9 +2683,10 @@ def windows_update_environment() -> dict[str, Any]:
         "$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};"
         "try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
         "$registered=@();try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;$registered=@($manager.Services|ForEach-Object{[pscustomobject]@{name=[string]$_.Name;serviceId=[string]$_.ServiceID;isManaged=[bool]$_.IsManaged;isDefault=[bool]$_.IsDefaultAUService;offersWindowsUpdates=[bool]$_.OffersWindowsUpdates}})}catch{};"
+        "$operatingSystem=$null;try{$operatingSystem=Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop}catch{};"
         "$lastSearch='';$lastInstall='';try{$results=(New-Object -ComObject Microsoft.Update.AutoUpdate).Results;if($results.LastSearchSuccessDate -and $results.LastSearchSuccessDate.Year -gt 1901){$lastSearch=$results.LastSearchSuccessDate.ToUniversalTime().ToString('o')};if($results.LastInstallationSuccessDate -and $results.LastInstallationSuccessDate.Year -gt 1901){$lastInstall=$results.LastInstallationSuccessDate.ToUniversalTime().ToString('o')}}catch{};"
         "$states=@{};foreach($serviceName in @('wuauserv','bits','usosvc')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;$states[$serviceName]=[pscustomobject]@{status=$service.Status.ToString();startType=$service.StartType.ToString()}}catch{$states[$serviceName]=[pscustomobject]@{status='missing';startType='missing'}}};"
-        "[pscustomobject]@{useWUServer=if($null -ne $auPolicy -and $null -ne $auPolicy.UseWUServer){[int]$auPolicy.UseWUServer}else{$null};wsusServer=if($null -ne $policy){[string]$policy.WUServer}else{''};wsusStatusServer=if($null -ne $policy){[string]$policy.WUStatusServer}else{''};doNotConnectInternet=if($null -ne $policy -and $null -ne $policy.DoNotConnectToWindowsUpdateInternetLocations){[int]$policy.DoNotConnectToWindowsUpdateInternetLocations}else{0};auOptions=if($null -ne $auPolicy -and $null -ne $auPolicy.AUOptions){[int]$auPolicy.AUOptions}else{$null};lastSearchSuccessDate=$lastSearch;lastInstallationSuccessDate=$lastInstall;registeredServices=@($registered);services=$states}|ConvertTo-Json -Depth 7 -Compress"
+        "[pscustomobject]@{useWUServer=if($null -ne $auPolicy -and $null -ne $auPolicy.UseWUServer){[int]$auPolicy.UseWUServer}else{$null};wsusServer=if($null -ne $policy){[string]$policy.WUServer}else{''};wsusStatusServer=if($null -ne $policy){[string]$policy.WUStatusServer}else{''};doNotConnectInternet=if($null -ne $policy -and $null -ne $policy.DoNotConnectToWindowsUpdateInternetLocations){[int]$policy.DoNotConnectToWindowsUpdateInternetLocations}else{0};auOptions=if($null -ne $auPolicy -and $null -ne $auPolicy.AUOptions){[int]$auPolicy.AUOptions}else{$null};lastSearchSuccessDate=$lastSearch;lastInstallationSuccessDate=$lastInstall;osName=if($operatingSystem){[string]$operatingSystem.Caption}else{''};osVersion=if($operatingSystem){[string]$operatingSystem.Version}else{''};osBuild=if($operatingSystem){[string]$operatingSystem.BuildNumber}else{''};registeredServices=@($registered);services=$states}|ConvertTo-Json -Depth 7 -Compress"
     )
     code, output = powershell(script, timeout=30, output_limit=1_000_000)
     environment: dict[str, Any] = {}
@@ -2649,6 +2726,60 @@ def windows_update_environment() -> dict[str, Any]:
         "policyIssue": policy_issue,
     })
     return environment
+
+
+def windows_update_source_probe(environment: dict[str, Any]) -> dict[str, Any]:
+    source_mode = str(environment.get("sourceMode") or "default")
+    if source_mode == "wsus":
+        wsus_server = str(environment.get("wsusServer") or "").strip().rstrip("/")
+        parsed = urlsplit(wsus_server)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return {"reachable": False, "status": "invalid_policy", "endpoint": "", "error": "WUServer is not a valid HTTP(S) URL."}
+        endpoints = [
+            f"{wsus_server}/ClientWebService/wusserverversion.xml",
+            f"{wsus_server}/Selfupdate/wuident.cab",
+        ]
+    elif source_mode == "windows_update":
+        endpoints = [
+            "https://sls.update.microsoft.com/",
+            "https://fe2.update.microsoft.com/",
+        ]
+    else:
+        return {"reachable": False, "status": "invalid_policy", "endpoint": "", "error": str(environment.get("policyIssue") or "Windows Update source is invalid.")}
+
+    encoded = base64.b64encode(json.dumps(endpoints).encode()).decode()
+    script = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        f"$urls=@([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json);"
+        "$result=[ordered]@{reachable=$false;endpoint='';httpStatus=0;error=''};"
+        "foreach($url in $urls){$response=$null;try{"
+        "$request=[System.Net.HttpWebRequest]::Create([string]$url);$request.Method='HEAD';$request.Timeout=5000;$request.ReadWriteTimeout=5000;$request.AllowAutoRedirect=$true;$request.UseDefaultCredentials=$true;"
+        "$request.Proxy=[System.Net.WebRequest]::GetSystemWebProxy();if($request.Proxy){$request.Proxy.Credentials=[System.Net.CredentialCache]::DefaultCredentials};"
+        "$response=$request.GetResponse();$result.reachable=$true;$result.endpoint=[string]$url;$result.httpStatus=[int]$response.StatusCode;break"
+        "}catch [System.Net.WebException]{if($_.Exception.Response){$response=$_.Exception.Response;$result.reachable=$true;$result.endpoint=[string]$url;try{$result.httpStatus=[int]$response.StatusCode}catch{};break};$result.error=$_.Exception.Message}"
+        "catch{$result.error=$_.Exception.Message}finally{if($response){$response.Close()}}};"
+        "[pscustomobject]$result|ConvertTo-Json -Compress"
+    )
+    code, output = powershell(script, timeout=20, output_limit=100_000)
+    if code == 0:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed_result = json.loads(output)
+            if isinstance(parsed_result, dict):
+                reachable = parsed_result.get("reachable") is True
+                return {
+                    "reachable": reachable,
+                    "status": "reachable" if reachable else ("wsus_unreachable" if source_mode == "wsus" else "no_internet"),
+                    "endpoint": str(parsed_result.get("endpoint") or ""),
+                    "httpStatus": parsed_result.get("httpStatus") or 0,
+                    "error": str(parsed_result.get("error") or "")[:1000],
+                }
+    return {
+        "reachable": False,
+        "status": "wsus_unreachable" if source_mode == "wsus" else "no_internet",
+        "endpoint": "",
+        "httpStatus": 0,
+        "error": (output or f"Source probe exited with code {code}")[:1000],
+    }
 
 
 def windows_update_cache_is_fresh(environment: dict[str, Any], maximum_age_seconds: int = 900) -> bool:
@@ -2709,6 +2840,7 @@ def scan_windows_updates() -> tuple[int, str]:
     wua_rows = [item for item in cache.get("updates", []) if isinstance(item, dict)]
     online_code: int | None = None
     online_output = ""
+    connectivity = {"reachable": False, "status": "not_checked", "endpoint": "", "error": ""}
     cache_is_fresh = cache_code == 0 and windows_update_cache_is_fresh(environment)
     if source_mode == "invalid_policy":
         online_status = "skipped_invalid_policy"
@@ -2716,29 +2848,34 @@ def scan_windows_updates() -> tuple[int, str]:
         online_code = 0
         online_status = "fresh_cache"
     else:
-        # DetectNow uses the update source selected by Windows policy. The
-        # bounded online query reads the selected WSUS or public catalogue.
-        powershell("$ErrorActionPreference='SilentlyContinue';$au=New-Object -ComObject Microsoft.Update.AutoUpdate;$au.DetectNow()", timeout=30)
-        online_code, online_output = windows_update_query(online=True, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS, source_mode=query_source)
-        if online_code == 0:
-            online_status = "complete"
-            with contextlib.suppress(TypeError, ValueError):
-                parsed = json.loads(online_output)
-                if isinstance(parsed, dict):
-                    cache = parsed
-                    wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
+        connectivity = windows_update_source_probe(environment)
+        if connectivity.get("reachable") is not True:
+            online_status = str(connectivity.get("status") or ("wsus_unreachable" if source_mode == "wsus" else "no_internet"))
         else:
-            online_status = "timeout" if online_code == 124 else "error"
-            # An online WUA search can continue in wuauserv after the client
-            # timeout. Re-read the local catalogue so completed detections are
-            # still returned instead of failing the entire dashboard job.
-            retry_code, retry_output = windows_update_query(online=False, timeout=60, source_mode=query_source)
-            if retry_code == 0:
+            # DetectNow uses the update source selected by Windows policy. A
+            # short source probe above prevents an offline host from occupying
+            # a worker until the much longer WUA search timeout expires.
+            powershell("$ErrorActionPreference='SilentlyContinue';$au=New-Object -ComObject Microsoft.Update.AutoUpdate;$au.DetectNow()", timeout=30)
+            online_code, online_output = windows_update_query(online=True, timeout=WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS, source_mode=query_source)
+            if online_code == 0:
+                online_status = "complete"
                 with contextlib.suppress(TypeError, ValueError):
-                    parsed = json.loads(retry_output)
+                    parsed = json.loads(online_output)
                     if isinstance(parsed, dict):
                         cache = parsed
                         wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
+            else:
+                online_status = "timeout" if online_code == 124 else "error"
+                # An online WUA search can continue in wuauserv after the client
+                # timeout. Re-read the local catalogue so completed detections are
+                # still returned instead of failing the entire dashboard job.
+                retry_code, retry_output = windows_update_query(online=False, timeout=60, source_mode=query_source)
+                if retry_code == 0:
+                    with contextlib.suppress(TypeError, ValueError):
+                        parsed = json.loads(retry_output)
+                        if isinstance(parsed, dict):
+                            cache = parsed
+                            wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
     merged: dict[str, dict[str, Any]] = {str(item.get("id")): item for item in [*wua_rows, *configmgr_rows] if item.get("id")}
     diagnostics = cache.get("diagnostics") if isinstance(cache.get("diagnostics"), dict) else {}
     current_scan_complete = online_status in {"complete", "fresh_cache"}
@@ -2750,10 +2887,15 @@ def scan_windows_updates() -> tuple[int, str]:
         "wuaCount": len(wua_rows),
         "wuaStatus": online_status,
         "wuaMode": "cache" if online_status == "fresh_cache" else "online",
-        "wuaError": "" if current_scan_complete else (online_output or environment.get("policyIssue") or f"WUA scan exited with code {online_code}")[:1000],
+        "wuaError": "" if current_scan_complete else (str(connectivity.get("error") or "") or online_output or environment.get("policyIssue") or f"WUA scan exited with code {online_code}")[:1000],
         "cacheStatus": "ok" if cache_code == 0 else "error",
         "cacheCount": len(wua_rows),
         "onlineTimeoutSeconds": WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS,
+        "connectivityStatus": connectivity.get("status"),
+        "connectivityReachable": connectivity.get("reachable"),
+        "connectivityEndpoint": connectivity.get("endpoint"),
+        "connectivityHttpStatus": connectivity.get("httpStatus", 0),
+        "applicabilityCriteria": "WUA applicability for the installed Windows host",
         "configMgrCount": len(configmgr_rows),
         "configMgrStatus": "ok" if configmgr_rows else "not_installed_or_empty",
     })

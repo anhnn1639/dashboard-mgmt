@@ -4703,30 +4703,7 @@ textarea:focus-visible {
   line-height: 1.5;
 }
 .update-scan-status {
-  display: grid;
-  gap: 10px;
   margin: 0 0 14px;
-  padding: 12px 14px;
-  border: 1px solid rgba(246, 183, 88, .32);
-  border-radius: 8px;
-  color: #d7b476;
-  background: rgba(246, 183, 88, .07);
-}
-.update-scan-status b,
-.update-scan-status span,
-.update-scan-status small {
-  display: block;
-  overflow-wrap: anywhere;
-}
-.update-scan-status b {
-  margin-bottom: 3px;
-  color: #f1c77d;
-}
-.update-scan-status span,
-.update-scan-status small {
-  color: #a98c5f;
-  font-size: 10px;
-  line-height: 1.45;
 }
 .update-scan-status dl {
   display: grid;
@@ -4736,9 +4713,10 @@ textarea:focus-visible {
 }
 .update-scan-status dl > div {
   min-width: 0;
-  padding: 7px 9px;
+  padding: 9px 10px;
+  border: 1px solid rgba(246, 183, 88, .08);
   border-radius: 6px;
-  background: rgba(8, 15, 23, .35);
+  background: rgba(8, 15, 23, .62);
 }
 .update-scan-status dt {
   margin-bottom: 3px;
@@ -4900,7 +4878,9 @@ textarea:focus-visible {
   max-height: 190px;
   overflow: auto;
 }
-.bulk-target-list > div {
+.bulk-target-list > div,
+.bulk-target-list > label,
+.bulk-update-list > label {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -4910,6 +4890,19 @@ textarea:focus-visible {
   border: 1px solid #26374c;
   border-radius: 7px;
   background: #0c1621;
+}
+.bulk-target-list > label,
+.bulk-update-list > label {
+  cursor: pointer;
+}
+.bulk-target-list > label > input,
+.bulk-update-list > label > input {
+  flex: 0 0 auto;
+  accent-color: #4c8ce8;
+}
+.bulk-target-list > label > span,
+.bulk-update-list > label > span {
+  flex: 1 1 auto;
 }
 .bulk-target-list span,
 .bulk-target-list b,
@@ -4945,6 +4938,49 @@ textarea:focus-visible {
 .bulk-task-result {
   display: grid;
   gap: 12px;
+}
+.bulk-update-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.bulk-update-steps span {
+  padding: 8px 10px;
+  border: 1px solid #293a50;
+  border-radius: 7px;
+  color: #6f829b;
+  background: #0b1520;
+  font-size: 9px;
+}
+.bulk-update-steps span.active,
+.bulk-update-steps span.done {
+  border-color: rgba(76, 140, 232, .5);
+  color: #a9c9f5;
+  background: rgba(76, 140, 232, .1);
+}
+.bulk-update-list {
+  display: grid;
+  gap: 6px;
+  max-height: 290px;
+  overflow: auto;
+}
+.bulk-update-list b,
+.bulk-update-list small {
+  display: block;
+}
+.bulk-update-list b {
+  color: #cbd9ea;
+  font-size: 10px;
+}
+.bulk-update-list small {
+  margin-top: 3px;
+  color: #647891;
+  font-size: 8px;
+}
+.bulk-update-list em {
+  color: #d5aa68;
+  font-size: 8px;
+  font-style: normal;
 }
 .resource-form {
   display: grid;

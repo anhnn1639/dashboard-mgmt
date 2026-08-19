@@ -66,7 +66,8 @@ test("Windows and Linux fleets can queue OS-aware common tasks", async () => {
   assert.match(source, /firewall\.rule\.add\.auto/);
   assert.match(source, /Windows dùng group Administrators theo SID/);
   assert.match(source, /Oracle Linux\/Red Hat chọn default firewalld zone/);
-  assert.match(source, /server_ids:\s*servers\.map/);
+  assert.match(source, /server_ids:\s*targetIds/);
+  assert.match(source, /initialServerIds=\{selectedServerIds\}/);
 });
 
 test("firewall add form uses server capabilities and a viewport-safe scroll region", async () => {
@@ -135,9 +136,17 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.doesNotMatch(resources, /Configuration Manager/);
   assert.match(resources, /objectArray\(payload\.updates\)/);
   assert.match(resources, /diagnostics\.currentScanComplete === true/);
-  assert.match(resources, /Chưa thể kết luận máy có 0 bản cập nhật/);
-  assert.match(resources, /Đang hiển thị dữ liệu hoàn tất gần nhất/);
+  assert.doesNotMatch(resources, /Chưa thể kết luận máy có 0 bản cập nhật/);
+  assert.doesNotMatch(resources, /Đang hiển thị dữ liệu hoàn tất gần nhất/);
+  assert.match(resources, /Không có Internet/);
+  assert.match(resources, /Mất kết nối WSUS/);
+  assert.match(resources, /Không kết nối được repository/);
+  assert.match(resources, /Phiên bản hệ điều hành/);
   assert.match(source, /successfulUpdateScanJobs/);
+  assert.match(source, /Cập nhật bản vá theo OS \+ version/);
+  assert.match(source, /\/api\/v1\/bulk-update\/catalog/);
+  assert.match(source, /Tiếp: Chọn patch/);
+  assert.match(source, /Patch chung cho toàn bộ máy đã chọn/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
   assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);

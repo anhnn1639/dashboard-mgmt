@@ -825,22 +825,27 @@ function updateScanComplete(payload: Record<string, unknown>) {
     : diagnostics.currentScanComplete !== false;
 }
 
-function updateDiagnosticText(value: unknown) {
-  const raw = String(value ?? "").trim();
-  if (/0x80072ee2/i.test(raw)) return "Windows Update hết thời gian chờ khi kết nối nguồn cập nhật (WSUS hoặc Microsoft Update). Hãy kiểm tra route/firewall/DNS/WSUS; website không coi đây là kết quả 0 bản cập nhật.";
-  if (/0x8024401c/i.test(raw)) return "Windows Update không nhận được phản hồi kịp thời từ WSUS. Kiểm tra trạng thái WSUS, proxy và kết nối từ chính máy chủ Windows.";
-  const text = raw
-    .replace(/^#< CLIXML\s*/i, "")
-    .replace(/_x000D__x000A_/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return text.length > 260 ? `${text.slice(0, 260)}…` : text;
-}
-
 function updateDate(value: unknown) {
   const date = new Date(String(value ?? ""));
   return Number.isNaN(date.getTime()) ? "chưa có" : date.toLocaleString("vi-VN");
+}
+
+function updateStatusText(diagnostics: Record<string, unknown>) {
+  const connectivity = String(diagnostics.connectivityStatus ?? "");
+  const raw = ["no_internet", "wsus_unreachable", "invalid_policy"].includes(connectivity)
+    ? connectivity
+    : String(diagnostics.wuaStatus ?? diagnostics.repositoryStatus ?? connectivity ?? "incomplete");
+  return ({
+    no_internet: "Không có Internet",
+    wsus_unreachable: "Mất kết nối WSUS",
+    invalid_policy: "Policy nguồn cập nhật không hợp lệ",
+    skipped_invalid_policy: "Policy nguồn cập nhật không hợp lệ",
+    unreachable: "Không kết nối được repository",
+    timeout: "Nguồn cập nhật phản hồi quá chậm",
+    error: "Lỗi quét cập nhật",
+    complete: "Đã quét xong",
+    fresh_cache: "Dữ liệu Windows hiện tại",
+  } as Record<string, string>)[raw] ?? "Chưa hoàn tất";
 }
 
 export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queue }: { scans: OperationJob[]; job?: OperationJob; serverName: string; busy: boolean; refresh: () => void; queue: QueueOperation }) {
@@ -866,10 +871,12 @@ export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queu
   const isWindows = scanState.latestPayload.platform === "windows";
   const showingPrevious = Boolean(scanState.display && scanState.latest && scanState.display.id !== scanState.latest.id);
   const latestAttemptMatches = !job || job.id === scanState.latest?.id;
-  const installAllowed = latestAttemptMatches && (!isWindows || (scanState.latestComplete && !showingPrevious));
-  const source = String(diagnostics.sourceLabel ?? diagnostics.updateSource ?? "Windows Update");
-  const issue = updateDiagnosticText(diagnostics.policyIssue || diagnostics.wuaError);
+  const installAllowed = latestAttemptMatches && scanState.latestComplete && !showingPrevious;
+  const source = String(diagnostics.sourceLabel ?? diagnostics.updateSource ?? diagnostics.repositoryLabel ?? scanState.latestPayload.manager ?? (isWindows ? "Windows Update" : "Repository hệ điều hành"));
   const lastSuccessfulSearch = updateDate(diagnostics.lastSearchSuccessDate);
+  const status = updateStatusText(diagnostics);
+  const statusDetail = String(diagnostics.policyIssue || diagnostics.wuaError || diagnostics.repositoryError || "");
+  const systemVersion = `${String(diagnostics.osName ?? diagnostics.distributionId ?? "")} ${String(diagnostics.osVersion ?? "")}`.trim() || "không xác định";
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const activeSelected = installAllowed ? selected.filter((id) => rows.some((row) => row.id === id)) : [];
@@ -879,13 +886,13 @@ export function UpdatesResourceTab({ scans, job, serverName, busy, refresh, queu
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  const emptyMessage = isWindows && !scanState.latestComplete
-    ? "Chưa xác định được danh sách bản cập nhật vì lần quét gần nhất chưa hoàn tất."
+  const emptyMessage = !scanState.latestComplete
+    ? `Chưa xác định được danh sách bản cập nhật: ${status}.`
     : "Không có bản cập nhật khả dụng trong lần quét hoàn tất gần nhất.";
   return <section className="resource-tab updates-resource-tab">
     <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật đang hiển thị · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!activeSelected.length || busy || !installAllowed} title={installAllowed ? "" : "Chỉ cài đặt sau một lần quét Windows Update hoàn tất"} onClick={() => void install()}>Cập nhật ({activeSelected.length})</button></div></div>
     <PendingState job={job} />
-    {isWindows && !scanState.latestComplete && <div className="update-scan-status warning"><div><b>Chưa thể kết luận máy có 0 bản cập nhật</b><span>Lần quét hiện tại chưa hoàn tất; danh sách cũ nếu có chỉ dùng để tham khảo và không được phép cài.</span></div><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>Lần Windows quét thành công</dt><dd>{lastSuccessfulSearch}</dd></div><div><dt>Trạng thái</dt><dd>{String(diagnostics.wuaStatus ?? "chưa hoàn tất")}</dd></div></dl>{issue && <small title={String(diagnostics.policyIssue || diagnostics.wuaError)}>{issue}</small>}{lastSuccessfulSearch !== "chưa có" && <small>Windows Settings vẫn có thể hiển thị các gói đã phát hiện, tải hoặc đánh dấu Pending install từ lần quét {lastSuccessfulSearch}; khi máy không tới được WSUS/Microsoft Update, Agent không thể xác minh lại danh sách đó là trạng thái hiện tại.</small>}{showingPrevious && scanState.display && <small>Đang hiển thị dữ liệu hoàn tất gần nhất lúc {updateDate(scanState.display.createdAt)}.</small>}</div>}
+    {scanState.latest && !scanState.latestComplete && <div className="update-scan-status"><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>{isWindows ? "Lần Windows quét thành công" : "Phiên bản hệ điều hành"}</dt><dd>{isWindows ? lastSuccessfulSearch : systemVersion}</dd></div><div><dt>Trạng thái</dt><dd title={statusDetail}>{status}</dd></div></dl></div>}
     <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" disabled={!installAllowed} checked={rows.length > 0 && rows.every((item) => activeSelected.includes(item.id))} onChange={() => setSelected(rows.every((item) => activeSelected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={!installAllowed} checked={activeSelected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
   </section>;
 }

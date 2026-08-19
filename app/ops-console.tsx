@@ -980,7 +980,7 @@ export function OpsConsole() {
                   </p>
                 </div>
                 <div className="fleet-head-actions">
-                  {scope ? <button type="button" className="button primary compact" disabled={!selectedServerIds.length} onClick={() => setBulkTaskOpen(true)}>＋ Tạo task chung</button> : null}
+                  {scope ? <button type="button" className="button primary compact" onClick={() => setBulkTaskOpen(true)}>＋ Tạo task chung</button> : null}
                   <div className="filters">
                     <button
                       className={filter === "all" ? "active" : ""}
@@ -1048,13 +1048,14 @@ export function OpsConsole() {
       {bulkTaskOpen && scope && (
         <BulkTaskModal
           close={() => setBulkTaskOpen(false)}
+          initialServerIds={selectedServerIds}
           openJobs={() => {
             setBulkTaskOpen(false);
             navigateSection("jobs");
           }}
           notify={notify}
           scope={scope}
-          servers={servers.filter((server) => selectedServerIds.includes(server.id))}
+          servers={servers.filter((server) => server.osFamily === scope)}
           token={token}
         />
       )}
@@ -1118,6 +1119,16 @@ type BulkTaskResponse = {
   items: Array<{ serverId: string; serverName: string; jobId: string; status: string }>;
 };
 
+type BulkUpdateCatalog = {
+  ready: boolean;
+  osFamily: OSFamily;
+  osName: string;
+  osVersion: string;
+  architecture: string;
+  servers: Array<{ id: string; name: string; scanStatus: string; scanAt?: string; updateCount: number }>;
+  updates: Array<{ id: string; name: string; version: string; repository: string; severity: string; architecture: string; kb: string[]; availableOn: number }>;
+};
+
 const firewallPresets = {
   ssh: { name: "Cho phép SSH", protocol: "tcp", port: "22" },
   http: { name: "Cho phép HTTP", protocol: "tcp", port: "80" },
@@ -1129,6 +1140,7 @@ const firewallPresets = {
 
 function BulkTaskModal({
   close,
+  initialServerIds,
   notify,
   openJobs,
   scope,
@@ -1136,13 +1148,34 @@ function BulkTaskModal({
   token,
 }: {
   close: () => void;
+  initialServerIds: string[];
   notify: (message: string) => void;
   openJobs: () => void;
   scope: OSFamily;
   servers: Server[];
   token: string;
 }) {
-  const [action, setAction] = useState<"user.create" | "firewall.rule.add.auto">("user.create");
+  const groups = useMemo(() => {
+    const result = new Map<string, { key: string; label: string; servers: Server[] }>();
+    for (const server of servers) {
+      const key = `${encodeURIComponent(server.os)}::${encodeURIComponent(server.version)}`;
+      const group = result.get(key) ?? { key, label: `${server.os} · ${server.version || "không rõ version"}`, servers: [] };
+      group.servers.push(server);
+      result.set(key, group);
+    }
+    return [...result.values()].sort((left, right) => left.label.localeCompare(right.label, "vi"));
+  }, [servers]);
+  const preferredServer = servers.find((server) => initialServerIds.includes(server.id));
+  const preferredGroup = groups.find((group) => group.servers.some((server) => server.id === preferredServer?.id)) ?? groups[0];
+  const [action, setAction] = useState<"user.create" | "firewall.rule.add.auto" | "patch.install">("patch.install");
+  const [step, setStep] = useState<1 | 2>(1);
+  const [groupKey, setGroupKey] = useState(preferredGroup?.key ?? "");
+  const [targetIds, setTargetIds] = useState<string[]>(() => {
+    const preferred = preferredGroup?.servers.filter((server) => initialServerIds.includes(server.id)).map((server) => server.id) ?? [];
+    return preferred.length ? preferred : (preferredGroup?.servers.map((server) => server.id) ?? []);
+  });
+  const [catalog, setCatalog] = useState<BulkUpdateCatalog | null>(null);
+  const [selectedUpdates, setSelectedUpdates] = useState<string[]>([]);
   const [preset, setPreset] = useState<keyof typeof firewallPresets>(scope === "windows" ? "rdp" : "ssh");
   const [firewallName, setFirewallName] = useState<string>(firewallPresets[scope === "windows" ? "rdp" : "ssh"].name);
   const [firewallProtocol, setFirewallProtocol] = useState<string>(firewallPresets[scope === "windows" ? "rdp" : "ssh"].protocol);
@@ -1151,6 +1184,23 @@ function BulkTaskModal({
   const [error, setError] = useState("");
   const [result, setResult] = useState<BulkTaskResponse | null>(null);
   const formId = "bulk-task-form";
+  const selectedGroup = groups.find((group) => group.key === groupKey) ?? groups[0];
+  const targetServers = servers.filter((server) => targetIds.includes(server.id));
+
+  function toggleTarget(serverId: string) {
+    setTargetIds((current) => current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId]);
+    setCatalog(null);
+    setSelectedUpdates([]);
+  }
+
+  function changeGroup(value: string) {
+    const group = groups.find((item) => item.key === value);
+    setGroupKey(value);
+    setTargetIds(group?.servers.map((server) => server.id) ?? []);
+    setCatalog(null);
+    setSelectedUpdates([]);
+    setStep(1);
+  }
 
   function applyPreset(value: keyof typeof firewallPresets) {
     const selectedPreset = firewallPresets[value];
@@ -1158,6 +1208,28 @@ function BulkTaskModal({
     setFirewallName(selectedPreset.name);
     setFirewallProtocol(selectedPreset.protocol);
     setFirewallPort(selectedPreset.port);
+  }
+
+  async function loadUpdateCatalog() {
+    if (!targetIds.length) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/v1/bulk-update/catalog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ os_family: scope, server_ids: targetIds }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể đọc catalog cập nhật chung");
+      setCatalog(data as BulkUpdateCatalog);
+      setSelectedUpdates([]);
+      setStep(2);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Không thể đọc catalog cập nhật chung");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -1171,7 +1243,7 @@ function BulkTaskModal({
           password: String(form.get("password") ?? ""),
           is_admin: form.get("is_admin") === "on",
         }
-      : {
+      : action === "firewall.rule.add.auto" ? {
           name: firewallName.trim(),
           direction: scope === "linux" ? "in" : String(form.get("direction") ?? "in"),
           action: String(form.get("rule_action") ?? "allow"),
@@ -1181,6 +1253,10 @@ function BulkTaskModal({
           source: String(form.get("source") ?? "any").trim() || "any",
           destination: String(form.get("destination") ?? "any").trim() || "any",
           family: String(form.get("family") ?? "ipv4"),
+        } : {
+          updates: (catalog?.updates ?? [])
+            .filter((update) => selectedUpdates.includes(`${update.id}\u0000${update.version}`))
+            .map((update) => ({ id: update.id, version: update.version })),
         };
     try {
       const response = await fetch("/api/v1/bulk-tasks", {
@@ -1188,7 +1264,7 @@ function BulkTaskModal({
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           os_family: scope,
-          server_ids: servers.map((server) => server.id),
+          server_ids: targetIds,
           action,
           parameters,
           reason: String(form.get("reason") ?? "").trim(),
@@ -1197,7 +1273,7 @@ function BulkTaskModal({
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.detail ?? "Không thể tạo task chung");
       setResult(data as BulkTaskResponse);
-      notify(`Đã xếp hàng ${servers.length} job trong task chung`);
+      notify(`Đã xếp hàng ${targetIds.length} job trong task chung`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Không thể tạo task chung");
     } finally {
@@ -1222,22 +1298,34 @@ function BulkTaskModal({
 
   return <ModalShell
     title="Tạo task chung"
-    subtitle={`${scope === "windows" ? "Windows" : "Linux"} · ${servers.length} máy chủ đã chọn`}
+    subtitle={`${scope === "windows" ? "Windows" : "Linux"} · chọn task, OS/version và máy chủ đích`}
     close={close}
     className="bulk-task-modal"
-    footer={<><button type="button" className="button ghost" onClick={close}>Hủy</button><button type="submit" form={formId} className="button primary" disabled={busy || !servers.length}>{busy ? "Đang tạo..." : `Tạo ${servers.length} job`}</button></>}
+    footer={action === "patch.install" && step === 1
+      ? <><button type="button" className="button ghost" onClick={close}>Hủy</button><button type="button" className="button primary" disabled={busy || !targetIds.length} onClick={() => void loadUpdateCatalog()}>{busy ? "Đang đọc catalog…" : "Tiếp: Chọn patch"}</button></>
+      : <><button type="button" className="button ghost" onClick={action === "patch.install" ? () => { setStep(1); setCatalog(null); setSelectedUpdates([]); } : close}>{action === "patch.install" ? "Quay lại" : "Hủy"}</button><button type="submit" form={formId} className="button primary" disabled={busy || !targetIds.length || (action === "patch.install" && (!catalog?.ready || !selectedUpdates.length))}>{busy ? "Đang tạo..." : `Tạo ${targetIds.length} job`}</button></>}
   >
     <form id={formId} className="resource-form bulk-task-form" onSubmit={submit}>
-      <fieldset>
-        <legend>Máy chủ đích</legend>
-        <div className="bulk-target-list">{servers.map((server) => <div key={server.id}><span><b>{server.name}</b><small>{server.os} {server.version}</small></span><em className={server.health}>{server.health === "offline" ? "Chờ kết nối" : "Sẵn sàng"}</em></div>)}</div>
-      </fieldset>
       <label>Loại tác vụ
-        <select value={action} onChange={(event) => { setAction(event.target.value as typeof action); setError(""); }}>
+        <select value={action} disabled={action === "patch.install" && step === 2} onChange={(event) => { setAction(event.target.value as typeof action); setStep(1); setCatalog(null); setSelectedUpdates([]); setError(""); }}>
+          <option value="patch.install">Cập nhật bản vá theo OS + version</option>
           <option value="user.create">Tạo user local trên nhiều máy</option>
           <option value="firewall.rule.add.auto">Thêm firewall rule trên nhiều máy</option>
         </select>
       </label>
+      {action === "patch.install" ? <>
+        <div className="bulk-update-steps"><span className={step === 1 ? "active" : "done"}>1 · OS/version & máy chủ</span><span className={step === 2 ? "active" : ""}>2 · Chọn patch & cập nhật</span></div>
+        {step === 1 ? <>
+          <label>OS + version<select value={groupKey} onChange={(event) => changeGroup(event.target.value)}>{groups.map((group) => <option key={group.key} value={group.key}>{group.label} · {group.servers.length} máy</option>)}</select></label>
+          <fieldset><legend>Máy chủ cùng OS/version</legend><div className="bulk-target-list selectable">{(selectedGroup?.servers ?? []).map((server) => <label key={server.id}><input type="checkbox" checked={targetIds.includes(server.id)} onChange={() => toggleTarget(server.id)} /><span><b>{server.name}</b><small>{server.os} {server.version}</small></span><em className={server.health}>{server.health === "offline" ? "Chờ kết nối" : "Sẵn sàng"}</em></label>)}</div></fieldset>
+          <div className="resource-help">Bước tiếp theo chỉ hiển thị patch đang khả dụng trên tất cả máy đã chọn. Windows dùng Update ID/revision do WUA xác nhận cho từng host; Linux dùng đúng repository của release hiện tại.</div>
+        </> : <>
+          <div className="resource-help"><b>{catalog?.osName} {catalog?.osVersion}</b>{catalog?.architecture ? ` · ${catalog.architecture}` : ""} · {targetServers.length} máy chủ</div>
+          {!catalog?.ready ? <div className="danger-panel">Có máy chưa có lần quét cập nhật hoàn tất. Hãy quét lại máy đó rồi tải lại catalog.</div> : null}
+          <div className="bulk-target-list compact">{catalog?.servers.map((server) => <div key={server.id}><span><b>{server.name}</b><small>{server.scanAt ? new Date(server.scanAt).toLocaleString("vi-VN") : "Chưa quét"}</small></span><em>{server.scanStatus === "complete" ? `${server.updateCount} gói` : server.scanStatus}</em></div>)}</div>
+          <fieldset><legend>Patch chung cho toàn bộ máy đã chọn</legend><div className="bulk-update-list">{catalog?.updates.map((update) => { const key = `${update.id}\u0000${update.version}`; return <label key={key}><input type="checkbox" checked={selectedUpdates.includes(key)} onChange={() => setSelectedUpdates((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key])} /><span><b>{update.name}</b><small>{update.version || "—"} · {update.repository || "nguồn hệ điều hành"}</small></span><em>{update.severity}</em></label>; })}{catalog?.ready && !catalog.updates.length ? <div className="empty-state">Không có patch chung đang chờ trên tất cả máy đã chọn.</div> : null}</div></fieldset>
+        </>}
+      </> : <fieldset><legend>Máy chủ đích</legend><div className="bulk-target-list selectable">{servers.map((server) => <label key={server.id}><input type="checkbox" checked={targetIds.includes(server.id)} onChange={() => toggleTarget(server.id)} /><span><b>{server.name}</b><small>{server.os} {server.version}</small></span><em className={server.health}>{server.health === "offline" ? "Chờ kết nối" : "Sẵn sàng"}</em></label>)}</div></fieldset>}
       {action === "user.create" ? <>
         <div className="form-grid">
           <label>Username<input name="username" required maxLength={scope === "windows" ? 20 : 32} pattern={scope === "windows" ? "[^\\/\\[\\]:;|=,+*?<>@]{1,20}" : "[a-z_][a-z0-9_.-]{0,31}"} title={scope === "windows" ? "Tên local Windows tối đa 20 ký tự" : "Linux dùng chữ thường, số, _, . hoặc -"} /></label>
@@ -1245,7 +1333,7 @@ function BulkTaskModal({
         </div>
         <label className="check"><input name="is_admin" type="checkbox" /> Cấp quyền quản trị hệ điều hành</label>
         <div className="resource-help">Agent đọc group thật trên từng máy ngay trước khi tạo: Windows dùng group Administrators theo SID, Ubuntu dùng sudo, Oracle Linux/Red Hat dùng wheel. Không truyền tên group đoán từ trình duyệt.</div>
-      </> : <>
+      </> : action === "firewall.rule.add.auto" ? <>
         <div className="form-grid">
           <label>Mẫu cấu hình<select value={preset} onChange={(event) => applyPreset(event.target.value as keyof typeof firewallPresets)}><option value="ssh">SSH · TCP 22</option><option value="rdp">Remote Desktop · TCP 3389</option><option value="http">HTTP · TCP 80</option><option value="https">HTTPS · TCP 443</option><option value="dns">DNS · UDP 53</option><option value="custom">Tùy chỉnh</option></select></label>
           <label>Tên rule<input value={firewallName} onChange={(event) => setFirewallName(event.target.value)} maxLength={128} required /></label>
@@ -1267,8 +1355,8 @@ function BulkTaskModal({
           <label>Đích local (CIDR)<input name="destination" defaultValue="any" placeholder="any" /></label>
         </div>
         <div className="resource-help">Agent tự đọc trạng thái thật ngay lúc chạy: Windows chọn Windows Firewall, Ubuntu chọn UFW đang active, Oracle Linux/Red Hat chọn default firewalld zone; nếu máy dùng nftables/iptables Agent chọn đúng filter INPUT theo IP family. Linux common rule giới hạn Inbound để tương thích an toàn với firewalld zone.</div>
-      </>}
-      <label>Lý do / ticket<textarea name="reason" rows={2} minLength={5} maxLength={2000} required placeholder="CHG-1234 · Mô tả mục đích áp dụng hàng loạt" /></label>
+      </> : null}
+      {(action !== "patch.install" || step === 2) && <label>Lý do / ticket<textarea name="reason" rows={2} minLength={5} maxLength={2000} required placeholder="CHG-1234 · Mô tả mục đích áp dụng hàng loạt" /></label>}
       {error ? <div className="resource-job-state failed"><b>Không thể tạo task</b><span>{error}</span></div> : null}
     </form>
   </ModalShell>;
