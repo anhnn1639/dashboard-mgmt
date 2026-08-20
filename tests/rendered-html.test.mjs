@@ -304,8 +304,10 @@ test("light theme keeps legacy and semantic text readable across the dashboard",
   );
   assert.match(
     styles,
-    /\.operation-result \*,[\s\S]*?\.recording-screen \*[\s\S]*?background:\s*#0f172a\s*!important;[\s\S]*?color:\s*#e6edf7\s*!important;/s,
+    /\.operation-result \*,[\s\S]*?\.recording-screen\s*\)[\s\S]*?background:\s*#0f172a\s*!important;[\s\S]*?color:\s*#e6edf7\s*!important;/s,
   );
+  assert.doesNotMatch(styles, /\.recording-screen\s+\*/);
+  assert.match(styles, /html\[data-theme="light"\] \.recording-screen > p\s*{[^}]*background:\s*transparent\s*!important;[^}]*color:\s*#e47a82\s*!important;/s);
   assert.match(styles, /html\[data-theme="light"\][\s\S]*?\.jobs-row\.head/);
 });
 

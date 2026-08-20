@@ -5999,11 +5999,17 @@ html[data-theme="light"] :where(
   .job-error-output *,
   .firewall-mutation-status pre,
   .firewall-scan-error pre,
-  .recording-screen,
-  .recording-screen *
+  .recording-screen
 ) {
   background: #0f172a !important;
   color: #e6edf7 !important;
+}
+
+/* Guacamole renders recordings as stacked transparent canvas layers. Never
+   give those descendants an opaque background or upper layers hide the video. */
+html[data-theme="light"] .recording-screen > p {
+  background: transparent !important;
+  color: #e47a82 !important;
 }
 
 html[data-theme="light"] :where(

@@ -1088,8 +1088,12 @@ class ClassificationTests(unittest.TestCase):
             approver_token = issue_jwt(approver)
         recording = recording_root / f"{session_id}.guac"
         typescript = recording_root / f"{session_id}.typescript"
+        rotated_typescript = recording_root / f"{session_id}.typescript.1"
+        typescript_timing = recording_root / f"{session_id}.typescript.1.timing"
         recording.write_bytes(b"guacamole-recording")
         typescript.write_bytes(b"terminal-text")
+        rotated_typescript.write_bytes(b"rotated-terminal-text")
+        typescript_timing.write_bytes(b"0.1 10\n")
         try:
             self.assertEqual(recording_file(session_id), recording.resolve())
             with TestClient(app) as client:
@@ -1104,6 +1108,8 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(approved.json()["status"], "deleted")
                 self.assertFalse(recording.exists())
                 self.assertFalse(typescript.exists())
+                self.assertFalse(rotated_typescript.exists())
+                self.assertFalse(typescript_timing.exists())
             with SessionLocal() as db:
                 self.assertEqual(db.get(RecordingDeletionRequest, deletion_id).status, "deleted")
         finally:

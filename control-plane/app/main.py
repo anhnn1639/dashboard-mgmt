@@ -3852,8 +3852,10 @@ def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[
             continue
         except OSError:
             continue
-        if not include_typescript and resolved.name.endswith(".typescript"):
-            continue
+        if not include_typescript:
+            suffix = resolved.name[len(session_id):]
+            if suffix == ".typescript" or suffix.startswith(".typescript."):
+                continue
         matches.append(resolved)
     ordered = sorted(matches, key=lambda item: item.stat().st_mtime, reverse=True)
     if ordered:
