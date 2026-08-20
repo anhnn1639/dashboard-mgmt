@@ -309,6 +309,24 @@ test("light theme keeps legacy and semantic text readable across the dashboard",
   assert.match(styles, /html\[data-theme="light"\][\s\S]*?\.jobs-row\.head/);
 });
 
+test("light theme recolors selectable cards, state badges, and compact controls", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.bulk-target-list > label,[\s\S]*?\.choice-grid label,[\s\S]*?\)\s*{\s*background:\s*var\(--panel-2\)\s*!important;/s,
+  );
+  assert.match(styles, /html\[data-theme="light"\] \.bulk-target-list em\s*{[^}]*color:\s*#176a4e\s*!important;[^}]*background:\s*#e5f5ee\s*!important;/s);
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.storage-row-actions button,[\s\S]*?\)\s*{\s*background:\s*var\(--panel-2\)\s*!important;/s,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\(\s*\.search kbd,[\s\S]*?\)\s*{\s*background:\s*#e3edf8\s*!important;[\s\S]*?color:\s*var\(--blue\)\s*!important;/s,
+  );
+});
+
 test("dashboard shell fits the viewport without global zoom", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);
