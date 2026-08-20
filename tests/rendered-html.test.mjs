@@ -193,7 +193,12 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(source, /new Map\(servers\.map\(\(server\) => \[server\.id, server\]\)\)/);
   assert.match(source, /currentServer\?\.name \|\| job\.serverName \|\| job\.serverId\.slice/);
   assert.match(source, /currentServer\?\.address \|\| job\.serverAddress \|\| "chưa có IP"/);
-  assert.match(source, /serverLabel\(job\)/);
+  assert.match(source, /serverIdentity\(job\)/);
+  assert.match(source, /className="job-server-hostname"/);
+  assert.match(source, /className="job-server-address"/);
+  assert.match(styles, /\.job-server-label\s*{[^}]*gap:\s*7px/s);
+  assert.match(styles, /\.job-server-hostname\s*{[^}]*color:\s*#f4f7ff;[^}]*font-weight:\s*700/s);
+  assert.match(styles, /\.job-server-address\s*{[^}]*color:\s*#66b7ff;[^}]*font-weight:\s*400/s);
   assert.match(styles, /\.server-delete-button\s*{[^}]*min-height:\s*30px/s);
   assert.match(source, /servers\.manage/);
   assert.match(source, /\/api\/v1\/audit\?limit=6/);

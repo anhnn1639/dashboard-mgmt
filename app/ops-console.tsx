@@ -3258,11 +3258,11 @@ function SessionsView({ token }: { token: string }) {
 function JobsView({ token, servers }: { token: string; servers: Server[] }) {
   const [jobs, setJobs] = useState<JobListRow[]>([]);
   const serversById = useMemo(() => new Map(servers.map((server) => [server.id, server])), [servers]);
-  const serverLabel = (job: JobListRow) => {
+  const serverIdentity = (job: JobListRow) => {
     const currentServer = serversById.get(job.serverId);
     const hostname = currentServer?.name || job.serverName || job.serverId.slice(0, 8);
     const address = currentServer?.address || job.serverAddress || "chưa có IP";
-    return `${hostname}[${address}]`;
+    return { hostname, address };
   };
   useEffect(() => {
     fetch("/api/v1/jobs", { headers: { Authorization: `Bearer ${token}` } })
@@ -3298,13 +3298,17 @@ function JobsView({ token, servers }: { token: string; servers: Server[] }) {
           <span>Trạng thái</span>
         </div>
         {jobs.length ? (
-          jobs.map((job) => (
-            <div className="jobs-row" key={job.id}>
+          jobs.map((job) => {
+            const identity = serverIdentity(job);
+            return <div className="jobs-row" key={job.id}>
               <p>
                 <b title={job.action}>{jobActionLabel(job.action)}</b>
                 <small>{job.reason}</small>
               </p>
-              <span className="job-server-label">{serverLabel(job)}</span>
+              <span className="job-server-label">
+                <strong className="job-server-hostname">{identity.hostname}</strong>
+                <span className="job-server-address">[{identity.address}]</span>
+              </span>
               <span>{job.risk}</span>
               <time>{new Date(job.createdAt).toLocaleString("vi-VN")}</time>
               <div className="job-controls">
@@ -3317,8 +3321,8 @@ function JobsView({ token, servers }: { token: string; servers: Server[] }) {
               {job.status === "failed" && (
                 <pre className="job-error-output">Exit code {job.exitCode ?? "?"}{"\n"}{job.output || "Agent không trả về nội dung lỗi."}</pre>
               )}
-            </div>
-          ))
+            </div>;
+          })
         ) : (
           <div className="empty-state">
             Chưa có công việc nào trong database.

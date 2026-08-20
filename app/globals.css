@@ -1928,6 +1928,22 @@ textarea:focus-visible {
   color: #536074;
   margin-top: 3px;
 }
+.job-server-label {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+.job-server-hostname {
+  color: #f4f7ff;
+  font-weight: 700;
+}
+.job-server-address {
+  color: #66b7ff;
+  font-weight: 400;
+  white-space: nowrap;
+}
 .job-progress {
   display: flex;
   align-items: center;
