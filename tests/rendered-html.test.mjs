@@ -267,6 +267,27 @@ test("overview health chart uses live fleet percentages and the operator system 
   assert.match(styles, /\.donut\.empty\s*{[^}]*background:\s*var\(--line\)/s);
 });
 
+test("light theme keeps legacy and semantic text readable across the dashboard", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?h1,[\s\S]*?textarea[\s\S]*?\)\s*{\s*color:\s*var\(--ink\)\s*!important;/s,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.job-server-address,[\s\S]*?\)\s*{\s*color:\s*var\(--blue\)\s*!important;/s,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.job-server-hostname,[\s\S]*?\)\s*{\s*color:\s*var\(--ink\)\s*!important;/s,
+  );
+  assert.match(
+    styles,
+    /\.operation-result \*,[\s\S]*?\.recording-screen \*[\s\S]*?background:\s*#0f172a\s*!important;[\s\S]*?color:\s*#e6edf7\s*!important;/s,
+  );
+  assert.match(styles, /html\[data-theme="light"\][\s\S]*?\.jobs-row\.head/);
+});
+
 test("dashboard shell fits the viewport without global zoom", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);

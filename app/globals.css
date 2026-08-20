@@ -5573,6 +5573,37 @@ textarea:focus-visible {
 }
 
 /* Automatic light palette: the active theme is selected from the operator machine's local time. */
+html[data-theme="light"] :where(
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  p,
+  span,
+  b,
+  strong,
+  small,
+  em,
+  label,
+  legend,
+  dt,
+  dd,
+  th,
+  td,
+  time,
+  code,
+  pre,
+  a,
+  button,
+  input,
+  select,
+  textarea
+) {
+  color: var(--ink) !important;
+}
+
 html[data-theme="light"] body,
 html[data-theme="light"] .shell,
 html[data-theme="light"] .workspace,
@@ -5636,6 +5667,16 @@ html[data-theme="light"] :where(
   .firewall-table th,
   .inventory-row.head,
   .audit-row.head,
+  .jobs-row.head,
+  .drawer-top,
+  .drawer-top > button:first-child,
+  .drawer-actions button span,
+  .server-tabs,
+  .firewall-search-field,
+  .firewall-table-scroll,
+  .inventory-table,
+  .resource-grid > div,
+  .operation-result,
   .role-editor-head > span,
   .permission-summary span,
   .firewall-rule-preview,
@@ -5646,13 +5687,17 @@ html[data-theme="light"] :where(
   .search-suggestions button:hover,
   .fact-grid > div,
   .audit-tabs,
+  .audit-filter-bar select,
   .recording-player header,
   .recording-player footer,
   .package-option,
+  .package-origin > input,
+  .agent-package-form > label > select,
   .login-tabs,
   .resource-search,
   .storage-tree-row.head,
   .storage-tree-row.disk-row,
+  .storage-tree-toggle button,
   .storage-disk-layout > div,
   .resource-table th,
   .resource-subtabs,
@@ -5660,7 +5705,13 @@ html[data-theme="light"] :where(
   .update-scan-status dl > div,
   .resource-modal-footer,
   .account-identity-summary > div,
-  .bulk-update-steps span
+  .bulk-update-steps span,
+  .logical-volume-card button,
+  .firewall-capability-note,
+  .setup-badge,
+  .setup-steps li > span,
+  .policy-summary,
+  .login-security
 ) {
   background: var(--panel-2) !important;
   border-color: var(--line) !important;
@@ -5720,7 +5771,15 @@ html[data-theme="light"] :where(
   .resource-table small,
   .access-note,
   .profile small,
-  .nav-heading
+  .nav-heading,
+  .field-hint,
+  .resource-toolbar p,
+  .setup-intro > p:not(.login-eyebrow),
+  .login-copy,
+  .access-note,
+  .job-server-label + small,
+  th,
+  time
 ) {
   color: var(--muted) !important;
 }
@@ -5769,6 +5828,160 @@ html[data-theme="light"] :where(.server-table td, .audit-row, .jobs-row, .resour
 
 html[data-theme="light"] :where(.button.primary, .button.danger, .server-delete-button, .brand-mark) {
   color: #ffffff !important;
+}
+
+html[data-theme="light"] :where(
+  .drawer-actions button.connect,
+  .firewall-delete-button
+) {
+  color: #ffffff !important;
+}
+
+html[data-theme="light"] :where(
+  .command-input kbd,
+  .role-list article > span,
+  .quick-actions em
+) {
+  background: #e3edf8 !important;
+  border-color: #b8cce2 !important;
+  color: var(--blue) !important;
+}
+
+html[data-theme="light"] .profile-avatar {
+  background: #dce8f7 !important;
+  color: #174f94 !important;
+}
+
+html[data-theme="light"] .os-avatar.linux {
+  background: #e4f4ee !important;
+  color: var(--green) !important;
+}
+
+html[data-theme="light"] .os-avatar.windows {
+  background: #e4eefb !important;
+  color: var(--blue) !important;
+}
+
+html[data-theme="light"] :where(
+  .firewall-icon-button.remove,
+  .resource-icon-button.remove,
+  .resource-icon-button.danger
+) {
+  background: #fbe8eb !important;
+  border-color: #e8b3ba !important;
+  color: var(--red) !important;
+}
+
+html[data-theme="light"] .command-palette > button:hover,
+html[data-theme="light"] .package-option:hover:not(:disabled) {
+  background: #e7f0fa !important;
+  color: var(--ink) !important;
+}
+
+html[data-theme="light"] .package-option > span {
+  background: #e3edf8 !important;
+  color: var(--blue) !important;
+}
+
+html[data-theme="light"] .package-option.linux > span {
+  background: #e4f4ee !important;
+  color: var(--green) !important;
+}
+
+html[data-theme="light"] .toast {
+  background: #e7f5ef !important;
+  border-color: #a7d5c3 !important;
+  color: #176a4e !important;
+}
+
+html[data-theme="light"] .toast * {
+  color: #176a4e !important;
+}
+
+html[data-theme="light"] :where(
+  a,
+  .server-link,
+  .server-breadcrumb a,
+  .job-server-address,
+  .share-button,
+  .login-back,
+  .eyebrow,
+  .server-tabs button.active,
+  .resource-subtabs button.active,
+  .table-sort:hover
+) {
+  color: var(--blue) !important;
+}
+
+html[data-theme="light"] :where(
+  .status.healthy,
+  .service-state.active,
+  .job-state.done,
+  .result-good,
+  .verified,
+  .state-pill.success,
+  .connection-state.connected,
+  .live-pill,
+  .recording,
+  .settings-message:not(.error)
+) {
+  color: var(--green) !important;
+}
+
+html[data-theme="light"] :where(
+  .status.warning,
+  .job-state.pending,
+  .result-warn,
+  .state-pill.warning,
+  .delta.warn,
+  .package-warning,
+  .firewall-capability-note.waiting,
+  .resource-help.warning
+) {
+  color: var(--amber) !important;
+}
+
+html[data-theme="light"] :where(
+  .status.critical,
+  .status.offline,
+  .service-state.failed,
+  .job-error-output,
+  .firewall-mutation-status.failed,
+  .firewall-scan-error,
+  .state-pill.error,
+  .settings-message.error,
+  .resource-job-state.failed,
+  .field-error,
+  .login-error,
+  .setup-error,
+  .danger-panel
+) {
+  color: var(--red) !important;
+}
+
+html[data-theme="light"] :where(
+  .operation-result,
+  .operation-result *,
+  .job-error-output,
+  .job-error-output *,
+  .firewall-mutation-status pre,
+  .firewall-scan-error pre,
+  .recording-screen,
+  .recording-screen *
+) {
+  background: #0f172a !important;
+  color: #e6edf7 !important;
+}
+
+html[data-theme="light"] :where(
+  .job-server-hostname,
+  .server-name strong,
+  .cell-main,
+  .jobs-row b,
+  .audit-row b,
+  .resource-table td b
+) {
+  color: var(--ink) !important;
 }
 
 html[data-theme="light"] :where(.modal-backdrop, .firewall-add-backdrop, .command-backdrop, .recording-backdrop, .resource-modal-backdrop) {
