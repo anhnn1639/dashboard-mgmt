@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --font-size-increase: 1.5px;
+  --font-size-increase: 3px;
   --ink: #e9edf4;
   --muted: #8591a5;
   --dim: #596579;
@@ -53,7 +53,7 @@ textarea:focus-visible {
   min-height: 100vh;
   min-height: 100dvh;
   display: grid;
-  grid-template-columns: 244px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 244px) minmax(0, 1fr);
   background:
     radial-gradient(
       circle at 84% -20%,
@@ -72,7 +72,37 @@ textarea:focus-visible {
   background: rgba(9, 16, 25, 0.93);
   display: flex;
   flex-direction: column;
+  min-width: 0;
   z-index: 20;
+}
+.sidebar-resizer {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  right: -5px;
+  width: 10px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.16s ease, box-shadow 0.16s ease;
+}
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+.sidebar-resizer:active::after {
+  background: var(--blue);
+  box-shadow: 0 0 8px rgba(77, 141, 255, 0.65);
 }
 .brand {
   display: flex;
@@ -131,16 +161,20 @@ textarea:focus-visible {
   border: 0;
   background: transparent;
   width: 100%;
-  height: 39px;
+  min-height: 39px;
+  height: auto;
   border-radius: 7px;
   display: flex;
   align-items: center;
   gap: 11px;
   color: #8793a6;
-  padding: 0 11px;
+  padding: 7px 11px;
   cursor: pointer;
   text-align: left;
   margin: 2px 0;
+  line-height: 1.25;
+  white-space: normal;
+  overflow-wrap: anywhere;
   transition: 0.18s ease;
 }
 .sidebar nav button:hover {
@@ -166,6 +200,7 @@ textarea:focus-visible {
   font-size: calc(12px + var(--font-size-increase));
   border: 1px solid #2d394b;
   color: #7f91ab;
+  flex: 0 0 auto;
 }
 .sidebar nav button.active .nav-icon {
   color: #85adff;
@@ -181,6 +216,7 @@ textarea:focus-visible {
   text-align: center;
   color: #78869a;
   background: #192331;
+  flex: 0 0 auto;
 }
 .security-card {
   border: 1px solid #1d3541;
@@ -2703,6 +2739,9 @@ textarea:focus-visible {
   }
   .sidebar {
     padding: 18px 9px;
+  }
+  .sidebar-resizer {
+    display: none;
   }
   .brand {
     padding: 0 7px 24px;

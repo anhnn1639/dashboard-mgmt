@@ -1,7 +1,7 @@
 "use client";
 
 import Guacamole from "guacamole-common-js";
-import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 
 type OSFamily = "linux" | "windows";
@@ -469,6 +469,38 @@ export function OpsConsole() {
   const [recentAudit, setRecentAudit] = useState<AuditEventRow[]>([]);
   const [recentAuditBusy, setRecentAuditBusy] = useState(false);
   const [recentAuditError, setRecentAuditError] = useState("");
+  const [sidebarWidth, setSidebarWidth] = useState(244);
+  const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+
+  function clampSidebarWidth(width: number) {
+    return Math.min(420, Math.max(190, Math.round(width)));
+  }
+
+  function startSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
+    sidebarResizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: sidebarWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function moveSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const resize = sidebarResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    setSidebarWidth(clampSidebarWidth(resize.startWidth + event.clientX - resize.startX));
+  }
+
+  function stopSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (sidebarResizeRef.current?.pointerId !== event.pointerId) return;
+    sidebarResizeRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  function resizeSidebarWithKeyboard(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Home") return setSidebarWidth(190);
+    if (event.key === "End") return setSidebarWidth(420);
+    setSidebarWidth((current) => clampSidebarWidth(current + (event.key === "ArrowRight" ? 16 : -16)));
+  }
   const loadServers = useCallback(async (showLoading = false) => {
     if (!token) return;
     if (showLoading) setLoading(true);
@@ -786,7 +818,7 @@ export function OpsConsole() {
     return <div className="auth-loading">Đang tải quyền tài khoản…</div>;
 
   return (
-    <main className="shell">
+    <main className="shell" style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}>
       <aside className="sidebar">
         <button
           className="brand"
@@ -871,6 +903,22 @@ export function OpsConsole() {
           </span>
           <strong>⌄</strong>
         </button>
+        <div
+          className="sidebar-resizer"
+          role="slider"
+          tabIndex={0}
+          aria-orientation="horizontal"
+          aria-label="Thay đổi chiều rộng menu"
+          aria-valuemin={190}
+          aria-valuemax={420}
+          aria-valuenow={sidebarWidth}
+          title="Kéo để thay đổi chiều rộng menu"
+          onPointerDown={startSidebarResize}
+          onPointerMove={moveSidebarResize}
+          onPointerUp={stopSidebarResize}
+          onPointerCancel={stopSidebarResize}
+          onKeyDown={resizeSidebarWithKeyboard}
+        />
       </aside>
 
       <section className="workspace">

@@ -207,12 +207,26 @@ test("job and audit action codes have readable labels", async () => {
 test("dashboard shell fits the viewport without global zoom", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);
-  assert.match(styles, /--font-size-increase:\s*1\.5px/);
+  assert.match(styles, /--font-size-increase:\s*3px/);
   assert.doesNotMatch(styles, /font-size:\s*\d+px/);
   assert.match(styles, /font-size:\s*calc\(14px \+ var\(--font-size-increase\)\)/);
   assert.match(styles, /\.shell\s*{[^}]*min-height:\s*100dvh/s);
   assert.match(styles, /\.sidebar\s*{[^}]*height:\s*100dvh/s);
   assert.match(styles, /\.sidebar nav\s*{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto/s);
+  assert.match(styles, /grid-template-columns:\s*var\(--sidebar-width, 244px\)/);
+  assert.match(styles, /\.sidebar nav button\s*{[^}]*min-height:\s*39px;[^}]*height:\s*auto;[^}]*white-space:\s*normal;[^}]*overflow-wrap:\s*anywhere/s);
+});
+
+test("sidebar can be resized with pointer or keyboard", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(source, /const \[sidebarWidth, setSidebarWidth\] = useState\(244\)/);
+  assert.match(source, /Math\.min\(420, Math\.max\(190/);
+  assert.match(source, /className="sidebar-resizer"/);
+  assert.match(source, /onPointerDown=\{startSidebarResize\}/);
+  assert.match(source, /onKeyDown=\{resizeSidebarWithKeyboard\}/);
+  assert.match(source, /"--sidebar-width": `\$\{sidebarWidth\}px`/);
+  assert.match(styles, /\.sidebar-resizer\s*{[^}]*cursor:\s*col-resize;[^}]*touch-action:\s*none/s);
 });
 
 test("MFA QR is CSP-compatible for every role", async () => {
