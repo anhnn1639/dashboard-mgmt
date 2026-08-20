@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from ldap3 import ALL, BASE, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, select, text, update
 from sqlalchemy.engine import Engine, URL
@@ -421,6 +421,17 @@ class LoginRequest(BaseModel):
 class MFAVerifyRequest(BaseModel):
     challenge_token: str
     code: str = Field(pattern=r"^\d{6}$")
+
+
+class CurrentUserProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    display_name: str = Field(min_length=1, max_length=160)
+
+
+class CurrentUserPasswordUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=14, max_length=1024)
 
 
 class PlatformUserCreateRequest(BaseModel):
@@ -2114,12 +2125,62 @@ def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = 
 
 @app.get("/api/v1/me")
 def me(user: User = Depends(current_user), db: Session = Depends(db_session)):
-    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "permissions": sorted(platform_role_permissions(db, user.role))}
+    credential = db.get(MFACredential, user.id)
+    return {
+        "id": user.id,
+        "username": user.username,
+        "displayName": user.display_name,
+        "role": user.role,
+        "source": "ldap" if user.password_hash == "!LDAP" else "local",
+        "mfaEnrolled": bool(credential and credential.enrolled),
+        "permissions": sorted(platform_role_permissions(db, user.role)),
+    }
+
+
+@app.patch("/api/v1/me/profile")
+def update_current_user_profile(payload: CurrentUserProfileUpdateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if user.password_hash == "!LDAP":
+        raise HTTPException(status_code=422, detail="Tên hiển thị LDAP được quản lý bởi Active Directory")
+    display_name = payload.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="Tên hiển thị không được để trống")
+    if display_name == user.display_name:
+        raise HTTPException(status_code=422, detail="Tên hiển thị không thay đổi")
+    user.display_name = display_name
+    audit(db, user.username, "identity.self.profile.update", user.id, request, detail={"username": user.username, "changes": {"display_name": True}})
+    db.commit()
+    return me(user, db)
+
+
+@app.post("/api/v1/me/password")
+def update_current_user_password(payload: CurrentUserPasswordUpdateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if user.password_hash == "!LDAP":
+        raise HTTPException(status_code=422, detail="Mật khẩu LDAP phải thay đổi tại Active Directory")
+    scopes = auth_throttle_scopes(request, f"self-password:{user.id}")
+    prune_auth_throttles(db)
+    enforce_auth_throttle(db, scopes)
+    try:
+        current_password_valid = password_hasher.verify(user.password_hash, payload.current_password)
+    except Exception:
+        current_password_valid = False
+    if not current_password_valid:
+        record_auth_failure(db, scopes)
+        audit(db, user.username, "identity.self.password.change", user.id, request, "denied", {"username": user.username, "reason": "current_password_invalid"})
+        db.commit()
+        raise HTTPException(status_code=401, detail="Mật khẩu hiện tại không đúng")
+    if hmac.compare_digest(payload.current_password, payload.new_password):
+        raise HTTPException(status_code=422, detail="Mật khẩu mới phải khác mật khẩu hiện tại")
+    clear_auth_throttle(db, scopes)
+    user.password_hash = password_hasher.hash(payload.new_password)
+    audit(db, user.username, "identity.self.password.change", user.id, request, detail={"username": user.username})
+    db.commit()
+    return {"status": "changed"}
 
 
 def platform_user_json(user: User, db: Session | None = None) -> dict[str, Any]:
     group_ids = [] if db is None else list(db.execute(select(PlatformGroupMember.group_id).where(PlatformGroupMember.user_id == user.id)).scalars().all())
-    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "source": "ldap" if user.password_hash == "!LDAP" else "local", "enabled": user.enabled, "createdAt": aware(user.created_at).isoformat(), "groupIds": group_ids}
+    credential = None if db is None else db.get(MFACredential, user.id)
+    return {"id": user.id, "username": user.username, "displayName": user.display_name, "role": user.role, "source": "ldap" if user.password_hash == "!LDAP" else "local", "enabled": user.enabled, "mfaEnrolled": bool(credential and credential.enrolled), "createdAt": aware(user.created_at).isoformat(), "groupIds": group_ids}
 
 
 def platform_group_json(db: Session, group: PlatformGroup) -> dict[str, Any]:
@@ -2278,6 +2339,22 @@ def update_platform_user_groups(user_id: str, payload: PlatformGroupMembersReque
     audit(db, actor.username, "identity.user.groups", user.id, request, detail={"group_ids": group_ids})
     db.commit()
     return platform_user_json(user, db)
+
+
+@app.delete("/api/v1/users/{user_id}/mfa")
+def reset_platform_user_mfa(user_id: str, request: Request, actor: User = Depends(current_user), db: Session = Depends(db_session)):
+    if actor.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được reset MFA")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Tài khoản không tồn tại")
+    credential = db.get(MFACredential, user.id)
+    was_enrolled = bool(credential and credential.enrolled)
+    if credential is not None:
+        db.delete(credential)
+    audit(db, actor.username, "identity.mfa.reset", user.id, request, detail={"username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local", "was_enrolled": was_enrolled})
+    db.commit()
+    return {"status": "reset", "enrollmentRequired": True, "wasEnrolled": was_enrolled}
 
 
 @app.delete("/api/v1/platform-groups/{group_id}")

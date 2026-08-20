@@ -52,7 +52,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 (test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -342,6 +342,64 @@ class ClassificationTests(unittest.TestCase):
                 stored = db.get(User, viewer_id)
                 if stored:
                     db.delete(stored)
+                    db.commit()
+
+    def test_self_service_profile_password_and_admin_mfa_reset(self):
+        username = f"self-service-{uuid.uuid4().hex[:8]}"
+        old_password = "Old-Self-Service-Password-123!"
+        new_password = "New-Self-Service-Password-456!"
+        with TestClient(app) as client:
+            admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            with SessionLocal() as db:
+                user = User(username=username, password_hash=password_hasher.hash(old_password), display_name="Self Service", role="viewer", enabled=True)
+                db.add(user)
+                db.flush()
+                db.add(MFACredential(user_id=user.id, secret_encrypted="test-encrypted-secret", enrolled=True, last_counter=4))
+                db.commit()
+                user_id = user.id
+                user_headers = {"Authorization": f"Bearer {issue_jwt(user)}"}
+            try:
+                profile = client.get("/api/v1/me", headers=user_headers)
+                self.assertEqual(profile.status_code, 200, profile.text)
+                self.assertEqual(profile.json()["source"], "local")
+                self.assertTrue(profile.json()["mfaEnrolled"])
+
+                role_injection = client.patch("/api/v1/me/profile", headers=user_headers, json={"display_name": "Injected", "role": "admin"})
+                self.assertEqual(role_injection.status_code, 422, role_injection.text)
+                updated = client.patch("/api/v1/me/profile", headers=user_headers, json={"display_name": "Tên hiển thị mới"})
+                self.assertEqual(updated.status_code, 200, updated.text)
+                self.assertEqual(updated.json()["displayName"], "Tên hiển thị mới")
+                self.assertEqual(updated.json()["role"], "viewer")
+
+                wrong_password = client.post("/api/v1/me/password", headers=user_headers, json={"current_password": "incorrect-password", "new_password": new_password})
+                self.assertEqual(wrong_password.status_code, 401, wrong_password.text)
+                changed = client.post("/api/v1/me/password", headers=user_headers, json={"current_password": old_password, "new_password": new_password})
+                self.assertEqual(changed.status_code, 200, changed.text)
+
+                denied_reset = client.delete(f"/api/v1/users/{user_id}/mfa", headers=user_headers)
+                self.assertEqual(denied_reset.status_code, 403, denied_reset.text)
+                reset = client.delete(f"/api/v1/users/{user_id}/mfa", headers=admin_headers)
+                self.assertEqual(reset.status_code, 200, reset.text)
+                self.assertTrue(reset.json()["wasEnrolled"])
+
+                with SessionLocal() as db:
+                    persisted = db.get(User, user_id)
+                    self.assertEqual((persisted.display_name, persisted.role), ("Tên hiển thị mới", "viewer"))
+                    self.assertTrue(password_hasher.verify(persisted.password_hash, new_password))
+                    self.assertIsNone(db.get(MFACredential, user_id))
+                    actions = set(db.execute(select(AuditEvent.action).where(AuditEvent.target == user_id)).scalars().all())
+                    self.assertTrue({"identity.self.profile.update", "identity.self.password.change", "identity.mfa.reset"}.issubset(actions))
+
+                self.assertEqual(client.post("/api/v1/auth/login", json={"username": username, "password": old_password}).status_code, 401)
+                next_login = client.post("/api/v1/auth/login", json={"username": username, "password": new_password})
+                self.assertEqual(next_login.status_code, 200, next_login.text)
+                self.assertTrue(next_login.json()["setup_required"])
+                self.assertTrue(next_login.json()["qr_svg"].startswith("data:image/svg+xml;base64,"))
+            finally:
+                with SessionLocal() as db:
+                    db.query(MFACredential).filter(MFACredential.user_id == user_id).delete()
+                    db.query(User).filter(User.id == user_id).delete()
+                    db.query(AuthThrottle).delete()
                     db.commit()
 
     def test_viewer_first_login_receives_an_mfa_qr(self):

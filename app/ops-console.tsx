@@ -24,6 +24,8 @@ type CurrentUser = {
   username: string;
   displayName: string;
   role: string;
+  source: "local" | "ldap";
+  mfaEnrolled: boolean;
   permissions: string[];
 };
 
@@ -152,6 +154,9 @@ const operationLabels: Record<string, string> = {
   "identity.user.update": "Cập nhật tài khoản hệ thống",
   "identity.user.delete": "Xóa tài khoản hệ thống",
   "identity.user.groups": "Cập nhật group của tài khoản",
+  "identity.self.profile.update": "Tự cập nhật thông tin tài khoản",
+  "identity.self.password.change": "Tự thay đổi mật khẩu",
+  "identity.mfa.reset": "Reset MFA người dùng",
   "identity.group.create": "Tạo group phân quyền",
   "identity.group.update": "Cập nhật group phân quyền",
   "identity.group.delete": "Xóa group phân quyền",
@@ -484,6 +489,7 @@ export function OpsConsole() {
   const [recentAuditBusy, setRecentAuditBusy] = useState(false);
   const [recentAuditError, setRecentAuditError] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(244);
+  const [accountOpen, setAccountOpen] = useState(false);
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   function clampSidebarWidth(width: number) {
@@ -750,6 +756,15 @@ export function OpsConsole() {
     window.setTimeout(() => setToast(""), 3200);
   }
 
+  function signOut() {
+    window.sessionStorage.removeItem("tram_ops_token");
+    setAccountOpen(false);
+    setCurrentUser(null);
+    setIdentityReady(true);
+    setIdentityError("");
+    setToken("");
+  }
+
   function openServer(server: Server) {
     setActive(server.osFamily);
     setSelected(server);
@@ -901,19 +916,13 @@ export function OpsConsole() {
         </div>
         <button
           className="profile"
-          onClick={() => {
-            window.sessionStorage.removeItem("tram_ops_token");
-            setCurrentUser(null);
-            setIdentityReady(true);
-            setIdentityError("");
-            setToken("");
-          }}
-          title="Đăng xuất"
+          onClick={() => setAccountOpen(true)}
+          title="Mở thông tin tài khoản"
         >
           <span className="profile-avatar">{(currentUser.displayName || currentUser.username).split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("")}</span>
           <span>
             <b>{currentUser.displayName || currentUser.username}</b>
-            <small>{currentUser.role} · nhấn để đăng xuất</small>
+            <small>{currentUser.role} · quản lý tài khoản</small>
           </span>
           <strong>⌄</strong>
         </button>
@@ -1178,7 +1187,7 @@ export function OpsConsole() {
           ) : active === "audit" ? (
             <AuditView token={token} />
           ) : active === "access" ? (
-            <AccessView token={token} />
+            <AccessView token={token} currentUser={currentUser} />
           ) : active === "agents" ? (
             <AgentPackagesView token={token} />
           ) : (
@@ -1277,6 +1286,7 @@ export function OpsConsole() {
       )}
       {serverManagement?.mode === "share" && <ServerShareModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} saved={(shares) => { setServers((current) => current.map((server) => server.id === serverManagement.server.id ? { ...server, shares } : server)); setServerManagement(null); notify("Đã cập nhật phạm vi nhìn thấy máy chủ."); }} />}
       {serverManagement?.mode === "delete" && <ServerDeleteModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} deleted={() => { setServers((current) => current.filter((server) => server.id !== serverManagement.server.id)); setSelectedServerIds((current) => current.filter((id) => id !== serverManagement.server.id)); setServerManagement(null); notify("Đã xóa máy chủ khỏi danh sách và ngừng chấp nhận Agent cũ."); }} />}
+      {accountOpen && <AccountSettingsModal user={currentUser} token={token} close={() => setAccountOpen(false)} signOut={signOut} updated={(nextUser) => { setCurrentUser(nextUser); notify("Đã cập nhật thông tin tài khoản."); }} />}
       {toast && (
         <div className="toast">
           <span>✓</span>
@@ -1284,6 +1294,120 @@ export function OpsConsole() {
         </div>
       )}
     </main>
+  );
+}
+
+function AccountSettingsModal({
+  user,
+  token,
+  close,
+  signOut,
+  updated,
+}: {
+  user: CurrentUser;
+  token: string;
+  close: () => void;
+  signOut: () => void;
+  updated: (user: CurrentUser) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [messageError, setMessageError] = useState(false);
+  const isLocal = user.source === "local";
+
+  function showResult(text: string, error = false) {
+    setMessage(text);
+    setMessageError(error);
+  }
+
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    showResult("");
+    const form = new FormData(event.currentTarget);
+    try {
+      const response = await fetch("/api/v1/me/profile", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ display_name: form.get("display_name") }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể cập nhật thông tin tài khoản");
+      updated(data as CurrentUser);
+      showResult("Đã lưu tên hiển thị. Role và tên đăng nhập không bị thay đổi.");
+    } catch (reason) {
+      showResult(reason instanceof Error ? reason.message : "Không thể cập nhật thông tin tài khoản", true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const newPassword = String(form.get("new_password") ?? "");
+    if (newPassword !== String(form.get("confirm_password") ?? "")) {
+      showResult("Mật khẩu mới và ô xác nhận chưa khớp.", true);
+      return;
+    }
+    setBusy(true);
+    showResult("");
+    try {
+      const response = await fetch("/api/v1/me/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ current_password: form.get("current_password"), new_password: newPassword }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail ?? "Không thể thay đổi mật khẩu");
+      formElement.reset();
+      showResult("Đã thay đổi mật khẩu. Phiên hiện tại vẫn được giữ; lần đăng nhập sau hãy dùng mật khẩu mới.");
+    } catch (reason) {
+      showResult(reason instanceof Error ? reason.message : "Không thể thay đổi mật khẩu", true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ModalShell
+      title="Thông tin tài khoản"
+      subtitle="Tự quản lý thông tin cơ bản và bảo mật; role chỉ do Administrator phân quyền"
+      close={close}
+      className="account-settings-modal"
+    >
+      <div className="account-settings">
+        <dl className="account-identity-summary">
+          <div><dt>Tên đăng nhập</dt><dd>{user.username}</dd></div>
+          <div><dt>Nguồn tài khoản</dt><dd>{isLocal ? "Local" : "Active Directory"}</dd></div>
+          <div><dt>Role</dt><dd>{user.role}</dd></div>
+          <div><dt>MFA</dt><dd>{user.mfaEnrolled ? "Đang hoạt động" : "Chờ đăng ký"}</dd></div>
+        </dl>
+        {message && <p className={`settings-message${messageError ? " error" : ""}`}>{message}</p>}
+        {isLocal ? (
+          <>
+            <form className="resource-form account-settings-section" onSubmit={saveProfile}>
+              <div className="account-settings-heading"><div><h3>Thông tin cơ bản</h3><p>Username và role không thể tự thay đổi.</p></div></div>
+              <label>Tên hiển thị<input name="display_name" defaultValue={user.displayName} minLength={1} maxLength={160} required /></label>
+              <div className="modal-actions"><button className="button primary" disabled={busy}>Lưu thông tin</button></div>
+            </form>
+            <form className="resource-form account-settings-section" onSubmit={changePassword}>
+              <div className="account-settings-heading"><div><h3>Thay đổi mật khẩu</h3><p>Phải nhập đúng mật khẩu hiện tại; mật khẩu mới tối thiểu 14 ký tự.</p></div></div>
+              <label>Mật khẩu hiện tại<input name="current_password" type="password" autoComplete="current-password" required /></label>
+              <div className="resource-form-grid">
+                <label>Mật khẩu mới<input name="new_password" type="password" autoComplete="new-password" minLength={14} maxLength={1024} required /></label>
+                <label>Xác nhận mật khẩu mới<input name="confirm_password" type="password" autoComplete="new-password" minLength={14} maxLength={1024} required /></label>
+              </div>
+              <div className="modal-actions"><button className="button primary" disabled={busy}>Đổi mật khẩu</button></div>
+            </form>
+          </>
+        ) : (
+          <div className="resource-help">Tên hiển thị và mật khẩu của tài khoản AD được quản lý tại Active Directory. Website chỉ hiển thị các thông tin đã đồng bộ; role vẫn do Administrator của Trạm Vận Hành phân quyền.</div>
+        )}
+        <div className="account-session-actions"><span>Muốn kết thúc phiên làm việc trên thiết bị này?</span><button type="button" className="button danger" onClick={signOut}>Đăng xuất</button></div>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -4003,11 +4127,11 @@ function AgentPackagesView({ token }: { token: string }) {
   );
 }
 
-type PlatformUserRow = { id: string; username: string; displayName: string; role: string; source: "local" | "ldap"; enabled: boolean; createdAt: string; groupIds: string[] };
+type PlatformUserRow = { id: string; username: string; displayName: string; role: string; source: "local" | "ldap"; enabled: boolean; mfaEnrolled: boolean; createdAt: string; groupIds: string[] };
 type PlatformRoleRow = { name: string; displayName: string; description: string; permissions: string[]; system: boolean };
 type PermissionRow = { id: string; group: string; label: string; description: string };
 
-function AccessView({ token }: { token: string }) {
+function AccessView({ token, currentUser }: { token: string; currentUser: CurrentUser }) {
   const [users, setUsers] = useState<PlatformUserRow[]>([]);
   const [roles, setRoles] = useState<PlatformRoleRow[]>([]);
   const [groups, setGroups] = useState<PlatformGroupRow[]>([]);
@@ -4117,6 +4241,18 @@ function AccessView({ token }: { token: string }) {
     else showResult(data.detail ?? "Không thể lưu LDAP", true);
     setBusy(false);
   }
+  async function resetUserMfa(user: PlatformUserRow) {
+    if (!window.confirm(`Reset MFA của ${user.displayName || user.username}? Lần đăng nhập sau người dùng phải quét QR mới.`)) return;
+    setBusy(true);
+    const response = await fetch(`/api/v1/users/${user.id}/mfa`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) {
+      showResult(`Đã reset MFA của ${user.displayName || user.username}. Lần đăng nhập sau sẽ hiển thị QR mới.`);
+      setEditingUser(null);
+      await loadAccess();
+    } else showResult(data.detail ?? "Không thể reset MFA", true);
+    setBusy(false);
+  }
   async function scanLdapDirectoryGroups() {
     setBusy(true);
     const response = await fetch("/api/v1/settings/ldap/groups", { headers: { Authorization: `Bearer ${token}` } });
@@ -4172,7 +4308,7 @@ function AccessView({ token }: { token: string }) {
     <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`} title={user.source === "ldap" ? "Active Directory / LDAP" : "Tài khoản Local"}>{user.source === "ldap" ? "AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng trong PostgreSQL."}</div>}</div>
     <p className="access-note">User AD được đồng bộ từ các group LDAP được phép đăng nhập và có thể gán mọi role hiện có. Đồng bộ lại không ghi đè role riêng; mật khẩu vẫn do Active Directory quản lý.</p>
     {showCreate && <ModalShell title="Tạo tài khoản Local" subtitle="Tài khoản mới bắt buộc thiết lập MFA ở lần đăng nhập đầu tiên" close={() => setShowCreate(false)}><form className="resource-form" onSubmit={createLocalUser}><div className="form-grid"><label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label><label>Role<select name="role" defaultValue="viewer">{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><label>Tên hiển thị<input name="display_name" required /></label><label>Mật khẩu ban đầu<input name="password" type="password" autoComplete="new-password" required minLength={14} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowCreate(false)}>Hủy</button><button className="button primary" disabled={busy}>Tạo tài khoản</button></div></form></ModalShell>}
-    {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User AD: gán bất kỳ role hiện có, trạng thái và group tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, group, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}:${editingUser.groupIds?.join(",")}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><fieldset><legend>Groups của trạm vận hành</legend><div className="choice-grid">{groups.map((group) => <label key={group.id}><input type="checkbox" name="platform_groups" value={group.id} defaultChecked={editingUser.groupIds?.includes(group.id)} />{group.name}</label>)}</div></fieldset><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
+    {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User AD: gán bất kỳ role hiện có, trạng thái và group tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, group, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}:${editingUser.mfaEnrolled}:${editingUser.groupIds?.join(",")}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><fieldset><legend>Groups của trạm vận hành</legend><div className="choice-grid">{groups.map((group) => <label key={group.id}><input type="checkbox" name="platform_groups" value={group.id} defaultChecked={editingUser.groupIds?.includes(group.id)} />{group.name}</label>)}</div></fieldset><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="mfa-admin-control"><span><b>MFA: {editingUser.mfaEnrolled ? "Đã đăng ký" : "Chờ đăng ký"}</b><small>Reset sẽ hủy khóa TOTP hiện tại; lần đăng nhập sau người dùng phải quét QR mới.</small></span>{currentUser.role === "admin" && <button type="button" className="button danger" disabled={busy} onClick={() => void resetUserMfa(editingUser)}>Reset MFA</button>}</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
     {showLdap && <ModalShell
       title="Cấu hình LDAP / Active Directory"
       subtitle="Kết nối LDAPS, giới hạn group và đồng bộ thành viên AD vào danh sách người dùng"

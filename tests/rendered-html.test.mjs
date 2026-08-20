@@ -157,6 +157,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
 
 test("platform users, LDAP assignments and custom roles are editable", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(source, /Tạo tài khoản Local/);
   assert.match(source, /Cấu hình LDAP \/ Active Directory/);
   assert.match(source, /Đồng bộ AD/);
@@ -172,6 +173,18 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
   assert.match(source, /platform-groups/);
   assert.match(source, /method: "PATCH"/);
   assert.match(source, /method: "DELETE"/);
+  assert.match(source, /Thông tin tài khoản/);
+  assert.match(source, /\/api\/v1\/me\/profile/);
+  assert.match(source, /\/api\/v1\/me\/password/);
+  assert.match(source, /name="current_password"/);
+  assert.match(source, /Role và tên đăng nhập không bị thay đổi/);
+  assert.match(source, /Tên hiển thị và mật khẩu của tài khoản AD được quản lý tại Active Directory/);
+  assert.match(source, /\/api\/v1\/users\/\$\{user\.id\}\/mfa/);
+  assert.match(source, /currentUser\.role === "admin"/);
+  assert.match(source, />Reset MFA<\/button>/);
+  assert.match(source, /Lần đăng nhập sau sẽ hiển thị QR mới/);
+  assert.match(styles, /\.account-settings-modal\s*{[^}]*width:\s*min\(720px, calc\(100vw - 16px\)\)/s);
+  assert.match(styles, /\.account-identity-summary\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
 });
 
 test("process resources and server visibility controls are operable", async () => {
