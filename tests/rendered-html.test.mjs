@@ -189,8 +189,11 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(source, /Share \$\{server\.name\}/);
   assert.match(source, /Xóa máy chủ/);
   assert.match(source, />Delete<\/button>/);
-  assert.match(source, /job\.serverName \|\| job\.serverId\.slice/);
-  assert.match(source, /job\.serverAddress \|\| "chưa có IP"/);
+  assert.match(source, /<JobsView token=\{token\} servers=\{servers\}/);
+  assert.match(source, /new Map\(servers\.map\(\(server\) => \[server\.id, server\]\)\)/);
+  assert.match(source, /currentServer\?\.name \|\| job\.serverName \|\| job\.serverId\.slice/);
+  assert.match(source, /currentServer\?\.address \|\| job\.serverAddress \|\| "chưa có IP"/);
+  assert.match(source, /serverLabel\(job\)/);
   assert.match(styles, /\.server-delete-button\s*{[^}]*min-height:\s*30px/s);
   assert.match(source, /servers\.manage/);
   assert.match(source, /\/api\/v1\/audit\?limit=6/);

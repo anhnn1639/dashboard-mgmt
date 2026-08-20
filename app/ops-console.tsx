@@ -64,6 +64,20 @@ type Server = {
 
 type PlatformGroupRow = { id: string; name: string; description: string; memberIds: string[]; memberCount: number; createdAt: string };
 
+type JobListRow = {
+  id: string;
+  serverId: string;
+  serverName?: string;
+  serverAddress?: string;
+  action: string;
+  status: string;
+  risk: string;
+  reason: string;
+  createdAt: string;
+  exitCode?: number | null;
+  output?: string;
+};
+
 const navItems = [
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
   { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
@@ -1160,7 +1174,7 @@ export function OpsConsole() {
           ) : active === "sessions" ? (
             <SessionsView token={token} />
           ) : active === "jobs" ? (
-            <JobsView token={token} />
+            <JobsView token={token} servers={servers} />
           ) : active === "audit" ? (
             <AuditView token={token} />
           ) : active === "access" ? (
@@ -3241,22 +3255,15 @@ function SessionsView({ token }: { token: string }) {
   );
 }
 
-function JobsView({ token }: { token: string }) {
-  const [jobs, setJobs] = useState<
-    Array<{
-      id: string;
-      serverId: string;
-      serverName: string;
-      serverAddress: string;
-      action: string;
-      status: string;
-      risk: string;
-      reason: string;
-      createdAt: string;
-      exitCode?: number | null;
-      output?: string;
-    }>
-  >([]);
+function JobsView({ token, servers }: { token: string; servers: Server[] }) {
+  const [jobs, setJobs] = useState<JobListRow[]>([]);
+  const serversById = useMemo(() => new Map(servers.map((server) => [server.id, server])), [servers]);
+  const serverLabel = (job: JobListRow) => {
+    const currentServer = serversById.get(job.serverId);
+    const hostname = currentServer?.name || job.serverName || job.serverId.slice(0, 8);
+    const address = currentServer?.address || job.serverAddress || "chưa có IP";
+    return `${hostname}[${address}]`;
+  };
   useEffect(() => {
     fetch("/api/v1/jobs", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
@@ -3297,7 +3304,7 @@ function JobsView({ token }: { token: string }) {
                 <b title={job.action}>{jobActionLabel(job.action)}</b>
                 <small>{job.reason}</small>
               </p>
-              <span className="job-server-label">{job.serverName || job.serverId.slice(0, 8)}[{job.serverAddress || "chưa có IP"}]</span>
+              <span className="job-server-label">{serverLabel(job)}</span>
               <span>{job.risk}</span>
               <time>{new Date(job.createdAt).toLocaleString("vi-VN")}</time>
               <div className="job-controls">
