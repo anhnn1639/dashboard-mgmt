@@ -29,6 +29,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
 os.environ["JWT_SECRET"] = "test-secret-that-is-not-used-in-production"
 os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "test-only-password-123456"
 os.environ["JOB_SECRET_KEY"] = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+os.environ["FILE_STAGING_ROOT"] = str(Path(tmp.name) / "file-staging")
 
 ca_key = ec.generate_private_key(ec.SECP256R1())
 ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Agent CA")])
@@ -51,7 +52,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 (test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -930,7 +931,7 @@ class ClassificationTests(unittest.TestCase):
             enroll = client.post("/api/v1/enroll", json={"token": token_response.json()["token"], "agent_id": agent_id, "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "inventory": {"hostname": "ubuntu-file-test", "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": "0.3.0", "addresses": ["10.30.1.60"]}})
             self.assertEqual(enroll.status_code, 201, enroll.text)
 
-            with patch("app.main.scan_with_clamav", return_value="stream: OK"):
+            with patch("app.main.scan_stream_with_clamav", return_value="stream: OK"):
                 uploaded = client.post(
                     f"/api/v1/servers/{agent_id}/files",
                     headers=headers,
@@ -941,6 +942,14 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(uploaded.json()["status"], "queued")
             self.assertEqual(uploaded.json()["note"], "The clean file is queued for the agent")
             self.assertEqual(uploaded.json()["sha256"], hashlib.sha256(b"setting: approved\n").hexdigest())
+            with SessionLocal() as db:
+                transfer = db.get(FileTransfer, uploaded.json()["id"])
+                chunks = db.execute(select(FileTransferChunk).where(FileTransferChunk.transfer_id == transfer.id).order_by(FileTransferChunk.sequence)).scalars().all()
+                self.assertEqual(transfer.nonce, "chunks-v1")
+                self.assertIsNone(transfer.content_encrypted)
+                self.assertEqual(sum(chunk.plain_size for chunk in chunks), transfer.size_bytes)
+                self.assertEqual(len(chunks), 1)
+            self.assertEqual(b"".join(stream_file_transfer_chunks(uploaded.json()["id"])), b"setting: approved\n")
 
             listed = client.get(f"/api/v1/servers/{agent_id}/files", headers=headers)
             self.assertEqual(listed.status_code, 200)

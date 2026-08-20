@@ -67,7 +67,7 @@ WINDOWS_RESERVED_FILENAMES = {
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
-MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+MAX_TRANSFER_BYTES = 1024 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
 MAX_CONCURRENT_JOBS = 4
 LINUX_BLOCK_SECTOR_BYTES = 512

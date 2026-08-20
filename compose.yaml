@@ -64,8 +64,11 @@ services:
       TUNNEL_MAX_SESSIONS_PER_AGENT: 4
       CLAMAV_HOST: clamav
       CLAMAV_PORT: 3310
-      FILE_MAX_BYTES: 52428800
+      CLAMAV_TIMEOUT_SECONDS: 900
+      FILE_MAX_BYTES: 1073741824
       FILE_TRANSFER_TTL_HOURS: 24
+      FILE_STAGING_ROOT: /var/lib/tram-ops/file-staging
+      TMPDIR: /var/lib/tram-ops/file-staging
     volumes:
       - ./deploy/pki:/run/ca-src:ro
       # The API receives only Caddy's exported public root. It never mounts
@@ -96,6 +99,14 @@ services:
   clamav:
     image: clamav/clamav:1.4
     restart: unless-stopped
+    environment:
+      # Official ClamAV defaults are intentionally small (25-100 MiB). Match
+      # the dashboard's 1 GiB file-transfer ceiling while keeping a hard cap.
+      CLAMD_CONF_StreamMaxLength: 1024M
+      CLAMD_CONF_MaxScanSize: 1100M
+      CLAMD_CONF_MaxFileSize: 1024M
+      CLAMD_CONF_MaxScanTime: 900000
+      CLAMD_CONF_ReadTimeout: 900
     expose: ["3310"]
     volumes:
       - clamav_database:/var/lib/clamav

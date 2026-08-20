@@ -20,8 +20,8 @@ https://{$OPS_DOMAIN} {
     @fileUpload path_regexp fileUpload ^/api/v1/servers/[^/]+/files/?$
     handle @fileUpload {
         request_body {
-            # Includes multipart framing in addition to the 50 MiB file limit.
-            max_size 55MB
+            # Includes multipart framing in addition to the 1 GiB file limit.
+            max_size 1100MB
         }
         reverse_proxy api:8000
     }

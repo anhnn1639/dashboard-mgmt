@@ -28,7 +28,7 @@ server {
     ssl_session_tickets off;
     server_tokens off;
 
-    client_max_body_size 55m;
+    client_max_body_size 1100m;
 
     location / {
         proxy_pass https://127.0.0.1:3000;

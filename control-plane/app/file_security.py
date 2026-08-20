@@ -7,6 +7,8 @@ import re
 import socket
 import struct
 from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, Iterable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -44,14 +46,14 @@ def normalize_upload_name(filename: str | None) -> str:
     return value
 
 
-def scan_with_clamav(data: bytes, host: str, port: int, timeout_seconds: int = 30) -> str:
-    """Scan bytes using clamd INSTREAM. The clamd TCP socket must stay private."""
+def _scan_chunks_with_clamav(chunks: Iterable[bytes], host: str, port: int, timeout_seconds: int) -> str:
     try:
         with socket.create_connection((host, port), timeout=timeout_seconds) as connection:
             connection.settimeout(timeout_seconds)
             connection.sendall(b"zINSTREAM\0")
-            for offset in range(0, len(data), 64 * 1024):
-                chunk = data[offset : offset + 64 * 1024]
+            for chunk in chunks:
+                if not chunk:
+                    continue
                 connection.sendall(struct.pack(">I", len(chunk)))
                 connection.sendall(chunk)
             connection.sendall(struct.pack(">I", 0))
@@ -75,6 +77,31 @@ def scan_with_clamav(data: bytes, host: str, port: int, timeout_seconds: int = 3
     raise ScannerUnavailable(f"Malware scanner returned an invalid result: {result[:200]}")
 
 
+def scan_with_clamav(data: bytes, host: str, port: int, timeout_seconds: int = 30) -> str:
+    """Scan bytes using clamd INSTREAM. The clamd TCP socket must stay private."""
+    return _scan_chunks_with_clamav(
+        (data[offset : offset + 64 * 1024] for offset in range(0, len(data), 64 * 1024)),
+        host,
+        port,
+        timeout_seconds,
+    )
+
+
+def scan_file_with_clamav(path: str | Path, host: str, port: int, timeout_seconds: int = 30) -> str:
+    """Stream a staged file to clamd without loading the whole payload into memory."""
+    with Path(path).open("rb") as source:
+        return scan_stream_with_clamav(source, host, port, timeout_seconds)
+
+
+def scan_stream_with_clamav(source: BinaryIO, host: str, port: int, timeout_seconds: int = 30) -> str:
+    """Stream an already-open upload spool to clamd without making another plaintext copy."""
+    def chunks() -> Iterable[bytes]:
+        while chunk := source.read(1024 * 1024):
+            yield chunk
+
+    return _scan_chunks_with_clamav(chunks(), host, port, timeout_seconds)
+
+
 def file_key(encoded_fernet_key: str) -> bytes:
     try:
         key = base64.urlsafe_b64decode(encoded_fernet_key.encode())
@@ -89,6 +116,10 @@ def file_aad(transfer_id: str, server_id: str, sha256: str) -> bytes:
     return f"tram-ops-file-v1\n{transfer_id}\n{server_id}\n{sha256}".encode()
 
 
+def file_chunk_aad(transfer_id: str, server_id: str, sha256: str, sequence: int, plain_size: int) -> bytes:
+    return f"tram-ops-file-chunk-v1\n{transfer_id}\n{server_id}\n{sha256}\n{sequence}\n{plain_size}".encode()
+
+
 def encrypt_file(data: bytes, transfer_id: str, server_id: str, sha256: str, encoded_key: str) -> tuple[bytes, str]:
     nonce = os.urandom(12)
     encrypted = AESGCM(file_key(encoded_key)).encrypt(nonce, data, file_aad(transfer_id, server_id, sha256))
@@ -98,3 +129,22 @@ def encrypt_file(data: bytes, transfer_id: str, server_id: str, sha256: str, enc
 def decrypt_file(encrypted: bytes, nonce_b64: str, transfer_id: str, server_id: str, sha256: str, encoded_key: str) -> bytes:
     nonce = base64.b64decode(nonce_b64.encode(), validate=True)
     return AESGCM(file_key(encoded_key)).decrypt(nonce, encrypted, file_aad(transfer_id, server_id, sha256))
+
+
+def encrypt_file_chunk(data: bytes, transfer_id: str, server_id: str, sha256: str, sequence: int, encoded_key: str) -> tuple[bytes, str]:
+    nonce = os.urandom(12)
+    encrypted = AESGCM(file_key(encoded_key)).encrypt(
+        nonce,
+        data,
+        file_chunk_aad(transfer_id, server_id, sha256, sequence, len(data)),
+    )
+    return encrypted, base64.b64encode(nonce).decode()
+
+
+def decrypt_file_chunk(encrypted: bytes, nonce_b64: str, transfer_id: str, server_id: str, sha256: str, sequence: int, plain_size: int, encoded_key: str) -> bytes:
+    nonce = base64.b64decode(nonce_b64.encode(), validate=True)
+    return AESGCM(file_key(encoded_key)).decrypt(
+        nonce,
+        encrypted,
+        file_chunk_aad(transfer_id, server_id, sha256, sequence, plain_size),
+    )

@@ -27,6 +27,17 @@ type CurrentUser = {
   permissions: string[];
 };
 
+type AuditEventRow = {
+  id: string;
+  occurredAt: string;
+  actor: string;
+  action: string;
+  target: string;
+  result: string;
+  sourceIp: string;
+  detail: Record<string, unknown>;
+};
+
 type Server = {
   id: string;
   name: string;
@@ -356,6 +367,9 @@ export function OpsConsole() {
   const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
   const [bulkTaskOpen, setBulkTaskOpen] = useState(false);
   const [serverManagement, setServerManagement] = useState<{ server: Server; mode: "share" | "delete" } | null>(null);
+  const [recentAudit, setRecentAudit] = useState<AuditEventRow[]>([]);
+  const [recentAuditBusy, setRecentAuditBusy] = useState(false);
+  const [recentAuditError, setRecentAuditError] = useState("");
   const loadServers = useCallback(async (showLoading = false) => {
     if (!token) return;
     if (showLoading) setLoading(true);
@@ -377,6 +391,28 @@ export function OpsConsole() {
       setLoading(false);
     }
   }, [token]);
+
+  const loadRecentAudit = useCallback(async () => {
+    if (!token || !currentUser?.permissions.includes("audit.view")) {
+      setRecentAudit([]);
+      setRecentAuditError("");
+      return;
+    }
+    setRecentAuditBusy(true);
+    setRecentAuditError("");
+    try {
+      const response = await fetch("/api/v1/audit?limit=6", {
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error("Không thể tải hoạt động gần đây");
+      const data = await response.json();
+      setRecentAudit(Array.isArray(data.items) ? data.items : []);
+    } catch (reason) {
+      setRecentAuditError(reason instanceof Error ? reason.message : "Không thể tải hoạt động gần đây");
+    } finally {
+      setRecentAuditBusy(false);
+    }
+  }, [currentUser, token]);
 
   useEffect(() => {
     let mounted = true;
@@ -449,6 +485,12 @@ export function OpsConsole() {
       window.clearInterval(timer);
     };
   }, [loadServers, token]);
+
+  useEffect(() => {
+    if (active !== "overview" || !currentUser) return;
+    const timer = window.setTimeout(() => void loadRecentAudit(), 0);
+    return () => window.clearTimeout(timer);
+  }, [active, currentUser, loadRecentAudit]);
 
   useEffect(() => {
     if (token && !currentUser) return;
@@ -924,24 +966,37 @@ export function OpsConsole() {
                       <h2>Hoạt động gần đây</h2>
                       <p>Dữ liệu audit từ PostgreSQL</p>
                     </div>
-                    <button onClick={() => navigateSection("audit")}>
-                      Mở nhật ký →
-                    </button>
+                    {currentUser.permissions.includes("audit.view") && (
+                      <button onClick={() => navigateSection("audit")}>
+                        Mở nhật ký →
+                      </button>
+                    )}
                   </div>
-                  <div className="overview-empty">
-                    <span>≡</span>
-                    <b>Xem nhật ký kiểm toán</b>
-                    <p>
-                      Các sự kiện thật được ghi vào chuỗi audit trong database,
-                      không hiển thị dữ liệu minh họa.
-                    </p>
-                    <button
-                      className="button ghost"
-                      onClick={() => navigateSection("audit")}
-                    >
-                      Xem sự kiện
-                    </button>
-                  </div>
+                  {!currentUser.permissions.includes("audit.view") ? (
+                    <div className="overview-empty compact">
+                      <span>≡</span>
+                      <b>Role hiện tại không có quyền xem audit</b>
+                    </div>
+                  ) : recentAuditBusy && recentAudit.length === 0 ? (
+                    <div className="overview-empty compact">Đang tải hoạt động…</div>
+                  ) : recentAuditError && recentAudit.length === 0 ? (
+                    <div className="overview-empty compact">{recentAuditError}</div>
+                  ) : recentAudit.length === 0 ? (
+                    <div className="overview-empty compact">Chưa có sự kiện audit.</div>
+                  ) : (
+                    <div className="overview-activity-list">
+                      {recentAudit.map((event) => (
+                        <button key={event.id} type="button" onClick={() => navigateSection("audit")}>
+                          <span className={`overview-activity-result ${event.result || "success"}`} />
+                          <span>
+                            <b>{event.action}</b>
+                            <small>{event.actor || "system"} · {event.target || "hệ thống"}</small>
+                          </span>
+                          <time>{new Date(event.occurredAt).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" })}</time>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </article>
               </section>
             </>
@@ -2343,8 +2398,12 @@ function ServerDrawer({
   async function uploadFile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFileBusy(true);
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     try {
+      const selectedFile = form.get("file");
+      if (selectedFile instanceof File && selectedFile.size > 1024 * 1024 * 1024)
+        throw new Error("File vượt quá giới hạn 1 GiB");
       const response = await fetch(`/api/v1/servers/${server.id}/files`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -2354,7 +2413,7 @@ function ServerDrawer({
       if (!response.ok)
         throw new Error(data.detail ?? "Không thể tải file vào vùng cách ly");
       notify("File sạch đã được xếp hàng để Agent nhận và chuyển vào inbox cách ly.");
-      event.currentTarget.reset();
+      formElement.reset();
       await loadTransfers();
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Không thể tải file");
@@ -2669,7 +2728,7 @@ function ServerDrawer({
             <div className="warning-box">
               <b>Không đi qua SFTP, RDP drive hoặc clipboard</b>
               <p>
-                File tối đa 50 MiB, được quét ClamAV trước khi mã hóa lưu trong PostgreSQL,
+                File tối đa 1 GiB, được quét ClamAV trước khi mã hóa lưu trong PostgreSQL,
                 sau đó được xếp hàng trực tiếp và quét lại bằng Defender/ClamAV tại máy đích. Agent
                 không tự chạy file và không ghi đè file đã có.
               </p>

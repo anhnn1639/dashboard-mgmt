@@ -3286,11 +3286,13 @@ textarea:focus-visible {
 }
 .login-page {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 22px;
   position: relative;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: radial-gradient(
     circle at 50% 0,
     #142440 0,
@@ -3321,6 +3323,10 @@ textarea:focus-visible {
   position: relative;
   z-index: 1;
   width: min(410px, 100%);
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
   border: 1px solid #2a374a;
   border-radius: 13px;
   padding: 30px;
@@ -4244,6 +4250,93 @@ textarea:focus-visible {
   border-color: #693841;
   color: #ffc2c7;
   background: #3d1c25;
+}
+.overview-empty.compact {
+  min-height: 150px;
+}
+.overview-activity-list {
+  display: grid;
+  gap: 1px;
+  max-height: 174px;
+  overflow-y: auto;
+}
+.overview-activity-list > button {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 4px;
+  border: 0;
+  border-bottom: 1px solid #202a38;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.overview-activity-list > button:hover {
+  background: rgba(77, 141, 255, 0.04);
+}
+.overview-activity-list > button > span:nth-child(2) {
+  min-width: 0;
+}
+.overview-activity-list b,
+.overview-activity-list small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overview-activity-list b {
+  color: #b7c4d7;
+  font-size: 9px;
+}
+.overview-activity-list small,
+.overview-activity-list time {
+  margin-top: 3px;
+  color: #64748a;
+  font-size: 8px;
+}
+.overview-activity-result {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.overview-activity-result.failed,
+.overview-activity-result.blocked,
+.overview-activity-result.error {
+  background: #f36873;
+}
+.overview-activity-result.warning,
+.overview-activity-result.expired {
+  background: var(--amber);
+}
+
+@media (max-height: 720px) {
+  .login-page {
+    place-items: start center;
+    padding: 8px;
+  }
+  .login-card {
+    padding: 18px 22px;
+    max-height: calc(100dvh - 16px);
+  }
+  .login-brand {
+    margin-bottom: 16px;
+  }
+  .login-copy {
+    margin-bottom: 12px;
+  }
+  .login-security {
+    margin-top: 13px;
+    padding-top: 11px;
+  }
+  .mfa-qr {
+    width: min(170px, 45vh);
+    height: min(170px, 45vh);
+  }
 }
 .resource-icon-button.danger {
   border-color: #693841;

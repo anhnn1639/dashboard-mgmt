@@ -207,9 +207,9 @@ Nếu SSH không mở được, không mở inbound `22`. Trên máy Linux đíc
 
 ## Truyền file an toàn
 
-1. Chọn máy chủ, tải file tối đa 50 MiB và nhập ticket/lý do.
-2. API giữ upload trong `/tmp` container gắn `noexec,nosuid,nodev`, gửi bytes qua `INSTREAM` tới ClamAV trên mạng Docker riêng. Socket `3310` không được public.
-3. File sạch được mã hóa AES-GCM có AAD gắn với transfer/server/SHA-256 rồi lưu trong PostgreSQL. File nhiễm hoặc scanner lỗi không được lưu nội dung.
+1. Chọn máy chủ, tải file tối đa 1 GiB và nhập ticket/lý do.
+2. Multipart upload được spool tạm trong vùng riêng của API, gửi theo stream `INSTREAM` tới ClamAV trên mạng Docker riêng rồi được xóa khi request kết thúc. Socket `3310` không được public.
+3. File sạch được chia thành các khối 8 MiB, từng khối mã hóa AES-GCM có AAD gắn với transfer/server/SHA-256/thứ tự rồi lưu trong PostgreSQL. File nhiễm hoặc scanner lỗi không được lưu nội dung.
 4. API tạo ngay job `file.deliver` ở trạng thái `queued`; Agent nhận ở lần check-in kế tiếp.
 5. Đúng agent tải file qua API mTLS `9443`, kiểm tra kích thước/SHA-256, quét lại bằng Microsoft Defender hoặc ClamAV endpoint, sau đó publish không ghi đè vào `%ProgramData%\TramVanHanh\Inbox` hoặc `/var/lib/tram-agent/inbox`.
 6. Sau khi agent báo thành công/thất bại, ciphertext bị xóa khỏi PostgreSQL; metadata, hash và audit được giữ lại. Không có luồng tải file từ server về dashboard hoặc server-sang-server.

@@ -57,6 +57,8 @@ test("resource dialogs fit the viewport and scroll internally", async () => {
   assert.match(source, /className="ldap-settings-modal"/);
   assert.match(styles, /\.storage-tree\s*{[^}]*overflow:\s*auto/s);
   assert.match(styles, /\.resource-table-scroll\s*{[^}]*overflow:\s*auto/s);
+  assert.match(styles, /\.login-card\s*{[^}]*max-height:\s*calc\(100dvh - 24px\)/s);
+  assert.match(styles, /\.login-card\s*{[^}]*overflow-y:\s*auto/s);
 });
 
 test("Windows and Linux fleets can queue OS-aware common tasks", async () => {
@@ -180,11 +182,16 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(resources, /Realtime 5s/);
   assert.match(resources, /refreshRef\.current/);
   assert.match(resources, /jobRef\.current/);
+  assert.match(resources, /job\?\.status === "failed" && <PendingState job=\{job\}/);
   assert.match(resources, /Đã khóa \/ disable/);
   assert.match(resources, /Unlock tài khoản/);
   assert.match(source, /Share \$\{server\.name\}/);
   assert.match(source, /Xóa máy chủ/);
   assert.match(source, /servers\.manage/);
+  assert.match(source, /\/api\/v1\/audit\?limit=6/);
+  assert.match(source, /overview-activity-list/);
+  assert.match(source, /File tối đa 1 GiB/);
+  assert.match(source, /const formElement = event\.currentTarget/);
 });
 
 test("MFA QR is CSP-compatible for every role", async () => {

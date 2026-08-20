@@ -6,10 +6,12 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source, Linux executable và Windows MSI bundle trong repo đều là `0.8.7`. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
+- Agent source đã tăng lên `0.8.8` để nhận file tới 1 GiB; Linux executable và Windows MSI bundle `0.8.8` phải lấy từ GitHub Actions ngay sau source commit này. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
+- Dashboard 0.8.8 sửa form đăng nhập theo `dvh`, co gọn trên màn hình thấp và cuộn bên trong card khi thật sự cần; nút đăng nhập/MFA không còn bị cắt khỏi viewport. Overview lấy sáu audit event mới nhất thật từ PostgreSQL khi role có `audit.view`. Process realtime 5 giây chỉ cập nhật số liệu, không chớp banner queued/dispatched; lỗi job thật vẫn hiển thị.
+- Truyền file 0.8.8 sửa lỗi React mất `currentTarget` sau `await` gây toast `Cannot read properties of null (reading 'reset')`. Trần file đồng bộ lên 1 GiB ở UI/Nginx/Caddy/API/ClamAV/Agent. API không giữ nguyên file trong RAM: multipart spool ở thư mục riêng, quét ClamAV bằng stream, mã hóa AES-GCM theo khối 8 MiB vào bảng PostgreSQL `file_transfer_chunks`, rồi giải mã/stream tuần tự xuống Agent; hash/kích thước toàn file vẫn được Agent kiểm tra và payload bị xóa sau kết quả hoặc TTL 24 giờ.
 - Lỗi SSH Guacamole ngày 16/08 đã xác định ở lớp Docker DNS, trước tunnel/sshd: container `guacamole` và `guacd` cùng network `tram-van-hanh_session` nhưng endpoint cũ có `Aliases=null`, nên `getent hosts guacd` rỗng và Tomcat báo `UnknownHostException: guacd`. Compose hiện khai báo alias `guacd`/`guacamole` tường minh và chỉ khởi động Guacamole sau khi `guacd` healthy.
 - Sau khi DNS chạy, log `guacd` xác nhận hai lỗi kế tiếp: host key bị pin cho `tunnel-relay` nhưng thiếu cổng relay động (`Host key does not match known hosts entry`) và recording/typescript bị `Permission denied`. API hiện sinh known_hosts dạng `[tunnel-relay]:PORT KEY_TYPE KEY`; recording-init dùng đúng owner guacd `1000`, shared GID cấu hình bằng `RECORDING_GID`, còn API/Guacamole chỉ được thêm nhóm để đọc. Log phiên mới ngày 16/08 cho thấy recording đã chạy nhưng host key vẫn mismatch: nguyên nhân cuối là agent 0.4.1 luôn gửi ED25519 trong khi libssh2 của guacd ưu tiên/đàm phán ECDSA P-256 trước. Agent 0.4.2 chọn ECDSA, rồi ED25519, rồi RSA theo đúng thứ tự tương thích với guacd.
 - Sau Agent 0.4.2, API đã mở được relay nhưng trình duyệt rơi về trang danh sách Guacamole và `guacd` không nhận connection. Nguyên nhân là URL launch chỉ trỏ `/guacamole/?data=...` thay vì route client. API hiện trả thẳng `/guacamole/#/client/BASE64URL?data=...`, trong đó identifier là `CONNECTION_NAME\0c\0json` và encrypted JSON được percent-encode toàn bộ.
@@ -110,7 +112,7 @@
 - Agent chỉ relay `127.0.0.1:22` cho SSH hoặc `127.0.0.1:3389` cho RDP, tối đa 4 tunnel; không fallback trực tiếp.
 - API gửi lệnh mở tunnel và chờ Agent gắn stream mTLS thành công trước khi trả relay port cho Guacamole. Điều này loại bỏ race khiến `guacd` kết nối trước Agent và biến lỗi sshd/RDP local thành HTTP 409 có hướng dẫn; Agent 0.4.2 phải được cập nhật trên endpoint để gửi đúng SSH host key.
 - Pin SSH host key/RDP certificate, tắt clipboard/SFTP/RDP drive/printing, giữ recording.
-- File một chiều: giới hạn 50 MiB, ClamAV trung tâm, AES-GCM PostgreSQL, job trực tiếp, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server.
+- File một chiều: giới hạn 1 GiB, ClamAV trung tâm, AES-GCM theo khối trong PostgreSQL, job trực tiếp, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server. Agent cũ trước 0.8.8 vẫn từ chối file trên 50 MiB, vì vậy endpoint phải được nâng trước khi test file lớn.
 - Payload file xóa sau kết quả hoặc hết hạn 24 giờ; scanner lỗi thì fail-closed.
 
 ## Nginx, TLS và firewall
@@ -238,6 +240,17 @@ docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recrea
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
 ```
 
+Từ 0.8.7 lên 0.8.8 phải render lại Nginx để nhận `client_max_body_size 1100m`, rebuild/recreate API/dashboard/Caddy/ClamAV để tạo bảng chunk và nhận giới hạn scan mới, rồi nâng Agent endpoint lên 0.8.8 trước khi thử file lớn:
+
+```bash
+git pull --ff-only origin main
+sudo sh deploy/configure-nginx.sh ops.sbsi.vn /path/to/public-fullchain.pem /path/to/public-private-key.pem
+nginx -t && systemctl reload nginx
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard caddy clamav
+docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent-assets/VERSION
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard caddy clamav
+```
+
 API tự tạo các bảng PostgreSQL mới khi khởi động; không có migration làm thay đổi hoặc xóa dữ liệu bảng hiện hữu.
 
 Máy đã tạo `guacd`/`guacamole` trước bản sửa Docker DNS phải recreate đúng hai container để endpoint nhận alias mới:
@@ -315,7 +328,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.7`, Linux available và Windows MSI 0.8.7 available.
+- Sau khi artifact được bundle, trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.8`, Linux available và Windows MSI 0.8.8 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -332,7 +345,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.7 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.7`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.8 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.8`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -355,13 +368,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `41/41`, gồm đồng bộ thành viên AD trực tiếp/lồng nhau có paging, giữ role/trạng thái gán riêng và đối chiếu username không phân biệt hoa thường; cùng catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server, Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Control plane `43/43`, gồm file upload mã hóa theo chunk và stream giải mã có kiểm tra thứ tự/hash; scan ClamAV từ upload spool; đồng bộ thành viên AD trực tiếp/lồng nhau có paging, giữ role/trạng thái gán riêng và đối chiếu username không phân biệt hoa thường; cùng catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server, Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
 - Agent security `65/65`, gồm probe Windows Update/WSUS hữu hạn, dừng ngay khi mất nguồn, APT/YUM repository failure có cấu trúc và applicability theo release; cùng căn dung lượng LVM xuống sector 512, Windows DiskPart Extend/Shrink, OL7 partition geometry/adjacency, CLIXML cleanup, nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, cache freshness, khóa cài từ scan chưa hoàn tất, upgrade identity, Oracle/RHEL 7 `lsblk --pairs`, process CPU/RAM, bootstrap detail, installer offline, firewall/storage/update/process/log/account validation, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
 - Render trực quan form bộ cài pass: label dùng grid, gap `7px`, input/select cao `40px`; tab kiểm thử và server tạm đã đóng/xóa.
-- Render test workspace `13/13` pass, gồm QR MFA tương thích CSP, process CPU/RAM realtime/sort/filter, server share và platform group; các kiểm tra permission-aware cho Viewer, shell/fleet/modal/task/firewall/recording/storage/update/user-role trước đó vẫn pass.
+- Render test workspace `13/13` pass, gồm login card theo viewport, recent audit thật, process realtime không chớp pending, file 1 GiB/form reset an toàn, QR MFA tương thích CSP, process CPU/RAM realtime/sort/filter, server share và platform group; các kiểm tra permission-aware cho Viewer, shell/fleet/modal/task/firewall/recording/storage/update/user-role trước đó vẫn pass.
 - Kiểm tra browser local bằng dữ liệu mẫu pass: cây Disk mở đúng cấp; modal hiển thị footer ở desktop và cuộn nội bộ tại `390x700`; Services/Users giữ bố cục; log tô toàn dòng error đỏ và warning vàng. Route dữ liệu mẫu và dev server đã gỡ/dừng trước commit.
 - Render trực quan modal thêm firewall pass trên Windows profile, Ubuntu/UFW, Oracle Linux/firewalld zone và Red Hat/iptables INPUT/OUTPUT. DOM đo ở 1024x600 và 390x700 xác nhận modal nằm trọn viewport, không có tràn ngang, body có thanh cuộn riêng và footer luôn hiển thị.
 - Python `py_compile` pass.

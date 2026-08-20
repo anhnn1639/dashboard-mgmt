@@ -33,9 +33,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from ldap3 import ALL, BASE, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, Field, field_validator
@@ -45,7 +45,7 @@ from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, encrypt_file, normalize_upload_name, scan_with_clamav
+from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
 from .agent_packages import LINUX_AGENT_PATH, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 
@@ -76,8 +76,9 @@ class Settings(BaseSettings):
     tunnel_listener_ttl_seconds: int = 120
     tunnel_connect_timeout_seconds: int = 20
     tunnel_max_sessions_per_agent: int = 4
-    file_max_bytes: int = 50 * 1024 * 1024
+    file_max_bytes: int = 1024 * 1024 * 1024
     file_transfer_ttl_hours: int = 24
+    file_staging_root: str = "/var/lib/tram-ops/file-staging"
     audit_retention_days: int = Field(default=30, ge=1, le=3650)
     clamav_host: str = "clamav"
     clamav_port: int = 3310
@@ -400,6 +401,15 @@ class FileTransfer(Base):
     nonce: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FileTransferChunk(Base):
+    __tablename__ = "file_transfer_chunks"
+    transfer_id: Mapped[str] = mapped_column(ForeignKey("file_transfers.id", ondelete="CASCADE"), primary_key=True)
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    nonce: Mapped[str] = mapped_column(String(64))
+    plain_size: Mapped[int] = mapped_column(Integer)
 
 
 class LoginRequest(BaseModel):
@@ -1818,19 +1828,35 @@ def guacamole_rdp_certificate_fingerprint(value: object) -> str | None:
     return f"{algorithm}:{separated}"
 
 
+def clear_file_transfer_payload(db: Session, transfer: FileTransfer) -> None:
+    transfer.content_encrypted = None
+    transfer.nonce = ""
+    db.execute(delete(FileTransferChunk).where(FileTransferChunk.transfer_id == transfer.id))
+
+
+def cleanup_file_staging() -> None:
+    root = Path(settings.file_staging_root)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    for staged in root.glob("upload-*.staged"):
+        with contextlib.suppress(OSError):
+            staged.unlink()
+
+
 def expire_file_payloads(db: Session) -> int:
     cutoff = now() - timedelta(hours=settings.file_transfer_ttl_hours)
     transfers = db.execute(
         select(FileTransfer).where(
             FileTransfer.created_at < cutoff,
-            FileTransfer.content_encrypted.is_not(None),
             FileTransfer.status.in_({"pending_approval", "queued", "transferring"}),
         )
     ).scalars().all()
     for transfer in transfers:
         transfer.status = "expired"
-        transfer.content_encrypted = None
-        transfer.nonce = ""
+        clear_file_transfer_payload(db, transfer)
         if transfer.job_id:
             job = db.get(Job, transfer.job_id)
             if job and job.status in {"pending_approval", "queued", "dispatched"}:
@@ -1850,8 +1876,7 @@ def retire_legacy_pending_jobs(db: Session) -> int:
         transfer = db.execute(select(FileTransfer).where(FileTransfer.job_id == job.id)).scalar_one_or_none()
         if transfer and transfer.status == "pending_approval":
             transfer.status = "cancelled"
-            transfer.content_encrypted = None
-            transfer.nonce = ""
+            clear_file_transfer_payload(db, transfer)
         audit(
             db,
             "system:direct-execution-migration",
@@ -1865,6 +1890,7 @@ def retire_legacy_pending_jobs(db: Session) -> int:
 
 @app.on_event("startup")
 def startup() -> None:
+    cleanup_file_staging()
     if not settings.database_url:
         return
     try:
@@ -2663,54 +2689,69 @@ async def upload_server_file(
         filename = normalize_upload_name(file.filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    content = bytearray()
-    digest = hashlib.sha256()
-    while chunk := await file.read(64 * 1024):
-        if len(content) + len(chunk) > settings.file_max_bytes:
-            audit(db, user.username, "file.upload.blocked", server_id, request, "blocked", {"filename": filename, "reason": "size-limit"})
-            db.commit()
-            await file.close()
-            raise HTTPException(status_code=413, detail=f"File exceeds the {settings.file_max_bytes // (1024 * 1024)} MiB limit")
-        content.extend(chunk)
-        digest.update(chunk)
-    await file.close()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty files are not accepted")
-
-    transfer_id = str(uuid.uuid4())
-    sha256 = digest.hexdigest()
     content_type = (file.content_type or "application/octet-stream")[:255]
+    staging_root = Path(settings.file_staging_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
     try:
-        scan_result = await asyncio.to_thread(
-            scan_with_clamav,
-            bytes(content),
-            settings.clamav_host,
-            settings.clamav_port,
-            settings.clamav_timeout_seconds,
-        )
-    except MalwareDetected as exc:
-        transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="blocked", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
-        db.add(transfer)
-        audit(db, user.username, "file.upload.blocked", transfer.id, request, "blocked", {"server": server.name, "filename": filename, "sha256": sha256, "scanner": "clamav", "signature": exc.signature})
-        db.commit()
-        raise HTTPException(status_code=422, detail="Malware scanner blocked this file") from exc
-    except ScannerUnavailable as exc:
-        transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="scan_failed", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
-        db.add(transfer)
-        audit(db, user.username, "file.upload.scan_failed", transfer.id, request, "failed", {"server": server.name, "filename": filename, "sha256": sha256})
-        db.commit()
-        raise HTTPException(status_code=503, detail="Malware scanner is unavailable; file was not stored") from exc
+        os.chmod(staging_root, 0o700)
+    except OSError:
+        pass
+    size_bytes = 0
+    digest = hashlib.sha256()
+    try:
+        while chunk := await file.read(1024 * 1024):
+            size_bytes += len(chunk)
+            if size_bytes > settings.file_max_bytes:
+                audit(db, user.username, "file.upload.blocked", server_id, request, "blocked", {"filename": filename, "reason": "size-limit"})
+                db.commit()
+                raise HTTPException(status_code=413, detail=f"File exceeds the {settings.file_max_bytes // (1024 * 1024)} MiB limit")
+            digest.update(chunk)
+        if size_bytes == 0:
+            raise HTTPException(status_code=400, detail="Empty files are not accepted")
 
-    encrypted, nonce = encrypt_file(bytes(content), transfer_id, server.id, sha256, settings.job_secret_key)
-    transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=len(content), sha256=sha256, status="queued", scan_result=scan_result[:255], reason=reason, created_by=user.id, content_encrypted=encrypted, nonce=nonce)
-    job = Job(server_id=server.id, action="file.deliver", parameters={"transfer_id": transfer.id, "filename": filename, "sha256": sha256, "size_bytes": len(content)}, reason=reason, status="queued", risk="critical", created_by=user.id)
-    db.add_all([transfer, job])
-    db.flush()
-    transfer.job_id = job.id
-    audit(db, user.username, "file.upload.clean", transfer.id, request, detail={"server": server.name, "filename": filename, "size": len(content), "sha256": sha256, "scanner": "clamav", "delivery": "direct"})
-    db.commit()
-    return {**file_transfer_json(transfer), "note": "The clean file is queued for the agent"}
+        transfer_id = str(uuid.uuid4())
+        sha256 = digest.hexdigest()
+        await file.seek(0)
+        try:
+            scan_result = await asyncio.to_thread(
+                scan_stream_with_clamav,
+                file.file,
+                settings.clamav_host,
+                settings.clamav_port,
+                settings.clamav_timeout_seconds,
+            )
+        except MalwareDetected as exc:
+            transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=size_bytes, sha256=sha256, status="blocked", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
+            db.add(transfer)
+            audit(db, user.username, "file.upload.blocked", transfer.id, request, "blocked", {"server": server.name, "filename": filename, "sha256": sha256, "scanner": "clamav", "signature": exc.signature})
+            db.commit()
+            raise HTTPException(status_code=422, detail="Malware scanner blocked this file") from exc
+        except ScannerUnavailable as exc:
+            transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=size_bytes, sha256=sha256, status="scan_failed", scan_result=str(exc)[:255], reason=reason, created_by=user.id)
+            db.add(transfer)
+            audit(db, user.username, "file.upload.scan_failed", transfer.id, request, "failed", {"server": server.name, "filename": filename, "sha256": sha256})
+            db.commit()
+            raise HTTPException(status_code=503, detail="Malware scanner is unavailable; file was not stored") from exc
+
+        transfer = FileTransfer(id=transfer_id, server_id=server.id, original_name=filename, content_type=content_type, size_bytes=size_bytes, sha256=sha256, status="queued", scan_result=scan_result[:255], reason=reason, created_by=user.id, content_encrypted=None, nonce="chunks-v1")
+        job = Job(server_id=server.id, action="file.deliver", parameters={"transfer_id": transfer.id, "filename": filename, "sha256": sha256, "size_bytes": size_bytes}, reason=reason, status="queued", risk="critical", created_by=user.id)
+        db.add_all([transfer, job])
+        db.flush()
+        transfer.job_id = job.id
+        await file.seek(0)
+        sequence = 0
+        while chunk := await file.read(8 * 1024 * 1024):
+            encrypted, nonce = encrypt_file_chunk(chunk, transfer.id, server.id, sha256, sequence, settings.job_secret_key)
+            encrypted_chunk = FileTransferChunk(transfer_id=transfer.id, sequence=sequence, content_encrypted=encrypted, nonce=nonce, plain_size=len(chunk))
+            db.add(encrypted_chunk)
+            db.flush()
+            db.expunge(encrypted_chunk)
+            sequence += 1
+        audit(db, user.username, "file.upload.clean", transfer.id, request, detail={"server": server.name, "filename": filename, "size": size_bytes, "sha256": sha256, "scanner": "clamav", "delivery": "direct", "storage": "encrypted-chunks-v1"})
+        db.commit()
+        return {**file_transfer_json(transfer), "note": "The clean file is queued for the agent"}
+    finally:
+        await file.close()
 
 
 @app.post("/api/v1/enrollment-tokens", status_code=201)
@@ -3011,21 +3052,80 @@ async def agent_tunnel_stream(websocket: WebSocket, session_id: str, agent_id: s
     await tunnel_hub.attach_stream(session_id, agent_id, websocket)
 
 
+def stream_file_transfer_chunks(transfer_id: str):
+    factory = SessionLocal
+    if factory is None:
+        raise RuntimeError("Database setup is required")
+    with factory() as stream_db:
+        transfer = stream_db.get(FileTransfer, transfer_id)
+        if not transfer or transfer.nonce != "chunks-v1":
+            raise RuntimeError("Chunked file transfer is unavailable")
+        digest = hashlib.sha256()
+        total = 0
+        chunks = stream_db.execute(
+            select(FileTransferChunk)
+            .where(FileTransferChunk.transfer_id == transfer.id)
+            .order_by(FileTransferChunk.sequence)
+            .execution_options(yield_per=1)
+        ).scalars()
+        expected_sequence = 0
+        for encrypted_chunk in chunks:
+            if encrypted_chunk.sequence != expected_sequence:
+                raise RuntimeError("File transfer chunk sequence is incomplete")
+            content = decrypt_file_chunk(
+                encrypted_chunk.content_encrypted,
+                encrypted_chunk.nonce,
+                transfer.id,
+                transfer.server_id,
+                transfer.sha256,
+                encrypted_chunk.sequence,
+                encrypted_chunk.plain_size,
+                settings.job_secret_key,
+            )
+            if len(content) != encrypted_chunk.plain_size:
+                raise RuntimeError("File transfer chunk size mismatch")
+            digest.update(content)
+            total += len(content)
+            expected_sequence += 1
+            yield content
+        if total != transfer.size_bytes or not hmac.compare_digest(digest.hexdigest(), transfer.sha256):
+            raise RuntimeError("File transfer integrity validation failed")
+
+
 @app.get("/api/v1/agent/files/{transfer_id}")
 async def agent_download_file(transfer_id: str, agent_id: str, request: Request, db: Session = Depends(db_session)):
     server = verify_agent(request, db, agent_id, b"")
     transfer = db.get(FileTransfer, transfer_id)
     if not transfer or transfer.server_id != server.id:
         raise HTTPException(status_code=404, detail="File transfer not found")
-    if transfer.status not in {"queued", "transferring"} or not transfer.content_encrypted or not transfer.nonce:
+    chunk_count = db.scalar(select(func.count()).select_from(FileTransferChunk).where(FileTransferChunk.transfer_id == transfer.id)) or 0
+    chunked = transfer.nonce == "chunks-v1" and chunk_count > 0
+    legacy = bool(transfer.content_encrypted and transfer.nonce and transfer.nonce != "chunks-v1")
+    if transfer.status not in {"queued", "transferring"} or not (chunked or legacy):
         raise HTTPException(status_code=409, detail="File transfer is not available for delivery")
     if now() - aware(transfer.created_at) > timedelta(hours=settings.file_transfer_ttl_hours):
         transfer.status = "expired"
-        transfer.content_encrypted = None
-        transfer.nonce = ""
+        clear_file_transfer_payload(db, transfer)
         audit(db, f"agent:{server.id}", "file.download.expired", transfer.id, request, "blocked")
         db.commit()
         raise HTTPException(status_code=410, detail="File transfer expired")
+    transfer.status = "transferring"
+    audit(db, f"agent:{server.id}", "file.download", transfer.id, request, detail={"filename": transfer.original_name, "size": transfer.size_bytes, "sha256": transfer.sha256})
+    db.commit()
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Length": str(transfer.size_bytes),
+        "X-Content-Type-Options": "nosniff",
+        "X-Tram-Filename": transfer.original_name,
+        "X-Tram-SHA256": transfer.sha256,
+        "X-Tram-Size": str(transfer.size_bytes),
+    }
+    if chunked:
+        return StreamingResponse(
+            stream_file_transfer_chunks(transfer.id),
+            media_type="application/octet-stream",
+            headers=headers,
+        )
     try:
         content = decrypt_file(transfer.content_encrypted, transfer.nonce, transfer.id, transfer.server_id, transfer.sha256, settings.job_secret_key)
     except Exception as exc:
@@ -3034,19 +3134,10 @@ async def agent_download_file(transfer_id: str, agent_id: str, request: Request,
         raise HTTPException(status_code=500, detail="File transfer integrity validation failed") from exc
     if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), transfer.sha256):
         raise HTTPException(status_code=500, detail="File transfer hash mismatch")
-    transfer.status = "transferring"
-    audit(db, f"agent:{server.id}", "file.download", transfer.id, request, detail={"filename": transfer.original_name, "size": transfer.size_bytes, "sha256": transfer.sha256})
-    db.commit()
     return Response(
         content=content,
         media_type="application/octet-stream",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Tram-Filename": transfer.original_name,
-            "X-Tram-SHA256": transfer.sha256,
-            "X-Tram-Size": str(transfer.size_bytes),
-        },
+        headers=headers,
     )
 
 
@@ -3168,8 +3259,7 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
         if transfer and transfer.server_id == server.id:
             transfer.status = "delivered" if payload.status == "succeeded" else "failed"
             transfer.delivered_at = now() if payload.status == "succeeded" else None
-            transfer.content_encrypted = None
-            transfer.nonce = ""
+            clear_file_transfer_payload(db, transfer)
     audit(db, f"agent:{server.id}", f"job.{payload.status}", job.id, request, payload.status, {"action": job.action, "exit_code": payload.exit_code})
     db.flush()
     refresh_jobs: list[Job] = []
@@ -3465,8 +3555,8 @@ def list_jobs(user: User = Depends(require_permission("servers.view")), db: Sess
 
 
 @app.get("/api/v1/audit")
-def list_audit(before: datetime | None = None, _: User = Depends(require_permission("audit.view")), db: Session = Depends(db_session)):
-    query = select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(500)
+def list_audit(before: datetime | None = None, limit: int = Query(default=500, ge=1, le=500), _: User = Depends(require_permission("audit.view")), db: Session = Depends(db_session)):
+    query = select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(limit)
     if before is not None:
         query = query.where(AuditEvent.occurred_at < aware(before))
     events = db.execute(query).scalars().all()
@@ -3486,7 +3576,7 @@ def list_audit(before: datetime | None = None, _: User = Depends(require_permiss
             }
             for item in events
         ],
-        "nextBefore": aware(events[-1].occurred_at).isoformat() if len(events) == 500 else None,
+        "nextBefore": aware(events[-1].occurred_at).isoformat() if len(events) == limit else None,
         "retentionDays": settings.audit_retention_days,
     }
 
