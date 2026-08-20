@@ -30,7 +30,6 @@ body {
   color: var(--ink);
   font-family: var(--font-geist-sans), "Segoe UI", sans-serif;
   font-size: 14px;
-  zoom: 1.2;
 }
 button,
 input,
@@ -51,6 +50,7 @@ textarea:focus-visible {
 
 .shell {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   grid-template-columns: 244px minmax(0, 1fr);
   background:
@@ -65,6 +65,7 @@ textarea:focus-visible {
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh;
   padding: 23px 14px 18px;
   border-right: 1px solid var(--line-soft);
   background: rgba(9, 16, 25, 0.93);
@@ -109,6 +110,10 @@ textarea:focus-visible {
 }
 .sidebar nav {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #263348 transparent;
 }
 .nav-heading {
   font-size: 9px;
@@ -186,6 +191,7 @@ textarea:focus-visible {
   border-radius: 9px;
   padding: 12px;
   margin: 8px 4px 15px;
+  flex-shrink: 0;
 }
 .security-title {
   display: flex;
@@ -228,6 +234,7 @@ textarea:focus-visible {
   border-top: 1px solid var(--line-soft);
   text-align: left;
   cursor: pointer;
+  flex-shrink: 0;
 }
 .profile-avatar {
   width: 30px;

@@ -194,6 +194,24 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(source, /const formElement = event\.currentTarget/);
 });
 
+test("job and audit action codes have readable labels", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /"file\.deliver": "Truyền file an toàn tới máy chủ"/);
+  assert.match(source, /"process\.list": "Đọc danh sách tiến trình"/);
+  assert.match(source, /jobActionLabel\(job\.action\)/);
+  assert.match(source, /auditActionLabel\(event\.action, event\.detail\)/);
+  assert.match(source, /auditActionLabel\(row\.action, row\.detail\)/);
+  assert.match(source, /action === "job\.succeeded"/);
+});
+
+test("dashboard shell fits the viewport without global zoom", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);
+  assert.match(styles, /\.shell\s*{[^}]*min-height:\s*100dvh/s);
+  assert.match(styles, /\.sidebar\s*{[^}]*height:\s*100dvh/s);
+  assert.match(styles, /\.sidebar nav\s*{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto/s);
+});
+
 test("MFA QR is CSP-compatible for every role", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const caddy = await readFile(new URL("../deploy/Caddyfile", import.meta.url), "utf8");

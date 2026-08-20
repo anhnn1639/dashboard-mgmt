@@ -82,6 +82,105 @@ const healthLabel: Record<Health, string> = {
   offline: "Mất kết nối",
 };
 
+const operationLabels: Record<string, string> = {
+  "inventory.collect": "Thu thập thông tin máy chủ",
+  "network.list": "Đọc cấu hình mạng",
+  "storage.list": "Đọc thông tin ổ đĩa",
+  "storage.create": "Tạo phân vùng hoặc volume",
+  "storage.extend": "Mở rộng phân vùng hoặc volume",
+  "storage.shrink": "Thu nhỏ phân vùng hoặc volume",
+  "storage.delete": "Xóa phân vùng hoặc volume",
+  "service.list": "Đọc danh sách dịch vụ",
+  "service.start": "Khởi động dịch vụ",
+  "service.stop": "Dừng dịch vụ",
+  "service.restart": "Khởi động lại dịch vụ",
+  "user.list": "Đọc danh sách người dùng",
+  "user.create": "Tạo người dùng trên máy chủ",
+  "user.update": "Cập nhật người dùng trên máy chủ",
+  "user.delete": "Xóa người dùng trên máy chủ",
+  "user.password.reset": "Đặt lại mật khẩu người dùng",
+  "user.enable": "Bật tài khoản người dùng",
+  "user.disable": "Vô hiệu hóa người dùng",
+  "user.add_group": "Thêm người dùng vào group",
+  "group.list": "Đọc danh sách group",
+  "group.create": "Tạo group trên máy chủ",
+  "group.delete": "Xóa group trên máy chủ",
+  "group.remove_user": "Gỡ người dùng khỏi group",
+  "firewall.list": "Đọc cấu hình firewall",
+  "firewall.rule.add": "Thêm rule firewall",
+  "firewall.rule.add.auto": "Thêm rule firewall tự nhận diện hệ điều hành",
+  "firewall.rule.remove": "Gỡ rule firewall",
+  "firewall.rule.reorder": "Đổi thứ tự rule firewall",
+  "process.list": "Đọc danh sách tiến trình",
+  "process.kill": "Dừng tiến trình",
+  "patch.scan": "Quét bản cập nhật",
+  "patch.install": "Cài bản cập nhật đã chọn",
+  "logs.read": "Đọc nhật ký hệ thống",
+  "logs.sources": "Đọc nguồn nhật ký",
+  "logs.sources.update": "Cập nhật nguồn nhật ký",
+  "file.deliver": "Truyền file an toàn tới máy chủ",
+  "system.reboot": "Khởi động lại máy chủ",
+  "job.create": "Tạo công việc",
+  "job.auto_refresh": "Tự động làm mới dữ liệu",
+  "job.interrupted.requeued": "Xếp hàng lại công việc bị gián đoạn",
+  "job.legacy_pending.cancelled": "Hủy công việc cũ chưa chạy",
+  "agent.enroll": "Đăng ký Agent",
+  "agent.package.create": "Tạo bộ cài Agent",
+  "agent.package.claim": "Kích hoạt bộ cài Agent",
+  "agent.package.os_mismatch": "Từ chối bộ cài sai hệ điều hành",
+  "agent.os_family.changed": "Cách ly Agent báo đổi hệ điều hành",
+  "agent.certificate.rotate": "Đổi chứng thư Agent",
+  "server.initial_scan.queued": "Xếp hàng quét máy chủ lần đầu",
+  "server.share.update": "Cập nhật chia sẻ máy chủ",
+  "server.delete": "Xóa máy chủ khỏi hệ thống",
+  "bulk_task.create": "Tạo công việc hàng loạt",
+  "identity.local.create": "Tạo tài khoản Local",
+  "identity.user.update": "Cập nhật tài khoản hệ thống",
+  "identity.user.delete": "Xóa tài khoản hệ thống",
+  "identity.user.groups": "Cập nhật group của tài khoản",
+  "identity.group.create": "Tạo group phân quyền",
+  "identity.group.update": "Cập nhật group phân quyền",
+  "identity.group.delete": "Xóa group phân quyền",
+  "identity.role.create": "Tạo role",
+  "identity.role.update": "Cập nhật role",
+  "identity.role.delete": "Xóa role",
+  "identity.ldap.users.sync": "Đồng bộ người dùng Active Directory",
+  "settings.ldap.update": "Cập nhật cấu hình LDAP",
+  "settings.recording_retention.update": "Cập nhật thời gian lưu recording",
+  "session.recording.view": "Xem lại recording",
+  "session.recording.delete.request": "Yêu cầu xóa recording",
+  "session.recording.delete.approve": "Duyệt xóa recording",
+  "session.recording.retention.pruned": "Tự động xóa recording hết hạn",
+  "session.tunnel.closed": "Đóng phiên truy cập từ xa",
+  "file.upload.clean": "File tải lên đã quét an toàn",
+  "file.upload.blocked": "Chặn file tải lên có mã độc",
+  "file.upload.scan_failed": "Quét file tải lên thất bại",
+  "file.download": "Agent tải file an toàn",
+  "file.download.expired": "Từ chối file đã hết hạn",
+  "file.download.decrypt_failed": "Giải mã file thất bại",
+  "file.payload.expired": "Xóa file truyền đã hết hạn",
+  "audit.retention.pruned": "Tự động xóa audit hết hạn",
+  "system.dashboard_url.update": "Cập nhật địa chỉ dashboard",
+  "system.setup.complete": "Hoàn tất thiết lập hệ thống",
+};
+
+function jobActionLabel(action: string) {
+  return operationLabels[action] ?? `Thao tác ${action.replaceAll(".", " / ")}`;
+}
+
+function auditActionLabel(action: string, detail: Record<string, unknown> = {}) {
+  const nestedAction = typeof detail.action === "string"
+    ? detail.action
+    : typeof detail.refresh_action === "string"
+      ? detail.refresh_action
+      : "";
+  if (action === "job.succeeded") return nestedAction ? `Hoàn tất: ${jobActionLabel(nestedAction)}` : "Công việc hoàn tất";
+  if (action === "job.failed") return nestedAction ? `Thất bại: ${jobActionLabel(nestedAction)}` : "Công việc thất bại";
+  if (action === "job.create" && nestedAction) return `Tạo công việc: ${jobActionLabel(nestedAction)}`;
+  if (action === "job.auto_refresh" && nestedAction) return `Làm mới sau thao tác: ${jobActionLabel(nestedAction)}`;
+  return operationLabels[action] ?? jobActionLabel(action);
+}
+
 function serverRoute(server: Server) {
   return `#/${server.osFamily}/${encodeURIComponent(server.name)}`;
 }
@@ -989,7 +1088,7 @@ export function OpsConsole() {
                         <button key={event.id} type="button" onClick={() => navigateSection("audit")}>
                           <span className={`overview-activity-result ${event.result || "success"}`} />
                           <span>
-                            <b>{event.action}</b>
+                            <b title={event.action}>{auditActionLabel(event.action, event.detail)}</b>
                             <small>{event.actor || "system"} · {event.target || "hệ thống"}</small>
                           </span>
                           <time>{new Date(event.occurredAt).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" })}</time>
@@ -3145,7 +3244,7 @@ function JobsView({ token }: { token: string }) {
           jobs.map((job) => (
             <div className="jobs-row" key={job.id}>
               <p>
-                <b>{job.action}</b>
+                <b title={job.action}>{jobActionLabel(job.action)}</b>
                 <small>{job.reason}</small>
               </p>
               <span>{job.serverId.slice(0, 8)}</span>
@@ -3507,7 +3606,7 @@ function AuditView({ token }: { token: string }) {
                       {new Date(row.occurredAt).toLocaleString("vi-VN")}
                     </time>
                     <b>{row.actor}</b>
-                    <code>{row.action}</code>
+                    <span title={row.action}>{auditActionLabel(row.action, row.detail)}</span>
                     <span>{row.target}</span>
                     <span className="audit-detail">{auditDetailText(row.detail) || "—"}</span>
                     <span
