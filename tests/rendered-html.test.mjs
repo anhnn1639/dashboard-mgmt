@@ -207,6 +207,9 @@ test("job and audit action codes have readable labels", async () => {
 test("dashboard shell fits the viewport without global zoom", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);
+  assert.match(styles, /--font-size-increase:\s*1\.5px/);
+  assert.doesNotMatch(styles, /font-size:\s*\d+px/);
+  assert.match(styles, /font-size:\s*calc\(14px \+ var\(--font-size-increase\)\)/);
   assert.match(styles, /\.shell\s*{[^}]*min-height:\s*100dvh/s);
   assert.match(styles, /\.sidebar\s*{[^}]*height:\s*100dvh/s);
   assert.match(styles, /\.sidebar nav\s*{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto/s);
