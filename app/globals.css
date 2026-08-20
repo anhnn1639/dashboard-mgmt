@@ -18,6 +18,28 @@
   --violet: #a681ff;
 }
 
+html[data-theme="light"] {
+  --ink: #162236;
+  --muted: #4c5e75;
+  --dim: #63738a;
+  --line: #c5d2df;
+  --line-soft: #dbe4ed;
+  --panel: #ffffff;
+  --panel-2: #f2f6fa;
+  --canvas: #eaf1f7;
+  --sidebar: #f7f9fc;
+  --blue: #1f67c9;
+  --green: #087f5b;
+  --amber: #a85f00;
+  --red: #c33243;
+  --violet: #7048c7;
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -360,6 +382,32 @@ textarea:focus-visible {
   align-items: center;
   gap: 9px;
 }
+.system-time {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 146px;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--muted);
+}
+.system-time > span:last-child {
+  display: grid;
+  gap: 1px;
+}
+.system-time b {
+  color: var(--ink);
+  font-family: var(--font-geist-mono);
+  font-size: calc(10px + var(--font-size-increase));
+  line-height: 1;
+}
+.system-time small {
+  color: var(--muted);
+  font-size: calc(7px + var(--font-size-increase));
+  white-space: nowrap;
+}
 .icon-button,
 .help {
   width: 32px;
@@ -395,6 +443,18 @@ textarea:focus-visible {
   border-radius: 50%;
   background: var(--green);
   box-shadow: 0 0 7px rgba(57, 213, 159, 0.75);
+}
+.now.warning i {
+  background: var(--amber);
+  box-shadow: 0 0 7px rgba(247, 185, 85, 0.7);
+}
+.now.critical i {
+  background: var(--red);
+  box-shadow: 0 0 7px rgba(255, 98, 110, 0.7);
+}
+.now.neutral i {
+  background: var(--dim);
+  box-shadow: none;
 }
 .content {
   padding: 30px clamp(22px, 3vw, 42px) 55px;
@@ -583,6 +643,11 @@ textarea:focus-visible {
   color: #657287;
   font-size: calc(9px + var(--font-size-increase));
 }
+.health-sampled-at {
+  color: var(--muted);
+  font-size: calc(8px + var(--font-size-increase));
+  white-space: nowrap;
+}
 .panel-head > button:not(.button) {
   border: 0;
   background: transparent;
@@ -597,25 +662,29 @@ textarea:focus-visible {
   height: 170px;
 }
 .donut {
-  --healthy: 280deg;
+  --healthy-end: 0deg;
+  --warning-end: 0deg;
   width: 132px;
   height: 132px;
   border-radius: 50%;
   background: conic-gradient(
-    var(--green) 0 var(--healthy),
-    var(--amber) var(--healthy) calc(var(--healthy) + 42deg),
-    #d94f5d calc(var(--healthy) + 42deg) 360deg
+    var(--green) 0 var(--healthy-end),
+    var(--amber) var(--healthy-end) var(--warning-end),
+    var(--red) var(--warning-end) 360deg
   );
   position: relative;
   display: grid;
   place-items: center;
   box-shadow: 0 0 30px rgba(57, 213, 159, 0.06);
 }
+.donut.empty {
+  background: var(--line);
+}
 .donut::after {
   content: "";
   position: absolute;
   inset: 9px;
-  background: #111a26;
+  background: var(--panel);
   border-radius: 50%;
 }
 .donut span {
@@ -5500,5 +5569,231 @@ textarea:focus-visible {
   .resource-subtabs button {
     flex: 1;
     min-width: 0;
+  }
+}
+
+/* Automatic light palette: the active theme is selected from the operator machine's local time. */
+html[data-theme="light"] body,
+html[data-theme="light"] .shell,
+html[data-theme="light"] .workspace,
+html[data-theme="light"] .content,
+html[data-theme="light"] .login-page,
+html[data-theme="light"] .setup-page,
+html[data-theme="light"] .auth-loading {
+  background: var(--canvas) !important;
+  color: var(--ink);
+}
+
+html[data-theme="light"] .shell {
+  background: radial-gradient(circle at 84% -20%, rgba(44, 112, 201, 0.1), transparent 33%), var(--canvas) !important;
+}
+
+html[data-theme="light"] .sidebar {
+  background: rgba(247, 249, 252, 0.96);
+  border-color: var(--line-soft);
+}
+
+html[data-theme="light"] .topbar {
+  background: rgba(255, 255, 255, 0.88);
+  border-color: var(--line-soft);
+}
+
+html[data-theme="light"] :where(
+  .stat-card,
+  .panel,
+  .drawer,
+  .server-workspace,
+  .access-workspace,
+  .modal,
+  .setup-card,
+  .login-card,
+  .system-unavailable,
+  .search-suggestions,
+  .server-action-form,
+  .secure-file-form,
+  .recording-player,
+  .package-security-note,
+  .storage-summary-grid > div,
+  .storage-tree,
+  .vg-card,
+  .resource-table-scroll,
+  .log-viewer,
+  .resource-modal,
+  .account-settings-section,
+  .bulk-update-list > label,
+  .log-source-list label
+) {
+  background: var(--panel) !important;
+  border-color: var(--line) !important;
+  color: var(--ink);
+  box-shadow: 0 10px 30px rgba(35, 63, 92, 0.07);
+}
+
+html[data-theme="light"] :where(
+  .search,
+  .filters,
+  .server-table th,
+  .firewall-table th,
+  .inventory-row.head,
+  .audit-row.head,
+  .role-editor-head > span,
+  .permission-summary span,
+  .firewall-rule-preview,
+  .firewall-add-actions,
+  .firewall-delete-list,
+  .firewall-reorder-preview,
+  .command-palette,
+  .search-suggestions button:hover,
+  .fact-grid > div,
+  .audit-tabs,
+  .recording-player header,
+  .recording-player footer,
+  .package-option,
+  .login-tabs,
+  .resource-search,
+  .storage-tree-row.head,
+  .storage-tree-row.disk-row,
+  .storage-disk-layout > div,
+  .resource-table th,
+  .resource-subtabs,
+  .update-detail-row td,
+  .update-scan-status dl > div,
+  .resource-modal-footer,
+  .account-identity-summary > div,
+  .bulk-update-steps span
+) {
+  background: var(--panel-2) !important;
+  border-color: var(--line) !important;
+  color: var(--ink);
+}
+
+html[data-theme="light"] :where(
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea,
+  .button:not(.primary):not(.danger),
+  .icon-button,
+  .help,
+  .firewall-icon-button,
+  .resource-icon-button,
+  .quick-actions button,
+  .inline-actions button,
+  .drawer-actions button,
+  .job-controls button
+) {
+  background: var(--panel-2) !important;
+  border-color: var(--line) !important;
+  color: var(--ink) !important;
+}
+
+html[data-theme="light"] :where(
+  h1,
+  h2,
+  h3,
+  h4,
+  legend,
+  .brand b,
+  .profile b,
+  .server-name strong,
+  .cell-main,
+  .jobs-row b,
+  .audit-row b,
+  .resource-table td b,
+  .health-legend span,
+  .health-legend b,
+  .donut b
+) {
+  color: var(--ink) !important;
+}
+
+html[data-theme="light"] :where(
+  .page-head p,
+  .panel-head p,
+  .stat-card > p,
+  .health-legend small,
+  .donut small,
+  .activity-list small,
+  .activity-list time,
+  .server-table td,
+  .server-table small,
+  .resource-table td,
+  .resource-table small,
+  .access-note,
+  .profile small,
+  .nav-heading
+) {
+  color: var(--muted) !important;
+}
+
+html[data-theme="light"] .sidebar nav button {
+  color: var(--muted);
+}
+
+html[data-theme="light"] .sidebar nav button:hover,
+html[data-theme="light"] .sidebar nav button.active {
+  color: var(--ink);
+  background: rgba(31, 103, 201, 0.1);
+}
+
+html[data-theme="light"] .sidebar nav em,
+html[data-theme="light"] .update-count,
+html[data-theme="light"] .tag {
+  background: #e1eaf3;
+  color: #42556d;
+}
+
+html[data-theme="light"] .security-card {
+  background: #eaf7f2;
+  border-color: #a9d5c5;
+}
+
+html[data-theme="light"] .security-title,
+html[data-theme="light"] .security-card p,
+html[data-theme="light"] .security-card > div:last-child {
+  color: #276b57;
+}
+
+html[data-theme="light"] .filters button.active,
+html[data-theme="light"] .audit-tabs button.active,
+html[data-theme="light"] .login-tabs button.active,
+html[data-theme="light"] .resource-subtabs button.active,
+html[data-theme="light"] .role-manager > aside button.active {
+  background: #dce9f7 !important;
+  color: #174f94 !important;
+  border-color: #a9c3df !important;
+}
+
+html[data-theme="light"] :where(.server-table td, .audit-row, .jobs-row, .resource-table td, .storage-tree-row) {
+  border-color: var(--line-soft) !important;
+}
+
+html[data-theme="light"] :where(.button.primary, .button.danger, .server-delete-button, .brand-mark) {
+  color: #ffffff !important;
+}
+
+html[data-theme="light"] :where(.modal-backdrop, .firewall-add-backdrop, .command-backdrop, .recording-backdrop, .resource-modal-backdrop) {
+  background: rgba(15, 23, 42, 0.46) !important;
+}
+
+html[data-theme="light"] ::placeholder {
+  color: #6a7a8e !important;
+  opacity: 1;
+}
+
+@media (max-width: 1050px) {
+  .system-time small {
+    display: none;
+  }
+  .system-time {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .system-time {
+    padding-inline: 7px;
+  }
+  .system-time > span:first-child {
+    display: none;
   }
 }

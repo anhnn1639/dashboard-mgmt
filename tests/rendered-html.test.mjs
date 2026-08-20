@@ -245,6 +245,28 @@ test("job and audit action codes have readable labels", async () => {
   assert.match(source, /action === "job\.succeeded"/);
 });
 
+test("overview health chart uses live fleet percentages and the operator system theme", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(source, /function healthPercentages/);
+  assert.match(source, /healthyCount = servers\.filter/);
+  assert.match(source, /warningCount = servers\.filter/);
+  assert.match(source, /criticalCount = servers\.filter/);
+  assert.match(source, /--healthy-end/);
+  assert.match(source, /--warning-end/);
+  assert.match(source, /Dữ liệu hiện tại từ Agent và PostgreSQL/);
+  assert.match(source, /Cập nhật \{systemClock\}/);
+  assert.doesNotMatch(source, />24 giờ/);
+  assert.doesNotMatch(source, />7 ngày</);
+  assert.doesNotMatch(source, /aria-label="Thông báo"/);
+  assert.doesNotMatch(source, /className="help"/);
+  assert.match(source, /themeForSystemTime/);
+  assert.match(source, /document\.documentElement\.dataset\.theme = nextTheme/);
+  assert.match(styles, /html\[data-theme="light"\]/);
+  assert.match(styles, /\.donut\s*{[^}]*--healthy-end:[^}]*--warning-end:/s);
+  assert.match(styles, /\.donut\.empty\s*{[^}]*background:\s*var\(--line\)/s);
+});
+
 test("dashboard shell fits the viewport without global zoom", async () => {
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.doesNotMatch(styles, /body\s*{[^}]*zoom:/s);

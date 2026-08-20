@@ -6,6 +6,7 @@ import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab,
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
+type SystemTheme = "light" | "dark";
 
 type SetupStatus = {
   setupRequired: boolean;
@@ -99,6 +100,24 @@ const healthLabel: Record<Health, string> = {
   critical: "Nguy cấp",
   offline: "Mất kết nối",
 };
+
+function themeForSystemTime(value: Date): SystemTheme {
+  const hour = value.getHours();
+  return hour >= 6 && hour < 18 ? "light" : "dark";
+}
+
+function healthPercentages(counts: readonly number[]): number[] {
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (!total) return counts.map(() => 0);
+  const exact = counts.map((count) => (count / total) * 100);
+  const percentages = exact.map(Math.floor);
+  const remainder = 100 - percentages.reduce((sum, value) => sum + value, 0);
+  const order = exact
+    .map((value, index) => ({ index, fraction: value - percentages[index] }))
+    .sort((left, right) => right.fraction - left.fraction || left.index - right.index);
+  for (let index = 0; index < remainder; index += 1) percentages[order[index].index] += 1;
+  return percentages;
+}
 
 const operationLabels: Record<string, string> = {
   "inventory.collect": "Thu thập thông tin máy chủ",
@@ -494,7 +513,22 @@ export function OpsConsole() {
   const [recentAuditError, setRecentAuditError] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(244);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [systemClock, setSystemClock] = useState("--:--:--");
+  const [systemTheme, setSystemTheme] = useState<SystemTheme>("dark");
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    const updateSystemAppearance = () => {
+      const current = new Date();
+      const nextTheme = themeForSystemTime(current);
+      setSystemClock(current.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }));
+      setSystemTheme(nextTheme);
+      document.documentElement.dataset.theme = nextTheme;
+    };
+    updateSystemAppearance();
+    const timer = window.setInterval(updateSystemAppearance, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   function clampSidebarWidth(width: number) {
     return Math.min(420, Math.max(190, Math.round(width)));
@@ -746,6 +780,17 @@ export function OpsConsole() {
     : 0;
   const warnings = servers.reduce((sum, s) => sum + s.alerts, 0);
   const updates = servers.reduce((sum, s) => sum + s.updates, 0);
+  const healthyCount = servers.filter((server) => server.health === "healthy").length;
+  const warningCount = servers.filter((server) => server.health === "warning").length;
+  const criticalCount = servers.filter((server) => ["critical", "offline"].includes(server.health)).length;
+  const [healthyPercent, warningPercent, criticalPercent] = healthPercentages([healthyCount, warningCount, criticalCount]);
+  const healthStatus = criticalCount
+    ? `${criticalCount} máy cần xử lý ngay`
+    : warningCount
+      ? `${warningCount} máy cần theo dõi`
+      : servers.length
+        ? "Hệ thống ổn định"
+        : "Chưa có máy chủ";
   const navCount = (id: string, fallback?: number) =>
     id === "linux"
       ? servers.filter((server) => server.osFamily === "linux").length
@@ -988,13 +1033,13 @@ export function OpsConsole() {
             )}
           </div>
           <div className="top-actions">
-            <button className="icon-button" aria-label="Thông báo">
-              ♢<span className="notification-dot" />
-            </button>
-            <button className="help">?</button>
-            <span className="now">
+            <span className="system-time" title="Tự động dùng giao diện sáng từ 06:00 đến 17:59 theo giờ máy quản trị">
+              <span aria-hidden="true">{systemTheme === "light" ? "☀" : "◐"}</span>
+              <span><b>{systemClock}</b><small>Giờ hệ thống · giao diện {systemTheme === "light" ? "sáng" : "tối"}</small></span>
+            </span>
+            <span className={`now ${criticalCount ? "critical" : warningCount ? "warning" : servers.length ? "healthy" : "neutral"}`}>
               <i />
-              Hệ thống ổn định
+              {healthStatus}
             </span>
           </div>
         </header>
@@ -1062,7 +1107,7 @@ export function OpsConsole() {
                 <article className="stat-card">
                   <div className="stat-top">
                     <span className="stat-icon violet">↥</span>
-                    <span className="delta">7 ngày</span>
+                    <span className="delta">Hiện tại</span>
                   </div>
                   <strong>{updates}</strong>
                   <h3>Bản vá chờ cài</h3>
@@ -1078,22 +1123,25 @@ export function OpsConsole() {
                   <div className="panel-head">
                     <div>
                       <h2>Sức khỏe hạ tầng</h2>
-                      <p>Trạng thái 24 giờ gần nhất</p>
+                      <p>Dữ liệu hiện tại từ Agent và PostgreSQL</p>
                     </div>
-                    <button>24 giờ⌄</button>
+                    <span className="health-sampled-at">Cập nhật {systemClock}</span>
                   </div>
                   <div className="health-chart">
                     <div
-                      className="donut"
+                      className={`donut${servers.length ? "" : " empty"}`}
+                      role="img"
+                      aria-label={`Ổn định ${healthyPercent}%, cảnh báo ${warningPercent}%, nguy cấp hoặc mất kết nối ${criticalPercent}%`}
                       style={
                         {
-                          "--healthy": `${availability * 3.6}deg`,
+                          "--healthy-end": `${healthyPercent * 3.6}deg`,
+                          "--warning-end": `${(healthyPercent + warningPercent) * 3.6}deg`,
                         } as React.CSSProperties
                       }
                     >
                       <span>
-                        <b>{availability}%</b>
-                        <small>khả dụng</small>
+                        <b>{servers.length}</b>
+                        <small>máy chủ</small>
                       </span>
                     </div>
                     <div className="health-legend">
@@ -1101,39 +1149,23 @@ export function OpsConsole() {
                         <i className="green-bg" />
                         <span>
                           Ổn định
-                          <small>
-                            {
-                              servers.filter((s) => s.health === "healthy")
-                                .length
-                            }{" "}
-                            máy chủ
-                          </small>
+                          <small>{healthyCount} máy chủ</small>
                         </span>
-                        <b>
-                          {servers.filter((s) => s.health === "healthy").length}
-                        </b>
+                        <b>{healthyPercent}%</b>
                       </div>
                       <div>
                         <i className="amber-bg" />
                         <span>
-                          Cảnh báo<small>Cần theo dõi</small>
+                          Cảnh báo<small>{warningCount} máy chủ cần theo dõi</small>
                         </span>
-                        <b>
-                          {servers.filter((s) => s.health === "warning").length}
-                        </b>
+                        <b>{warningPercent}%</b>
                       </div>
                       <div>
                         <i className="red-bg" />
                         <span>
-                          Nguy cấp / Offline<small>Cần xử lý ngay</small>
+                          Nguy cấp / Mất kết nối<small>{criticalCount} máy chủ cần xử lý ngay</small>
                         </span>
-                        <b>
-                          {
-                            servers.filter((s) =>
-                              ["critical", "offline"].includes(s.health),
-                            ).length
-                          }
-                        </b>
+                        <b>{criticalPercent}%</b>
                       </div>
                     </div>
                   </div>
