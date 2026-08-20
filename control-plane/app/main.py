@@ -114,8 +114,7 @@ def read_release_version() -> str:
 
 RELEASE_VERSION = read_release_version()
 AGENT_SERVER_CA_UNAVAILABLE = (
-    "CA TLS của kênh Agent chưa sẵn sàng; hãy kiểm tra dịch vụ "
-    "caddy-ca-export rồi triển khai lại API."
+    "Chứng thư bảo mật của kênh Agent chưa sẵn sàng; hãy đồng bộ lại dịch vụ bảo mật và thử lại."
 )
 
 
@@ -1196,7 +1195,7 @@ def database_state() -> dict[str, Any]:
 def db_session():
     factory = SessionLocal
     if factory is None:
-        raise HTTPException(status_code=503, detail="Database setup is required")
+        raise HTTPException(status_code=503, detail="System setup is required")
     session = factory()
     try:
         yield session
@@ -1838,7 +1837,7 @@ def sign_agent_csr(csr_pem: str, agent_id: str) -> tuple[str, str, datetime]:
 def encrypt_guacamole_json(payload: dict[str, Any]) -> str:
     key_hex = settings.guacamole_json_secret
     if not re.fullmatch(r"[0-9a-fA-F]{32}", key_hex):
-        raise HTTPException(status_code=503, detail="Guacamole JSON secret is not configured")
+        raise HTTPException(status_code=503, detail="Dịch vụ truy cập từ xa chưa sẵn sàng")
     key = bytes.fromhex(key_hex)
     body = json.dumps(payload, separators=(",", ":")).encode()
     signed = hmac.new(key, body, hashlib.sha256).digest() + body
@@ -2125,7 +2124,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
                     admin = User(username=payload.admin.username, display_name=payload.admin.display_name, password_hash=password_hasher.hash(payload.admin.password), role="admin")
                     db.add(admin)
             db.merge(SystemSetting(key="dashboard_url", value=payload.dashboard_url))
-            audit(db, payload.admin.username, "system.setup.complete", "control-plane", request, detail={"dashboard_url": payload.dashboard_url})
+            audit(db, payload.admin.username, "system.setup.complete", "system", request, detail={"dashboard_url": payload.dashboard_url})
             db.commit()
         save_bootstrap_config(database_url, jwt_secret, job_secret_key)
         settings.jwt_secret = jwt_secret
@@ -2142,7 +2141,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Không thể kết nối hoặc khởi tạo PostgreSQL. Hãy kiểm tra máy chủ, database, tài khoản và chế độ SSL.") from exc
+        raise HTTPException(status_code=400, detail="Không thể kết nối hoặc khởi tạo kho dữ liệu. Hãy kiểm tra máy chủ, tên kho, tài khoản và chế độ SSL.") from exc
     return {"status": "ready", "dashboardUrl": payload.dashboard_url, "adminUsername": payload.admin.username}
 
 
@@ -2996,7 +2995,7 @@ def issue_agent_identity(
     try:
         agent_ca_certificate = Path(settings.agent_ca_cert).read_text(encoding="utf-8")
     except OSError as exc:
-        raise HTTPException(status_code=503, detail="Control-plane PKI is unavailable; restart Caddy/API and retry enrollment") from exc
+        raise HTTPException(status_code=503, detail="Kênh bảo mật Agent chưa sẵn sàng; hãy đồng bộ chứng thư dịch vụ và thử lại") from exc
     replacing_certificate = bool(existing and existing.cert_fingerprint)
     remote_protocol = "rdp" if family == "windows" else "ssh"
     server = existing or Server(id=agent_id, name=inventory.hostname, os_family=family, os_name=inventory.os_name)
@@ -3076,7 +3075,7 @@ def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, u
     if previous and previous != payload.dashboard_url and has_agents and not payload.confirm_existing_agents:
         raise HTTPException(status_code=409, detail="Existing agents keep their old endpoint; confirm the domain change after planning their migration")
     db.merge(SystemSetting(key="dashboard_url", value=payload.dashboard_url))
-    audit(db, user.username, "system.dashboard_url.update", "control-plane", request, detail={"previous": previous, "dashboard_url": payload.dashboard_url, "existing_agents": has_agents})
+    audit(db, user.username, "system.dashboard_url.update", "system", request, detail={"previous": previous, "dashboard_url": payload.dashboard_url, "existing_agents": has_agents})
     db.commit()
     return {"dashboardUrl": payload.dashboard_url, "existingAgentsNeedMigration": bool(has_agents and previous != payload.dashboard_url)}
 
@@ -3196,7 +3195,7 @@ def agent_server_ca():
 def authenticate_agent_websocket(websocket: WebSocket, agent_id: str) -> Server:
     factory = SessionLocal
     if factory is None:
-        raise HTTPException(status_code=503, detail="Database setup is required")
+        raise HTTPException(status_code=503, detail="System setup is required")
     with factory() as db:
         return verify_agent_identity(websocket.headers, "GET", websocket.url.path, db, agent_id, b"")
 
@@ -3244,7 +3243,7 @@ async def agent_tunnel_stream(websocket: WebSocket, session_id: str, agent_id: s
 def stream_file_transfer_chunks(transfer_id: str):
     factory = SessionLocal
     if factory is None:
-        raise RuntimeError("Database setup is required")
+        raise RuntimeError("System setup is required")
     with factory() as stream_db:
         transfer = stream_db.get(FileTransfer, transfer_id)
         if not transfer or transfer.nonce != "chunks-v1":
@@ -3370,7 +3369,7 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
     dispatched_by_id = {job.id: job for job in dispatched}
     for active_job_id in active_job_ids:
         if active_job_id not in dispatched_by_id:
-            raise HTTPException(status_code=409, detail="Agent active job does not match control-plane state")
+            raise HTTPException(status_code=409, detail="Agent active job does not match system state")
     for job in dispatched:
         if job.id in active_job_ids:
             continue

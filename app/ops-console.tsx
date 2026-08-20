@@ -119,6 +119,35 @@ function healthPercentages(counts: readonly number[]): number[] {
   return percentages;
 }
 
+function normalizeSearchText(value: unknown) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[đĐ]/g, "d")
+    .toLocaleLowerCase("vi-VN")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const auditResultLabels: Record<string, string> = {
+  success: "Thành công",
+  denied: "Bị từ chối",
+  failed: "Thất bại",
+  partial: "Một phần",
+  cancelled: "Đã hủy",
+};
+
+const hiddenAuditDetailKeys = new Set([
+  "backend",
+  "database",
+  "database_url",
+  "delivery",
+  "framework",
+  "reverse_proxy",
+  "scanner",
+  "storage",
+]);
+
 const operationLabels: Record<string, string> = {
   "inventory.collect": "Thu thập thông tin máy chủ",
   "network.list": "Đọc cấu hình mạng",
@@ -221,6 +250,10 @@ function auditActionLabel(action: string, detail: Record<string, unknown> = {}) 
   if (action === "job.create" && nestedAction) return `Tạo công việc: ${jobActionLabel(nestedAction)}`;
   if (action === "job.auto_refresh" && nestedAction) return `Làm mới sau thao tác: ${jobActionLabel(nestedAction)}`;
   return operationLabels[action] ?? jobActionLabel(action);
+}
+
+function auditTargetLabel(target: string) {
+  return String(target ?? "").trim().toLocaleLowerCase("en-US") === "control-plane" ? "hệ thống" : target;
 }
 
 function serverRoute(server: Server) {
@@ -526,7 +559,7 @@ export function OpsConsole() {
       document.documentElement.dataset.theme = nextTheme;
     };
     updateSystemAppearance();
-    const timer = window.setInterval(updateSystemAppearance, 30_000);
+    const timer = window.setInterval(updateSystemAppearance, 1_000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -609,7 +642,7 @@ export function OpsConsole() {
       .then((response) =>
         response.ok
           ? response.json()
-          : Promise.reject(new Error("Control plane chưa sẵn sàng")),
+          : Promise.reject(new Error("Dịch vụ vận hành chưa sẵn sàng")),
       )
       .then((data: SetupStatus) => {
         if (mounted) setSetupStatus(data);
@@ -961,7 +994,7 @@ export function OpsConsole() {
             <span>◆</span>
             <b>Kết nối được bảo vệ</b>
           </div>
-          <p>Agent mTLS · TLS 1.3</p>
+          <p>Kênh quản trị · TLS 1.3</p>
           <div>
             <i />
             CA nội bộ hoạt động
@@ -1033,7 +1066,7 @@ export function OpsConsole() {
             )}
           </div>
           <div className="top-actions">
-            <span className="system-time" title="Tự động dùng giao diện sáng từ 06:00 đến 17:59 theo giờ máy quản trị">
+            <span className="system-time" role="timer" aria-label={`Giờ hệ thống ${systemClock}`} title="Đồng hồ hệ thống · tự động dùng giao diện sáng từ 06:00 đến 17:59 theo giờ máy quản trị">
               <span aria-hidden="true">{systemTheme === "light" ? "☀" : "◐"}</span>
               <span><b>{systemClock}</b><small>Giờ hệ thống · giao diện {systemTheme === "light" ? "sáng" : "tối"}</small></span>
             </span>
@@ -1047,7 +1080,7 @@ export function OpsConsole() {
         <div className="content">
           {!selected && <div className="page-head">
             <div>
-              <p className="eyebrow">CONTROL PLANE · AP-SOUTHEAST</p>
+              <p className="eyebrow">TRẠM VẬN HÀNH · AP-SOUTHEAST</p>
               <h1>{title}</h1>
               <p>
                 Giám sát, truy cập và thực thi tác vụ an toàn trên toàn bộ máy
@@ -1071,7 +1104,7 @@ export function OpsConsole() {
                 <article className="stat-card">
                   <div className="stat-top">
                     <span className="stat-icon blue">▦</span>
-                    <span className="delta good">PostgreSQL</span>
+                    <span className="delta good">Đang quản lý</span>
                   </div>
                   <strong>{servers.length}</strong>
                   <h3>Tổng máy chủ</h3>
@@ -1123,7 +1156,7 @@ export function OpsConsole() {
                   <div className="panel-head">
                     <div>
                       <h2>Sức khỏe hạ tầng</h2>
-                      <p>Dữ liệu hiện tại từ Agent và PostgreSQL</p>
+                      <p>Trạng thái hiện tại của toàn bộ máy chủ</p>
                     </div>
                     <span className="health-sampled-at">Cập nhật {systemClock}</span>
                   </div>
@@ -1174,7 +1207,7 @@ export function OpsConsole() {
                   <div className="panel-head">
                     <div>
                       <h2>Hoạt động gần đây</h2>
-                      <p>Dữ liệu audit từ PostgreSQL</p>
+                      <p>Các thao tác mới nhất trong hệ thống</p>
                     </div>
                     {currentUser.permissions.includes("audit.view") && (
                       <button onClick={() => navigateSection("audit")}>
@@ -1200,7 +1233,7 @@ export function OpsConsole() {
                           <span className={`overview-activity-result ${event.result || "success"}`} />
                           <span>
                             <b title={event.action}>{auditActionLabel(event.action, event.detail)}</b>
-                            <small>{event.actor || "system"} · {event.target || "hệ thống"}</small>
+                            <small>{event.actor || "system"} · {auditTargetLabel(event.target) || "hệ thống"}</small>
                           </span>
                           <time>{new Date(event.occurredAt).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" })}</time>
                         </button>
@@ -1665,13 +1698,13 @@ function BulkTaskModal({
   if (result) {
     return <ModalShell
       title="Task chung đã được tạo"
-      subtitle={`Mã ${result.id.slice(0, 8)} · ${result.targetCount} job được lưu trong PostgreSQL`}
+      subtitle={`Mã ${result.id.slice(0, 8)} · ${result.targetCount} công việc đã được ghi nhận`}
       close={close}
       className="bulk-task-modal"
       footer={<><button type="button" className="button ghost" onClick={close}>Đóng</button><button type="button" className="button primary" onClick={openJobs}>Xem công việc</button></>}
     >
       <div className="bulk-task-result">
-        <div className="resource-help">Mỗi máy chủ nhận một job riêng qua Agent mTLS. Máy offline giữ trạng thái chờ và sẽ nhận job khi kết nối lại.</div>
+        <div className="resource-help">Mỗi máy chủ nhận một công việc riêng. Máy đang mất kết nối sẽ giữ trạng thái chờ và tiếp tục khi kết nối lại.</div>
         <div className="bulk-target-list">{result.items.map((item) => <div key={item.jobId}><span><b>{item.serverName}</b><small>Job {item.jobId.slice(0, 8)}</small></span><em>{item.status === "queued" ? "Đang chờ Agent" : item.status}</em></div>)}</div>
       </div>
     </ModalShell>;
@@ -1749,9 +1782,9 @@ function SystemUnavailable({ message }: { message: string }) {
       <div className="login-glow" />
       <section className="system-unavailable">
         <span className="setup-state-icon">!</span>
-        <p className="login-eyebrow">CONTROL PLANE OFFLINE</p>
+        <p className="login-eyebrow">HỆ THỐNG TẠM GIÁN ĐOẠN</p>
         <h1>Không thể kiểm tra cấu hình</h1>
-        <p>{message}. Hãy kiểm tra API control plane rồi tải lại trang.</p>
+        <p>{message}. Hãy kiểm tra dịch vụ vận hành rồi tải lại trang.</p>
         <button
           className="button primary"
           onClick={() => window.location.reload()}
@@ -1842,18 +1875,18 @@ function SetupScreen({
       </header>
       <div className="setup-layout">
         <aside className="setup-intro">
-          <p className="login-eyebrow">SECURE CONTROL PLANE</p>
+          <p className="login-eyebrow">THIẾT LẬP AN TOÀN</p>
           <h1>Khởi tạo trung tâm vận hành</h1>
           <p>
-            Kết nối PostgreSQL, tạo quản trị viên local đầu tiên và xác lập địa
-            chỉ chính thức cho dashboard.
+            Kết nối kho dữ liệu, tạo quản trị viên local đầu tiên và xác lập địa
+            chỉ chính thức cho Trạm vận hành.
           </p>
           <ol className="setup-steps">
             <li className="active">
               <span>01</span>
               <div>
-                <b>PostgreSQL</b>
-                <small>Kết nối và khởi tạo schema</small>
+                <b>Kho dữ liệu</b>
+                <small>Kết nối và kiểm tra quyền lưu trữ</small>
               </div>
             </li>
             <li className="active">
@@ -1866,18 +1899,18 @@ function SetupScreen({
             <li className="active">
               <span>03</span>
               <div>
-                <b>Địa chỉ dashboard</b>
-                <small>URL chuẩn dùng bởi agent và gateway</small>
+                <b>Địa chỉ truy cập</b>
+                <small>URL chính thức của Trạm vận hành</small>
               </div>
             </li>
           </ol>
           <div className="setup-note">
             <span>◆</span>
             <p>
-              <b>Dữ liệu tập trung trong PostgreSQL</b>
+              <b>Dữ liệu vận hành được bảo vệ</b>
               <small>
-                Tài khoản, máy chủ, tác vụ, cấu hình và audit được lưu bền vững.
-                Khóa mã hóa được giữ tách biệt trong volume bảo mật.
+                Tài khoản, máy chủ, tác vụ, cấu hình và nhật ký được lưu bền vững
+                và chỉ truy cập theo quyền được cấp.
               </small>
             </p>
           </div>
@@ -1893,7 +1926,7 @@ function SetupScreen({
               className={`connection-state ${status.databaseConnected ? "connected" : ""}`}
             >
               <i />
-              {status.databaseConnected ? "Đã kết nối" : "Chưa kết nối DB"}
+              {status.databaseConnected ? "Đã kết nối" : "Chưa kết nối"}
             </div>
           </div>
 
@@ -1901,32 +1934,19 @@ function SetupScreen({
             <legend>
               <span>01</span>
               <div>
-                <b>Kết nối PostgreSQL</b>
+                <b>Kết nối kho dữ liệu</b>
                 <small>
-                  Database cần tồn tại và tài khoản phải có quyền tạo bảng.
+                  Kho dữ liệu cần tồn tại và tài khoản phải có quyền khởi tạo.
                 </small>
               </div>
             </legend>
-            <div className="postgres-help">
-              <b>Thông tin bản test dùng PostgreSQL trong Docker</b>
-              <span>
-                Máy chủ: <code>postgres</code> · Cổng: <code>5432</code> ·
-                Database: <code>tramops</code> · Tài khoản: <code>tramops</code>{" "}
-                · SSL: <code>Ưu tiên SSL</code>
-              </span>
-              <small>
-                Mật khẩu là giá trị POSTGRES_PASSWORD trong file
-                /home/ubuntu/dashboard-mgmt/.env trên server.
-              </small>
-            </div>
             <div className="setup-grid three">
               <label>
                 Máy chủ
                 <input
                   name="db_host"
-                  defaultValue="postgres"
                   required
-                  placeholder="postgres.example.internal"
+                  placeholder="data.internal"
                   autoComplete="off"
                 />
               </label>
@@ -1937,7 +1957,7 @@ function SetupScreen({
                   type="number"
                   min="1"
                   max="65535"
-                  defaultValue="5432"
+                  placeholder="Nhập cổng"
                   required
                 />
               </label>
@@ -1954,26 +1974,24 @@ function SetupScreen({
             </div>
             <div className="setup-grid">
               <label>
-                Tên database
+                Tên kho dữ liệu
                 <input
                   name="db_name"
-                  defaultValue="tramops"
                   required
                   autoComplete="off"
                 />
               </label>
               <label>
-                Tài khoản database
+                Tài khoản kết nối
                 <input
                   name="db_username"
-                  defaultValue="tramops"
                   required
                   autoComplete="username"
                 />
               </label>
             </div>
             <label>
-              Mật khẩu database
+              Mật khẩu kết nối
               <input
                 name="db_password"
                 type="password"
@@ -2089,8 +2107,7 @@ function SetupScreen({
           )}
           <div className="setup-actions">
             <p>
-              <span>◆</span> Mật khẩu database không được gửi về trình duyệt sau
-              khi lưu.
+              <span>◆</span> Thông tin bí mật không được hiển thị lại sau khi lưu.
             </p>
             <button className="button primary" disabled={busy}>
               {busy
@@ -2251,7 +2268,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
             <small>VẬN HÀNH</small>
           </div>
         </div>
-        <p className="login-eyebrow">SECURE CONTROL PLANE</p>
+        <p className="login-eyebrow">TRUY CẬP AN TOÀN</p>
         <h1>Đăng nhập hệ thống</h1>
         <div className="login-tabs">
           <button
@@ -2271,7 +2288,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
         </div>
         <p className="login-copy">
           {source === "local"
-            ? "Tài khoản quản trị được lưu trong PostgreSQL."
+            ? "Đăng nhập bằng tài khoản Local của Trạm vận hành."
             : "Xác thực bằng tài khoản LDAP/Active Directory của doanh nghiệp."}
         </p>
         <label>
@@ -2795,7 +2812,7 @@ function ServerDrawer({
             <span>↗</span>
             <b>{server.osFamily === "windows" ? "Remote Desktop" : "Mở SSH"}</b>
             <small>
-              {server.tunnelOnline ? "Tunnel mTLS 9443 sẵn sàng" : "Tunnel agent đang offline"}
+              {server.tunnelOnline ? "Kênh truy cập an toàn sẵn sàng" : "Máy chủ đang mất kết nối"}
             </small>
           </button>
           <button
@@ -2878,7 +2895,7 @@ function ServerDrawer({
             <div>
               <dt>Agent</dt>
               <dd>
-                v{server.agentVersion} · mTLS · {server.tunnelOnline ? "tunnel online" : "tunnel offline"}
+                v{server.agentVersion} · {server.tunnelOnline ? "kết nối an toàn" : "mất kết nối"}
               </dd>
             </div>
           </dl>
@@ -2890,7 +2907,7 @@ function ServerDrawer({
               {activeTab === "firewall" && <div className="server-tab-toolbar">
                 <div>
                   <h2>{serverTabs.find((tab) => tab.id === activeTab)?.label}</h2>
-                  <p>Dữ liệu thật từ Agent và lịch sử tác vụ trong PostgreSQL.</p>
+                  <p>Thông tin được cập nhật trực tiếp từ máy chủ đang quản trị.</p>
                 </div>
                 <div className="firewall-toolbar-actions">
                   <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
@@ -3071,9 +3088,8 @@ function ServerDrawer({
             <div className="warning-box">
               <b>Không đi qua SFTP, RDP drive hoặc clipboard</b>
               <p>
-                File tối đa 1 GiB, được quét ClamAV trước khi mã hóa lưu trong PostgreSQL,
-                sau đó được xếp hàng trực tiếp và quét lại bằng Defender/ClamAV tại máy đích. Agent
-                không tự chạy file và không ghi đè file đã có.
+                File tối đa 1 GiB, được kiểm tra an toàn trước khi truyền và được quét lại tại máy đích.
+                Hệ thống không tự chạy file và không ghi đè file đã có.
               </p>
             </div>
             <button className="button primary" disabled={fileBusy || !server.tunnelOnline}>
@@ -3399,8 +3415,7 @@ function SessionsView({ token }: { token: string }) {
         <div>
           <h2>Lịch sử phiên truy cập</h2>
           <p>
-            Mọi phiên được lưu trong PostgreSQL và gắn với danh tính người vận
-            hành.
+            Mọi phiên đều được ghi nhận và gắn với danh tính người vận hành.
           </p>
         </div>
         <span className="live-pill">
@@ -3429,7 +3444,7 @@ function SessionsView({ token }: { token: string }) {
           ))
         ) : (
           <div className="empty-state">
-            Chưa có phiên truy cập nào trong database.
+            Chưa có phiên truy cập nào.
           </div>
         )}
       </div>
@@ -3439,6 +3454,7 @@ function SessionsView({ token }: { token: string }) {
 
 function JobsView({ token, servers }: { token: string; servers: Server[] }) {
   const [jobs, setJobs] = useState<JobListRow[]>([]);
+  const [jobSearch, setJobSearch] = useState("");
   const serversById = useMemo(() => new Map(servers.map((server) => [server.id, server])), [servers]);
   const serverIdentity = (job: JobListRow) => {
     const currentServer = serversById.get(job.serverId);
@@ -3461,15 +3477,43 @@ function JobsView({ token, servers }: { token: string; servers: Server[] }) {
       succeeded: "Hoàn tất",
       failed: "Thất bại",
     })[status] ?? status;
+  const normalizedJobSearch = normalizeSearchText(jobSearch);
+  const visibleJobs = normalizedJobSearch
+    ? jobs.filter((job) => {
+        const identity = serverIdentity(job);
+        return normalizeSearchText([
+          jobActionLabel(job.action),
+          job.action,
+          job.reason,
+          identity.hostname,
+          identity.address,
+          job.risk,
+          statusLabel(job.status),
+          job.status,
+          new Date(job.createdAt).toLocaleString("vi-VN"),
+        ].join(" ")).includes(normalizedJobSearch);
+      })
+    : jobs;
   return (
     <section className="panel view-panel">
       <div className="panel-head">
         <div>
           <h2>Luồng công việc</h2>
-          <p>
-            Tác vụ được kiểm tra theo allowlist, xếp hàng trực tiếp và lưu audit trong PostgreSQL.
-          </p>
+          <p>Theo dõi trạng thái và kết quả thao tác trên các máy chủ.</p>
         </div>
+      </div>
+      <div className="jobs-toolbar">
+        <label>
+          Tìm kiếm công việc
+          <input
+            className="resource-search"
+            value={jobSearch}
+            onChange={(event) => setJobSearch(event.target.value)}
+            maxLength={160}
+            placeholder="Từ/cụm từ tiếng Việt hoặc English, hostname, IP…"
+          />
+        </label>
+        <span>{visibleJobs.length}/{jobs.length} công việc</span>
       </div>
       <div className="jobs-table">
         <div className="jobs-row head">
@@ -3479,8 +3523,8 @@ function JobsView({ token, servers }: { token: string; servers: Server[] }) {
           <span>Thời điểm</span>
           <span>Trạng thái</span>
         </div>
-        {jobs.length ? (
-          jobs.map((job) => {
+        {visibleJobs.length ? (
+          visibleJobs.map((job) => {
             const identity = serverIdentity(job);
             return <div className="jobs-row" key={job.id}>
               <p>
@@ -3507,7 +3551,7 @@ function JobsView({ token, servers }: { token: string; servers: Server[] }) {
           })
         ) : (
           <div className="empty-state">
-            Chưa có công việc nào trong database.
+            {jobs.length ? "Không tìm thấy công việc phù hợp." : "Chưa có công việc nào."}
           </div>
         )}
       </div>
@@ -3659,6 +3703,7 @@ function RecordingPlayer({
 
 function auditDetailText(detail: Record<string, unknown>) {
   return Object.entries(detail ?? {})
+    .filter(([key]) => !hiddenAuditDetailKeys.has(key.toLocaleLowerCase("en-US")))
     .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
     .join(" · ");
 }
@@ -3717,7 +3762,6 @@ function AuditView({ token }: { token: string }) {
     try {
       const query = new URLSearchParams();
       if (before) query.set("before", before);
-      if (auditSearch.trim()) query.set("search", auditSearch.trim());
       if (auditResult) query.set("result", auditResult);
       const response = await fetch(`/api/v1/audit?${query.toString()}`, { headers: { Authorization: `Bearer ${token}` } });
       if (response.status === 403) setForbidden(true);
@@ -3732,7 +3776,7 @@ function AuditView({ token }: { token: string }) {
     } finally {
       setAuditBusy(false);
     }
-  }, [auditResult, auditSearch, token]);
+  }, [auditResult, token]);
   useEffect(() => {
     fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
@@ -3746,6 +3790,20 @@ function AuditView({ token }: { token: string }) {
     const auditTimer = window.setTimeout(() => void loadAudit(), 300);
     return () => window.clearTimeout(auditTimer);
   }, [loadAudit]);
+  const normalizedAuditSearch = normalizeSearchText(auditSearch);
+  const visibleAuditRows = useMemo(() => normalizedAuditSearch
+    ? rows.filter((row) => normalizeSearchText([
+        row.actor,
+        auditActionLabel(row.action, row.detail),
+        row.action,
+        auditTargetLabel(row.target),
+        auditDetailText(row.detail),
+        auditResultLabels[row.result] ?? row.result,
+        row.result,
+        row.sourceIp,
+        new Date(row.occurredAt).toLocaleString("vi-VN"),
+      ].join(" ")).includes(normalizedAuditSearch))
+    : rows, [normalizedAuditSearch, rows]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
   const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
@@ -3774,7 +3832,7 @@ function AuditView({ token }: { token: string }) {
       setDeleteConfirmation("");
       await loadDeletionRequests();
     } catch {
-      setDeleteValidation("Không kết nối được API. Hãy thử lại; chưa có yêu cầu nào được tạo.");
+      setDeleteValidation("Không kết nối được hệ thống. Hãy thử lại; chưa có yêu cầu nào được tạo.");
     } finally {
       setRecordingBusy(false);
     }
@@ -3820,7 +3878,7 @@ function AuditView({ token }: { token: string }) {
         <div className="panel-head">
           <div>
             <h2>Nhật ký kiểm toán</h2>
-            <p>Mọi thao tác người dùng được lưu trong PostgreSQL và tự xóa sau {auditRetentionDays} ngày.</p>
+            <p>Ghi nhận thao tác người dùng và tự động dọn dữ liệu cũ sau {auditRetentionDays} ngày.</p>
           </div>
           <div className="audit-integrity">◆ Chuỗi hash liên kết</div>
         </div>
@@ -3841,7 +3899,7 @@ function AuditView({ token }: { token: string }) {
         {tab === "events" ? (
           <div className="audit-events-panel">
             <div className="audit-filter-bar">
-              <label>Tìm trong audit<input value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} maxLength={160} placeholder="Người dùng, hành động, đối tượng hoặc IP…" /></label>
+              <label>Tìm kiếm<input value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} maxLength={160} placeholder="Từ/cụm từ tiếng Việt hoặc English, người dùng, đối tượng, IP…" /></label>
               <label>Kết quả<select value={auditResult} onChange={(event) => setAuditResult(event.target.value)}><option value="">Tất cả</option><option value="success">Thành công</option><option value="denied">Bị từ chối</option><option value="failed">Thất bại</option><option value="partial">Một phần</option><option value="cancelled">Đã hủy</option></select></label>
               <button type="button" className="button ghost" disabled={auditBusy} onClick={() => void loadAudit()}>{auditBusy ? "Đang lọc…" : "↻ Làm mới"}</button>
             </div>
@@ -3855,22 +3913,22 @@ function AuditView({ token }: { token: string }) {
                 <span>Kết quả</span>
                 <span>IP nguồn</span>
               </div>
-              {rows.length ? (
-                rows.map((row) => (
+              {visibleAuditRows.length ? (
+                visibleAuditRows.map((row) => (
                   <div className="audit-row" key={row.id}>
                     <time>
                       {new Date(row.occurredAt).toLocaleString("vi-VN")}
                     </time>
                     <b>{row.actor}</b>
                     <span title={row.action}>{auditActionLabel(row.action, row.detail)}</span>
-                    <span>{row.target}</span>
+                    <span>{auditTargetLabel(row.target)}</span>
                     <span className="audit-detail">{auditDetailText(row.detail) || "—"}</span>
                     <span
                       className={
                         row.result === "success" ? "result-good" : "result-warn"
                       }
                     >
-                      {row.result}
+                      {auditResultLabels[row.result] ?? row.result}
                     </span>
                     <span>{row.sourceIp || "—"}</span>
                   </div>
@@ -3879,7 +3937,9 @@ function AuditView({ token }: { token: string }) {
                 <div className="empty-state">
                   {forbidden
                     ? "Vai trò hiện tại không có quyền đọc audit."
-                    : "Chưa có sự kiện audit trong database."}
+                    : rows.length
+                      ? "Không tìm thấy nhật ký phù hợp."
+                      : "Chưa có sự kiện kiểm toán."}
                 </div>
               )}
             </div>
@@ -4033,7 +4093,7 @@ function AgentPackagesView({ token }: { token: string }) {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       setMessageIsError(true);
-      setMessage(data.detail ?? "Không thể cập nhật URL control plane");
+      setMessage(data.detail ?? "Không thể cập nhật địa chỉ hệ thống");
       return;
     }
     setStatus((current) => current ? { ...current, dashboardUrl: data.dashboardUrl } : current);
@@ -4100,13 +4160,13 @@ function AgentPackagesView({ token }: { token: string }) {
     <section className="agent-package-layout">
       <article className="panel agent-package-intro">
         <p className="eyebrow">ZERO-TOUCH ENROLLMENT</p>
-        <h2>Bộ cài tự nhận đúng control plane</h2>
+        <h2>Bộ cài tự nhận đúng Trạm vận hành</h2>
         <p>
-          Domain, chế độ xác minh TLS và claim một lần được lấy từ cấu hình HTTPS của hệ thống.
-          Private key mTLS chỉ được sinh trên máy đích, không nằm trong file tải về.
+          Domain và chế độ xác minh kết nối được lấy từ cấu hình HTTPS của hệ thống.
+          Thông tin nhận diện riêng chỉ được sinh trên máy đích, không nằm trong file tải về.
         </p>
         <form className="package-origin" key={status?.dashboardUrl} onSubmit={saveDashboardUrl}>
-          <span>URL control plane dùng để sinh Agent</span>
+          <span>URL Trạm vận hành dùng để sinh Agent</span>
           <input
             name="dashboard_url"
             type="url"
@@ -4119,13 +4179,13 @@ function AgentPackagesView({ token }: { token: string }) {
             Tôi hiểu agent cũ vẫn giữ endpoint cũ nếu đổi domain
           </label>
           <button className="button ghost" type="submit">Lưu URL HTTPS</button>
-          <small>Hãy mở dashboard bằng chính domain mới, hoàn tất DNS/TLS/Nginx/Caddy rồi mới lưu.</small>
+          <small>Hãy mở Trạm vận hành bằng chính domain mới và kiểm tra kết nối HTTPS trước khi lưu.</small>
         </form>
         <ul>
           <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>
           <li>
-            Bootstrap web: {status?.webTlsTrust === "system" ? "CA công khai của Nginx" : "CA nội bộ đã pin"};
-            agent mTLS trên 9443 vẫn dùng CA riêng.
+            Kết nối cài đặt: {status?.webTlsTrust === "system" ? "chứng thư công khai" : "chứng thư nội bộ đã xác minh"};
+            kênh quản trị Agent sử dụng chứng thư riêng.
           </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
           <li>Linux là gói offline self-contained: không cần Python, pip, apt, dnf, yum hoặc Internet để cài Agent.</li>
@@ -4140,7 +4200,7 @@ function AgentPackagesView({ token }: { token: string }) {
         <div className="panel-head">
           <div>
             <h2>Tạo bộ cài riêng cho máy chủ</h2>
-            <p>Agent {status?.agentVersion ?? "…"} · chỉ admin được tạo claim enrollment.</p>
+            <p>Agent {status?.agentVersion ?? "…"} · chỉ quản trị viên được tạo gói cài một lần.</p>
           </div>
         </div>
         <label>
@@ -4177,16 +4237,16 @@ function AgentPackagesView({ token }: { token: string }) {
             <small>Windows Server 2025 · auto-start service</small>
           </button>
         </div>
-        {busy && <p className="package-progress">Đang sinh claim và đóng gói {busy}…</p>}
+        {busy && <p className="package-progress">Đang chuẩn bị gói cài {busy}…</p>}
         {status && !status.windowsMsiAvailable && (
-          <p className="package-warning">MSI chung chưa có trong API image. Build workflow Windows rồi rebuild container API.</p>
+          <p className="package-warning">Bộ cài Windows chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
         )}
         {status && !status.linuxAvailable && (
-          <p className="package-warning">Linux executable offline chưa có trong API image. Build workflow Linux rồi rebuild container API.</p>
+          <p className="package-warning">Bộ cài Linux offline chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
         )}
         {status && !status.agentTlsCaAvailable && (
           <p className="package-warning">
-            CA TLS của kênh Agent chưa được đồng bộ. Kiểm tra container caddy-ca-export rồi recreate API trước khi tải bộ cài.
+            Kênh bảo mật dành cho Agent chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.
           </p>
         )}
         {message && <p className={`settings-message${messageIsError ? " error" : ""}`}>{message}</p>}
@@ -4376,7 +4436,7 @@ function AccessView({ token, currentUser }: { token: string; currentUser: Curren
   return <section className="panel view-panel access-workspace">
     <div className="panel-head access-head"><div><h2>Người dùng & vai trò</h2><p>Tài khoản Local và AD dùng chung MFA; group dùng để cấp quyền nhìn thấy máy chủ theo đội vận hành.</p></div>{!forbidden && <div className="access-actions"><button className="resource-icon-button" type="button" title="Tạo tài khoản Local" onClick={() => setShowCreate(true)}>+</button><button className="resource-icon-button danger" type="button" title="Xóa tài khoản đã chọn" disabled={!selectedUserIds.length || busy} onClick={() => void deleteUsers()}>−</button><button className="button ghost compact" type="button" disabled={busy || ldap.enabled !== true} onClick={() => void syncLdapDirectoryUsers()}>Đồng bộ AD</button><button className="button ghost compact" type="button" onClick={() => { setGroupEditor(null); setShowGroups(true); }}>Groups</button><button className="button ghost compact" type="button" onClick={() => { setRoleEditor(null); setShowRoles(true); }}>Roles</button><button className="resource-icon-button settings" type="button" title="Cấu hình LDAP" onClick={() => setShowLdap(true)}>⚙</button></div>}</div>
     {message && <p className={`settings-message${messageError ? " error" : ""}`}>{message}</p>}
-    <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`} title={user.source === "ldap" ? "Active Directory / LDAP" : "Tài khoản Local"}>{user.source === "ldap" ? "AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng trong PostgreSQL."}</div>}</div>
+    <div className="access-table-scroll"><table className="resource-table access-table"><thead><tr><th className="check-column"><input type="checkbox" checked={users.length > 0 && users.every((user) => selectedUserIds.includes(user.id))} onChange={() => setSelectedUserIds(users.every((user) => selectedUserIds.includes(user.id)) ? [] : users.map((user) => user.id))} /></th><th>Người dùng</th><th>Nguồn</th><th>Role</th><th>Trạng thái</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="clickable" onClick={() => setEditingUser(user)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => setSelectedUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /></td><td><b>{user.displayName || user.username}</b><small>{user.username} · tạo {new Date(user.createdAt).toLocaleDateString("vi-VN")}</small></td><td><span className={`identity-source ${user.source}`} title={user.source === "ldap" ? "Active Directory / LDAP" : "Tài khoản Local"}>{user.source === "ldap" ? "AD" : "Local"}</span></td><td><span className="state-pill">{roles.find((role) => role.name === user.role)?.displayName ?? user.role}</span></td><td><span className={`state-pill ${user.enabled ? "success" : "warning"}`}>{user.enabled ? "Hoạt động" : "Đã khóa"}</span></td><td><button type="button" className="row-more" onClick={(event) => { event.stopPropagation(); setEditingUser(user); }}>Sửa</button></td></tr>)}</tbody></table>{!users.length && <div className="empty-state">{forbidden ? "Role hiện tại không có quyền quản lý người dùng." : "Chưa có người dùng."}</div>}</div>
     <p className="access-note">User AD được đồng bộ từ các group LDAP được phép đăng nhập và có thể gán mọi role hiện có. Đồng bộ lại không ghi đè role riêng; mật khẩu vẫn do Active Directory quản lý.</p>
     {showCreate && <ModalShell title="Tạo tài khoản Local" subtitle="Tài khoản mới bắt buộc thiết lập MFA ở lần đăng nhập đầu tiên" close={() => setShowCreate(false)}><form className="resource-form" onSubmit={createLocalUser}><div className="form-grid"><label>Tên đăng nhập<input name="username" required minLength={3} pattern="[A-Za-z0-9_.@-]+" /></label><label>Role<select name="role" defaultValue="viewer">{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label></div><label>Tên hiển thị<input name="display_name" required /></label><label>Mật khẩu ban đầu<input name="password" type="password" autoComplete="new-password" required minLength={14} /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setShowCreate(false)}>Hủy</button><button className="button primary" disabled={busy}>Tạo tài khoản</button></div></form></ModalShell>}
     {editingUser && <ModalShell title={`Sửa ${editingUser.username}`} subtitle={editingUser.source === "ldap" ? "User AD: gán bất kỳ role hiện có, trạng thái và group tại website; mật khẩu do Active Directory quản lý" : "Tài khoản Local: đổi thông tin, role, group, trạng thái hoặc đặt mật khẩu mới"} close={() => setEditingUser(null)}><form key={`${editingUser.id}:${editingUser.role}:${editingUser.enabled}:${editingUser.mfaEnrolled}:${editingUser.groupIds?.join(",")}`} className="resource-form" onSubmit={updateUser}><label>Tên hiển thị<input name="display_name" defaultValue={editingUser.displayName} required /></label><label>Role<select name="role" defaultValue={editingUser.role}>{roles.map((role) => <option key={role.name} value={role.name}>{role.displayName}</option>)}</select></label><fieldset><legend>Groups của trạm vận hành</legend><div className="choice-grid">{groups.map((group) => <label key={group.id}><input type="checkbox" name="platform_groups" value={group.id} defaultChecked={editingUser.groupIds?.includes(group.id)} />{group.name}</label>)}</div></fieldset><label className="check"><input type="checkbox" name="enabled" defaultChecked={editingUser.enabled} /> Cho phép đăng nhập</label><label>Mật khẩu mới<input name="password" type="password" minLength={14} autoComplete="new-password" disabled={editingUser.source === "ldap"} placeholder={editingUser.source === "ldap" ? "Đổi tại Active Directory" : "Để trống nếu giữ nguyên"} /></label><div className="mfa-admin-control"><span><b>MFA: {editingUser.mfaEnrolled ? "Đã đăng ký" : "Chờ đăng ký"}</b><small>Reset sẽ hủy khóa TOTP hiện tại; lần đăng nhập sau người dùng phải quét QR mới.</small></span>{currentUser.role === "admin" && <button type="button" className="button danger" disabled={busy} onClick={() => void resetUserMfa(editingUser)}>Reset MFA</button>}</div><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditingUser(null)}>Hủy</button><button className="button primary" disabled={busy}>Lưu thay đổi</button></div></form></ModalShell>}
@@ -4523,8 +4583,8 @@ function SessionModal({
           </b>
           <p>
             {server.osFamily === "linux"
-              ? "Control plane sẽ buộc Agent kết nối thành công tới 127.0.0.1:22 trước khi mở Guacamole. Dùng tài khoản thường đã đặt mật khẩu, ví dụ ubuntu."
-              : "Mật khẩu chỉ được đưa vào token Guacamole mã hóa, không được lưu trong database hoặc audit log."}
+              ? "Hệ thống sẽ kiểm tra dịch vụ SSH trên máy đích trước khi mở phiên. Dùng tài khoản thường đã đặt mật khẩu, ví dụ ubuntu."
+              : "Mật khẩu chỉ được sử dụng để khởi tạo phiên và không xuất hiện trong nhật ký thao tác."}
           </p>
         </div>
         <div className="modal-actions">

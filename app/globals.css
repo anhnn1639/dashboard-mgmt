@@ -1962,6 +1962,30 @@ textarea:focus-visible {
   color: #5dbf9e;
   font-size: calc(8px + var(--font-size-increase));
 }
+.jobs-toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.jobs-toolbar label {
+  display: grid;
+  gap: 5px;
+  width: min(620px, 100%);
+  color: #8290a4;
+  font-size: calc(8px + var(--font-size-increase));
+}
+.jobs-toolbar input {
+  width: 100%;
+  min-height: 38px;
+}
+.jobs-toolbar > span {
+  flex: 0 0 auto;
+  padding-bottom: 10px;
+  color: #8290a4;
+  font-size: calc(8px + var(--font-size-increase));
+}
 .jobs-table,
 .audit-table {
   border: 1px solid #222d3c;
@@ -2144,6 +2168,13 @@ textarea:focus-visible {
   gap: 13px;
 }
 @media (max-width: 760px) {
+  .jobs-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .jobs-toolbar > span {
+    padding-bottom: 0;
+  }
   .audit-filter-bar {
     grid-template-columns: 1fr;
   }
@@ -3343,32 +3374,6 @@ textarea:focus-visible {
   display: block;
   color: #607087;
   margin-top: 5px;
-  font-size: calc(8px + var(--font-size-increase));
-}
-.postgres-help {
-  margin: -3px 0 15px;
-  padding: 11px 12px;
-  border: 1px solid #294464;
-  border-radius: 7px;
-  background: rgba(48, 103, 181, 0.08);
-  color: #8294ad;
-  font-size: calc(9px + var(--font-size-increase));
-  line-height: 1.55;
-}
-.postgres-help b {
-  display: block;
-  margin-bottom: 4px;
-  color: #9fc0f3;
-  font-size: calc(10px + var(--font-size-increase));
-}
-.postgres-help code {
-  color: #80d4b4;
-  font: 600 9px var(--font-geist-mono);
-}
-.postgres-help small {
-  display: block;
-  margin-top: 4px;
-  color: #697b93;
   font-size: calc(8px + var(--font-size-increase));
 }
 .setup-error {

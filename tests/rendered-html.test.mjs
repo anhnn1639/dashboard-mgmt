@@ -40,7 +40,7 @@ test("dashboard includes automatic Windows and Linux fleet views", async () => {
   assert.match(resources, /process\.kill/);
   assert.match(resources, /Tối đa 500 dòng/);
   assert.match(source, /\/api\/v1\/setup\/status/);
-  assert.match(source, /Kết nối PostgreSQL/);
+  assert.match(source, /Kết nối kho dữ liệu/);
   assert.match(source, /Admin local đầu tiên/);
 });
 
@@ -151,7 +151,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(source, /Patch chung cho toàn bộ máy đã chọn/);
   assert.match(source, /Chi tiết thao tác/);
   assert.match(source, /Tải thêm nhật ký/);
-  assert.match(source, /tự xóa sau \{auditRetentionDays\} ngày/);
+  assert.match(source, /tự động dọn dữ liệu cũ sau \{auditRetentionDays\} ngày/);
   assert.match(source, /loadServers\(true\)/);
 });
 
@@ -232,7 +232,7 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(source, /const formElement = event\.currentTarget/);
   assert.match(source, /currentUser\.permissions\.includes\("logs\.configure"\)/);
   assert.match(source, /audit-filter-bar/);
-  assert.match(source, /query\.set\("search"/);
+  assert.match(source, /visibleAuditRows/);
 });
 
 test("job and audit action codes have readable labels", async () => {
@@ -254,8 +254,9 @@ test("overview health chart uses live fleet percentages and the operator system 
   assert.match(source, /criticalCount = servers\.filter/);
   assert.match(source, /--healthy-end/);
   assert.match(source, /--warning-end/);
-  assert.match(source, /Dữ liệu hiện tại từ Agent và PostgreSQL/);
+  assert.match(source, /Trạng thái hiện tại của toàn bộ máy chủ/);
   assert.match(source, /Cập nhật \{systemClock\}/);
+  assert.match(source, /setInterval\(updateSystemAppearance, 1_000\)/);
   assert.doesNotMatch(source, />24 giờ/);
   assert.doesNotMatch(source, />7 ngày</);
   assert.doesNotMatch(source, /aria-label="Thông báo"/);
@@ -265,6 +266,26 @@ test("overview health chart uses live fleet percentages and the operator system 
   assert.match(styles, /html\[data-theme="light"\]/);
   assert.match(styles, /\.donut\s*{[^}]*--healthy-end:[^}]*--warning-end:/s);
   assert.match(styles, /\.donut\.empty\s*{[^}]*background:\s*var\(--line\)/s);
+});
+
+test("clock and phrase search work with Vietnamese or English text", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(source, /role="timer"/);
+  assert.match(source, /function normalizeSearchText/);
+  assert.match(source, /\.normalize\("NFD"\)/);
+  assert.match(source, /replace\(\/\\p\{M\}\/gu, ""\)/);
+  assert.match(source, /const \[jobSearch, setJobSearch\] = useState\(""\)/);
+  assert.match(source, /jobActionLabel\(job\.action\)/);
+  assert.match(source, /const visibleAuditRows = useMemo/);
+  assert.match(source, /auditActionLabel\(row\.action, row\.detail\)/);
+  assert.match(source, /hiddenAuditDetailKeys/);
+  assert.match(source, /!hiddenAuditDetailKeys\.has/);
+  assert.match(source, /Từ\/cụm từ tiếng Việt hoặc English/);
+  assert.match(styles, /\.jobs-toolbar\s*{/);
+  assert.doesNotMatch(source, /PostgreSQL|Nginx|Caddy|ClamAV|SECURE CONTROL PLANE|CONTROL PLANE ·/);
+  assert.doesNotMatch(resources, /PostgreSQL/);
 });
 
 test("light theme keeps legacy and semantic text readable across the dashboard", async () => {

@@ -807,7 +807,8 @@ class ClassificationTests(unittest.TestCase):
                     json={"label": "missing-ca", "os_family": "linux", "expires_minutes": 15},
                 )
                 self.assertEqual(package.status_code, 503, package.text)
-                self.assertIn("caddy-ca-export", package.json()["detail"])
+                self.assertIn("Chứng thư bảo mật của kênh Agent", package.json()["detail"])
+                self.assertNotIn("caddy", package.json()["detail"].lower())
 
                 public_ca = client.get("/api/v1/agent-server-ca")
                 self.assertEqual(public_ca.status_code, 503, public_ca.text)
