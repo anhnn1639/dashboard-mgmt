@@ -611,6 +611,8 @@ class ClassificationTests(unittest.TestCase):
             listed_failure = next(item for item in global_jobs.json()["items"] if item["id"] == failed_mutation_id)
             self.assertEqual(listed_failure["exitCode"], 1)
             self.assertEqual(listed_failure["output"], "not removed")
+            self.assertEqual(listed_failure["serverName"], "firewall-refresh")
+            self.assertEqual(listed_failure["serverAddress"], "10.30.1.70")
             with SessionLocal() as db:
                 refreshes = db.query(Job).filter(Job.server_id == agent_id, Job.action == "firewall.list", Job.reason.like("Tự động quét lại sau%")).all()
                 self.assertEqual(len(refreshes), 2)

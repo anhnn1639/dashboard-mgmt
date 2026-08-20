@@ -437,7 +437,7 @@ function ServerTable({
               </td>
               {onShare ? <td><button type="button" className="row-more share-button" onClick={(event) => { event.stopPropagation(); onShare(server); }}>{server.shares?.count ?? 0} user/group</button></td> : null}
               <td>
-                <div className="server-row-actions"><button className="row-more" aria-label={`Mở ${server.name}`} onClick={(e) => { e.stopPropagation(); onSelect(server); }}>•••</button>{onDelete ? <button className="row-more danger" aria-label={`Xóa ${server.name}`} title="Xóa máy chủ" onClick={(event) => { event.stopPropagation(); onDelete(server); }}>−</button> : null}</div>
+                <div className="server-row-actions"><button type="button" className="row-more" aria-label={`Mở ${server.name}`} onClick={(e) => { e.stopPropagation(); onSelect(server); }}>•••</button>{onDelete ? <button type="button" className="server-delete-button" aria-label={`Xóa ${server.name}`} title={`Xóa máy chủ ${server.name}`} onClick={(event) => { event.stopPropagation(); onDelete(server); }}>Delete</button> : null}</div>
               </td>
             </tr>
           ))}
@@ -3246,6 +3246,8 @@ function JobsView({ token }: { token: string }) {
     Array<{
       id: string;
       serverId: string;
+      serverName: string;
+      serverAddress: string;
       action: string;
       status: string;
       risk: string;
@@ -3295,7 +3297,7 @@ function JobsView({ token }: { token: string }) {
                 <b title={job.action}>{jobActionLabel(job.action)}</b>
                 <small>{job.reason}</small>
               </p>
-              <span>{job.serverId.slice(0, 8)}</span>
+              <span className="job-server-label">{job.serverName || job.serverId.slice(0, 8)}[{job.serverAddress || "chưa có IP"}]</span>
               <span>{job.risk}</span>
               <time>{new Date(job.createdAt).toLocaleString("vi-VN")}</time>
               <div className="job-controls">

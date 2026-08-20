@@ -2614,10 +2614,12 @@ def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, 
     return {"sources": sources}
 
 
-def job_json(job: Job, *, include_output: bool = False) -> dict[str, Any]:
+def job_json(job: Job, *, server: Server, include_output: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": job.id,
         "serverId": job.server_id,
+        "serverName": server.name,
+        "serverAddress": server.address,
         "action": job.action,
         "status": job.status,
         "risk": job.risk,
@@ -2639,11 +2641,11 @@ def can_view_job_output(user: User, action: str, db: Session) -> bool:
 
 @app.get("/api/v1/servers/{server_id}/jobs")
 def list_server_jobs(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    visible_server(db, user, server_id)
+    server = visible_server(db, user, server_id)
     jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
     return {
         "items": [
-            job_json(job, include_output=can_view_job_output(user, job.action, db))
+            job_json(job, server=server, include_output=can_view_job_output(user, job.action, db))
             for job in jobs
         ]
     }
@@ -3550,8 +3552,19 @@ def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: Use
 
 @app.get("/api/v1/jobs")
 def list_jobs(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    jobs = db.execute(select(Job).where(Job.server_id.in_(visible_server_ids(db, user))).order_by(Job.created_at.desc()).limit(200)).scalars().all()
-    return {"items": [job_json(job, include_output=can_view_job_output(user, job.action, db)) for job in jobs]}
+    rows = db.execute(
+        select(Job, Server)
+        .join(Server, Server.id == Job.server_id)
+        .where(Job.server_id.in_(visible_server_ids(db, user)))
+        .order_by(Job.created_at.desc())
+        .limit(200)
+    ).all()
+    return {
+        "items": [
+            job_json(job, server=server, include_output=can_view_job_output(user, job.action, db))
+            for job, server in rows
+        ]
+    }
 
 
 @app.get("/api/v1/audit")

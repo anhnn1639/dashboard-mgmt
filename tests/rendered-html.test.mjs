@@ -177,6 +177,7 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
 test("process resources and server visibility controls are operable", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(resources, /cpuPercent/);
   assert.match(resources, /memoryBytes/);
   assert.match(resources, /Realtime 5s/);
@@ -187,6 +188,10 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(resources, /Unlock tài khoản/);
   assert.match(source, /Share \$\{server\.name\}/);
   assert.match(source, /Xóa máy chủ/);
+  assert.match(source, />Delete<\/button>/);
+  assert.match(source, /job\.serverName \|\| job\.serverId\.slice/);
+  assert.match(source, /job\.serverAddress \|\| "chưa có IP"/);
+  assert.match(styles, /\.server-delete-button\s*{[^}]*min-height:\s*30px/s);
   assert.match(source, /servers\.manage/);
   assert.match(source, /\/api\/v1\/audit\?limit=6/);
   assert.match(source, /overview-activity-list/);

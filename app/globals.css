@@ -2035,9 +2035,24 @@ textarea:focus-visible {
   align-items: center;
   gap: 5px;
 }
-.server-row-actions .danger {
+.server-delete-button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid rgba(255, 105, 116, 0.35);
+  border-radius: 7px;
+  background: rgba(126, 31, 42, 0.2);
   color: #ff8d96;
-  border-color: rgba(255, 105, 116, .25);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.server-delete-button:hover,
+.server-delete-button:focus-visible {
+  border-color: #ff6974;
+  background: rgba(160, 39, 53, 0.34);
+  color: #ffd5d8;
+  outline: none;
 }
 .share-button {
   width: auto;
