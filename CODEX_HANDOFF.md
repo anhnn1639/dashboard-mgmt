@@ -1,4 +1,4 @@
-# Bàn giao Codex — 19/08/2026
+# Bàn giao Codex — 20/08/2026
 
 ## Repository và trạng thái
 
@@ -62,6 +62,7 @@
 - API entrypoint nay đăng ký `RECORDING_GID` vào supplementary groups của user `ops` trước khi `gosu`; điều này ngăn `gosu` làm rơi GID mà Docker `group_add` đã cấp và sửa trường hợp file thật tồn tại trên host nhưng website báo không tìm thấy. API trả riêng trạng thái mount thiếu, permission denied, file rỗng và file chưa tồn tại để UI chỉ đúng nguyên nhân thay vì gộp thành một thông báo.
 - Modal xóa recording nay giải thích rõ lý do/ticket tối thiểu 5 ký tự và từ `DELETE` đều bắt buộc, trả lỗi API/network ngay trong modal thay vì nút xám im lặng. Cấu hình retention recording mặc định bật 180 ngày, lưu trong PostgreSQL, dọn ngay khi lưu/API startup và mỗi 6 giờ; chỉ xóa file recording/typescript có UUID hợp lệ, đủ tuổi và không thuộc session đang ghi. Tác vụ hệ thống này không qua phê duyệt nhưng có audit và trạng thái lần chạy.
 - Trang **Người dùng & vai trò** nay là bảng toàn chiều rộng với nút `+`/`-`, sửa user theo dòng, bánh răng cấu hình LDAP và trình quản lý role riêng. Local user đổi được tên hiển thị, role, trạng thái và mật khẩu; LDAP user đổi được role/trạng thái riêng nhưng cả UI lẫn API đều cấm đổi mật khẩu LDAP. Role mặc định chỉ áp dụng lúc LDAP user đăng nhập lần đầu, còn role đã gán riêng được giữ nguyên. PostgreSQL có bảng `platform_roles`, seed sẵn Administrator/Operator/Viewer/Auditor và cho tạo role tùy chỉnh theo 20 permission chức năng; API kiểm tra permission thật cho job, file, Agent, audit, recording, session, user, LDAP và role, không chỉ ẩn nút trên giao diện.
+- LDAP/AD hiện đồng bộ chủ động toàn bộ user trực tiếp hoặc lồng nhau của các group được phép đăng nhập bằng AD matching-rule-in-chain và LDAP paging, tối đa 10.000 user mỗi lượt. Lưu cấu hình có group sẽ đồng bộ ngay; nút **Đồng bộ AD** cho phép chạy lại sau khi membership thay đổi. User mới nhận role mặc định, user AD đã có giữ nguyên role/trạng thái quản trị viên gán, danh sách gắn nhãn **AD** và modal cho chọn mọi role hiện có. Username AD được đối chiếu không phân biệt hoa thường; collision với tài khoản Local không bị tự chuyển nguồn và được trả trong thống kê/audit.
 - Ảnh production ngày 18/08 vẫn là form User/LDAP cũ, nghĩa là server mới pull source nhưng chưa rebuild/recreate `dashboard` và `api`. Sau pull commit mới phải chạy `docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate dashboard api`; hard refresh trình duyệt rồi kiểm tra nút `+`, `−`, `Roles`, bánh răng LDAP và bảng user toàn chiều rộng.
 - Tab **Services** chỉ liệt kê tên, trạng thái, start cùng OS và Start/Stop/Restart; có filter running/stopped/other. **Tài khoản** có Users/Groups, multi-select, tạo/xóa, đổi password/expiry/group/quyền sudo-wheel-Administrators; hiển thị mọi local user/group nhưng khóa built-in theo UID/GID/SID. **Tiến trình** chỉ hiển thị tên và đối chiếu PID/name/create-time trước khi kill. **Cập nhật** chỉ cài đúng các gói/version được chọn, không còn action update-all. **Nhật ký** lấy tối đa 500 dòng, cấu hình nguồn bền vững trong PostgreSQL, chỉ cho file thật dưới `/var/log` hoặc Windows Event Log đang bật và tô cả dòng error/warning.
 - Sau mọi mutation Services/Users/Groups/Disk/Process/Updates, API tự tạo job quét lại tương ứng giống Firewall; dashboard polling hiển thị dữ liệu thật mới nhất. Các thao tác vẫn chạy trực tiếp không qua phê duyệt, nhưng giữ MFA, RBAC, allowlist, live stale-target guard và audit PostgreSQL.
@@ -229,6 +230,14 @@ docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
 ```
 
+Thay đổi đồng bộ LDAP/AD sau 0.8.7 chỉ nằm ở control plane/dashboard, không đổi Agent. Sau pull chỉ cần rebuild/recreate `api` và `dashboard`; mở **Người dùng & vai trò** rồi bấm **Đồng bộ AD** một lần nếu cấu hình LDAP đã được lưu từ bản cũ:
+
+```bash
+git pull --ff-only origin main
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api dashboard
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
+```
+
 API tự tạo các bảng PostgreSQL mới khi khởi động; không có migration làm thay đổi hoặc xóa dữ liệu bảng hiện hữu.
 
 Máy đã tạo `guacd`/`guacamole` trước bản sửa Docker DNS phải recreate đúng hai container để endpoint nhận alias mới:
@@ -346,7 +355,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `40/40`, gồm catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server; cùng Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Control plane `41/41`, gồm đồng bộ thành viên AD trực tiếp/lồng nhau có paging, giữ role/trạng thái gán riêng và đối chiếu username không phân biệt hoa thường; cùng catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server, Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
 - Agent security `65/65`, gồm probe Windows Update/WSUS hữu hạn, dừng ngay khi mất nguồn, APT/YUM repository failure có cấu trúc và applicability theo release; cùng căn dung lượng LVM xuống sector 512, Windows DiskPart Extend/Shrink, OL7 partition geometry/adjacency, CLIXML cleanup, nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, cache freshness, khóa cài từ scan chưa hoàn tất, upgrade identity, Oracle/RHEL 7 `lsblk --pairs`, process CPU/RAM, bootstrap detail, installer offline, firewall/storage/update/process/log/account validation, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.

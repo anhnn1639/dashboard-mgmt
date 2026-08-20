@@ -11,6 +11,7 @@ import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
@@ -50,7 +51,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 (test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, Inventory, Job, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -138,6 +139,7 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 401, path)
                 self.assertEqual(response.headers.get("cache-control"), "no-store")
                 self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+            self.assertEqual(client.post("/api/v1/settings/ldap/users/sync").status_code, 401)
 
     def test_server_visibility_comes_only_from_direct_or_group_share(self):
         with TestClient(app) as client:
@@ -256,6 +258,62 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 409)
             self.assertEqual(client.patch(f"/api/v1/users/{ldap_user_id}", headers=admin_headers, json={"role": "viewer"}).status_code, 200)
             self.assertEqual(client.delete(f"/api/v1/roles/{role_name}", headers=admin_headers).status_code, 200)
+
+    def test_allowed_ldap_group_members_are_synced_without_overwriting_assigned_roles(self):
+        with TestClient(app):
+            pass
+        domain_label = f"AD{uuid.uuid4().hex[:8]}"
+        config = {
+            "base_dn": "DC=example,DC=test",
+            "user_attribute": "sAMAccountName",
+            "display_attribute": "displayName",
+            "domain_label": domain_label,
+            "default_role": "viewer",
+            "allowed_group_dns": ["CN=Operations,OU=Groups,DC=example,DC=test"],
+        }
+        search_arguments: dict = {}
+
+        def service_with(records: list[dict]):
+            def paged_search(**kwargs):
+                search_arguments.update(kwargs)
+                return iter(records)
+
+            return SimpleNamespace(extend=SimpleNamespace(standard=SimpleNamespace(paged_search=paged_search)))
+
+        first_records = [
+            {"type": "searchResEntry", "attributes": {"sAMAccountName": "alice", "displayName": "Alice AD"}},
+            {"type": "searchResEntry", "attributes": {"sAMAccountName": "bob", "displayName": "Bob AD"}},
+        ]
+        try:
+            with SessionLocal() as db:
+                first = synchronize_ldap_users_from_connection(db, config, service_with(first_records))
+                db.commit()
+                self.assertEqual(first, {"scanned": 2, "created": 2, "updated": 0, "unchanged": 0, "conflicts": 0, "skipped": 0})
+                self.assertIn("1.2.840.113556.1.4.1941", search_arguments["search_filter"])
+                alice = db.execute(select(User).where(User.username == f"{domain_label}\\alice")).scalar_one()
+                bob = db.execute(select(User).where(User.username == f"{domain_label}\\bob")).scalar_one()
+                self.assertEqual((alice.password_hash, bob.password_hash), ("!LDAP", "!LDAP"))
+                alice.role = "auditor"
+                alice.enabled = False
+                db.commit()
+
+            second_records = [
+                {"type": "searchResEntry", "attributes": {"sAMAccountName": "ALICE", "displayName": "Alice Renamed"}},
+                {"type": "searchResEntry", "attributes": {"sAMAccountName": "bob", "displayName": "Bob AD"}},
+            ]
+            with SessionLocal() as db:
+                second = synchronize_ldap_users_from_connection(db, config, service_with(second_records))
+                db.commit()
+                self.assertEqual(second, {"scanned": 2, "created": 0, "updated": 1, "unchanged": 1, "conflicts": 0, "skipped": 0})
+                alice = db.execute(select(User).where(User.username == f"{domain_label}\\alice")).scalar_one()
+                self.assertEqual(alice.display_name, "Alice Renamed")
+                self.assertEqual(alice.role, "auditor")
+                self.assertFalse(alice.enabled)
+        finally:
+            with SessionLocal() as db:
+                for user in db.execute(select(User).where(User.username.like(f"{domain_label}\\%"))).scalars().all():
+                    db.delete(user)
+                db.commit()
 
     def test_viewer_can_load_its_allowed_workspace_without_identity_admin_access(self):
         with SessionLocal() as db:

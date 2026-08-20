@@ -157,7 +157,11 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   assert.match(source, /Tạo tài khoản Local/);
   assert.match(source, /Cấu hình LDAP \/ Active Directory/);
-  assert.match(source, /đổi role riêng từng user LDAP/);
+  assert.match(source, /Đồng bộ AD/);
+  assert.match(source, /settings\/ldap\/users\/sync/);
+  assert.match(source, /user\.source === "ldap" \? "AD" : "Local"/);
+  assert.match(source, /gán mọi role hiện có/);
+  assert.doesNotMatch(source, /xuất hiện sau lần đăng nhập Domain đầu tiên/);
   assert.match(source, /Roles & quyền hạn/);
   assert.match(source, /permission-groups/);
   assert.match(source, /Groups của trạm vận hành/);

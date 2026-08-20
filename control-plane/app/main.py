@@ -1452,14 +1452,96 @@ def read_ldap_config(db: Session, include_secret: bool = False) -> dict[str, Any
     return config
 
 
+LDAP_SYNC_USER_LIMIT = 10000
+
+
+def ldap_attribute_text(attributes: Mapping[str, Any], attribute: str) -> str:
+    value: Any = None
+    for key, candidate in attributes.items():
+        if str(key).casefold() == attribute.casefold():
+            value = candidate
+            break
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def ldap_allowed_user_filter(config: Mapping[str, Any]) -> str:
+    allowed_group_dns = [str(value).strip() for value in config.get("allowed_group_dns", []) if str(value).strip()]
+    if not allowed_group_dns:
+        raise HTTPException(status_code=409, detail="Hãy chọn ít nhất một group LDAP được phép đăng nhập trước khi đồng bộ user AD")
+    clauses = "".join(f"(memberOf:1.2.840.113556.1.4.1941:={escape_filter_chars(group_dn)})" for group_dn in allowed_group_dns)
+    return f"(&(objectCategory=person)(objectClass=user)(!(objectClass=computer))(|{clauses}))"
+
+
+def synchronize_ldap_users_from_connection(db: Session, config: Mapping[str, Any], service: Connection) -> dict[str, int]:
+    user_attribute = str(config.get("user_attribute", "sAMAccountName"))
+    display_attribute = str(config.get("display_attribute", "displayName"))
+    domain_label = str(config.get("domain_label", "DOMAIN"))
+    default_role = str(config.get("default_role", "viewer"))
+    validate_platform_role(db, default_role, ldap_default=True)
+    results = service.extend.standard.paged_search(
+        search_base=str(config["base_dn"]),
+        search_filter=ldap_allowed_user_filter(config),
+        search_scope=SUBTREE,
+        attributes=list(dict.fromkeys([user_attribute, display_attribute])),
+        paged_size=500,
+        generator=True,
+    )
+    scanned: dict[str, tuple[str, str]] = {}
+    skipped = 0
+    for result in results:
+        if result.get("type") != "searchResEntry":
+            continue
+        attributes = result.get("attributes") or {}
+        directory_username = ldap_attribute_text(attributes, user_attribute)
+        canonical = f"{domain_label}\\{directory_username}"
+        if not directory_username or len(canonical) > 80:
+            skipped += 1
+            continue
+        key = canonical.casefold()
+        display_name = ldap_attribute_text(attributes, display_attribute) or directory_username
+        scanned[key] = (canonical, display_name[:160])
+        if len(scanned) > LDAP_SYNC_USER_LIMIT:
+            raise HTTPException(status_code=409, detail=f"Group LDAP vượt quá giới hạn đồng bộ an toàn {LDAP_SYNC_USER_LIMIT} user")
+
+    existing_users = db.execute(select(User)).scalars().all()
+    existing_by_username = {item.username.casefold(): item for item in existing_users}
+    created = updated = unchanged = conflicts = 0
+    for key in sorted(scanned):
+        canonical, display_name = scanned[key]
+        user = existing_by_username.get(key)
+        if user is None:
+            user = User(username=canonical, password_hash="!LDAP", display_name=display_name, role=default_role, enabled=True)
+            db.add(user)
+            existing_by_username[key] = user
+            created += 1
+            continue
+        if user.password_hash != "!LDAP":
+            conflicts += 1
+            continue
+        if user.display_name != display_name:
+            user.display_name = display_name
+            updated += 1
+        else:
+            unchanged += 1
+    db.flush()
+    return {"scanned": len(scanned), "created": created, "updated": updated, "unchanged": unchanged, "conflicts": conflicts, "skipped": skipped}
+
+
+def ldap_server_from_config(config: Mapping[str, Any]) -> LDAPServer:
+    use_ssl = bool(config.get("use_ssl", True))
+    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if use_ssl else None
+    return LDAPServer(str(config["host"]), port=int(config.get("port", 636)), use_ssl=use_ssl, tls=tls, get_info=ALL, connect_timeout=8)
+
+
 def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
     config = read_ldap_config(db, include_secret=True)
     if not config.get("enabled"):
         raise HTTPException(status_code=503, detail="Đăng nhập Domain chưa được cấu hình")
     if not username or not password:
         return None
-    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if config.get("use_ssl", True) else None
-    ldap_server = LDAPServer(config["host"], port=int(config.get("port", 636)), use_ssl=bool(config.get("use_ssl", True)), tls=tls, get_info=ALL, connect_timeout=8)
+    ldap_server = ldap_server_from_config(config)
     try:
         with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=10) as service:
             attribute = config.get("user_attribute", "sAMAccountName")
@@ -1473,21 +1555,23 @@ def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
                 membership_filter = f"(|{clauses})"
             user_filter = f"({attribute}={escape_filter_chars(username)})"
             search_filter = f"(&{user_filter}{membership_filter})" if membership_filter else user_filter
-            service.search(config["base_dn"], search_filter, search_scope=SUBTREE, attributes=[config.get("display_attribute", "displayName")], size_limit=2)
+            display_attribute = str(config.get("display_attribute", "displayName"))
+            service.search(config["base_dn"], search_filter, search_scope=SUBTREE, attributes=list(dict.fromkeys([attribute, display_attribute])), size_limit=2)
             if len(service.entries) != 1:
                 return None
             entry = service.entries[0]
             user_dn = entry.entry_dn
-            display_value = getattr(entry, config.get("display_attribute", "displayName"), None)
-            display_name = str(display_value.value) if display_value and display_value.value else username
+            attributes = entry.entry_attributes_as_dict
+            directory_username = ldap_attribute_text(attributes, attribute) or username
+            display_name = ldap_attribute_text(attributes, display_attribute) or directory_username
         with Connection(ldap_server, user=user_dn, password=password, auto_bind=True, receive_timeout=10):
             pass
     except Exception:
         return None
-    canonical = f"{config.get('domain_label', 'DOMAIN')}\\{username}"
+    canonical = f"{config.get('domain_label', 'DOMAIN')}\\{directory_username}"
     if len(canonical) > 80:
         return None
-    user = db.execute(select(User).where(User.username == canonical)).scalar_one_or_none()
+    user = db.execute(select(User).where(func.lower(User.username) == canonical.lower())).scalar_one_or_none()
     if user is None:
         default_role = str(config.get("default_role", "viewer"))
         if db.get(PlatformRole, default_role) is None:
@@ -1496,6 +1580,8 @@ def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
         db.add(user)
         db.flush()
     else:
+        if user.password_hash != "!LDAP":
+            return None
         user.display_name = display_name
     return user
 
@@ -1542,7 +1628,7 @@ def validate_platform_role(db: Session, role_name: str, *, ldap_default: bool = 
     if role is None:
         raise HTTPException(status_code=422, detail="Role không tồn tại")
     if ldap_default and role.name == "admin":
-        raise HTTPException(status_code=422, detail="Role mặc định LDAP không được là admin; hãy gán admin riêng cho từng user sau lần đăng nhập đầu tiên")
+        raise HTTPException(status_code=422, detail="Role mặc định LDAP không được là admin; hãy đồng bộ rồi gán admin riêng cho đúng user AD")
     return role
 
 
@@ -2248,8 +2334,7 @@ def scan_ldap_groups(query: str = "", _: User = Depends(require_permission("ldap
     if not config.get("host") or not config.get("base_dn"):
         raise HTTPException(status_code=409, detail="Hãy cấu hình LDAP Host và Base DN trước khi quét group")
     try:
-        tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if config.get("use_ssl", True) else None
-        ldap_server = LDAPServer(config["host"], port=int(config.get("port", 636)), use_ssl=bool(config.get("use_ssl", True)), tls=tls, get_info=ALL, connect_timeout=8)
+        ldap_server = ldap_server_from_config(config)
         with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=15) as service:
             term = escape_filter_chars(query.strip())
             group_filter = f"(&(objectClass=group)(|(cn=*{term}*)(name=*{term}*)))" if term else "(objectClass=group)"
@@ -2264,30 +2349,57 @@ def scan_ldap_groups(query: str = "", _: User = Depends(require_permission("ldap
         raise HTTPException(status_code=400, detail="Không thể quét group LDAP. Kiểm tra kết nối và quyền đọc directory của Bind DN.") from exc
 
 
+@app.post("/api/v1/settings/ldap/users/sync")
+def sync_ldap_users(request: Request, actor: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
+    if "users.manage" not in platform_role_permissions(db, actor.role):
+        raise HTTPException(status_code=403, detail="Role hiện tại cần cả quyền LDAP và quản lý người dùng để đồng bộ user AD")
+    config = read_ldap_config(db, include_secret=True)
+    if not config.get("enabled") or not config.get("host") or not config.get("base_dn"):
+        raise HTTPException(status_code=409, detail="Hãy bật và lưu cấu hình LDAP trước khi đồng bộ user AD")
+    try:
+        ldap_server = ldap_server_from_config(config)
+        with Connection(ldap_server, user=config.get("bind_dn") or None, password=config.get("bind_password") or None, auto_bind=True, receive_timeout=30) as service:
+            result = synchronize_ldap_users_from_connection(db, config, service)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Không thể đồng bộ user AD. Kiểm tra kết nối LDAPS và quyền đọc member của Bind DN.") from exc
+    audit(db, actor.username, "identity.ldap.users.sync", "allowed-groups", request, detail={**result, "allowed_group_count": len(config.get("allowed_group_dns", []))})
+    db.commit()
+    return result
+
+
 @app.put("/api/v1/settings/ldap")
 def update_ldap_config(payload: LDAPConfigRequest, request: Request, user: User = Depends(require_permission("ldap.manage")), db: Session = Depends(db_session)):
     if payload.enabled and (not payload.host or not payload.base_dn):
         raise HTTPException(status_code=400, detail="LDAP host và Base DN là bắt buộc")
+    if payload.enabled and payload.allowed_group_dns and "users.manage" not in platform_role_permissions(db, user.role):
+        raise HTTPException(status_code=403, detail="Role hiện tại cần cả quyền LDAP và quản lý người dùng để lưu group và đồng bộ user AD")
     current = read_ldap_config(db, include_secret=True)
     bind_password = payload.bind_password or current.get("bind_password", "")
     validate_platform_role(db, payload.default_role, ldap_default=True)
+    user_sync: dict[str, int] | None = None
     if payload.enabled:
         try:
-            tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=payload.ca_certificate or None) if payload.use_ssl else None
-            ldap_server = LDAPServer(payload.host, port=payload.port, use_ssl=payload.use_ssl, tls=tls, get_info=ALL, connect_timeout=8)
+            candidate_config = {**payload.model_dump(exclude={"bind_password"}), "bind_password": bind_password}
+            ldap_server = ldap_server_from_config(candidate_config)
             with Connection(ldap_server, user=payload.bind_dn or None, password=bind_password or None, auto_bind=True, receive_timeout=10) as service:
                 for group_dn in payload.allowed_group_dns:
                     if not service.search(group_dn, "(objectClass=group)", search_scope=BASE, attributes=["distinguishedName"], size_limit=1) or len(service.entries) != 1:
                         raise ValueError(f"LDAP group không tồn tại hoặc Bind DN không đọc được: {group_dn}")
+                if payload.allowed_group_dns:
+                    user_sync = synchronize_ldap_users_from_connection(db, candidate_config, service)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Không thể bind LDAP. Kiểm tra host, certificate LDAPS, Bind DN và mật khẩu.") from exc
     serialized = payload.model_dump(exclude={"bind_password"})
     if bind_password:
         serialized["bind_password_encrypted"] = job_fernet().encrypt(bind_password.encode()).decode()
     db.merge(SystemSetting(key="ldap_config", value=json.dumps(serialized, separators=(",", ":"))))
-    audit(db, user.username, "settings.ldap.update", payload.host, request, detail={"enabled": payload.enabled, "use_ssl": payload.use_ssl, "allowed_group_count": len(payload.allowed_group_dns)})
+    audit(db, user.username, "settings.ldap.update", payload.host, request, detail={"enabled": payload.enabled, "use_ssl": payload.use_ssl, "allowed_group_count": len(payload.allowed_group_dns), "user_sync": user_sync})
     db.commit()
-    return {**serialized, "password_configured": bool(bind_password)}
+    return {**payload.model_dump(exclude={"bind_password"}), "password_configured": bool(bind_password), "userSync": user_sync}
 
 
 def retired_server_ids(db: Session) -> set[str]:
