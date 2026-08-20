@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source đã tăng lên `0.8.8` để nhận file tới 1 GiB; Linux executable và Windows MSI bundle `0.8.8` phải lấy từ GitHub Actions ngay sau source commit này. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
+- Agent source, Linux executable và Windows MSI đã đồng bộ/bundle ở phiên bản `0.8.8` để nhận file tới 1 GiB. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -89,9 +89,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `14,450,688` bytes.
-- Phiên bản MSI: `0.8.7`.
-- SHA-256: `0A94992264808E5292C198655EE170FC88B3E9198C946DC77501B79CB3A520CD`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `c450339282d8b29818ba25d9cd5331058c454e69` trên GitHub Actions run `32228767018`; ProductVersion `0.8.7`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.8.8`.
+- SHA-256: `D648979D37E6A774A07133760DC3F6F9FC7C426719152A74CBE878D53044BD93`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `73d08f7e31cc2726990b1a7ad1b18c89a34c4a06` trên GitHub Actions run `32325161405`; ProductVersion `0.8.8`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -101,9 +101,9 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; kích thước `16,633,896` bytes.
-- Phiên bản: `0.8.7`; SHA-256 `778C24C54D6BD6C7D48ADB8C37E08BFE8D6F94DEF8ED42A5E83D5649BDCF7F54`.
-- GitHub Actions run `32228767049` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `c450339282d8b29818ba25d9cd5331058c454e69`.
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,634,544` bytes.
+- Phiên bản: `0.8.8`; SHA-256 `D7F295F231D3FFCF1E821EC2B4D4F4D06BA2B7CB9D0D21C7DA65355FE5E36A7E`.
+- GitHub Actions run `32325161416` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `73d08f7e31cc2726990b1a7ad1b18c89a34c4a06`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
@@ -380,7 +380,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions cho 0.8.7: security audit run `32228767079` pass; Linux build run `32228767049` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32228767018` pass và ProductVersion đọc trực tiếp là `0.8.7`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions cho 0.8.8: security audit run `32325161387` pass; Linux build run `32325161416` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32325161405` pass và ProductVersion đọc trực tiếp là `0.8.8`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Sites
 
@@ -395,7 +395,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Windows yêu cầu unallocated space liền kề ngay bên phải. Với layout hiện tại `C: -> 10 GiB Unallocated -> Recovery -> 10 GiB Unallocated`, `Extend` của C: phải bật với đúng 10 GiB đầu tiên; 10 GiB sau Recovery không được cộng vào capacity. Ứng dụng không tự di chuyển/xóa Recovery.
 - Audit API trả thêm `detail`, phân trang 500 dòng và giao diện hiển thị cụ thể server/action/risk để truy ra ai đã thao tác gì.
 - PostgreSQL tự xóa audit event quá 30 ngày khi API startup và mỗi giờ. Mỗi lần dọn có audit event riêng và lưu hash neo tại `system_settings.audit_retention_anchor`.
-- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.8.7` ở phần trên.
+- Ghi chú lịch sử của bản 17/08: thay đổi lúc đó không đổi Agent/MSI và production dùng Agent `0.7.2`; trạng thái hiện tại đã được thay bằng Agent/MSI `0.8.8` ở phần trên.
 - Sửa nhận diện LV khi `lsblk` trả `/dev/mapper/<vg>-<lv>` nhưng `lvs` trả `/dev/<vg>/<lv>`: dashboard ánh xạ đúng quy tắc escape dấu gạch ngang của device-mapper, nên root LV hiện lại nút Extend và dùng đúng path do `lvs` cung cấp cho Agent.
 - Unallocated Windows không phải partition nên không hỗ trợ kéo-thả. Nếu Recovery nằm giữa C: và vùng trống, Windows native chỉ extend sau khi Recovery được di chuyển hoặc xóa/tạo lại trong maintenance window có backup; dashboard chỉ báo khóa, không tự làm thao tác phá hủy này.
 
