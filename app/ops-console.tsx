@@ -2076,12 +2076,19 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [source, setSource] = useState<"local" | "domain">("local");
+  const [mfaCode, setMfaCode] = useState("");
+  const mfaCodeRef = useRef<HTMLInputElement>(null);
   const [mfa, setMfa] = useState<{
     challenge_token: string;
     setup_required: boolean;
     qr_svg?: string;
     provisioning_uri?: string;
   } | null>(null);
+  useEffect(() => {
+    if (!mfa) return;
+    const frame = window.requestAnimationFrame(() => mfaCodeRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [mfa]);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
@@ -2099,6 +2106,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Không thể đăng nhập");
+      setMfaCode("");
       setMfa(data);
     } catch (reason) {
       setError(
@@ -2113,18 +2121,20 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
     if (!mfa) return;
     setBusy(true);
     setError("");
-    const form = new FormData(event.currentTarget);
     try {
       const response = await fetch("/api/v1/auth/mfa/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Tram-Auth-Mode": "cookie" },
         body: JSON.stringify({
           challenge_token: mfa.challenge_token,
-          code: form.get("code"),
+          code: mfaCode,
         }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.detail ?? "Mã MFA không hợp lệ");
+      if (!response.ok) {
+        setMfaCode("");
+        throw new Error(data.detail ?? "Mã MFA không hợp lệ");
+      }
       onLogin();
     } catch (reason) {
       setError(
@@ -2138,7 +2148,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
     return (
       <div className="login-page">
         <div className="login-glow" />
-        <form className="login-card mfa-card" onSubmit={verifyMfa}>
+        <form className="login-card mfa-card" onSubmit={verifyMfa} autoComplete="off">
           <div className="login-brand">
             <span className="brand-mark">V</span>
             <div>
@@ -2164,12 +2174,16 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
               alt="QR thiết lập MFA"
             />
           )}
+          <input className="login-autofill-sink" name="username" autoComplete="username" tabIndex={-1} aria-hidden="true" />
           <label>
             Mã MFA 6 số
             <input
-              name="code"
+              name="totp_code"
+              ref={mfaCodeRef}
               inputMode="numeric"
               autoComplete="one-time-code"
+              value={mfaCode}
+              onChange={(event) => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
               pattern="[0-9]{6}"
               maxLength={6}
               required
@@ -2185,6 +2199,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
             className="login-back"
             onClick={() => {
               setMfa(null);
+              setMfaCode("");
               setError("");
             }}
           >

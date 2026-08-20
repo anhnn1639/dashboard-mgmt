@@ -4284,6 +4284,15 @@ textarea:focus-visible {
 .mfa-card {
   width: min(450px, 100%);
 }
+.login-autofill-sink {
+  position: absolute !important;
+  left: -10000px !important;
+  bottom: 0 !important;
+  width: 1px !important;
+  height: 1px !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
 .mfa-qr {
   display: block;
   width: 210px;

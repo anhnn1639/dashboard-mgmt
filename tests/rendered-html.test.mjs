@@ -272,9 +272,15 @@ test("sidebar can be resized with pointer or keyboard", async () => {
 
 test("MFA QR is CSP-compatible for every role", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const caddy = await readFile(new URL("../deploy/Caddyfile", import.meta.url), "utf8");
   assert.match(source, /<img\s+className="mfa-qr"\s+src=\{mfa\.qr_svg\}/s);
   assert.doesNotMatch(source, /<object\s+className="mfa-qr"/s);
+  assert.match(source, /className="login-autofill-sink"\s+name="username"\s+autoComplete="username"/s);
+  assert.match(source, /name="totp_code"[\s\S]*ref=\{mfaCodeRef\}[\s\S]*autoComplete="one-time-code"[\s\S]*value=\{mfaCode\}/s);
+  assert.match(source, /requestAnimationFrame\(\(\) => mfaCodeRef\.current\?\.focus\(\)\)/);
+  assert.match(source, /replace\(\/\\D\/g, ""\)\.slice\(0, 6\)/);
+  assert.match(styles, /\.login-autofill-sink\s*\{[^}]*left:\s*-10000px/s);
   assert.match(caddy, /img-src 'self' data: blob:/);
   assert.match(caddy, /script-src-attr 'none'/);
 });
