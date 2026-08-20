@@ -41,7 +41,7 @@ https://{$OPS_DOMAIN} {
     @dashboardSecurity not path /guacamole/*
     # Vinext emits small inline hydration scripts. Keep those enabled while
     # disallowing third-party script origins and all plugin/object embedding.
-    header @dashboardSecurity Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss:"
+    header @dashboardSecurity Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss:; upgrade-insecure-requests"
 
     header {
         X-Content-Type-Options "nosniff"

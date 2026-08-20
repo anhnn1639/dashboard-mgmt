@@ -40,7 +40,7 @@ from ldap3 import ALL, BASE, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, select, text, update
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, or_, select, text, update
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     database_url: str = ""
     jwt_secret: str = ""
     jwt_issuer: str = "tram-van-hanh"
-    jwt_ttl_minutes: int = 480
+    jwt_ttl_minutes: int = Field(default=60, ge=5, le=480)
     bootstrap_admin_user: str = "admin"
     bootstrap_admin_password: str = ""
     agent_ca_cert: str = "/run/secrets/agent-ca.crt"
@@ -237,6 +237,14 @@ class AuthThrottle(Base):
     window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+
+
+class RevokedSessionToken(Base):
+    __tablename__ = "revoked_session_tokens"
+    jti: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class Server(Base):
@@ -489,7 +497,7 @@ class LDAPConfigRequest(BaseModel):
     enabled: bool = False
     host: str = Field(default="", max_length=255)
     port: int = Field(default=636, ge=1, le=65535)
-    use_ssl: bool = True
+    use_ssl: Literal[True] = True
     base_dn: str = Field(default="", max_length=512)
     bind_dn: str = Field(default="", max_length=512)
     bind_password: str = Field(default="", max_length=1024)
@@ -748,7 +756,8 @@ PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     "storage.manage": {"group": "Vận hành", "label": "Quản lý Disk", "description": "Extend, Shrink, tạo và xóa partition/LVM/volume."},
     "processes.manage": {"group": "Vận hành", "label": "Kill process", "description": "Dừng process đã chọn sau khi Agent đối chiếu PID."},
     "updates.manage": {"group": "Vận hành", "label": "Cài bản cập nhật", "description": "Cài đúng các gói update được chọn."},
-    "logs.view": {"group": "Vận hành", "label": "Xem và cấu hình log", "description": "Đọc tối đa 500 dòng và chọn nguồn log cho từng máy chủ."},
+    "logs.view": {"group": "Vận hành", "label": "Xem log", "description": "Đọc tối đa 500 dòng log từ các nguồn đã được cấu hình."},
+    "logs.configure": {"group": "Vận hành", "label": "Cấu hình nguồn log", "description": "Chọn Event Log hoặc file /var/log được phép đọc trên từng máy chủ."},
     "files.view": {"group": "Vận hành", "label": "Xem lịch sử truyền file", "description": "Xem metadata, trạng thái quét và kết quả giao file."},
     "files.manage": {"group": "Vận hành", "label": "Gửi file", "description": "Quét malware và gửi file tới Agent."},
     "system.reboot": {"group": "Vận hành", "label": "Khởi động lại máy chủ", "description": "Lên lịch reboot máy chủ từ Agent."},
@@ -803,7 +812,7 @@ BUILTIN_ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
     "admin": {"display_name": "Administrator", "description": "Toàn quyền quản trị website và máy chủ.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS)},
     "operator": {"display_name": "Operator", "description": "Vận hành các máy chủ được chia sẻ, phiên truy cập và file; không quản trị danh tính website.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"audit.view", "users.manage", "ldap.manage", "roles.manage", "agents.manage", "recordings.delete", "servers.manage"})},
     "viewer": {"display_name": "Viewer", "description": "Chỉ xem fleet và dữ liệu tài nguyên; không thực hiện thay đổi.", "permissions": ["logs.view", "resources.view", "servers.view"]},
-    "auditor": {"display_name": "Auditor", "description": "Xem fleet, log, audit, file và recording; không thay đổi máy chủ.", "permissions": ["audit.view", "files.view", "logs.view", "recordings.view", "servers.view"]},
+    "auditor": {"display_name": "Auditor", "description": "Xem fleet được chia sẻ, log, audit, file và recording; không thay đổi cấu hình hay máy chủ.", "permissions": ["audit.view", "files.view", "logs.view", "recordings.view", "servers.view"]},
 }
 
 AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
@@ -1048,6 +1057,10 @@ tunnel_hub = TunnelHub(
     closed_callback=mark_tunnel_closed,
 )
 
+SESSION_COOKIE_NAME = "tram_ops_session"
+SESSION_COOKIE_MARKER = "cookie-session"
+SAFE_COOKIE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
 
 app = FastAPI(
     title="Trạm Vận Hành API",
@@ -1073,6 +1086,28 @@ async def add_api_security_headers(request: Request, call_next):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
+        if response.status_code == 403 and getattr(request.state, "authenticated_user", None) is not None:
+            factory = SessionLocal
+            if factory is not None:
+                try:
+                    with factory() as audit_db:
+                        route = request.scope.get("route")
+                        route_path = getattr(route, "path", request.url.path)
+                        user = request.state.authenticated_user
+                        audit(
+                            audit_db,
+                            user.username,
+                            "security.authorization.denied",
+                            str(route_path),
+                            request,
+                            result="denied",
+                            detail={"method": request.method, "status": 403, "role": user.role},
+                        )
+                        audit_db.commit()
+                except Exception:
+                    # Authorization must remain fail-closed even if audit
+                    # persistence is temporarily unavailable.
+                    pass
     return response
 
 
@@ -1280,6 +1315,10 @@ def prune_auth_throttles(db: Session) -> None:
     db.execute(delete(AuthThrottle).where(AuthThrottle.updated_at < now() - timedelta(days=1)))
 
 
+def prune_revoked_session_tokens(db: Session) -> None:
+    db.execute(delete(RevokedSessionToken).where(RevokedSessionToken.expires_at <= now()))
+
+
 def audit(db: Session, actor: str, action: str, target: str, request: Request | None = None, result: str = "success", detail: dict[str, Any] | None = None) -> None:
     previous = db.execute(select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(1)).scalar_one_or_none()
     occurred = now()
@@ -1425,7 +1464,19 @@ def prune_recording_files(db: Session) -> dict[str, Any]:
 
 def issue_jwt(user: User) -> str:
     timestamp = now()
-    return jwt.encode({"sub": user.id, "username": user.username, "role": user.role, "iss": settings.jwt_issuer, "iat": timestamp, "exp": timestamp + timedelta(minutes=settings.jwt_ttl_minutes)}, settings.jwt_secret, algorithm="HS256")
+    return jwt.encode(
+        {
+            "sub": user.id,
+            "username": user.username,
+            "role": user.role,
+            "jti": str(uuid.uuid4()),
+            "iss": settings.jwt_issuer,
+            "iat": timestamp,
+            "exp": timestamp + timedelta(minutes=settings.jwt_ttl_minutes),
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
 
 
 def issue_mfa_challenge(user: User) -> str:
@@ -1551,9 +1602,10 @@ def synchronize_ldap_users_from_connection(db: Session, config: Mapping[str, Any
 
 
 def ldap_server_from_config(config: Mapping[str, Any]) -> LDAPServer:
-    use_ssl = bool(config.get("use_ssl", True))
-    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None) if use_ssl else None
-    return LDAPServer(str(config["host"]), port=int(config.get("port", 636)), use_ssl=use_ssl, tls=tls, get_info=ALL, connect_timeout=8)
+    if config.get("use_ssl") is not True:
+        raise HTTPException(status_code=422, detail="Chỉ cho phép LDAPS có xác minh certificate; LDAP plaintext đã bị vô hiệu hóa")
+    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=config.get("ca_certificate") or None)
+    return LDAPServer(str(config["host"]), port=int(config.get("port", 636)), use_ssl=True, tls=tls, get_info=ALL, connect_timeout=8)
 
 
 def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
@@ -1607,16 +1659,34 @@ def authenticate_ldap(db: Session, username: str, password: str) -> User | None:
     return user
 
 
-def current_user(authorization: str | None = Header(default=None), db: Session = Depends(db_session)) -> User:
-    if not authorization or not authorization.startswith("Bearer "):
+def current_user(request: Request, authorization: str | None = Header(default=None), db: Session = Depends(db_session)) -> User:
+    token = ""
+    using_cookie = False
+    if authorization and authorization.startswith("Bearer ") and authorization[7:] != SESSION_COOKIE_MARKER:
+        token = authorization[7:]
+    else:
+        token = request.cookies.get(SESSION_COOKIE_NAME, "")
+        using_cookie = bool(token)
+    if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        claims = jwt.decode(authorization[7:], settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer)
+        claims = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer)
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid session") from exc
+    jti = str(claims.get("jti", ""))
+    if not re.fullmatch(r"[0-9a-f-]{36}", jti) or db.get(RevokedSessionToken, jti) is not None:
+        raise HTTPException(status_code=401, detail="Session has been revoked")
     user = db.get(User, claims.get("sub"))
     if not user or not user.enabled:
         raise HTTPException(status_code=401, detail="User disabled")
+    request.state.authenticated_user = user
+    request.state.authenticated_claims = claims
+    if using_cookie and request.method not in SAFE_COOKIE_METHODS:
+        origin = request.headers.get("origin", "")
+        forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        fetch_site = request.headers.get("sec-fetch-site", "")
+        if fetch_site == "cross-site" or (origin and urlsplit(origin).netloc.casefold() != forwarded_host.casefold()):
+            raise HTTPException(status_code=403, detail="Cross-site request was rejected")
     return user
 
 
@@ -1671,6 +1741,17 @@ def require_permission(permission: str):
 
     def dependency(user: User = Depends(current_user), db: Session = Depends(db_session)) -> User:
         if permission not in platform_role_permissions(db, user.role):
+            raise HTTPException(status_code=403, detail="Role hiện tại không có quyền thực hiện chức năng này")
+        return user
+    return dependency
+
+
+def require_any_permission(*permissions: str):
+    if not permissions or any(permission not in PERMISSION_CATALOG for permission in permissions):
+        raise RuntimeError("Unknown or empty platform permission set")
+
+    def dependency(user: User = Depends(current_user), db: Session = Depends(db_session)) -> User:
+        if platform_role_permissions(db, user.role).isdisjoint(permissions):
             raise HTTPException(status_code=403, detail="Role hiện tại không có quyền thực hiện chức năng này")
         return user
     return dependency
@@ -1913,6 +1994,7 @@ def startup() -> None:
             ensure_builtin_roles(db)
             retire_legacy_pending_jobs(db)
             expire_file_payloads(db)
+            prune_revoked_session_tokens(db)
             prune_audit_events(db)
             prune_recording_files(db)
             exists = db.execute(select(User).limit(1)).scalar_one_or_none()
@@ -2089,7 +2171,7 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(db_sess
 
 
 @app.post("/api/v1/auth/mfa/verify")
-def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = Depends(db_session)):
+def verify_mfa_login(payload: MFAVerifyRequest, request: Request, response: Response, auth_mode: str = Header(default="bearer", alias="X-Tram-Auth-Mode"), db: Session = Depends(db_session)):
     try:
         claims = jwt.decode(payload.challenge_token, settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer)
     except jwt.PyJWTError as exc:
@@ -2120,7 +2202,35 @@ def verify_mfa_login(payload: MFAVerifyRequest, request: Request, db: Session = 
     credential.last_counter = matched_counter
     audit(db, user.username, "auth.mfa", "dashboard", request)
     db.commit()
-    return {"access_token": issue_jwt(user), "token_type": "bearer", "expires_in": settings.jwt_ttl_minutes * 60, "user": {"username": user.username, "displayName": user.display_name, "role": user.role}}
+    access_token = issue_jwt(user)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=access_token,
+        max_age=settings.jwt_ttl_minutes * 60,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+    result = {"expires_in": settings.jwt_ttl_minutes * 60, "user": {"username": user.username, "displayName": user.display_name, "role": user.role}}
+    if auth_mode.casefold() != "cookie":
+        result.update({"access_token": access_token, "token_type": "bearer"})
+    return result
+
+
+@app.post("/api/v1/auth/logout")
+def logout(request: Request, response: Response, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    claims = getattr(request.state, "authenticated_claims", {})
+    jti = str(claims.get("jti", ""))
+    expires_at = datetime.fromtimestamp(int(claims.get("exp", 0)), UTC)
+    if not re.fullmatch(r"[0-9a-f-]{36}", jti) or expires_at <= now():
+        raise HTTPException(status_code=401, detail="Invalid session")
+    db.merge(RevokedSessionToken(jti=jti, user_id=user.id, expires_at=expires_at))
+    audit(db, user.username, "auth.logout", "dashboard", request, detail={"jti_suffix": jti[-8:]})
+    prune_revoked_session_tokens(db)
+    db.commit()
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=True, httponly=True, samesite="strict")
+    return {"status": "signed_out"}
 
 
 @app.get("/api/v1/me")
@@ -2371,7 +2481,7 @@ def delete_platform_group(group_id: str, request: Request, actor: User = Depends
 
 
 @app.get("/api/v1/roles")
-def list_platform_roles(_: User = Depends(current_user), db: Session = Depends(db_session)):
+def list_platform_roles(_: User = Depends(require_any_permission("users.manage", "ldap.manage", "roles.manage")), db: Session = Depends(db_session)):
     ensure_builtin_roles(db)
     db.commit()
     roles = db.execute(select(PlatformRole).order_by(PlatformRole.system.desc(), PlatformRole.name)).scalars().all()
@@ -2682,7 +2792,7 @@ def get_server_log_sources(server_id: str, user: User = Depends(require_permissi
 
 
 @app.put("/api/v1/servers/{server_id}/log-sources")
-def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
+def update_server_log_sources(payload: LogSourcesUpdateRequest, server_id: str, request: Request, user: User = Depends(require_permission("logs.configure")), db: Session = Depends(db_session)):
     server = visible_server(db, user, server_id)
     sources = validate_log_sources(server, payload.sources)
     db.merge(SystemSetting(key=log_sources_setting_key(server.id), value=json.dumps(sources, ensure_ascii=False, separators=(",", ":"))))
@@ -3645,10 +3755,35 @@ def list_jobs(user: User = Depends(require_permission("servers.view")), db: Sess
 
 
 @app.get("/api/v1/audit")
-def list_audit(before: datetime | None = None, limit: int = Query(default=500, ge=1, le=500), _: User = Depends(require_permission("audit.view")), db: Session = Depends(db_session)):
-    query = select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(limit)
+def list_audit(
+    before: datetime | None = None,
+    search_text: str = Query(default="", alias="search", max_length=160),
+    result: Literal["success", "denied", "failed", "partial", "cancelled"] | None = None,
+    action: str = Query(default="", max_length=120),
+    limit: int = Query(default=500, ge=1, le=500),
+    _: User = Depends(require_permission("audit.view")),
+    db: Session = Depends(db_session),
+):
+    query = select(AuditEvent)
     if before is not None:
         query = query.where(AuditEvent.occurred_at < aware(before))
+    if result is not None:
+        query = query.where(AuditEvent.result == result)
+    normalized_action = action.strip()
+    if normalized_action:
+        query = query.where(func.lower(AuditEvent.action).contains(normalized_action.casefold()))
+    normalized_search = search_text.strip()
+    if normalized_search:
+        needle = normalized_search.casefold()
+        query = query.where(
+            or_(
+                func.lower(AuditEvent.actor).contains(needle),
+                func.lower(AuditEvent.action).contains(needle),
+                func.lower(AuditEvent.target).contains(needle),
+                func.lower(AuditEvent.source_ip).contains(needle),
+            )
+        )
+    query = query.order_by(AuditEvent.occurred_at.desc()).limit(limit)
     events = db.execute(query).scalars().all()
     return {
         "items": [

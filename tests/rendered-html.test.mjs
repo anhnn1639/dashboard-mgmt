@@ -183,8 +183,20 @@ test("platform users, LDAP assignments and custom roles are editable", async () 
   assert.match(source, /currentUser\.role === "admin"/);
   assert.match(source, />Reset MFA<\/button>/);
   assert.match(source, /Lần đăng nhập sau sẽ hiển thị QR mới/);
+  assert.match(source, /LDAPS bắt buộc/);
+  assert.match(source, /use_ssl: true/);
+  assert.doesNotMatch(source, /name="use_ssl"/);
   assert.match(styles, /\.account-settings-modal\s*{[^}]*width:\s*min\(720px, calc\(100vw - 16px\)\)/s);
   assert.match(styles, /\.account-identity-summary\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+});
+
+test("dashboard authentication uses a revocable HttpOnly cookie instead of web storage", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /COOKIE_SESSION_MARKER = "cookie-session"/);
+  assert.match(source, /\/api\/v1\/auth\/logout/);
+  assert.match(source, /"X-Tram-Auth-Mode": "cookie"/);
+  assert.doesNotMatch(source, /sessionStorage/);
+  assert.doesNotMatch(source, /tram_ops_token/);
 });
 
 test("process resources and server visibility controls are operable", async () => {
@@ -218,6 +230,9 @@ test("process resources and server visibility controls are operable", async () =
   assert.match(source, /overview-activity-list/);
   assert.match(source, /File tối đa 1 GiB/);
   assert.match(source, /const formElement = event\.currentTarget/);
+  assert.match(source, /currentUser\.permissions\.includes\("logs\.configure"\)/);
+  assert.match(source, /audit-filter-bar/);
+  assert.match(source, /query\.set\("search"/);
 });
 
 test("job and audit action codes have readable labels", async () => {
@@ -261,6 +276,7 @@ test("MFA QR is CSP-compatible for every role", async () => {
   assert.match(source, /<img\s+className="mfa-qr"\s+src=\{mfa\.qr_svg\}/s);
   assert.doesNotMatch(source, /<object\s+className="mfa-qr"/s);
   assert.match(caddy, /img-src 'self' data: blob:/);
+  assert.match(caddy, /script-src-attr 'none'/);
 });
 
 test("viewer navigation is permission-aware and stale admin hashes are replaced", async () => {

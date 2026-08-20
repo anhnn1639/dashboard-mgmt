@@ -12,7 +12,7 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Giao diện **Bộ cài Agent** tự sinh Linux `.run` hoặc Windows `.msi` theo đúng domain HTTPS/CA của control plane; không sửa domain bằng tay trên máy đích.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
 - Nginx trên host giữ public TCP `80/443`; Caddy chỉ xuất HTTPS web trên `127.0.0.1:3000`. Port `80` của Nginx chỉ chuyển hướng sang HTTPS.
-- RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT ngắn hạn và Argon2 password hashing.
+- RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT mặc định 60 phút và Argon2 password hashing. Trình duyệt nhận session bằng cookie `Secure`/`HttpOnly`/`SameSite=Strict`, không lưu access token trong Web Storage; logout thu hồi `jti` trong PostgreSQL. Bearer token chỉ giữ cho API/CLI tương thích.
 - Công việc có cấu trúc và allowlist; không có endpoint chạy shell tùy ý.
 - Tác vụ được xếp hàng trực tiếp sau khi kiểm tra MFA/RBAC, allowlist tham số và ghi audit.
 - Quản lý local user/group theo máy đang chọn: tạo/khóa/mở khóa/xóa/reset mật khẩu, tạo/xóa group và thêm/xóa thành viên.
@@ -219,9 +219,9 @@ Không hệ thống antivirus nào đảm bảo chặn tuyệt đối zero-day. 
 ## LDAP Domain Login và MFA
 
 1. Đăng nhập bằng admin Local và mở **Truy cập & Vai trò**.
-2. Nhập LDAP/Active Directory host, Base DN, Bind DN, service-account password, chọn LDAPS và dán CA certificate nếu dùng enterprise/private CA.
+2. Nhập LDAP/Active Directory host, Base DN, Bind DN, service-account password và dán CA certificate nếu dùng enterprise/private CA. LDAPS cùng xác minh certificate là bắt buộc; API từ chối cấu hình LDAP plaintext.
 3. Bật **Domain Login**, lưu cấu hình, sau đó dùng tab **Domain Login** ở màn hình đăng nhập.
-4. Lần đầu mỗi tài khoản Local hoặc Domain đăng nhập thành công, hệ thống bắt buộc quét QR TOTP và xác minh mã 6 số trước khi cấp JWT.
+4. Lần đầu mỗi tài khoản Local hoặc Domain đăng nhập thành công, hệ thống bắt buộc quét QR TOTP và xác minh mã 6 số trước khi cấp session.
 
 Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` trước khi lưu PostgreSQL. Bắt buộc dùng LDAPS có certificate được API container tin cậy ở production.
 
@@ -244,7 +244,7 @@ Tác vụ đặc quyền được tạo ở trạng thái `queued` và Agent nh�
 
 Nút **Extend** luôn hiển thị trên partition/LV. Nút chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn: Windows cần vùng unallocated liền kề partition, còn Linux LVM cần dung lượng trống trong Volume Group. Windows Extend/Shrink dùng DiskPart native giống Disk Management, yêu cầu đúng dung lượng đã nhập và xác minh kích thước partition sau thao tác; Shrink chỉ áp dụng cho NTFS có drive letter. Root LV được phép extend nhưng vẫn bị khóa xóa; partition boot/root trực tiếp không được tự động extend. Ứng dụng không tự di chuyển partition Recovery của Windows.
 
-Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA, cấu hình, agent, job vận hành, file, phiên SSH/RDP và recording) được ghi vào `audit_events` trong PostgreSQL với actor, IP nguồn, kết quả, tham số an toàn và chuỗi hash. Giao diện audit phân trang 500 bản ghi mỗi lần. Bản ghi quá 30 ngày được dọn lúc API khởi động và mỗi giờ; hash cuối của phần đã xóa được giữ trong `system_settings.audit_retention_anchor` để duy trì dấu vết liên kết.
+Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA/logout, cấu hình, agent, job vận hành, file, phiên SSH/RDP và recording) được ghi vào `audit_events` trong PostgreSQL với actor, IP nguồn, kết quả, tham số an toàn và chuỗi hash. Mọi phản hồi `403` của người dùng đã xác thực cũng sinh sự kiện `security.authorization.denied`. Giao diện audit phân trang 500 bản ghi mỗi lần và có lọc theo từ khóa, kết quả, hành động. Bản ghi quá 30 ngày được dọn lúc API khởi động và mỗi giờ; hash cuối của phần đã xóa được giữ trong `system_settings.audit_retention_anchor` để duy trì dấu vết liên kết.
 
 ## API tác vụ allowlist
 

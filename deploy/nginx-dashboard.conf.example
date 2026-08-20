@@ -32,6 +32,7 @@ server {
 
     location / {
         proxy_pass https://127.0.0.1:3000;
+        proxy_hide_header Server;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

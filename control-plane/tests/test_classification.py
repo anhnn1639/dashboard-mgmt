@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
@@ -52,7 +52,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 (test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, RecordingDeletionRequest, RemoteSession, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, RecordingDeletionRequest, RemoteSession, RevokedSessionToken, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -228,6 +228,52 @@ class ClassificationTests(unittest.TestCase):
                 db.query(AuthThrottle).delete()
                 db.commit()
 
+    def test_logout_revokes_bearer_replay_and_browser_cookie_session(self):
+        username = f"logout-{uuid.uuid4().hex[:8]}"
+        password = "Logout-Test-Password-123!"
+        with SessionLocal() as db:
+            user = User(username=username, password_hash=password_hasher.hash(password), display_name="Logout Test", role="viewer", enabled=True)
+            db.add(user)
+            db.commit()
+            user_id = user.id
+        try:
+            with TestClient(app, base_url="https://testserver") as client:
+                login = client.post("/api/v1/auth/login", json={"username": username, "password": password})
+                self.assertEqual(login.status_code, 200, login.text)
+                secret = parse_qs(urlsplit(login.json()["provisioning_uri"]).query)["secret"][0]
+                verified = client.post("/api/v1/auth/mfa/verify", headers={"X-Tram-Auth-Mode": "cookie"}, json={"challenge_token": login.json()["challenge_token"], "code": pyotp.TOTP(secret).now()})
+                self.assertEqual(verified.status_code, 200, verified.text)
+                self.assertNotIn("access_token", verified.json())
+                bearer = client.cookies.get("tram_ops_session")
+                self.assertTrue(bearer)
+                cookie = verified.headers.get("set-cookie", "")
+                self.assertIn("tram_ops_session=", cookie)
+                self.assertIn("HttpOnly", cookie)
+                self.assertIn("Secure", cookie)
+                self.assertIn("SameSite=strict", cookie)
+                self.assertEqual(client.get("/api/v1/me").status_code, 200)
+                signed_out = client.post("/api/v1/auth/logout")
+                self.assertEqual(signed_out.status_code, 200, signed_out.text)
+                self.assertEqual(client.get("/api/v1/me").status_code, 401)
+                replay = client.get("/api/v1/me", headers={"Authorization": f"Bearer {bearer}"})
+                self.assertEqual(replay.status_code, 401, replay.text)
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(RevokedSessionToken).where(RevokedSessionToken.user_id == user_id))
+                credential = db.get(MFACredential, user_id)
+                if credential:
+                    db.delete(credential)
+                user = db.get(User, user_id)
+                if user:
+                    db.delete(user)
+                db.commit()
+
+    def test_plaintext_ldap_configuration_is_rejected(self):
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            response = client.put("/api/v1/settings/ldap", headers=headers, json={"enabled": False, "use_ssl": False})
+            self.assertEqual(response.status_code, 422, response.text)
+
     def test_custom_role_and_per_user_ldap_role_are_enforced(self):
         role_name = f"ldapops_{uuid.uuid4().hex[:8]}"
         ldap_username = f"TEST\\ldap-{uuid.uuid4().hex[:8]}"
@@ -337,6 +383,11 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(client.get("/api/v1/servers", headers=viewer_headers).status_code, 200)
                 self.assertEqual(client.get("/api/v1/users", headers=viewer_headers).status_code, 403)
                 self.assertEqual(client.get("/api/v1/settings/ldap", headers=viewer_headers).status_code, 403)
+                self.assertEqual(client.get("/api/v1/roles", headers=viewer_headers).status_code, 403)
+                with SessionLocal() as db:
+                    denial = db.execute(select(AuditEvent).where(AuditEvent.actor == viewer.username, AuditEvent.action == "security.authorization.denied").order_by(AuditEvent.occurred_at.desc())).scalars().first()
+                    self.assertIsNotNone(denial)
+                    self.assertEqual(denial.result, "denied")
         finally:
             with SessionLocal() as db:
                 stored = db.get(User, viewer_id)
@@ -555,6 +606,9 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(row["detail"], {"operation": "verify"})
             paged = client.get("/api/v1/audit", params={"before": (datetime.now(UTC) + timedelta(days=1)).isoformat()}, headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(paged.status_code, 200, paged.text)
+            filtered = client.get("/api/v1/audit", params={"search": "recent-user", "result": "success", "action": "test.recent"}, headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(filtered.status_code, 200, filtered.text)
+            self.assertEqual([item["id"] for item in filtered.json()["items"]], [recent_id])
 
     def test_storage_actions_must_match_the_server_os(self):
         windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server")

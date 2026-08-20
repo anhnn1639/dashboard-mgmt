@@ -80,6 +80,8 @@ type JobListRow = {
   output?: string;
 };
 
+const COOKIE_SESSION_MARKER = "cookie-session";
+
 const navItems = [
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
   { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
@@ -166,6 +168,8 @@ const operationLabels: Record<string, string> = {
   "identity.ldap.users.sync": "Đồng bộ người dùng Active Directory",
   "settings.ldap.update": "Cập nhật cấu hình LDAP",
   "settings.recording_retention.update": "Cập nhật thời gian lưu recording",
+  "auth.logout": "Đăng xuất và thu hồi phiên",
+  "security.authorization.denied": "Từ chối truy cập do thiếu quyền",
   "session.recording.view": "Xem lại recording",
   "session.recording.delete.request": "Yêu cầu xóa recording",
   "session.recording.delete.approve": "Duyệt xóa recording",
@@ -529,7 +533,7 @@ export function OpsConsole() {
         headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
       });
       if (response.status === 401) {
-        window.sessionStorage.removeItem("tram_ops_token");
+        setCurrentUser(null);
         setToken("");
         throw new Error("Unauthorized");
       }
@@ -591,9 +595,8 @@ export function OpsConsole() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const storedToken = window.sessionStorage.getItem("tram_ops_token") ?? "";
-      setToken(storedToken);
-      setIdentityReady(!storedToken);
+      setToken(COOKIE_SESSION_MARKER);
+      setIdentityReady(false);
       setAuthReady(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -605,7 +608,6 @@ export function OpsConsole() {
     fetch("/api/v1/me", { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } })
       .then((response) => {
         if (response.status === 401) {
-          window.sessionStorage.removeItem("tram_ops_token");
           setCurrentUser(null);
           setIdentityReady(true);
           setToken("");
@@ -756,13 +758,21 @@ export function OpsConsole() {
     window.setTimeout(() => setToast(""), 3200);
   }
 
-  function signOut() {
-    window.sessionStorage.removeItem("tram_ops_token");
-    setAccountOpen(false);
-    setCurrentUser(null);
-    setIdentityReady(true);
-    setIdentityError("");
-    setToken("");
+  async function signOut() {
+    try {
+      const response = await fetch("/api/v1/auth/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok && response.status !== 401) throw new Error("Không thể thu hồi phiên đăng nhập");
+      setAccountOpen(false);
+      setCurrentUser(null);
+      setIdentityReady(true);
+      setIdentityError("");
+      setToken("");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Không thể đăng xuất an toàn");
+    }
   }
 
   function openServer(server: Server) {
@@ -814,7 +824,6 @@ export function OpsConsole() {
       <SetupScreen
         status={setupStatus}
         onComplete={(dashboardUrl) => {
-          window.sessionStorage.removeItem("tram_ops_token");
           setToken("");
           setSetupStatus({
             ...setupStatus,
@@ -833,12 +842,11 @@ export function OpsConsole() {
   if (!token)
     return (
       <LoginScreen
-        onLogin={(nextToken) => {
-          window.sessionStorage.setItem("tram_ops_token", nextToken);
+        onLogin={() => {
           setCurrentUser(null);
           setIdentityReady(false);
           setIdentityError("");
-          setToken(nextToken);
+          setToken(COOKIE_SESSION_MARKER);
         }}
       />
     );
@@ -1179,6 +1187,7 @@ export function OpsConsole() {
               openSession={() => setModal("session")}
               notify={notify}
               token={token}
+              canConfigureLogs={currentUser.permissions.includes("logs.configure")}
             />
           ) : active === "sessions" ? (
             <SessionsView token={token} />
@@ -1307,7 +1316,7 @@ function AccountSettingsModal({
   user: CurrentUser;
   token: string;
   close: () => void;
-  signOut: () => void;
+  signOut: () => void | Promise<void>;
   updated: (user: CurrentUser) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -2063,7 +2072,7 @@ function SetupScreen({
   );
 }
 
-function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
+function LoginScreen({ onLogin }: { onLogin: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [source, setSource] = useState<"local" | "domain">("local");
@@ -2108,7 +2117,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
     try {
       const response = await fetch("/api/v1/auth/mfa/verify", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Tram-Auth-Mode": "cookie" },
         body: JSON.stringify({
           challenge_token: mfa.challenge_token,
           code: form.get("code"),
@@ -2116,7 +2125,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Mã MFA không hợp lệ");
-      onLogin(data.access_token);
+      onLogin();
     } catch (reason) {
       setError(
         reason instanceof Error ? reason.message : "Không thể xác thực MFA",
@@ -2294,12 +2303,14 @@ function ServerDrawer({
   openSession,
   notify,
   token,
+  canConfigureLogs,
 }: {
   server: Server;
   close: () => void;
   openSession: () => void;
   notify: (message: string) => void;
   token: string;
+  canConfigureLogs: boolean;
 }) {
   type Fact = {
     name?: string;
@@ -2993,7 +3004,7 @@ function ServerDrawer({
               )}
 
               {activeTab === "logs" && (
-                <LogsResourceTab output={latestSuccessfulReadJob?.output} sourceOutput={latestSuccessfulLogSourcesJob?.output} configured={configuredLogSources} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} saveSources={saveLogSources} />
+                <LogsResourceTab output={latestSuccessfulReadJob?.output} sourceOutput={latestSuccessfulLogSourcesJob?.output} configured={configuredLogSources} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} saveSources={saveLogSources} canConfigure={canConfigureLogs} />
               )}
             </>
           )}
@@ -3621,6 +3632,8 @@ function AuditView({ token }: { token: string }) {
   const [auditNextBefore, setAuditNextBefore] = useState<string | null>(null);
   const [auditRetentionDays, setAuditRetentionDays] = useState(30);
   const [auditBusy, setAuditBusy] = useState(false);
+  const [auditSearch, setAuditSearch] = useState("");
+  const [auditResult, setAuditResult] = useState("");
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [deletionRequests, setDeletionRequests] = useState<RecordingDeletionRequest[]>([]);
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string; permissions: string[] } | null>(null);
@@ -3655,11 +3668,15 @@ function AuditView({ token }: { token: string }) {
   const loadAudit = useCallback(async (before?: string) => {
     setAuditBusy(true);
     try {
-      const suffix = before ? `?before=${encodeURIComponent(before)}` : "";
-      const response = await fetch(`/api/v1/audit${suffix}`, { headers: { Authorization: `Bearer ${token}` } });
+      const query = new URLSearchParams();
+      if (before) query.set("before", before);
+      if (auditSearch.trim()) query.set("search", auditSearch.trim());
+      if (auditResult) query.set("result", auditResult);
+      const response = await fetch(`/api/v1/audit?${query.toString()}`, { headers: { Authorization: `Bearer ${token}` } });
       if (response.status === 403) setForbidden(true);
       if (!response.ok) throw new Error("audit-unavailable");
       const data = await response.json();
+      setForbidden(false);
       setRows((current) => before ? [...current, ...(data.items ?? [])] : (data.items ?? []));
       setAuditNextBefore(data.nextBefore ?? null);
       setAuditRetentionDays(Number(data.retentionDays) || 30);
@@ -3668,9 +3685,8 @@ function AuditView({ token }: { token: string }) {
     } finally {
       setAuditBusy(false);
     }
-  }, [token]);
+  }, [auditResult, auditSearch, token]);
   useEffect(() => {
-    const auditTimer = window.setTimeout(() => void loadAudit(), 0);
     fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then(setCurrentUser)
@@ -3678,8 +3694,11 @@ function AuditView({ token }: { token: string }) {
     void loadSessions();
     void loadDeletionRequests();
     void loadRecordingRetention();
+  }, [token, loadSessions, loadDeletionRequests, loadRecordingRetention]);
+  useEffect(() => {
+    const auditTimer = window.setTimeout(() => void loadAudit(), 300);
     return () => window.clearTimeout(auditTimer);
-  }, [token, loadSessions, loadDeletionRequests, loadRecordingRetention, loadAudit]);
+  }, [loadAudit]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
   const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
@@ -3774,6 +3793,11 @@ function AuditView({ token }: { token: string }) {
         </div>
         {tab === "events" ? (
           <div className="audit-events-panel">
+            <div className="audit-filter-bar">
+              <label>Tìm trong audit<input value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} maxLength={160} placeholder="Người dùng, hành động, đối tượng hoặc IP…" /></label>
+              <label>Kết quả<select value={auditResult} onChange={(event) => setAuditResult(event.target.value)}><option value="">Tất cả</option><option value="success">Thành công</option><option value="denied">Bị từ chối</option><option value="failed">Thất bại</option><option value="partial">Một phần</option><option value="cancelled">Đã hủy</option></select></label>
+              <button type="button" className="button ghost" disabled={auditBusy} onClick={() => void loadAudit()}>{auditBusy ? "Đang lọc…" : "↻ Làm mới"}</button>
+            </div>
             <div className="audit-table">
               <div className="audit-row head">
                 <span>Thời gian</span>
@@ -4228,7 +4252,7 @@ function AccessView({ token, currentUser }: { token: string; currentUser: Curren
   }
   async function saveLdap(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); const form = new FormData(event.currentTarget);
-    const payload = { enabled: form.get("enabled") === "on", host: form.get("host"), port: Number(form.get("port")), use_ssl: form.get("use_ssl") === "on", base_dn: form.get("base_dn"), bind_dn: form.get("bind_dn"), bind_password: form.get("bind_password"), ca_certificate: form.get("ca_certificate"), user_attribute: form.get("user_attribute"), display_attribute: form.get("display_attribute"), domain_label: form.get("domain_label"), default_role: form.get("default_role"), allowed_group_dns: form.getAll("allowed_group_dns") };
+    const payload = { enabled: form.get("enabled") === "on", host: form.get("host"), port: Number(form.get("port")), use_ssl: true, base_dn: form.get("base_dn"), bind_dn: form.get("bind_dn"), bind_password: form.get("bind_password"), ca_certificate: form.get("ca_certificate"), user_attribute: form.get("user_attribute"), display_attribute: form.get("display_attribute"), domain_label: form.get("domain_label"), default_role: form.get("default_role"), allowed_group_dns: form.getAll("allowed_group_dns") };
     const response = await fetch("/api/v1/settings/ldap", { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
     const data = await response.json().catch(() => ({}));
     if (response.ok) {
@@ -4319,7 +4343,7 @@ function AccessView({ token, currentUser }: { token: string; currentUser: Curren
       <form id="ldap-settings-form" key={JSON.stringify(ldap)} className="resource-form ldap-settings-form" onSubmit={saveLdap}>
         <label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(ldap.enabled)} /> Bật Domain Login</label>
         <div className="form-grid"><label>LDAP Host<input name="host" defaultValue={String(ldap.host ?? "")} placeholder="dc01.company.local" /></label><label>Cổng<input name="port" type="number" min={1} max={65535} defaultValue={Number(ldap.port ?? 636)} /></label></div>
-        <label className="check"><input name="use_ssl" type="checkbox" defaultChecked={Boolean(ldap.use_ssl)} /> Dùng LDAPS và xác minh certificate</label>
+        <div className="resource-help"><b>LDAPS bắt buộc</b> · Kết nối luôn dùng TLS và xác minh certificate; LDAP plaintext không được phép lưu hoặc sử dụng.</div>
         <label>Base DN<input name="base_dn" defaultValue={String(ldap.base_dn ?? "")} placeholder="DC=company,DC=local" /></label>
         <label>Bind DN<input name="bind_dn" defaultValue={String(ldap.bind_dn ?? "")} placeholder="CN=svc-dashboard,OU=Service Accounts,..." /></label>
         <label>Bind password<input name="bind_password" type="password" autoComplete="new-password" placeholder={ldap.password_configured ? "Đã lưu · để trống nếu giữ nguyên" : "Mật khẩu service account"} /></label>
@@ -4386,7 +4410,8 @@ function SessionModal({
       // localStorage. A stale token from a previous/manual Guacamole login
       // takes precedence over the encrypted JSON connection in the new URL,
       // causing the valid temporary connection to appear missing. Dashboard
-      // authentication uses a separate sessionStorage key and is unaffected.
+      // Dashboard authentication remains in a Secure HttpOnly cookie and is
+      // independent from Guacamole's origin-wide localStorage token.
       window.localStorage.removeItem("GUAC_AUTH_TOKEN");
       if (sessionWindow) sessionWindow.location.href = data.url;
       else window.location.href = data.url;

@@ -2006,6 +2006,29 @@ textarea:focus-visible {
   border-radius: 5px;
   padding: 6px 8px;
 }
+.audit-filter-bar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, 220px) auto;
+  align-items: end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.audit-filter-bar label {
+  display: grid;
+  gap: 5px;
+  color: #8290a4;
+  font-size: calc(8px + var(--font-size-increase));
+}
+.audit-filter-bar input,
+.audit-filter-bar select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #29384c;
+  border-radius: 7px;
+  padding: 0 11px;
+  color: #d5deeb;
+  background: #0b1421;
+}
 .audit-row {
   display: grid;
   grid-template-columns: 72px 0.75fr 1.1fr 1fr minmax(180px, 1.8fr) 0.6fr 0.65fr;
@@ -2050,6 +2073,11 @@ textarea:focus-visible {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
   gap: 13px;
+}
+@media (max-width: 760px) {
+  .audit-filter-bar {
+    grid-template-columns: 1fr;
+  }
 }
 .server-row-actions {
   display: flex;
