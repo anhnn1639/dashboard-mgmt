@@ -720,6 +720,8 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "user.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "group.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "patch.scan": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "patch.source.read": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
+    "patch.source.configure": {"roles": {"admin", "operator"}, "risk": "high"},
     "patch.install": {"roles": {"admin", "operator"}, "risk": "high"},
     "logs.sources": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low"},
     "logs.read": {"roles": {"admin", "operator", "viewer", "auditor"}, "risk": "low"},
@@ -786,6 +788,8 @@ ACTION_PERMISSIONS: dict[str, str] = {
     "user.list": "resources.view",
     "group.list": "resources.view",
     "patch.scan": "resources.view",
+    "patch.source.read": "resources.view",
+    "patch.source.configure": "updates.manage",
     "patch.install": "updates.manage",
     "logs.sources": "logs.view",
     "logs.read": "logs.view",
@@ -838,6 +842,7 @@ AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
     "storage.delete": ("storage.list",),
     "process.kill": ("process.list",),
     "patch.install": ("patch.scan",),
+    "patch.source.configure": ("patch.source.read", "patch.scan"),
 }
 
 
@@ -938,7 +943,7 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
     if action.startswith("firewall."):
         validate_firewall_job_parameters(action, parameters)
         return
-    empty_actions = {"inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "logs.sources", "process.list", "storage.list", "network.list", "system.reboot"}
+    empty_actions = {"inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "patch.source.read", "logs.sources", "process.list", "storage.list", "network.list", "system.reboot"}
     if action in empty_actions:
         if parameters:
             raise HTTPException(status_code=422, detail=f"{action} does not accept parameters")
@@ -995,6 +1000,54 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         if set(parameters) != {"updates"} or not isinstance(updates, list) or not 1 <= len(updates) <= 100 or any(not isinstance(item, dict) or set(item) - {"id", "version", "revision"} or not isinstance(item.get("id"), str) or not 1 <= len(item["id"]) <= 300 or not isinstance(item.get("version", ""), str) or len(item.get("version", "")) > 300 or ("revision" in item and (isinstance(item["revision"], bool) or not isinstance(item["revision"], int))) for item in updates):
             raise HTTPException(status_code=422, detail="Select between 1 and 100 updates")
         return
+    if action == "patch.source.configure":
+        def repository_url(value: Any) -> str:
+            normalized = str(value or "").strip().rstrip("/")
+            parsed = urlsplit(normalized)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or len(normalized) > 2048:
+                raise HTTPException(status_code=422, detail="Repository URL must be HTTP(S) without credentials, query or fragment")
+            return normalized
+
+        mode = str(parameters.get("mode") or "")
+        if server.os_family == "windows":
+            if set(parameters) - {"mode", "wsus_url"} or mode not in {"wsus", "internet"}:
+                raise HTTPException(status_code=422, detail="Windows update source parameters are invalid")
+            if mode == "wsus":
+                repository_url(parameters.get("wsus_url"))
+            elif parameters.get("wsus_url") not in {None, ""}:
+                raise HTTPException(status_code=422, detail="WSUS URL is allowed only when WSUS is enabled")
+            return
+        distribution = str(server.distribution_id or "").lower()
+        major = str(server.os_version or "").split(".", 1)[0]
+        if distribution == "ubuntu":
+            if not str(server.os_version or "").startswith(("22.04", "24.04")) or set(parameters) - {"mode", "repository_url"} or mode not in {"custom", "default"}:
+                raise HTTPException(status_code=422, detail="Only Ubuntu 22.04/24.04 default repository switching is supported")
+            if mode == "custom":
+                repository_url(parameters.get("repository_url"))
+            elif parameters.get("repository_url") not in {None, ""}:
+                raise HTTPException(status_code=422, detail="Repository URL is allowed only in custom mode")
+            return
+        if distribution in {"ol", "oracle", "oraclelinux"} and major in {"7", "8"}:
+            if set(parameters) - {"mode", "repositories"} or mode not in {"custom", "default"}:
+                raise HTTPException(status_code=422, detail="Oracle Linux update source parameters are invalid")
+            repositories = parameters.get("repositories", [])
+            if mode == "default":
+                if repositories not in (None, [], ()):
+                    raise HTTPException(status_code=422, detail="Repository mappings are allowed only in custom mode")
+                return
+            if not isinstance(repositories, list) or not 1 <= len(repositories) <= 20:
+                raise HTTPException(status_code=422, detail="Configure between 1 and 20 Oracle Linux repositories")
+            seen: set[str] = set()
+            for item in repositories:
+                if not isinstance(item, dict) or set(item) != {"id", "base_url"}:
+                    raise HTTPException(status_code=422, detail="Oracle Linux repository mapping is invalid")
+                repository_id = str(item.get("id") or "")
+                if not re.fullmatch(rf"ol{major}_[A-Za-z0-9_.:-]{{1,120}}", repository_id) or repository_id in seen:
+                    raise HTTPException(status_code=422, detail="Oracle Linux repository ID is invalid or duplicated")
+                seen.add(repository_id)
+                repository_url(item.get("base_url"))
+            return
+        raise HTTPException(status_code=422, detail="Update source configuration supports Windows Server, Ubuntu 22.04/24.04 and Oracle Linux 7/8")
     if action in {"storage.extend", "storage.shrink", "storage.create", "storage.delete"}:
         kind = str(parameters.get("kind", ""))
         if action == "storage.shrink":

@@ -625,6 +625,26 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "unsupported"):
             validate_job_parameters("storage.delete", {"kind": "linux_lv", "path": "/dev/vg0/data", "command": "rm -rf /"}, linux)
 
+    def test_update_source_configuration_is_os_scoped_and_validated(self):
+        windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server 2022", os_version="10.0.20348")
+        ubuntu = Server(id=str(uuid.uuid4()), name="ubuntu", os_family="linux", os_name="Ubuntu", os_version="24.04.3", distribution_id="ubuntu")
+        oracle = Server(id=str(uuid.uuid4()), name="oracle", os_family="linux", os_name="Oracle Linux Server", os_version="8.10", distribution_id="ol")
+
+        validate_job_parameters("patch.source.configure", {"mode": "internet", "wsus_url": ""}, windows)
+        validate_job_parameters("patch.source.configure", {"mode": "wsus", "wsus_url": "http://wsus.internal:8530"}, windows)
+        validate_job_parameters("patch.source.configure", {"mode": "custom", "repository_url": "https://repo.internal/ubuntu"}, ubuntu)
+        validate_job_parameters("patch.source.configure", {"mode": "custom", "repositories": [{"id": "ol8_baseos_latest", "base_url": "https://repo.internal/ol8/baseos/$basearch"}]}, oracle)
+        self.assertEqual(AUTO_REFRESH_ACTIONS["patch.source.configure"], ("patch.source.read", "patch.scan"))
+
+        invalid_payloads = [
+            (windows, {"mode": "wsus", "wsus_url": "https://user:secret@wsus.internal"}),
+            (ubuntu, {"mode": "custom", "repository_url": "file:///srv/ubuntu"}),
+            (oracle, {"mode": "custom", "repositories": [{"id": "docker-ce-stable", "base_url": "https://repo.internal/docker"}]}),
+        ]
+        for server, parameters in invalid_payloads:
+            with self.subTest(server=server.name), self.assertRaises(Exception):
+                validate_job_parameters("patch.source.configure", parameters, server)
+
     def test_resource_job_payloads_reject_nested_or_malformed_values(self):
         linux = Server(id=str(uuid.uuid4()), name="linux", os_family="linux", os_name="Ubuntu")
         with self.assertRaisesRegex(Exception, "group selection"):

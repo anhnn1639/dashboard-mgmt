@@ -180,6 +180,8 @@ const operationLabels: Record<string, string> = {
   "process.list": "Đọc danh sách tiến trình",
   "process.kill": "Dừng tiến trình",
   "patch.scan": "Quét bản cập nhật",
+  "patch.source.read": "Đọc nguồn cập nhật",
+  "patch.source.configure": "Cấu hình nguồn cập nhật",
   "patch.install": "Cài bản cập nhật đã chọn",
   "logs.read": "Đọc nhật ký hệ thống",
   "logs.sources": "Đọc nguồn nhật ký",
@@ -1253,6 +1255,7 @@ export function OpsConsole() {
               notify={notify}
               token={token}
               canConfigureLogs={currentUser.permissions.includes("logs.configure")}
+              canConfigureUpdates={currentUser.permissions.includes("updates.manage")}
             />
           ) : active === "sessions" ? (
             <SessionsView token={token} />
@@ -2368,6 +2371,7 @@ function ServerDrawer({
   notify,
   token,
   canConfigureLogs,
+  canConfigureUpdates,
 }: {
   server: Server;
   close: () => void;
@@ -2375,6 +2379,7 @@ function ServerDrawer({
   notify: (message: string) => void;
   token: string;
   canConfigureLogs: boolean;
+  canConfigureUpdates: boolean;
 }) {
   type Fact = {
     name?: string;
@@ -2508,6 +2513,8 @@ function ServerDrawer({
     ? jobs.find((job) => job.action === currentReadAction && job.status === "succeeded")
     : undefined;
   const successfulUpdateScanJobs = jobs.filter((job) => job.action === "patch.scan" && job.status === "succeeded");
+  const latestUpdateSourceJob = jobs.find((job) => job.action === "patch.source.read");
+  const latestSuccessfulUpdateSourceJob = jobs.find((job) => job.action === "patch.source.read" && job.status === "succeeded");
   const latestUserJob = jobs.find((job) => job.action === "user.list");
   const latestSuccessfulUserJob = jobs.find((job) => job.action === "user.list" && job.status === "succeeded");
   const latestGroupJob = jobs.find((job) => job.action === "group.list");
@@ -3060,7 +3067,7 @@ function ServerDrawer({
               )}
 
               {activeTab === "updates" && (
-                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} sourceJob={latestUpdateSourceJob} sourceOutput={latestSuccessfulUpdateSourceJob?.output} serverName={server.name} osFamily={server.osFamily} osName={server.os} osVersion={server.version} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} canConfigure={canConfigureUpdates} />
               )}
 
               {activeTab === "processes" && (

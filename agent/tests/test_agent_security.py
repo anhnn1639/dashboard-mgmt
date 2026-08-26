@@ -69,6 +69,131 @@ class AgentSecurityTests(unittest.TestCase):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Version="$(var.AgentVersion)"', wix_source)
 
+    def test_repository_url_rejects_embedded_credentials_and_query(self):
+        self.assertEqual(tram_agent.validated_repository_url("http://repo.internal/ubuntu/"), "http://repo.internal/ubuntu")
+        for value in ("ftp://repo.internal/ubuntu", "https://user:secret@repo.internal/ubuntu", "https://repo.internal/ubuntu?token=secret", "https://repo.internal/ubuntu#latest"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, r"HTTP\(S\)"):
+                tram_agent.validated_repository_url(value)
+
+    def test_ubuntu_source_switch_preserves_third_party_repositories_and_restores_defaults(self):
+        inventory = {"os_family": "linux", "distribution_id": "ubuntu", "os_version": "22.04.5"}
+        original = (
+            "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse\n"
+            "deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse\n"
+            "deb https://download.docker.com/linux/ubuntu jammy stable\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apt_root = root / "apt"
+            state_root = root / "state"
+            apt_root.mkdir()
+            source = apt_root / "sources.list"
+            source.write_text(original, encoding="utf-8")
+
+            code, output = tram_agent.configure_ubuntu_update_source(
+                {"mode": "custom", "repository_url": "https://repo.internal/ubuntu"},
+                inventory,
+                apt_root,
+                state_root,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["repositoryUrl"], "https://repo.internal/ubuntu")
+            changed = source.read_text(encoding="utf-8")
+            self.assertIn("# tram-os-default-disabled deb http://archive.ubuntu.com/ubuntu", changed)
+            self.assertIn("# tram-os-default-disabled deb http://security.ubuntu.com/ubuntu", changed)
+            self.assertIn("deb https://download.docker.com/linux/ubuntu jammy stable", changed)
+            managed = apt_root / "sources.list.d" / tram_agent.APT_MANAGED_SOURCE_NAME
+            self.assertIn("Suites: jammy jammy-updates jammy-backports jammy-security", managed.read_text(encoding="utf-8"))
+
+            code, output = tram_agent.configure_ubuntu_update_source({"mode": "default"}, inventory, apt_root, state_root)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["mode"], "default")
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertFalse(managed.exists())
+
+    def test_ubuntu_deb822_switch_disables_only_official_stanza(self):
+        content = (
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates\nComponents: main universe\n\n"
+            "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\n"
+        )
+        changed = tram_agent.disable_ubuntu_default_sources(content, deb822_default_file=True)
+        official, docker = changed.split("\n\n")
+        self.assertIn("Enabled: no", official)
+        self.assertNotIn("Enabled: no", docker)
+
+    def test_oracle_source_switch_preserves_third_party_repo_and_restores_defaults(self):
+        inventory = {"os_family": "linux", "distribution_id": "ol", "os_version": "8.10"}
+        oracle_source = (
+            "[ol8_baseos_latest]\nname=BaseOS\nbaseurl=https://yum.oracle.com/repo/OracleLinux/OL8/baseos/latest/$basearch/\nenabled=1\ngpgcheck=1\n\n"
+            "[ol8_appstream]\nname=AppStream\nbaseurl=https://yum.oracle.com/repo/OracleLinux/OL8/appstream/$basearch/\nenabled=1\ngpgcheck=1\n"
+        )
+        docker_source = "[docker-ce-stable]\nname=Docker\nbaseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable\nenabled=1\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository_root = root / "repos"
+            state_root = root / "state"
+            repository_root.mkdir()
+            oracle_file = repository_root / "oracle-linux-ol8.repo"
+            docker_file = repository_root / "docker-ce.repo"
+            oracle_file.write_text(oracle_source, encoding="utf-8")
+            docker_file.write_text(docker_source, encoding="utf-8")
+
+            code, output = tram_agent.configure_oracle_update_source(
+                {
+                    "mode": "custom",
+                    "repositories": [
+                        {"id": "ol8_baseos_latest", "base_url": "https://repo.internal/ol8/baseos/$basearch"},
+                        {"id": "ol8_appstream", "base_url": "https://repo.internal/ol8/appstream/$basearch"},
+                    ],
+                },
+                inventory,
+                repository_root,
+                state_root,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["mode"], "custom")
+            self.assertIn("enabled=0", oracle_file.read_text(encoding="utf-8"))
+            self.assertEqual(docker_file.read_text(encoding="utf-8"), docker_source)
+            managed = repository_root / tram_agent.ORACLE_MANAGED_REPOSITORY_NAME
+            managed_content = managed.read_text(encoding="utf-8")
+            self.assertIn("[tram_ol8_baseos_latest]", managed_content)
+            self.assertIn("https://repo.internal/ol8/appstream/$basearch", managed_content)
+
+            code, output = tram_agent.configure_oracle_update_source({"mode": "default"}, inventory, repository_root, state_root)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["mode"], "default")
+            self.assertEqual(oracle_file.read_text(encoding="utf-8"), oracle_source)
+            self.assertEqual(docker_file.read_text(encoding="utf-8"), docker_source)
+            self.assertFalse(managed.exists())
+
+    def test_windows_update_source_writes_wsus_and_internet_policies(self):
+        scripts = []
+        wsus_environment = json.dumps({"useWUServer": 1, "wsusServer": "http://wsus.internal:8530", "doNotConnectInternet": 1})
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}" if len(scripts) == 1 else wsus_environment))):
+            code, output = tram_agent.configure_windows_update_source({"mode": "wsus", "wsus_url": "http://wsus.internal:8530"})
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["mode"], "wsus")
+        self.assertIn("WUServer", scripts[0])
+        self.assertIn("WUStatusServer", scripts[0])
+        self.assertIn("UseWUServer -Type DWord -Value 1", scripts[0])
+        self.assertNotIn("wsus.internal", scripts[0])
+
+        scripts = []
+        internet_environment = json.dumps({"useWUServer": 0, "wsusServer": "", "doNotConnectInternet": 0})
+        with patch.object(tram_agent, "powershell", side_effect=lambda script, **_: (scripts.append(script) or (0, "{}" if len(scripts) == 1 else internet_environment))):
+            code, output = tram_agent.configure_windows_update_source({"mode": "internet"})
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["mode"], "internet")
+        self.assertIn("UseWUServer -Type DWord -Value 0", scripts[0])
+        self.assertIn("Remove-ItemProperty", scripts[0])
+
+    def test_windows_update_source_rejects_an_effective_policy_mismatch(self):
+        internet_environment = json.dumps({"useWUServer": 0, "wsusServer": "", "doNotConnectInternet": 0})
+        with patch.object(tram_agent, "powershell", side_effect=[(0, "{}"), (0, internet_environment)]):
+            code, output = tram_agent.configure_windows_update_source({"mode": "wsus", "wsus_url": "http://wsus.internal:8530"})
+        self.assertEqual(code, 1)
+        self.assertIn("verification failed", output)
+
     def test_command_timeout_is_reported_without_crashing_the_agent(self):
         timeout = subprocess.TimeoutExpired(["slow-command"], 7, output="partial output")
         with patch.object(tram_agent.subprocess, "run", side_effect=timeout):

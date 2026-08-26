@@ -252,6 +252,8 @@ Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA/logout, c�
 
 Không có `command.run`, `powershell.run` hoặc `shell.run`. Tham số user/group/service được validate bằng allowlist ký tự và mọi subprocess đều chạy không qua shell. Password/secret trong job được mã hóa bằng Fernet ở tầng ứng dụng và chỉ giải mã khi dispatch qua mTLS. Khi cần xử lý ngoài danh sách, dùng SSH/RDP có recording.
 
+Trong tab **Cập nhật**, người có quyền `updates.manage` có thể mở **Nguồn cập nhật** cho từng máy. Ubuntu 22.04/24.04 chỉ vô hiệu nguồn hệ điều hành chuẩn và tạo file Deb822 do Agent quản lý; PPA, Docker và repository ứng dụng khác không bị sửa. Oracle Linux 7/8 chỉ thay các repo hệ điều hành `ol7_*`/`ol8_*` đang bật, giữ nguyên EPEL/Docker/repo ứng dụng. Windows có hai chế độ: ép `WUServer`/`WUStatusServer`/`UseWUServer=1` tới WSUS được chỉ định, hoặc gỡ policy WSUS cục bộ do Agent quản lý để dùng Microsoft Update qua Internet. Mỗi thay đổi đều được validate, audit, đọc lại cấu hình thực tế và tự quét patch đúng OS/version.
+
 ## Bảo mật và vận hành production
 
 - Đặt dashboard sau VPN/Zero Trust; hạn chế `443/9443` theo mạng quản trị.

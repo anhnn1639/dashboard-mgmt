@@ -144,6 +144,15 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(resources, /Mất kết nối WSUS/);
   assert.match(resources, /Không kết nối được repository/);
   assert.match(resources, /Phiên bản hệ điều hành/);
+  assert.match(resources, /Nguồn cập nhật của máy chủ/);
+  assert.match(resources, /Microsoft Update qua Internet/);
+  assert.match(resources, /Ép sử dụng WSUS/);
+  assert.match(resources, /Repo nội bộ do quản trị viên chỉ định/);
+  assert.match(resources, /Docker, EPEL và repo ứng dụng khác được giữ nguyên/);
+  assert.match(resources, /Docker, PPA và repo ứng dụng vẫn giữ nguyên/);
+  assert.match(resources, /queue\("patch\.source\.configure"/);
+  assert.match(source, /"patch\.source\.read": "Đọc nguồn cập nhật"/);
+  assert.match(source, /"patch\.source\.configure": "Cấu hình nguồn cập nhật"/);
   assert.match(source, /successfulUpdateScanJobs/);
   assert.match(source, /Cập nhật bản vá theo OS \+ version/);
   assert.match(source, /\/api\/v1\/bulk-update\/catalog/);

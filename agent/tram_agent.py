@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import getpass
@@ -60,6 +61,7 @@ PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~-]{0,254}$")
 DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_.+/-]{1,180}$")
 MOUNT_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_.-]+/?){1,12}$")
 FIREWALL_OBJECT_RE = re.compile(r"^[A-Za-z0-9_.@:+/-]{1,160}$")
+REPOSITORY_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 TRANSFER_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,179}$")
 SYSTEM_COMMAND_DIRS = tuple(Path(value) for value in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"))
 WINDOWS_RESERVED_FILENAMES = {
@@ -73,20 +75,25 @@ MAX_CONCURRENT_JOBS = 4
 LINUX_BLOCK_SECTOR_BYTES = 512
 WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
+UPDATE_SOURCE_STATE_ROOT = Path("/var/lib/tram-agent/update-sources")
+APT_SOURCE_ROOT = Path("/etc/apt")
+YUM_REPOSITORY_ROOT = Path("/etc/yum.repos.d")
+APT_MANAGED_SOURCE_NAME = "tram-os-default.sources"
+ORACLE_MANAGED_REPOSITORY_NAME = "tram-os-default.repo"
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
 MUTATION_JOB_LOCK = threading.Lock()
 ALLOWED_ACTIONS = {
     "inventory.collect", "service.list", "service.restart", "service.start", "service.stop",
     "user.create", "user.update", "user.disable", "user.enable", "user.delete", "user.password.reset",
-    "group.create", "group.delete", "user.add_group", "patch.scan",
-    "patch.install", "logs.sources", "logs.read", "process.list", "process.kill", "firewall.list", "system.reboot",
+    "group.create", "group.delete", "user.add_group", "patch.scan", "patch.source.read",
+    "patch.source.configure", "patch.install", "logs.sources", "logs.read", "process.list", "process.kill", "firewall.list", "system.reboot",
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend", "storage.shrink",
     "storage.create", "storage.delete",
     "firewall.rule.add", "firewall.rule.add.auto", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
 }
 READ_ONLY_ACTIONS = {
-    "inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "logs.sources", "logs.read",
+    "inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "patch.source.read", "logs.sources", "logs.read",
     "process.list", "firewall.list", "storage.list", "network.list",
 }
 
@@ -2545,6 +2552,420 @@ def delete_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     return code, output
 
 
+def validated_repository_url(value: Any) -> str:
+    normalized = str(value or "").strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or len(normalized) > 2048
+    ):
+        raise ValueError("Repository URL must be an HTTP(S) URL without credentials, query or fragment")
+    return normalized
+
+
+def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tram-{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        with contextlib.suppress(OSError):
+            temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def ubuntu_release_codename(inventory: dict[str, Any]) -> str:
+    version = str(inventory.get("os_version") or "").strip()
+    if version.startswith("22.04"):
+        return "jammy"
+    if version.startswith("24.04"):
+        return "noble"
+    raise ValueError("Only Ubuntu 22.04 and Ubuntu 24.04 repository switching is supported")
+
+
+def apt_source_files(apt_root: Path = APT_SOURCE_ROOT) -> list[Path]:
+    candidates = [apt_root / "sources.list"]
+    source_directory = apt_root / "sources.list.d"
+    if source_directory.is_dir():
+        candidates.extend(sorted(source_directory.glob("*.list")))
+        candidates.extend(sorted(source_directory.glob("*.sources")))
+    managed = source_directory / APT_MANAGED_SOURCE_NAME
+    return [path for path in candidates if path.is_file() and path != managed]
+
+
+def ubuntu_default_uri(value: str) -> bool:
+    with contextlib.suppress(ValueError):
+        hostname = (urlsplit(value).hostname or "").lower()
+        return hostname == "ubuntu.com" or hostname.endswith(".ubuntu.com")
+    return False
+
+
+def apt_urls(content: str) -> list[str]:
+    return [match.rstrip("/") for match in re.findall(r"https?://[^\s#]+", content, re.IGNORECASE)]
+
+
+def disable_ubuntu_default_sources(content: str, *, deb822_default_file: bool = False) -> str:
+    if deb822_default_file:
+        stanzas: list[str] = []
+        for stanza in re.split(r"\n\s*\n", content.strip()):
+            uri_match = re.search(r"(?mi)^URIs:\s*(.+)$", stanza)
+            uris = uri_match.group(1).split() if uri_match else []
+            if uris and any(ubuntu_default_uri(uri) for uri in uris):
+                if re.search(r"(?mi)^Enabled:\s*", stanza):
+                    stanza = re.sub(r"(?mi)^Enabled:\s*.*$", "Enabled: no", stanza)
+                else:
+                    stanza += "\nEnabled: no"
+            stanzas.append(stanza)
+        return "\n\n".join(stanzas).rstrip() + "\n"
+    lines: list[str] = []
+    pattern = re.compile(r"^\s*deb(?:-src)?\s+(?:\[[^\]]+\]\s+)?(https?://\S+)", re.IGNORECASE)
+    for line in content.splitlines():
+        match = pattern.match(line)
+        lines.append(f"# tram-os-default-disabled {line}" if match and ubuntu_default_uri(match.group(1)) else line)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def read_ubuntu_update_source(inventory: dict[str, Any], apt_root: Path = APT_SOURCE_ROOT) -> dict[str, Any]:
+    codename = ubuntu_release_codename(inventory)
+    managed = apt_root / "sources.list.d" / APT_MANAGED_SOURCE_NAME
+    default_rows: list[dict[str, Any]] = []
+    third_party: set[str] = set()
+    for path in [*apt_source_files(apt_root), managed]:
+        if not path.is_file():
+            continue
+        content = path.read_text(encoding="utf-8", errors="replace")
+        for url in apt_urls(content):
+            row = {"id": path.name, "url": url, "file": str(path), "managed": path == managed}
+            if path == managed or ubuntu_default_uri(url):
+                if row not in default_rows:
+                    default_rows.append(row)
+            else:
+                third_party.add(url)
+    return {
+        "platform": "ubuntu",
+        "mode": "custom" if managed.is_file() else "default",
+        "osVersion": str(inventory.get("os_version") or ""),
+        "codename": codename,
+        "repositoryUrl": next((row["url"] for row in default_rows if row["managed"]), ""),
+        "repositories": default_rows,
+        "thirdPartyRepositoryCount": len(third_party),
+        "preservesThirdPartyRepositories": True,
+    }
+
+
+def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[str, Any], apt_root: Path = APT_SOURCE_ROOT, state_root: Path = UPDATE_SOURCE_STATE_ROOT) -> tuple[int, str]:
+    mode = str(parameters.get("mode") or "")
+    if mode not in {"custom", "default"}:
+        raise ValueError("Ubuntu update source mode must be custom or default")
+    codename = ubuntu_release_codename(inventory)
+    managed = apt_root / "sources.list.d" / APT_MANAGED_SOURCE_NAME
+    state_file = state_root / "ubuntu-default-sources.json"
+    state: dict[str, Any] = {}
+    if state_file.is_file():
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            parsed_state = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(parsed_state, dict):
+                state = parsed_state
+
+    if mode == "default":
+        originals = state.get("originals") if isinstance(state.get("originals"), dict) else {}
+        if not originals:
+            return 0, json.dumps(read_ubuntu_update_source(inventory, apt_root), ensure_ascii=False, separators=(",", ":"))
+        apt_root_resolved = apt_root.resolve()
+        for filename, content in originals.items():
+            path = Path(str(filename))
+            if not path.is_absolute() or not path.resolve().is_relative_to(apt_root_resolved) or not isinstance(content, str):
+                raise ValueError("Saved Ubuntu repository state is invalid")
+            atomic_write_text(path, content)
+        with contextlib.suppress(OSError):
+            managed.unlink()
+        with contextlib.suppress(OSError):
+            state_file.unlink()
+        return 0, json.dumps(read_ubuntu_update_source(inventory, apt_root), ensure_ascii=False, separators=(",", ":"))
+
+    repository_url = validated_repository_url(parameters.get("repository_url"))
+    source_files = apt_source_files(apt_root)
+    targeted: dict[str, str] = {}
+    for path in source_files:
+        content = path.read_text(encoding="utf-8", errors="strict")
+        if (path.name == "ubuntu.sources" and apt_urls(content)) or any(ubuntu_default_uri(url) for url in apt_urls(content)):
+            targeted[str(path)] = content
+    if not targeted and not state:
+        raise ValueError("Agent did not find a standard Ubuntu repository entry to replace")
+    if not state:
+        state = {"version": 1, "originals": targeted}
+        atomic_write_text(state_file, json.dumps(state, ensure_ascii=False, separators=(",", ":")), 0o600)
+    for filename, content in targeted.items():
+        path = Path(filename)
+        disabled = disable_ubuntu_default_sources(content, deb822_default_file=path.suffix == ".sources")
+        atomic_write_text(path, disabled)
+    managed_content = (
+        "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n"
+        "Types: deb\n"
+        f"URIs: {repository_url}\n"
+        f"Suites: {codename} {codename}-updates {codename}-backports {codename}-security\n"
+        "Components: main restricted universe multiverse\n"
+        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+    )
+    atomic_write_text(managed, managed_content)
+    result = read_ubuntu_update_source(inventory, apt_root)
+    return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def repository_sections(repository_root: Path = YUM_REPOSITORY_ROOT) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not repository_root.is_dir():
+        return rows
+    for path in sorted(repository_root.glob("*.repo")):
+        parser = configparser.RawConfigParser(interpolation=None, strict=False)
+        parser.optionxform = str.lower
+        with contextlib.suppress(configparser.Error, OSError, UnicodeError):
+            parser.read_string(path.read_text(encoding="utf-8", errors="strict"))
+            for section in parser.sections():
+                values = dict(parser.items(section))
+                rows.append({
+                    "id": section,
+                    "file": str(path),
+                    "enabled": str(values.get("enabled", "1")).strip() not in {"0", "false", "False"},
+                    "url": str(values.get("baseurl") or values.get("mirrorlist") or values.get("metalink") or "").strip(),
+                    "values": values,
+                })
+    return rows
+
+
+def set_repository_enabled(content: str, repository_id: str, enabled: bool) -> str:
+    section_pattern = re.compile(rf"(?ms)^\[{re.escape(repository_id)}\]\s*$.*?(?=^\[|\Z)")
+    match = section_pattern.search(content)
+    if not match:
+        raise ValueError(f"Repository {repository_id} changed before it could be configured")
+    section = match.group(0)
+    replacement = f"enabled={1 if enabled else 0}"
+    if re.search(r"(?mi)^\s*enabled\s*=", section):
+        section = re.sub(r"(?mi)^\s*enabled\s*=.*$", replacement, section)
+    else:
+        trailing = re.search(r"\s*\Z", section)
+        insertion = trailing.start() if trailing else len(section)
+        separator = "" if insertion and section[insertion - 1] == "\n" else "\n"
+        section = section[:insertion] + separator + replacement + section[insertion:]
+    return content[:match.start()] + section + content[match.end():]
+
+
+def oracle_linux_major(inventory: dict[str, Any]) -> str:
+    distribution = str(inventory.get("distribution_id") or "").lower()
+    version = str(inventory.get("os_version") or "")
+    major = version.split(".", 1)[0]
+    if distribution not in {"ol", "oracle", "oraclelinux"} or major not in {"7", "8"}:
+        raise ValueError("Only Oracle Linux 7 and Oracle Linux 8 repository switching is supported")
+    return major
+
+
+def read_oracle_update_source(inventory: dict[str, Any], repository_root: Path = YUM_REPOSITORY_ROOT) -> dict[str, Any]:
+    major = oracle_linux_major(inventory)
+    prefix = f"ol{major}_"
+    managed_path = repository_root / ORACLE_MANAGED_REPOSITORY_NAME
+    managed_rows = [row for row in repository_sections(repository_root) if Path(row["file"]) == managed_path]
+    managed_by_source = {str(row["id"]).removeprefix("tram_"): row for row in managed_rows}
+    originals = [row for row in repository_sections(repository_root) if Path(row["file"]) != managed_path and str(row["id"]).startswith(prefix)]
+    repositories = []
+    for row in originals:
+        managed = managed_by_source.get(str(row["id"]))
+        repositories.append({
+            "id": row["id"],
+            "url": managed["url"] if managed else row["url"],
+            "enabled": bool(managed["enabled"] if managed else row["enabled"]),
+            "managed": managed is not None,
+            "file": row["file"],
+        })
+    all_rows = repository_sections(repository_root)
+    third_party_count = len([row for row in all_rows if Path(row["file"]) != managed_path and not str(row["id"]).startswith(prefix)])
+    return {
+        "platform": "oracle",
+        "mode": "custom" if managed_path.is_file() else "default",
+        "osVersion": str(inventory.get("os_version") or ""),
+        "repositories": repositories,
+        "thirdPartyRepositoryCount": third_party_count,
+        "preservesThirdPartyRepositories": True,
+    }
+
+
+def configure_oracle_update_source(parameters: dict[str, Any], inventory: dict[str, Any], repository_root: Path = YUM_REPOSITORY_ROOT, state_root: Path = UPDATE_SOURCE_STATE_ROOT) -> tuple[int, str]:
+    mode = str(parameters.get("mode") or "")
+    if mode not in {"custom", "default"}:
+        raise ValueError("Oracle Linux update source mode must be custom or default")
+    major = oracle_linux_major(inventory)
+    prefix = f"ol{major}_"
+    managed_path = repository_root / ORACLE_MANAGED_REPOSITORY_NAME
+    state_file = state_root / f"oracle-linux-{major}-repositories.json"
+    state: dict[str, Any] = {}
+    if state_file.is_file():
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            parsed_state = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(parsed_state, dict):
+                state = parsed_state
+    originals = [row for row in repository_sections(repository_root) if Path(row["file"]) != managed_path and str(row["id"]).startswith(prefix)]
+    by_id = {str(row["id"]): row for row in originals}
+
+    if mode == "default":
+        if not state:
+            if managed_path.is_file():
+                raise ValueError("Oracle Linux repository restore state is unavailable; refusing to remove the managed repository")
+            return 0, json.dumps(read_oracle_update_source(inventory, repository_root), ensure_ascii=False, separators=(",", ":"))
+        saved = state.get("repositories") if isinstance(state.get("repositories"), list) else []
+        by_file: dict[str, list[dict[str, Any]]] = {}
+        for item in saved:
+            if isinstance(item, dict):
+                by_file.setdefault(str(item.get("file") or ""), []).append(item)
+        root_resolved = repository_root.resolve()
+        for filename, items in by_file.items():
+            path = Path(filename)
+            if not path.is_absolute() or not path.resolve().is_relative_to(root_resolved) or not path.is_file():
+                raise ValueError("Saved Oracle repository state is invalid")
+            content = path.read_text(encoding="utf-8", errors="strict")
+            for item in items:
+                repository_id = str(item.get("id") or "")
+                if not REPOSITORY_ID_RE.fullmatch(repository_id):
+                    raise ValueError("Saved Oracle repository state is invalid")
+                content = set_repository_enabled(content, repository_id, bool(item.get("enabled")))
+            atomic_write_text(path, content)
+        with contextlib.suppress(OSError):
+            managed_path.unlink()
+        with contextlib.suppress(OSError):
+            state_file.unlink()
+        return 0, json.dumps(read_oracle_update_source(inventory, repository_root), ensure_ascii=False, separators=(",", ":"))
+
+    requested = parameters.get("repositories")
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("Select at least one Oracle Linux default repository")
+    mappings: dict[str, str] = {}
+    for item in requested:
+        if not isinstance(item, dict) or set(item) != {"id", "base_url"}:
+            raise ValueError("Oracle Linux repository mapping is invalid")
+        repository_id = str(item.get("id") or "")
+        if not REPOSITORY_ID_RE.fullmatch(repository_id) or not repository_id.startswith(prefix) or repository_id not in by_id or repository_id in mappings:
+            raise ValueError("Oracle Linux repository ID is invalid or changed")
+        mappings[repository_id] = validated_repository_url(item.get("base_url"))
+    required = {str(row["id"]) for row in originals if row["enabled"]}
+    if state:
+        saved = state.get("repositories") if isinstance(state.get("repositories"), list) else []
+        required = {str(item.get("id")) for item in saved if isinstance(item, dict) and item.get("enabled")}
+    if not required or set(mappings) != required:
+        raise ValueError("Configure every enabled Oracle Linux default repository; third-party repositories are excluded")
+    if not state:
+        state = {"version": 1, "repositories": [{"id": row["id"], "file": row["file"], "enabled": row["enabled"]} for row in originals]}
+        atomic_write_text(state_file, json.dumps(state, ensure_ascii=False, separators=(",", ":")), 0o600)
+    by_file: dict[str, list[str]] = {}
+    for repository_id in mappings:
+        by_file.setdefault(str(by_id[repository_id]["file"]), []).append(repository_id)
+    for filename, repository_ids in by_file.items():
+        path = Path(filename)
+        content = path.read_text(encoding="utf-8", errors="strict")
+        for repository_id in repository_ids:
+            content = set_repository_enabled(content, repository_id, False)
+        atomic_write_text(path, content)
+    managed_blocks = ["# Managed by Tram Van Hanh Agent. Third-party repositories are not changed."]
+    for repository_id, base_url in mappings.items():
+        source_values = by_id[repository_id]["values"]
+        block = [f"[tram_{repository_id}]", f"name=Tram managed {repository_id}", f"baseurl={base_url}", "enabled=1"]
+        for key in ("gpgcheck", "repo_gpgcheck", "gpgkey", "sslverify", "sslcacert", "sslclientcert", "sslclientkey", "metadata_expire", "module_hotfixes"):
+            value = str(source_values.get(key) or "").strip()
+            if value:
+                block.append(f"{key}={value}")
+        if not source_values.get("gpgcheck"):
+            block.append("gpgcheck=1")
+        managed_blocks.append("\n".join(block))
+    atomic_write_text(managed_path, "\n\n".join(managed_blocks).rstrip() + "\n")
+    return 0, json.dumps(read_oracle_update_source(inventory, repository_root), ensure_ascii=False, separators=(",", ":"))
+
+
+def read_windows_update_source() -> tuple[int, str]:
+    environment = windows_update_environment()
+    if environment.get("environmentError"):
+        return 1, str(environment["environmentError"])
+    result = {
+        "platform": "windows",
+        "mode": "wsus" if environment.get("sourceMode") == "wsus" else "internet",
+        "wsusEnabled": environment.get("sourceMode") == "wsus",
+        "wsusUrl": str(environment.get("wsusServer") or ""),
+        "effectiveSource": environment.get("sourceLabel"),
+        "policyIssue": environment.get("policyIssue"),
+    }
+    return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def configure_windows_update_source(parameters: dict[str, Any]) -> tuple[int, str]:
+    mode = str(parameters.get("mode") or "")
+    if mode not in {"wsus", "internet"}:
+        raise ValueError("Windows update source mode must be wsus or internet")
+    wsus_url = validated_repository_url(parameters.get("wsus_url")) if mode == "wsus" else ""
+    encoded = base64.b64encode(wsus_url.encode()).decode()
+    if mode == "wsus":
+        mutation = (
+            f"$url=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'));"
+            "New-Item -Path $wu -Force|Out-Null;New-Item -Path $au -Force|Out-Null;"
+            "Set-ItemProperty -Path $wu -Name WUServer -Type String -Value $url;"
+            "Set-ItemProperty -Path $wu -Name WUStatusServer -Type String -Value $url;"
+            "Set-ItemProperty -Path $wu -Name DoNotConnectToWindowsUpdateInternetLocations -Type DWord -Value 1;"
+            "Set-ItemProperty -Path $au -Name UseWUServer -Type DWord -Value 1;"
+        )
+    else:
+        mutation = (
+            "New-Item -Path $wu -Force|Out-Null;New-Item -Path $au -Force|Out-Null;"
+            "Set-ItemProperty -Path $au -Name UseWUServer -Type DWord -Value 0;"
+            "Set-ItemProperty -Path $wu -Name DoNotConnectToWindowsUpdateInternetLocations -Type DWord -Value 0;"
+            "Set-ItemProperty -Path $wu -Name DisableWindowsUpdateAccess -Type DWord -Value 0;"
+            "Remove-ItemProperty -Path $wu -Name WUServer,WUStatusServer,UpdateServiceUrlAlternate -ErrorAction SilentlyContinue;"
+            "Remove-ItemProperty -Path $wu -Name DisableDualScan,SetPolicyDrivenUpdateSourceForDriverUpdates,SetPolicyDrivenUpdateSourceForFeatureUpdates,SetPolicyDrivenUpdateSourceForOtherUpdates,SetPolicyDrivenUpdateSourceForQualityUpdates -ErrorAction SilentlyContinue;"
+        )
+    script = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        "$wu='HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate';$au=$wu+'\\AU';"
+        + mutation
+        + "try{Restart-Service -Name wuauserv -Force -ErrorAction Stop}catch{if((Get-Service wuauserv -ErrorAction SilentlyContinue).StartType -ne 'Disabled'){Start-Service wuauserv -ErrorAction SilentlyContinue}};"
+        "[pscustomobject]@{configured=$true;mode='" + mode + "';wsusUrl='" + ("configured" if mode == "wsus" else "") + "'}|ConvertTo-Json -Compress"
+    )
+    code, output = powershell(script, timeout=120, output_limit=100_000)
+    if code:
+        return code, output
+    read_code, read_output = read_windows_update_source()
+    if read_code:
+        return read_code, read_output
+    effective = json.loads(read_output)
+    if effective.get("mode") != mode:
+        return 1, f"Windows Update source verification failed: requested {mode}, effective {effective.get('mode')}"
+    if mode == "wsus" and str(effective.get("wsusUrl") or "").rstrip("/").lower() != wsus_url.lower():
+        return 1, "Windows Update source verification failed: effective WSUS URL differs from the requested URL"
+    return 0, read_output
+
+
+def read_update_source(inventory: dict[str, Any]) -> tuple[int, str]:
+    if inventory["os_family"] == "windows":
+        return read_windows_update_source()
+    distribution = str(inventory.get("distribution_id") or "").lower()
+    if distribution == "ubuntu":
+        return 0, json.dumps(read_ubuntu_update_source(inventory), ensure_ascii=False, separators=(",", ":"))
+    if distribution in {"ol", "oracle", "oraclelinux"}:
+        return 0, json.dumps(read_oracle_update_source(inventory), ensure_ascii=False, separators=(",", ":"))
+    return 2, "Update source configuration is supported only for Windows Server, Ubuntu 22.04/24.04 and Oracle Linux 7/8"
+
+
+def configure_update_source(parameters: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+    if inventory["os_family"] == "windows":
+        return configure_windows_update_source(parameters)
+    distribution = str(inventory.get("distribution_id") or "").lower()
+    if distribution == "ubuntu":
+        return configure_ubuntu_update_source(parameters, inventory)
+    if distribution in {"ol", "oracle", "oraclelinux"}:
+        return configure_oracle_update_source(parameters, inventory)
+    return 2, "Update source configuration is supported only for Windows Server, Ubuntu 22.04/24.04 and Oracle Linux 7/8"
+
+
 def _scan_updates_monolithic(inventory: dict[str, Any]) -> tuple[int, str]:
     if inventory["os_family"] == "windows":
         script = (
@@ -3171,6 +3592,10 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         return powershell(f"Remove-LocalGroupMember -Group '{group}' -Member '{username}' -ErrorAction Stop") if windows else run(["/usr/bin/gpasswd", "-d", username, group])
     if action == "patch.scan":
         return scan_updates(inventory)
+    if action == "patch.source.read":
+        return read_update_source(inventory)
+    if action == "patch.source.configure":
+        return configure_update_source(parameters, inventory)
     if action == "patch.install":
         return install_updates(parameters, inventory)
     if action == "logs.sources":
