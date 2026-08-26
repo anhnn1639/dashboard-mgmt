@@ -817,7 +817,6 @@ export function ProcessesResourceTab({ output, job, serverName, busy, refresh, q
 }
 
 export type UpdateRow = { id: string; revision?: number; name: string; version?: string; currentVersion?: string; architecture?: string; repository?: string; severity?: string; sizeBytes?: number; description?: string; kb?: string[]; rebootRequired?: boolean };
-type UpdateSourceRepository = { id: string; url: string; enabled?: boolean; managed?: boolean; file?: string };
 
 function updateScanComplete(payload: Record<string, unknown>) {
   const diagnostics = parseObject(JSON.stringify(payload.diagnostics ?? {}));
@@ -849,95 +848,7 @@ function updateStatusText(diagnostics: Record<string, unknown>) {
   } as Record<string, string>)[raw] ?? "Chưa hoàn tất";
 }
 
-type UpdateSourceMode = "default" | "custom" | "internet" | "wsus";
-
-function UpdateSourceSettingsModal({ sourceOutput, sourceJob, serverName, osFamily, osName, osVersion, busy, queue, close }: { sourceOutput?: string; sourceJob?: OperationJob; serverName: string; osFamily: "windows" | "linux"; osName: string; osVersion: string; busy: boolean; queue: QueueOperation; close: () => void }) {
-  const sourcePayload = useMemo(() => parseObject(sourceOutput), [sourceOutput]);
-  const isWindows = osFamily === "windows";
-  const sourcePlatform = String(sourcePayload.platform || (isWindows ? "windows" : osName.toLowerCase().includes("oracle") ? "oracle" : "ubuntu"));
-  const sourceRepositories = useMemo(() => (objectArray(sourcePayload.repositories) as UpdateSourceRepository[]).filter((item) => item.enabled !== false || item.managed), [sourcePayload]);
-  const payloadMode = String(sourcePayload.mode || (isWindows ? "internet" : "default"));
-  const initialMode: UpdateSourceMode = ["default", "custom", "internet", "wsus"].includes(payloadMode) ? payloadMode as UpdateSourceMode : isWindows ? "internet" : "default";
-  const [sourceMode, setSourceMode] = useState<UpdateSourceMode>(initialMode);
-  const [repositoryUrl, setRepositoryUrl] = useState(String(sourcePayload.repositoryUrl || ""));
-  const [wsusUrl, setWsusUrl] = useState(String(sourcePayload.wsusUrl || ""));
-  const [oracleRepositories, setOracleRepositories] = useState<Array<{ id: string; url: string }>>(() => sourceRepositories.map((item) => ({ id: String(item.id), url: String(item.url || "") })));
-  const sourceReady = sourcePlatform === "windows"
-    ? sourceMode !== "wsus" || /^https?:\/\/[^\s]+$/i.test(wsusUrl.trim())
-    : sourcePlatform === "oracle"
-      ? sourceMode !== "custom" || (oracleRepositories.length > 0 && oracleRepositories.every((item) => /^https?:\/\/[^\s]+$/i.test(item.url.trim())))
-      : sourceMode !== "custom" || /^https?:\/\/[^\s]+$/i.test(repositoryUrl.trim());
-
-  async function configureSource() {
-    let parameters: Record<string, unknown>;
-    if (sourcePlatform === "windows") {
-      parameters = { mode: sourceMode === "wsus" ? "wsus" : "internet", wsus_url: sourceMode === "wsus" ? wsusUrl.trim() : "" };
-    } else if (sourcePlatform === "oracle") {
-      parameters = sourceMode === "custom"
-        ? { mode: "custom", repositories: oracleRepositories.map((item) => ({ id: item.id, base_url: item.url.trim() })) }
-        : { mode: "default", repositories: [] };
-    } else {
-      parameters = { mode: sourceMode === "custom" ? "custom" : "default", repository_url: sourceMode === "custom" ? repositoryUrl.trim() : "" };
-    }
-    if (await queue("patch.source.configure", parameters, `Cấu hình nguồn cập nhật trên ${serverName}`)) close();
-  }
-
-  return <ModalShell title="Nguồn cập nhật của máy chủ" subtitle={`${serverName} · ${osName} ${osVersion}`} close={close} className="update-source-modal">
-    <div className="resource-form update-source-form">
-      <PendingState job={sourceJob} />
-      {sourcePlatform === "windows" ? <>
-        <fieldset>
-          <legend>Chế độ cập nhật Windows</legend>
-          <label className="source-choice" htmlFor="update-source-windows-internet" aria-label="Dùng Microsoft Update qua Internet">
-            <input id="update-source-windows-internet" name="windows-update-source" type="radio" checked={sourceMode !== "wsus"} onChange={() => setSourceMode("internet")} />
-            <span><b>Microsoft Update qua Internet</b><small>Gỡ cấu hình WSUS cục bộ do Agent quản lý và dùng nguồn công khai của Windows.</small></span>
-          </label>
-          <label className="source-choice" htmlFor="update-source-windows-wsus" aria-label="Ép sử dụng WSUS">
-            <input id="update-source-windows-wsus" name="windows-update-source" type="radio" checked={sourceMode === "wsus"} onChange={() => setSourceMode("wsus")} />
-            <span><b>Ép sử dụng WSUS</b><small>Đặt WUServer, WUStatusServer và UseWUServer trên máy đích.</small></span>
-          </label>
-        </fieldset>
-        {sourceMode === "wsus" && <label>Địa chỉ WSUS<input value={wsusUrl} onChange={(event) => setWsusUrl(event.target.value)} placeholder="http://wsus.company.local:8530" spellCheck={false} /></label>}
-      </> : sourcePlatform === "oracle" ? <>
-        <fieldset>
-          <legend>Chế độ repository Oracle Linux</legend>
-          <label className="source-choice" htmlFor="update-source-oracle-default" aria-label="Dùng repo mặc định của Oracle Linux">
-            <input id="update-source-oracle-default" name="oracle-update-source" type="radio" checked={sourceMode !== "custom"} onChange={() => setSourceMode("default")} />
-            <span><b>Repo mặc định của Oracle Linux</b><small>Khôi phục trạng thái các repo hệ điều hành trước lần cấu hình đầu tiên.</small></span>
-          </label>
-          <label className="source-choice" htmlFor="update-source-oracle-custom" aria-label="Dùng repo Oracle Linux nội bộ">
-            <input id="update-source-oracle-custom" name="oracle-update-source" type="radio" checked={sourceMode === "custom"} onChange={() => setSourceMode("custom")} />
-            <span><b>Repo nội bộ do quản trị viên chỉ định</b><small>Chỉ thay các repo mặc định ol7_*/ol8_* đang bật; Docker, EPEL và repo ứng dụng khác được giữ nguyên.</small></span>
-          </label>
-        </fieldset>
-        {sourceMode === "custom" && <fieldset>
-          <legend>Địa chỉ cho từng repo Oracle đang bật</legend>
-          <div className="update-source-repository-list">
-            {oracleRepositories.map((item, index) => <label key={item.id}><span>{item.id}</span><input value={item.url} onChange={(event) => setOracleRepositories((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, url: event.target.value } : row))} placeholder={`https://repo.company.local/${item.id}/$basearch`} spellCheck={false} /></label>)}
-            {!oracleRepositories.length && <div className="empty-state">Agent chưa trả về danh sách repo Oracle mặc định. Hãy đợi tác vụ đọc nguồn hoàn tất.</div>}
-          </div>
-        </fieldset>}
-      </> : <>
-        <fieldset>
-          <legend>Chế độ repository Ubuntu</legend>
-          <label className="source-choice" htmlFor="update-source-ubuntu-default" aria-label="Dùng repo mặc định của Ubuntu">
-            <input id="update-source-ubuntu-default" name="ubuntu-update-source" type="radio" checked={sourceMode !== "custom"} onChange={() => setSourceMode("default")} />
-            <span><b>Repo mặc định của Ubuntu</b><small>Khôi phục nguồn Ubuntu trước lần thay đổi đầu tiên.</small></span>
-          </label>
-          <label className="source-choice" htmlFor="update-source-ubuntu-custom" aria-label="Dùng mirror Ubuntu nội bộ">
-            <input id="update-source-ubuntu-custom" name="ubuntu-update-source" type="radio" checked={sourceMode === "custom"} onChange={() => setSourceMode("custom")} />
-            <span><b>Mirror Ubuntu nội bộ</b><small>Chỉ vô hiệu nguồn Ubuntu chuẩn và tạo nguồn được quản lý; Docker, PPA và repo ứng dụng vẫn giữ nguyên.</small></span>
-          </label>
-        </fieldset>
-        {sourceMode === "custom" && <label>URL gốc của mirror Ubuntu<input value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)} placeholder="https://repo.company.local/ubuntu" spellCheck={false} /><small>Mirror phải có đủ suite {osVersion.startsWith("22.04") ? "jammy" : "noble"}, updates, backports và security.</small></label>}
-      </>}
-      <div className="resource-help">Agent chỉ chấp nhận URL HTTP/HTTPS không chứa tài khoản, query hoặc fragment. Sau khi áp dụng, hệ thống tự đọc lại nguồn thực tế và quét patch phù hợp đúng OS/version.</div>
-      <div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button type="button" className="button primary" disabled={busy || !sourceReady || ["queued", "dispatched"].includes(sourceJob?.status ?? "")} onClick={() => void configureSource()}>Áp dụng & quét lại</button></div>
-    </div>
-  </ModalShell>;
-}
-
-export function UpdatesResourceTab({ scans, job, sourceJob, sourceOutput, serverName, osFamily, osName, osVersion, busy, refresh, queue, canConfigure }: { scans: OperationJob[]; job?: OperationJob; sourceJob?: OperationJob; sourceOutput?: string; serverName: string; osFamily: "windows" | "linux"; osName: string; osVersion: string; busy: boolean; refresh: () => void; queue: QueueOperation; canConfigure: boolean }) {
+export function UpdatesResourceTab({ scans, job, serverName, osFamily, busy, refresh, queue }: { scans: OperationJob[]; job?: OperationJob; serverName: string; osFamily: "windows" | "linux"; busy: boolean; refresh: () => void; queue: QueueOperation }) {
   const scanState = useMemo(() => {
     const succeeded = scans.filter((scan) => scan.status === "succeeded");
     const latest = succeeded[0];
@@ -968,7 +879,6 @@ export function UpdatesResourceTab({ scans, job, sourceJob, sourceOutput, server
   const systemVersion = `${String(diagnostics.osName ?? diagnostics.distributionId ?? "")} ${String(diagnostics.osVersion ?? "")}`.trim() || "không xác định";
   const [selected, setSelected] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [sourceOpen, setSourceOpen] = useState(false);
   const activeSelected = installAllowed ? selected.filter((id) => rows.some((row) => row.id === id)) : [];
   async function install() {
     if (!installAllowed) return;
@@ -976,21 +886,14 @@ export function UpdatesResourceTab({ scans, job, sourceJob, sourceOutput, server
     if (!await queue("patch.install", { updates }, `Cài ${updates.length} update đã chọn trên ${serverName}`)) return;
     setSelected([]);
   }
-  async function openSourceSettings() {
-    setSourceOpen(true);
-    if (!sourceOutput && !["queued", "dispatched"].includes(sourceJob?.status ?? "")) {
-      await queue("patch.source.read", {}, `Đọc nguồn cập nhật hiện tại trên ${serverName}`);
-    }
-  }
   const emptyMessage = !scanState.latestComplete
     ? `Chưa xác định được danh sách bản cập nhật: ${status}.`
     : "Không có bản cập nhật khả dụng trong lần quét hoàn tất gần nhất.";
   return <section className="resource-tab updates-resource-tab">
-    <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật đang hiển thị · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions">{canConfigure && <button className="button ghost" type="button" onClick={() => void openSourceSettings()}>⚙ Nguồn cập nhật</button>}<button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!activeSelected.length || busy || !installAllowed} title={installAllowed ? "" : "Chỉ cài đặt sau một lần quét Windows Update hoàn tất"} onClick={() => void install()}>Cập nhật ({activeSelected.length})</button></div></div>
+    <div className="resource-toolbar"><div><h2>Updates</h2><p>{rows.length} bản cập nhật đang hiển thị · chỉ cài gói được chọn</p></div><div className="resource-toolbar-actions"><button className="button ghost" onClick={refresh} disabled={busy}>↻ Quét lại</button><button className="button primary compact" disabled={!activeSelected.length || busy || !installAllowed} title={installAllowed ? "" : "Chỉ cài đặt sau một lần quét Windows Update hoàn tất"} onClick={() => void install()}>Cập nhật ({activeSelected.length})</button></div></div>
     <PendingState job={job} />
     {scanState.latest && !scanState.latestComplete && <div className="update-scan-status"><dl><div><dt>Nguồn</dt><dd>{source}</dd></div><div><dt>{isWindows ? "Lần Windows quét thành công" : "Phiên bản hệ điều hành"}</dt><dd>{isWindows ? lastSuccessfulSearch : systemVersion}</dd></div><div><dt>Trạng thái</dt><dd title={statusDetail}>{status}</dd></div></dl></div>}
     <div className="resource-table-scroll"><table className="resource-table updates-table"><thead><tr><th className="check-column"><input type="checkbox" disabled={!installAllowed} checked={rows.length > 0 && rows.every((item) => activeSelected.includes(item.id))} onChange={() => setSelected(rows.every((item) => activeSelected.includes(item.id)) ? [] : rows.map((item) => item.id))} /></th><th>Gói / bản cập nhật</th><th>Phiên bản</th><th>Nguồn</th><th>Mức độ</th></tr></thead><tbody>{rows.map((update) => <Fragment key={update.id}><tr className="clickable" onClick={() => setExpanded(expanded === update.id ? null : update.id)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={!installAllowed} checked={activeSelected.includes(update.id)} onChange={() => setSelected((current) => current.includes(update.id) ? current.filter((item) => item !== update.id) : [...current, update.id])} /></td><td><b>{update.name}</b><small>{update.kb?.join(", ")}</small></td><td>{update.currentVersion ? `${update.currentVersion} → ` : ""}{update.version || "—"}</td><td>{update.repository || "—"}</td><td><span className={`state-pill ${update.severity === "security" || update.severity === "Critical" ? "warning" : ""}`}>{update.severity || "normal"}</span></td></tr>{expanded === update.id && <tr className="update-detail-row"><td /><td colSpan={4}><p>{update.description || "Không có mô tả chi tiết từ package manager."}</p><span>{update.architecture || ""}{update.sizeBytes ? ` · ${formatBytes(update.sizeBytes)}` : ""}{update.rebootRequired ? " · yêu cầu reboot" : ""}</span></td></tr>}</Fragment>)}</tbody></table>{!rows.length && <div className="empty-state">{emptyMessage}</div>}</div>
-    {sourceOpen && <UpdateSourceSettingsModal key={`${sourceOutput ?? "loading"}-${sourceJob?.status ?? "idle"}`} sourceOutput={sourceOutput} sourceJob={sourceJob} serverName={serverName} osFamily={osFamily} osName={osName} osVersion={osVersion} busy={busy} queue={queue} close={() => setSourceOpen(false)} />}
   </section>;
 }
 

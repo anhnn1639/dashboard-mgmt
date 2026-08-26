@@ -3,6 +3,7 @@
 import Guacamole from "guacamole-common-js";
 import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
+import { UpdateSourceSettingsView } from "./update-source-settings";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -91,6 +92,7 @@ const navItems = [
   { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["servers.view"] },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
   { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
+  { id: "update-settings", icon: "↥", label: "Cấu hình cập nhật", group: "administration", permissions: ["updates.manage"] },
   { id: "agents", icon: "↓", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
 ];
 
@@ -892,6 +894,8 @@ export function OpsConsole() {
               ? "Nhật ký kiểm toán"
               : active === "access"
                 ? "Người dùng & vai trò"
+                : active === "update-settings"
+                  ? "Cấu hình cập nhật"
                 : active === "agents"
                   ? "Tạo bộ cài Agent"
                 : "Trung tâm vận hành";
@@ -1255,7 +1259,6 @@ export function OpsConsole() {
               notify={notify}
               token={token}
               canConfigureLogs={currentUser.permissions.includes("logs.configure")}
-              canConfigureUpdates={currentUser.permissions.includes("updates.manage")}
             />
           ) : active === "sessions" ? (
             <SessionsView token={token} />
@@ -1265,6 +1268,8 @@ export function OpsConsole() {
             <AuditView token={token} />
           ) : active === "access" ? (
             <AccessView token={token} currentUser={currentUser} />
+          ) : active === "update-settings" ? (
+            <UpdateSourceSettingsView servers={servers} token={token} notify={notify} openJobs={() => navigateSection("jobs")} />
           ) : active === "agents" ? (
             <AgentPackagesView token={token} />
           ) : (
@@ -2371,7 +2376,6 @@ function ServerDrawer({
   notify,
   token,
   canConfigureLogs,
-  canConfigureUpdates,
 }: {
   server: Server;
   close: () => void;
@@ -2379,7 +2383,6 @@ function ServerDrawer({
   notify: (message: string) => void;
   token: string;
   canConfigureLogs: boolean;
-  canConfigureUpdates: boolean;
 }) {
   type Fact = {
     name?: string;
@@ -2513,8 +2516,6 @@ function ServerDrawer({
     ? jobs.find((job) => job.action === currentReadAction && job.status === "succeeded")
     : undefined;
   const successfulUpdateScanJobs = jobs.filter((job) => job.action === "patch.scan" && job.status === "succeeded");
-  const latestUpdateSourceJob = jobs.find((job) => job.action === "patch.source.read");
-  const latestSuccessfulUpdateSourceJob = jobs.find((job) => job.action === "patch.source.read" && job.status === "succeeded");
   const latestUserJob = jobs.find((job) => job.action === "user.list");
   const latestSuccessfulUserJob = jobs.find((job) => job.action === "user.list" && job.status === "succeeded");
   const latestGroupJob = jobs.find((job) => job.action === "group.list");
@@ -3067,7 +3068,7 @@ function ServerDrawer({
               )}
 
               {activeTab === "updates" && (
-                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} sourceJob={latestUpdateSourceJob} sourceOutput={latestSuccessfulUpdateSourceJob?.output} serverName={server.name} osFamily={server.osFamily} osName={server.os} osVersion={server.version} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} canConfigure={canConfigureUpdates} />
+                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "processes" && (

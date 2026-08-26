@@ -613,7 +613,7 @@ class JobCreateRequest(BaseModel):
 class BulkTaskCreateRequest(BaseModel):
     os_family: Literal["windows", "linux"]
     server_ids: list[str] = Field(min_length=1, max_length=100)
-    action: Literal["user.create", "firewall.rule.add.auto", "patch.install"]
+    action: Literal["user.create", "firewall.rule.add.auto", "patch.install", "patch.source.read", "patch.source.configure"]
     parameters: dict[str, Any] = Field(default_factory=dict)
     reason: str = Field(min_length=5, max_length=2000)
 
@@ -3620,6 +3620,55 @@ def update_catalog_rows(payload: dict[str, Any]) -> dict[tuple[str, str], dict[s
     return rows
 
 
+def update_source_profile(server: Server) -> tuple[str, str, str]:
+    """Return the managed update-source profile used for safe bulk operations."""
+    if server.os_family == "windows":
+        return "windows-server", "windows", "Windows Server"
+    distribution = str(server.distribution_id or "").strip().lower()
+    os_name = str(server.os_name or "").strip().lower()
+    version = str(server.os_version or "").strip()
+    if distribution == "ubuntu" or "ubuntu" in os_name:
+        release = "22.04" if version.startswith("22.04") else "24.04" if version.startswith("24.04") else ""
+        if release:
+            return f"ubuntu-{release}", "ubuntu", f"Ubuntu {release}"
+    if distribution in {"ol", "oracle", "oraclelinux"} or "oracle linux" in os_name:
+        major = version.split(".", 1)[0]
+        if major in {"7", "8"}:
+            return f"oracle-{major}", "oracle", f"Oracle Linux {major}"
+    raise HTTPException(status_code=422, detail=f"{server.name} does not use a supported managed update source")
+
+
+def latest_update_source(db: Session, server: Server) -> tuple[Job | None, dict[str, Any], bool]:
+    job = db.execute(
+        select(Job)
+        .where(Job.server_id == server.id, Job.action == "patch.source.read")
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if not job or job.status != "succeeded":
+        return job, {}, False
+    try:
+        payload = json.loads(job.output)
+    except (TypeError, ValueError):
+        return job, {}, False
+    return (job, payload, True) if isinstance(payload, dict) else (job, {}, False)
+
+
+def oracle_source_repositories(payload: dict[str, Any], major: str) -> list[dict[str, str]]:
+    repositories = payload.get("repositories") if isinstance(payload.get("repositories"), list) else []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in repositories:
+        if not isinstance(item, dict) or (item.get("enabled") is False and not item.get("managed")):
+            continue
+        repository_id = str(item.get("id") or "")
+        if not re.fullmatch(rf"ol{major}_[A-Za-z0-9_.:-]{{1,120}}", repository_id) or repository_id in seen:
+            continue
+        seen.add(repository_id)
+        result.append({"id": repository_id, "url": str(item.get("url") or "")})
+    return result
+
+
 def bulk_target_servers(payload: BulkUpdateCatalogRequest | BulkTaskCreateRequest, user: User, db: Session) -> list[Server]:
     server_ids = list(dict.fromkeys(payload.server_ids))
     if len(server_ids) != len(payload.server_ids):
@@ -3683,6 +3732,62 @@ def bulk_update_catalog(payload: BulkUpdateCatalogRequest, user: User = Depends(
     }
 
 
+@app.post("/api/v1/bulk-update-sources/catalog")
+def bulk_update_source_catalog(payload: BulkUpdateCatalogRequest, user: User = Depends(require_permission("updates.manage")), db: Session = Depends(db_session)):
+    servers = bulk_target_servers(payload, user, db)
+    profiles = {update_source_profile(server) for server in servers}
+    if len(profiles) != 1:
+        raise HTTPException(status_code=422, detail="Select servers from the same supported operating-system profile")
+    profile, platform, label = next(iter(profiles))
+    server_rows: list[dict[str, Any]] = []
+    repository_rows: dict[str, dict[str, Any]] = {}
+    modes: set[str] = set()
+    repository_urls: set[str] = set()
+    wsus_urls: set[str] = set()
+    all_ready = True
+    for server in servers:
+        job, source, ready = latest_update_source(db, server)
+        all_ready = all_ready and ready
+        mode = str(source.get("mode") or "")
+        if mode:
+            modes.add(mode)
+        repository_url = str(source.get("repositoryUrl") or "")
+        wsus_url = str(source.get("wsusUrl") or "")
+        if repository_url:
+            repository_urls.add(repository_url)
+        if wsus_url:
+            wsus_urls.add(wsus_url)
+        if platform == "oracle" and ready:
+            major = profile.rsplit("-", 1)[-1]
+            for repository in oracle_source_repositories(source, major):
+                row = repository_rows.setdefault(repository["id"], {"id": repository["id"], "currentUrls": set(), "requiredOn": 0})
+                if repository["url"]:
+                    row["currentUrls"].add(repository["url"])
+                row["requiredOn"] += 1
+        server_rows.append({
+            "id": server.id,
+            "name": server.name,
+            "address": server.address,
+            "status": "complete" if ready else (job.status if job else "not_scanned"),
+            "readAt": aware(job.created_at).isoformat() if job else None,
+            "mode": mode or None,
+        })
+    return {
+        "ready": all_ready,
+        "profile": profile,
+        "platform": platform,
+        "label": label,
+        "mode": next(iter(modes)) if len(modes) == 1 else "mixed" if modes else "unknown",
+        "repositoryUrl": next(iter(repository_urls)) if len(repository_urls) == 1 else "",
+        "wsusUrl": next(iter(wsus_urls)) if len(wsus_urls) == 1 else "",
+        "servers": server_rows,
+        "repositories": [
+            {"id": row["id"], "currentUrls": sorted(row["currentUrls"]), "requiredOn": row["requiredOn"]}
+            for row in sorted(repository_rows.values(), key=lambda item: item["id"].casefold())
+        ],
+    }
+
+
 @app.post("/api/v1/bulk-tasks", status_code=201)
 def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
     policy = SAFE_ACTIONS.get(payload.action)
@@ -3709,7 +3814,55 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
         job_parameters = requested
         summary = {key: value for key, value in requested.items() if key not in {"password", "secret", "token"}}
         parameters_by_server = {server.id: job_parameters for server in ordered_servers}
-    else:
+    elif payload.action == "patch.source.read":
+        if requested:
+            raise HTTPException(status_code=422, detail="Reading update sources does not accept parameters")
+        profiles = {update_source_profile(server) for server in ordered_servers}
+        if len(profiles) != 1:
+            raise HTTPException(status_code=422, detail="Select servers from the same supported operating-system profile")
+        profile, _, label = next(iter(profiles))
+        parameters_by_server = {server.id: {} for server in ordered_servers}
+        summary = {"profile": profile, "osLabel": label}
+    elif payload.action == "patch.source.configure":
+        profiles = {update_source_profile(server) for server in ordered_servers}
+        if len(profiles) != 1:
+            raise HTTPException(status_code=422, detail="Select servers from the same supported operating-system profile")
+        profile, platform, label = next(iter(profiles))
+        mode = str(requested.get("mode") or "")
+        if platform != "oracle" or mode != "custom":
+            parameters_by_server = {server.id: requested for server in ordered_servers}
+        else:
+            repositories = requested.get("repositories")
+            if set(requested) != {"mode", "repositories"} or not isinstance(repositories, list):
+                raise HTTPException(status_code=422, detail="Oracle Linux repository mappings are incomplete")
+            requested_urls: dict[str, str] = {}
+            for item in repositories:
+                if not isinstance(item, dict) or set(item) != {"id", "base_url"}:
+                    raise HTTPException(status_code=422, detail="Oracle Linux repository mapping is invalid")
+                repository_id = str(item.get("id") or "")
+                if repository_id in requested_urls:
+                    raise HTTPException(status_code=422, detail="Oracle Linux repository mapping is duplicated")
+                requested_urls[repository_id] = str(item.get("base_url") or "")
+            required_union: set[str] = set()
+            major = profile.rsplit("-", 1)[-1]
+            for server in ordered_servers:
+                _, source, ready = latest_update_source(db, server)
+                if not ready:
+                    raise HTTPException(status_code=409, detail=f"Read the current update source on {server.name} before applying a custom Oracle mirror")
+                required_ids = [item["id"] for item in oracle_source_repositories(source, major)]
+                if not required_ids:
+                    raise HTTPException(status_code=409, detail=f"{server.name} did not report any managed Oracle repositories")
+                required_union.update(required_ids)
+                if any(repository_id not in requested_urls for repository_id in required_ids):
+                    raise HTTPException(status_code=422, detail=f"Repository mappings are incomplete for {server.name}")
+                parameters_by_server[server.id] = {
+                    "mode": "custom",
+                    "repositories": [{"id": repository_id, "base_url": requested_urls[repository_id]} for repository_id in required_ids],
+                }
+            if set(requested_urls) != required_union:
+                raise HTTPException(status_code=422, detail="Oracle Linux repository mappings do not match the selected servers")
+        summary = {"profile": profile, "osLabel": label, "mode": mode, "repositoryCount": len(requested.get("repositories") or []) if platform == "oracle" else 1 if mode in {"custom", "wsus"} else 0}
+    elif payload.action == "patch.install":
         requested_updates = requested.get("updates")
         if set(requested) != {"updates"} or not isinstance(requested_updates, list) or not 1 <= len(requested_updates) <= 100:
             raise HTTPException(status_code=422, detail="Select between 1 and 100 updates")
@@ -3745,6 +3898,8 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
             "osName": ordered_servers[0].os_name,
             "osVersion": ordered_servers[0].os_version,
         }
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported bulk action")
 
     for server in ordered_servers:
         validate_job_parameters(payload.action, parameters_by_server[server.id], server)

@@ -569,6 +569,68 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual({job.parameters["updates"][0]["revision"] for job in jobs}, {4, 5})
             self.assertTrue(all(job.parameters["updates"][0]["id"] == common_id for job in jobs))
 
+    def test_bulk_oracle_update_source_uses_real_repository_ids_per_server(self):
+        server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            for index, server_id in enumerate(server_ids):
+                db.add(Server(
+                    id=server_id,
+                    name=f"bulk-oracle-{index}",
+                    address=f"10.80.0.{index + 10}",
+                    os_family="linux",
+                    os_name="Oracle Linux Server",
+                    os_version="8.10",
+                    distribution_id="ol",
+                    architecture="x86_64",
+                ))
+                repositories = [
+                    {"id": "ol8_baseos_latest", "url": "https://yum.oracle.com/repo/OracleLinux/OL8/baseos/latest/x86_64", "enabled": True},
+                ]
+                if index == 0:
+                    repositories.append({"id": "ol8_appstream", "url": "https://yum.oracle.com/repo/OracleLinux/OL8/appstream/x86_64", "enabled": True})
+                db.add(Job(
+                    server_id=server_id,
+                    action="patch.source.read",
+                    status="succeeded",
+                    risk="low",
+                    reason="read current sources",
+                    created_by="system",
+                    output=json.dumps({"platform": "oracle", "mode": "default", "repositories": repositories}),
+                ))
+            db.commit()
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            catalog = client.post("/api/v1/bulk-update-sources/catalog", headers=headers, json={"os_family": "linux", "server_ids": server_ids})
+            self.assertEqual(catalog.status_code, 200, catalog.text)
+            body = catalog.json()
+            self.assertTrue(body["ready"])
+            self.assertEqual(body["profile"], "oracle-8")
+            self.assertEqual({item["id"]: item["requiredOn"] for item in body["repositories"]}, {"ol8_appstream": 1, "ol8_baseos_latest": 2})
+
+            created = client.post("/api/v1/bulk-tasks", headers=headers, json={
+                "os_family": "linux",
+                "server_ids": server_ids,
+                "action": "patch.source.configure",
+                "parameters": {
+                    "mode": "custom",
+                    "repositories": [
+                        {"id": "ol8_baseos_latest", "base_url": "https://repo.internal/ol8/baseos/$basearch"},
+                        {"id": "ol8_appstream", "base_url": "https://repo.internal/ol8/appstream/$basearch"},
+                    ],
+                },
+                "reason": "CHG-8192 switch Oracle hosts to the managed mirror",
+            })
+            self.assertEqual(created.status_code, 201, created.text)
+            self.assertEqual(created.json()["targetCount"], 2)
+        with SessionLocal() as db:
+            jobs = db.execute(select(Job).where(Job.server_id.in_(server_ids), Job.action == "patch.source.configure").order_by(Job.server_id)).scalars().all()
+            self.assertEqual(len(jobs), 2)
+            repositories_by_server = {job.server_id: {item["id"] for item in job.parameters["repositories"]} for job in jobs}
+            self.assertEqual(repositories_by_server[server_ids[0]], {"ol8_baseos_latest", "ol8_appstream"})
+            self.assertEqual(repositories_by_server[server_ids[1]], {"ol8_baseos_latest"})
+
     def test_common_firewall_payload_rejects_unknown_commands_and_wrong_family(self):
         valid = {"name": "SSH from jump", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 22, "remote_port": "any", "source": "10.64.83.172/32", "destination": "any", "family": "ipv4"}
         validate_firewall_job_parameters("firewall.rule.add.auto", valid)

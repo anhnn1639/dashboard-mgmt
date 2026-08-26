@@ -120,6 +120,8 @@ test("recording deletion requires a distinct second administrator", async () => 
 test("storage resize stays explicit and Updates shows only patches", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const resources = await readFile(new URL("../app/server-resource-tabs.tsx", import.meta.url), "utf8");
+  const updateSettings = await readFile(new URL("../app/update-source-settings.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(resources, /<span>Thao tác<\/span>/);
   assert.match(resources, /disabled=\{!canExtend\}/);
   assert.match(resources, /partition Recovery hoặc partition khác đang nằm ở giữa/);
@@ -144,13 +146,19 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(resources, /Mất kết nối WSUS/);
   assert.match(resources, /Không kết nối được repository/);
   assert.match(resources, /Phiên bản hệ điều hành/);
-  assert.match(resources, /Nguồn cập nhật của máy chủ/);
-  assert.match(resources, /Microsoft Update qua Internet/);
-  assert.match(resources, /Ép sử dụng WSUS/);
-  assert.match(resources, /Repo nội bộ do quản trị viên chỉ định/);
-  assert.match(resources, /Docker, EPEL và repo ứng dụng khác được giữ nguyên/);
-  assert.match(resources, /Docker, PPA và repo ứng dụng vẫn giữ nguyên/);
-  assert.match(resources, /queue\("patch\.source\.configure"/);
+  assert.doesNotMatch(resources, /Nguồn cập nhật của máy chủ/);
+  assert.doesNotMatch(resources, /patch\.source\.configure/);
+  assert.match(source, /label: "Cấu hình cập nhật"/);
+  assert.match(updateSettings, /Cấu hình nguồn cập nhật hàng loạt/);
+  assert.match(updateSettings, /Microsoft Update qua Internet/);
+  assert.match(updateSettings, /Ép dùng WSUS/);
+  assert.match(updateSettings, /Repo Oracle Linux nội bộ/);
+  assert.match(updateSettings, /Docker, PPA và repo ứng dụng khác được giữ nguyên/);
+  assert.match(updateSettings, /\/api\/v1\/bulk-update-sources\/catalog/);
+  assert.match(updateSettings, /"patch\.source\.configure"/);
+  assert.match(updateSettings, /Áp dụng cho \$\{selectedIds\.length\} máy/);
+  assert.match(styles, /input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)/);
+  assert.match(styles, /\.update-settings-layout\s*{[^}]*grid-template-columns:/s);
   assert.match(source, /"patch\.source\.read": "Đọc nguồn cập nhật"/);
   assert.match(source, /"patch\.source\.configure": "Cấu hình nguồn cập nhật"/);
   assert.match(source, /successfulUpdateScanJobs/);
