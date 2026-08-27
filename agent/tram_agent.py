@@ -3103,7 +3103,7 @@ def windows_update_environment() -> dict[str, Any]:
         "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
         "$policy=$null;$auPolicy=$null;try{$policy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -ErrorAction Stop}catch{};"
         "try{$auPolicy=Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -ErrorAction Stop}catch{};"
-        "$registered=@();try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;$registered=@($manager.Services|ForEach-Object{[pscustomobject]@{name=[string]$_.Name;serviceId=[string]$_.ServiceID;isManaged=[bool]$_.IsManaged;isDefault=[bool]$_.IsDefaultAUService;offersWindowsUpdates=[bool]$_.OffersWindowsUpdates}})}catch{};"
+        "$registered=@();try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;$services=$manager.Services;for($serviceIndex=0;$serviceIndex -lt $services.Count;$serviceIndex++){$service=$services.Item($serviceIndex);$registered+=,[pscustomobject]@{name=[string]$service.Name;serviceId=[string]$service.ServiceID;isManaged=[bool]$service.IsManaged;isDefault=[bool]$service.IsDefaultAUService;offersWindowsUpdates=[bool]$service.OffersWindowsUpdates}}}catch{};"
         "$operatingSystem=$null;try{$operatingSystem=Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop}catch{};"
         "$lastSearch='';$lastInstall='';try{$results=(New-Object -ComObject Microsoft.Update.AutoUpdate).Results;if($results.LastSearchSuccessDate -and $results.LastSearchSuccessDate.Year -gt 1901){$lastSearch=$results.LastSearchSuccessDate.ToUniversalTime().ToString('o')};if($results.LastInstallationSuccessDate -and $results.LastInstallationSuccessDate.Year -gt 1901){$lastInstall=$results.LastInstallationSuccessDate.ToUniversalTime().ToString('o')}}catch{};"
         "$states=@{};foreach($serviceName in @('wuauserv','bits','usosvc')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;$states[$serviceName]=[pscustomobject]@{status=$service.Status.ToString();startType=$service.StartType.ToString()}}catch{$states[$serviceName]=[pscustomobject]@{status='missing';startType='missing'}}};"
@@ -3224,16 +3224,36 @@ def windows_update_query(*, online: bool, timeout: int, source_mode: str = "defa
     mode = "online" if online else "cached"
     server_selection = {"default": 0, "wsus": 1, "windows_update": 2}[source_mode]
     source_label = {"default": "Windows configured source", "wsus": "WSUS", "windows_update": "Windows Update"}[source_mode]
+    primary_query = (
+        "$session=New-Object -ComObject Microsoft.Update.Session;"
+        "$session.ClientApplicationID='TramVanHanhAgent-" + mode + "';"
+        "$searcher=$session.CreateUpdateSearcher();"
+        "$searcher.ServerSelection=" + str(server_selection) + ";"
+        "$searcher.Online=" + online_literal + ";"
+        "$result=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");"
+        "AddRows $result '" + source_label + "';"
+    )
+    if not online:
+        primary_query = "try{" + primary_query + "}catch{$queryError=$_.Exception.Message};"
+    registered_cache_query = ""
+    if not online:
+        registered_cache_query = (
+            "try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;$services=$manager.Services;"
+            "for($serviceIndex=0;$serviceIndex -lt $services.Count;$serviceIndex++){$service=$services.Item($serviceIndex);"
+            "try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSearcher=$serviceSession.CreateUpdateSearcher();"
+            "$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$service.ServiceID;$serviceSearcher.Online=$false;"
+            "$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");"
+            "AddRows $serviceResult ([string]$service.Name) ([string]$service.ServiceID)}catch{}}}catch{};"
+        )
     script = (
-        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$rows=@();"
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$rows=@();$queryError='';"
         "foreach($serviceName in @('wuauserv','bits')){try{$service=Get-Service -Name $serviceName -ErrorAction Stop;if($service.Status -eq 'Stopped' -and $service.StartType -ne 'Disabled'){Start-Service -Name $serviceName -ErrorAction Stop}}catch{}};"
         "function AddRows([object]$result,[string]$repository,[string]$serviceId=''){for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i);$id=[string]$u.Identity.UpdateID;if($script:rows|Where-Object{$_.id -eq $id}){continue};$kb=@($u.KBArticleIDs|ForEach-Object{[string]$_});$categories=@($u.Categories|ForEach-Object{[string]$_.Name});$severity=[string]$u.MsrcSeverity;if(-not $severity){if($u.Title -match '(?i)security|defender|malicious software|cumulative update'){$severity='security'}elseif($categories -match '(?i)driver'){$severity='driver'}else{$severity='normal'}};$architecture=if($u.Title -match '(?i)\\b(x64|x86|arm64)\\b'){$Matches[1].ToLower()}else{''};$version=if($kb.Count){(@($kb|ForEach-Object{'KB'+$_}) -join ', ')}else{[string]$u.Identity.RevisionNumber};$script:rows+=,[pscustomobject]@{id=$id;revision=[int]$u.Identity.RevisionNumber;manager='wua';serviceId=$serviceId;name=[string]$u.Title;version=$version;architecture=$architecture;repository=$repository;severity=$severity;kb=$kb;categories=$categories;sizeBytes=[int64]$u.MaxDownloadSize;description=[string]$u.Description;rebootRequired=[bool]$u.RebootRequired;downloaded=[bool]$u.IsDownloaded;hidden=[bool]$u.IsHidden}}};"
-        "$session=New-Object -ComObject Microsoft.Update.Session;$session.ClientApplicationID='TramVanHanhAgent-" + mode + "';$searcher=$session.CreateUpdateSearcher();$searcher.ServerSelection=" + str(server_selection) + ";$searcher.Online=" + online_literal + ";$result=$searcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $result '" + source_label + "';"
-        + ("" if online else "try{$manager=New-Object -ComObject Microsoft.Update.ServiceManager;foreach($service in @($manager.Services)){try{$serviceSession=New-Object -ComObject Microsoft.Update.Session;$serviceSearcher=$serviceSession.CreateUpdateSearcher();$serviceSearcher.ServerSelection=3;$serviceSearcher.ServiceID=[string]$service.ServiceID;$serviceSearcher.Online=$false;$serviceResult=$serviceSearcher.Search(\"IsInstalled=0 and IsHidden=0\");AddRows $serviceResult ([string]$service.Name) ([string]$service.ServiceID)}catch{}}}catch{};")
-        + "[pscustomobject]@{platform='windows';manager='wua';count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=" + online_literal + ";wuaStatus='" + mode + "';wuaMode='" + mode + "';wuaCount=[int]$rows.Count;updateSource='" + source_label + "';serverSelection=" + str(server_selection) + "}}|ConvertTo-Json -Depth 8 -Compress"
+        + primary_query
+        + registered_cache_query
+        + "[pscustomobject]@{platform='windows';manager='wua';count=[int]$rows.Count;updates=@($rows);diagnostics=[pscustomobject]@{currentScanComplete=" + online_literal + ";wuaStatus='" + mode + "';wuaMode='" + mode + "';wuaCount=[int]$rows.Count;wuaError=$queryError;updateSource='" + source_label + "';serverSelection=" + str(server_selection) + "}}|ConvertTo-Json -Depth 8 -Compress"
     )
     return powershell(script, timeout=timeout, output_limit=10_000_000)
-
 
 def windows_configmgr_updates() -> list[dict[str, Any]]:
     script = "$ErrorActionPreference='Stop';$rows=@();try{$updates=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{$_.ComplianceState -eq 0});foreach($u in $updates){$article=[string]$u.ArticleID;$id=[string]$u.UpdateID;$rows+=,[pscustomobject]@{id=$id;revision=0;manager='configmgr';serviceId='';name=[string]$u.Name;version=if($article){'KB'+$article}else{$id};architecture='';repository='Microsoft Configuration Manager';severity=if($u.BulletinID -or $u.Name -match '(?i)security|defender|malicious software|cumulative update'){'security'}else{'normal'};kb=if($article){@($article)}else{@()};categories=@();sizeBytes=[int64]$u.ContentSize;description=[string]$u.Description;rebootRequired=$false;downloaded=$false;hidden=$false}};$rows|ConvertTo-Json -Depth 6 -Compress}catch{'[]'}"
@@ -3259,15 +3279,12 @@ def scan_windows_updates() -> tuple[int, str]:
             if isinstance(parsed, dict):
                 cache = parsed
     wua_rows = [item for item in cache.get("updates", []) if isinstance(item, dict)]
+    cache_count = len(wua_rows)
     online_code: int | None = None
     online_output = ""
     connectivity = {"reachable": False, "status": "not_checked", "endpoint": "", "error": ""}
-    cache_is_fresh = cache_code == 0 and windows_update_cache_is_fresh(environment)
     if source_mode == "invalid_policy":
         online_status = "skipped_invalid_policy"
-    elif cache_is_fresh:
-        online_code = 0
-        online_status = "fresh_cache"
     else:
         connectivity = windows_update_source_probe(environment)
         if connectivity.get("reachable") is not True:
@@ -3299,7 +3316,7 @@ def scan_windows_updates() -> tuple[int, str]:
                             wua_rows = [item for item in parsed.get("updates", []) if isinstance(item, dict)]
     merged: dict[str, dict[str, Any]] = {str(item.get("id")): item for item in [*wua_rows, *configmgr_rows] if item.get("id")}
     diagnostics = cache.get("diagnostics") if isinstance(cache.get("diagnostics"), dict) else {}
-    current_scan_complete = online_status in {"complete", "fresh_cache"}
+    current_scan_complete = online_status == "complete"
     if configmgr_rows and not wua_rows:
         current_scan_complete = True
     diagnostics.update({
@@ -3307,10 +3324,10 @@ def scan_windows_updates() -> tuple[int, str]:
         "currentScanComplete": current_scan_complete,
         "wuaCount": len(wua_rows),
         "wuaStatus": online_status,
-        "wuaMode": "cache" if online_status == "fresh_cache" else "online",
+        "wuaMode": "online" if online_status == "complete" else "cache",
         "wuaError": "" if current_scan_complete else (str(connectivity.get("error") or "") or online_output or environment.get("policyIssue") or f"WUA scan exited with code {online_code}")[:1000],
         "cacheStatus": "ok" if cache_code == 0 else "error",
-        "cacheCount": len(wua_rows),
+        "cacheCount": cache_count,
         "onlineTimeoutSeconds": WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS,
         "connectivityStatus": connectivity.get("status"),
         "connectivityReachable": connectivity.get("reachable"),

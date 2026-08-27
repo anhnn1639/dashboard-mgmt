@@ -834,6 +834,8 @@ trusted
         self.assertIn('Search("IsInstalled=0 and IsHidden=0")', cached[0])
         self.assertIn("$result.Updates.Item($i)", cached[0])
         self.assertIn("Microsoft.Update.ServiceManager", cached[0])
+        self.assertIn("$services.Item($serviceIndex)", cached[0])
+        self.assertIn("catch{$queryError=$_.Exception.Message}", cached[0])
         self.assertIn("Microsoft.Update.AutoUpdate", "\n".join(scripts))
         self.assertLess(scripts.index(cached[0]), scripts.index(online[0]))
         configmgr = next(script for script in scripts if "CCM_SoftwareUpdate" in script)
@@ -923,6 +925,51 @@ trusted
         current = datetime.now(UTC).isoformat()
         self.assertTrue(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": current}))
         self.assertFalse(tram_agent.windows_update_cache_is_fresh({"lastSearchSuccessDate": "2026-01-01T00:00:00+00:00"}))
+
+    def test_windows_update_scan_does_not_treat_an_empty_recent_cache_as_complete(self):
+        environment = {
+            "sourceMode": "wsus",
+            "sourceLabel": "WSUS",
+            "wsusServer": "http://wsus.example.test:8530",
+            "policyIssue": "",
+            "lastSearchSuccessDate": datetime.now(UTC).isoformat(),
+        }
+        cached = json.dumps({
+            "platform": "windows",
+            "updates": [],
+            "diagnostics": {"currentScanComplete": False},
+        })
+        online = json.dumps({
+            "platform": "windows",
+            "updates": [{
+                "id": "update-id",
+                "revision": 1,
+                "manager": "wua",
+                "name": "Cumulative Update",
+                "version": "KB5000001",
+            }],
+            "diagnostics": {"currentScanComplete": True},
+        })
+        queries = []
+
+        def fake_query(**kwargs):
+            queries.append(kwargs)
+            return (0, online) if kwargs["online"] else (0, cached)
+
+        with patch.object(tram_agent, "windows_update_environment", return_value=environment), \
+             patch.object(tram_agent, "windows_configmgr_updates", return_value=[]), \
+             patch.object(tram_agent, "windows_update_source_probe", return_value={"reachable": True, "status": "reachable", "endpoint": "http://wsus.example.test:8530", "error": ""}), \
+             patch.object(tram_agent, "windows_update_query", side_effect=fake_query), \
+             patch.object(tram_agent, "powershell", return_value=(0, "")):
+            code, output = tram_agent.scan_windows_updates()
+
+        parsed = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual([item["online"] for item in queries], [False, True])
+        self.assertEqual(parsed["count"], 1)
+        self.assertTrue(parsed["diagnostics"]["currentScanComplete"])
+        self.assertEqual(parsed["diagnostics"]["wuaStatus"], "complete")
+        self.assertEqual(parsed["diagnostics"]["cacheCount"], 0)
 
     def test_ubuntu_update_scan_reports_repository_failure_as_structured_status(self):
         commands = []
