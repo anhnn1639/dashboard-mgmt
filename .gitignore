@@ -21,6 +21,7 @@ __pycache__/
 /.next/
 /.vinext/
 /out/
+/public/build-info.json
 
 # misc
 .DS_Store

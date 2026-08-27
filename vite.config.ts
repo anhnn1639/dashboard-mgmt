@@ -44,6 +44,9 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    define: {
+      __TRAM_BUILD_ID__: JSON.stringify(process.env.TRAM_BUILD_ID ?? "development"),
+    },
     server: {
       ...(isCodexSeatbeltSandbox
         ? { watch: { useFsEvents: false, usePolling: true } }

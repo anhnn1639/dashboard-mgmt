@@ -5,11 +5,12 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 FROM node:22-alpine AS build
+ARG SOURCE_REVISION=
 WORKDIR /app
 RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN pnpm run build
+RUN SOURCE_REVISION="$SOURCE_REVISION" pnpm run build
 
 FROM node:22-alpine AS runtime
 WORKDIR /app

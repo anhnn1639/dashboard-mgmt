@@ -411,3 +411,22 @@ test("Linux package is advertised as a self-contained offline installer", async 
   assert.match(source, /Ubuntu 22\.04\/24\.04 · Oracle Linux 7\/8 · RHEL 7\/8 · x86_64/);
   assert.match(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
 });
+
+test("dashboard exposes build freshness and deployment verification", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const packageJson = await readFile(new URL("../package.json", import.meta.url), "utf8");
+  const dockerfile = await readFile(new URL("../Dockerfile", import.meta.url), "utf8");
+  const deployScript = await readFile(new URL("../deploy/deploy-dashboard.sh", import.meta.url), "utf8");
+  assert.match(source, /CURRENT_DASHBOARD_BUILD/);
+  assert.match(source, /\/build-info\.json\?check=/);
+  assert.match(source, /Có giao diện mới/);
+  assert.match(source, /Tải lại giao diện/);
+  assert.match(styles, /\.build-update-banner\s*\{/);
+  assert.match(packageJson, /scripts\/build-dashboard\.mjs/);
+  assert.match(dockerfile, /ARG SOURCE_REVISION=/);
+  assert.match(dockerfile, /SOURCE_REVISION="\$SOURCE_REVISION" pnpm run build/);
+  assert.match(deployScript, /--no-cache --build-arg SOURCE_REVISION="\$revision" dashboard/);
+  assert.match(deployScript, /Dashboard build mismatch/);
+  assert.match(deployScript, /Lưu cấu hình mẫu/);
+});

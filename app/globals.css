@@ -329,6 +329,56 @@ textarea:focus-visible {
 .workspace {
   min-width: 0;
 }
+.build-update-banner {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 220;
+  width: min(440px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 58%, var(--line));
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 16px 45px rgba(0, 0, 0, 0.32);
+}
+.build-update-banner span {
+  display: grid;
+  gap: 3px;
+}
+.build-update-banner small {
+  color: var(--muted);
+  line-height: 1.35;
+}
+.build-update-banner button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  background: var(--blue);
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.dashboard-build-id {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--panel);
+  font-family: var(--font-geist-mono);
+  font-size: calc(8px + var(--font-size-increase));
+}
 .topbar {
   height: 66px;
   border-bottom: 1px solid var(--line-soft);

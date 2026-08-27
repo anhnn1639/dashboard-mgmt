@@ -83,6 +83,7 @@ type JobListRow = {
 };
 
 const COOKIE_SESSION_MARKER = "cookie-session";
+const CURRENT_DASHBOARD_BUILD = typeof __TRAM_BUILD_ID__ === "string" ? __TRAM_BUILD_ID__ : "development";
 
 const navItems = [
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
@@ -552,6 +553,7 @@ export function OpsConsole() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [systemClock, setSystemClock] = useState("--:--:--");
   const [systemTheme, setSystemTheme] = useState<SystemTheme>("dark");
+  const [newDashboardBuild, setNewDashboardBuild] = useState("");
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
@@ -565,6 +567,32 @@ export function OpsConsole() {
     updateSystemAppearance();
     const timer = window.setInterval(updateSystemAppearance, 1_000);
     return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (CURRENT_DASHBOARD_BUILD === "development") return;
+    let active = true;
+    const checkDashboardBuild = async () => {
+      try {
+        const response = await fetch(`/build-info.json?check=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) return;
+        const data = await response.json() as { buildId?: unknown };
+        if (!active || typeof data.buildId !== "string") return;
+        setNewDashboardBuild(data.buildId !== CURRENT_DASHBOARD_BUILD ? data.buildId : "");
+      } catch {
+        // A temporary status-check failure must not interrupt the operations console.
+      }
+    };
+    void checkDashboardBuild();
+    const timer = window.setInterval(checkDashboardBuild, 60_000);
+    const checkWhenVisible = () => {
+      if (document.visibilityState === "visible") void checkDashboardBuild();
+    };
+    document.addEventListener("visibilitychange", checkWhenVisible);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", checkWhenVisible);
+    };
   }, []);
 
   function clampSidebarWidth(width: number) {
@@ -1037,6 +1065,12 @@ export function OpsConsole() {
       </aside>
 
       <section className="workspace">
+        {newDashboardBuild && (
+          <aside className="build-update-banner" role="status" aria-live="polite">
+            <span><b>Có giao diện mới</b><small>Trang đang mở là bản cũ; tải lại để dùng đầy đủ chức năng vừa triển khai.</small></span>
+            <button type="button" onClick={() => window.location.reload()}>Tải lại giao diện</button>
+          </aside>
+        )}
         <header className="topbar">
           <div className="search">
             <span>⌕</span>
@@ -1072,6 +1106,7 @@ export function OpsConsole() {
             )}
           </div>
           <div className="top-actions">
+            <span className="dashboard-build-id" title={`Bản giao diện ${CURRENT_DASHBOARD_BUILD}`}>Bản {CURRENT_DASHBOARD_BUILD.slice(0, 8)}</span>
             <span className="system-time" role="timer" aria-label={`Giờ hệ thống ${systemClock}`} title="Đồng hồ hệ thống · tự động dùng giao diện sáng từ 06:00 đến 17:59 theo giờ máy quản trị">
               <span aria-hidden="true">{systemTheme === "light" ? "☀" : "◐"}</span>
               <span><b>{systemClock}</b><small>Giờ hệ thống · giao diện {systemTheme === "light" ? "sáng" : "tối"}</small></span>
