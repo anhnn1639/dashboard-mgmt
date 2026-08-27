@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source, Linux executable và Windows MSI đã đồng bộ/bundle ở phiên bản `0.8.10` để sửa quét Windows Update/WSUS. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
+- Agent source, Linux executable và Windows MSI đã đồng bộ/bundle ở phiên bản `0.8.11` để hỗ trợ trực tiếp các Pulp APT Distribution tách riêng theo Base/Updates/Security/Backports. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -66,6 +66,7 @@
 - Agent/dashboard/API 0.8.7 kiểm tra nhanh đúng nguồn trước khi chạy quét update dài. Windows phân biệt public Windows Update không có Internet với WSUS mất kết nối bằng probe tối đa 5 giây/endpoint, dùng system proxy/default credential của LocalSystem; host offline không còn chờ hết WUA timeout 900 giây. Ubuntu refresh metadata bằng APT với timeout/retry hữu hạn; Oracle Linux/RHEL dùng YUM/DNF refresh đúng repository của release, lỗi kết nối trả payload có cấu trúc thay vì làm job treo/failed mơ hồ. WUA vẫn dùng `IsInstalled=0 and IsHidden=0`, tức native applicability của đúng Windows host; Linux dùng source đang cấu hình cho đúng release/architecture. Tab Updates bỏ toàn bộ banner giải thích dài, chỉ giữ ba ô Nguồn/Lần quét hoặc OS version/Trạng thái và khóa cài từ scan chưa hoàn tất.
 - Agent 0.8.9 giữ cơ chế chuyển nguồn cập nhật, còn dashboard/API nay đưa toàn bộ cấu hình vào menu quản trị riêng **Cấu hình cập nhật** và bỏ modal theo từng server trong tab Cập nhật. Trang mới lọc/tìm/chọn hàng loạt theo đúng profile Windows Server, Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7 hoặc Oracle Linux 8; một bulk task PostgreSQL sinh job riêng cho từng endpoint, đọc lại nguồn và quét patch sau khi áp dụng. Ubuntu chỉ vô hiệu source Ubuntu chuẩn, giữ Docker/PPA/repo ứng dụng. Oracle chỉ quản lý đúng các repo `ol7_*`/`ol8_*` Agent đọc được trên từng máy; giao diện dùng hợp các repo thật trong nhóm và API lọc mapping riêng từng host, giữ EPEL/Docker/repo ứng dụng. Windows bật WSUS sẽ ghi đồng bộ WUServer/WUStatusServer/UseWUServer và chặn fallback Internet; tắt WSUS sẽ dùng Microsoft Update. URL bị giới hạn HTTP/HTTPS không credential/query/fragment; role cần `updates.manage`, mọi thay đổi có audit.
 - Agent 0.8.10 sửa catalog Windows không hiện patch: không còn coi `LastSearchSuccessDate` mới kèm cache rỗng là một scan hoàn tất, nên mỗi `patch.scan` hợp lệ đều probe nhanh nguồn rồi thực hiện WUA online trên đúng WSUS/Microsoft Update. Duyệt `IUpdateServiceCollection` bằng `Item(index)` để tương thích COM trên Windows Server; lỗi query cache nguồn chính không chặn việc thử các cache service đã đăng ký. Chỉ catalog online hoàn tất mới mở checkbox/cài; khi WSUS reachable và trả update được approve/applicable, UI hiển thị từng KB để chọn.
+- Agent/dashboard/API 0.8.11 hỗ trợ trực tiếp cấu trúc Pulp Ubuntu mỗi pocket một Distribution URL. Giao diện bulk theo profile 22.04/24.04 nhận riêng Base, Updates và Security bắt buộc, Backports tùy chọn; Agent tạo một stanza Deb822 cho từng suite, đọc lại đúng mapping và vẫn giữ nguyên Docker/PPA/repository ứng dụng. Payload một URL cũ vẫn được chấp nhận để tương thích; API khóa suite sai codename và URL không an toàn.
 - Nút **Tạo task chung** 0.8.7 mở modal ngay cả khi chưa tick trước máy chủ. Loại task mới **Cập nhật bản vá theo OS + version** đi qua hai bước: chọn nhóm OS/version và máy đích, sau đó chọn catalog patch chung của toàn bộ target. API chỉ chấp nhận các máy cùng OS/version/architecture, đối chiếu ID/version bằng scan hoàn tất mới nhất và ghim revision riêng của từng host trước khi tạo từng job `patch.install`; user/firewall bulk task cũ vẫn giữ. Thiết kế kho bản vá cho mạng cách ly nằm tại `PATCH_RELAY_ARCHITECTURE.md`: Windows dùng WSUS upstream/downstream hoặc export/import, Linux dùng APT/YUM/DNF mirror có chữ ký; không đẩy file tùy ý qua kênh Agent 9443.
 - API 0.8.0 tắt hoàn toàn Swagger/ReDoc/OpenAPI (`/api/docs`, `/api/openapi.json`, `/api/redoc` đều 404), giảm setup status public xuống bốn trường không nhạy cảm và bắt buộc setup token tối thiểu 32 ký tự cho cài đặt mới. PostgreSQL lưu bộ đếm throttle đăng nhập/MFA theo IP và identity đã HMAC; API bật Trusted Host, no-store/nosniff/frame deny, còn Caddy bật CSP/HSTS/referrer policy và Nginx ẩn version.
 - Route audit tự động xác nhận mọi browser API ngoài allowlist public đều phụ thuộc xác thực; route Agent tiếp tục dùng certificate/chữ ký/replay protection. Role Viewer đọc `/api/v1/me` rồi chỉ render các workspace được cấp quyền; URL hash admin cũ như `#/access` tự chuyển sang trang đầu tiên được phép nên không còn làm trang đen/crash. Dependency Python có advisory đã nâng lên FastAPI 0.141.1, Starlette 1.6.0, PyJWT 2.13.0, cryptography 50.0.0 và python-multipart 0.0.32.
@@ -101,9 +102,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `14,491,648` bytes.
-- Phiên bản MSI: `0.8.10`.
-- SHA-256: `AC6F03E06B539391AC78C7A3B4C30D6E9902157502DDB2B41134DF1A77A50FC9`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `8a76a2888691257e7b82ef84f7145f85f3806062` trên GitHub Actions run `33031815598`; ProductVersion `0.8.10`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.8.11`.
+- SHA-256: `E15054F89000266221B621023BDE345B81E3F63840E9281A1337CCA90CC934EE`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `922dd351e320669581367447f2db3262777e7b18` trên GitHub Actions run `33035036056`; ProductVersion `0.8.11`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -113,9 +114,9 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; kích thước `16,675,624` bytes.
-- Phiên bản: `0.8.10`; SHA-256 `0FDA58597C66E302C44AAEA0763CE48E0BD81C2E9C8C69CE1DF71B0AE0CFB71B`.
-- GitHub Actions run `33031815642` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `8a76a2888691257e7b82ef84f7145f85f3806062`.
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,678,056` bytes.
+- Phiên bản: `0.8.11`; SHA-256 `A4EB547714373DC173C530CC6E90967D85258AC3E0A809A315E218469E5FB30C`.
+- GitHub Actions run `33035036075` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `922dd351e320669581367447f2db3262777e7b18`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
@@ -276,6 +277,8 @@ Sau khi endpoint lên 0.8.9, vào menu **Cấu hình cập nhật**, chọn mộ
 
 Từ 0.8.9 lên 0.8.10 chỉ cần pull commit đã bundle artifact, rebuild/recreate API để website phát bộ cài mới, nâng Agent Windows rồi bấm **Quét lại** trong tab Cập nhật. Bản này buộc WUA thực hiện scan online thật trên nguồn đang cấu hình; cache rỗng có timestamp mới không còn làm UI kết luận nhầm là đã quét xong.
 
+Từ 0.8.10 lên 0.8.11 phải pull commit đã bundle artifact, rebuild/recreate `api dashboard` để website phát Agent mới, rồi nâng Agent Linux trước khi áp dụng nguồn Pulp. Trong menu **Cấu hình cập nhật**, chọn đúng Ubuntu 22.04 hoặc 24.04, điền riêng Base/Updates/Security theo URL Distribution Pulp; Backports để trống nếu chưa sync. Oracle Linux tiếp tục bấm **Đọc lại nguồn** rồi ánh xạ từng repo ID thật sang URL Pulp tương ứng.
+
 Bản xử lý ANTT 20/08 chỉ đổi control plane/dashboard/proxy, không tăng Agent khỏi `0.8.8`. Sau pull phải render lại Nginx, rebuild/recreate `api`, `dashboard`, `caddy`, rồi đăng nhập lại vì token cũ chưa có `jti` bị từ chối chủ động:
 
 ```bash
@@ -365,7 +368,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.10`, Linux available và Windows MSI 0.8.10 available.
+- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.11`, Linux available và Windows MSI 0.8.11 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -382,7 +385,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.10 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.10`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.11 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.11`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -405,8 +408,8 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Kiểm thử local đã đạt
 
-- Control plane `48/48`, gồm catalog/cấu hình nguồn cập nhật hàng loạt theo cùng OS profile, tách mapping Oracle theo repo ID thật của từng server, validate nguồn theo OS/version, URL an toàn và quyền `updates.manage`; cùng browser cookie session không lộ token qua Web Storage, logout thu hồi `jti` PostgreSQL và chặn replay, CSRF same-origin, audit mọi `403`, lọc audit, bắt buộc LDAPS, bảo vệ catalog role và tách quyền cấu hình log; cùng tự phục vụ hồ sơ/mật khẩu Local, chống tự nâng role, Administrator-only reset MFA và QR đăng ký lại; file upload mã hóa theo chunk và stream giải mã có kiểm tra thứ tự/hash; scan ClamAV từ upload spool; đồng bộ thành viên AD trực tiếp/lồng nhau có paging, giữ role/trạng thái gán riêng và đối chiếu username không phân biệt hoa thường; cùng catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server, Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
-- Agent security `72/72`, gồm ép quét WUA online dù cache rỗng có timestamp mới, duyệt collection update service bằng `Item(index)` và vẫn đọc cache service khi query cache mặc định lỗi; cùng chuyển/khôi phục nguồn Ubuntu và Oracle mà giữ nguyên Docker/PPA/EPEL/repo ứng dụng, validate URL, xác minh policy WSUS/Internet có hiệu lực thật và fail-closed khi mất trạng thái khôi phục Oracle; probe Windows Update/WSUS hữu hạn, dừng ngay khi mất nguồn, APT/YUM repository failure có cấu trúc và applicability theo release; căn dung lượng LVM xuống sector 512, Windows DiskPart Extend/Shrink, OL7 partition geometry/adjacency, CLIXML cleanup, nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, khóa cài từ scan chưa hoàn tất, upgrade identity, Oracle/RHEL 7 `lsblk --pairs`, process CPU/RAM, bootstrap detail, installer offline, firewall/storage/update/process/log/account validation, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
+- Control plane `49/49`, gồm catalog/cấu hình nguồn cập nhật hàng loạt theo cùng OS profile, tách mapping Oracle theo repo ID thật của từng server, validate nguồn theo OS/version, URL an toàn và quyền `updates.manage`; cùng browser cookie session không lộ token qua Web Storage, logout thu hồi `jti` PostgreSQL và chặn replay, CSRF same-origin, audit mọi `403`, lọc audit, bắt buộc LDAPS, bảo vệ catalog role và tách quyền cấu hình log; cùng tự phục vụ hồ sơ/mật khẩu Local, chống tự nâng role, Administrator-only reset MFA và QR đăng ký lại; file upload mã hóa theo chunk và stream giải mã có kiểm tra thứ tự/hash; scan ClamAV từ upload spool; đồng bộ thành viên AD trực tiếp/lồng nhau có paging, giữ role/trạng thái gán riêng và đối chiếu username không phân biệt hoa thường; cùng catalog bulk update chỉ lấy giao patch của cùng OS/version/architecture và ghim đúng revision riêng từng server, Viewer first-login nhận QR MFA, direct/group server share, retire, guest surface/docs 404, route-auth audit, PostgreSQL login throttle, Viewer RBAC workspace, bundle Linux ELF offline, batch task, recording retention, auto-scan, active-job heartbeat/requeue/idempotent result, audit retention, validation, custom role/LDAP role, recording diagnostics/delete, output RBAC, Guacamole route, CA pin, OS binding, replay rejection và tunnel chuẩn bị trước Guacamole.
+- Agent security `73/73`, gồm ép quét WUA online dù cache rỗng có timestamp mới, duyệt collection update service bằng `Item(index)` và vẫn đọc cache service khi query cache mặc định lỗi; cùng nguồn Pulp Ubuntu tách Base/Updates/Security/Backports và chuyển/khôi phục nguồn Ubuntu/Oracle mà giữ nguyên Docker/PPA/EPEL/repo ứng dụng, validate URL, xác minh policy WSUS/Internet có hiệu lực thật và fail-closed khi mất trạng thái khôi phục Oracle; probe Windows Update/WSUS hữu hạn, dừng ngay khi mất nguồn, APT/YUM repository failure có cấu trúc và applicability theo release; căn dung lượng LVM xuống sector 512, Windows DiskPart Extend/Shrink, OL7 partition geometry/adjacency, CLIXML cleanup, nhận diện WSUS/direct/incomplete policy, pin WUA `ServerSelection`, khóa cài từ scan chưa hoàn tất, upgrade identity, Oracle/RHEL 7 `lsblk --pairs`, process CPU/RAM, bootstrap detail, installer offline, firewall/storage/update/process/log/account validation, `AF_NETLINK`, command-path fallback, Docker lock, SSH host key, MSI locator/bootstrap TLS và version contract.
 - `deploy/configure-nginx.sh` integration test chạy lặp hai lần: giữ nguyên secret, không nhân đôi key và tạo backup đúng.
 - ESLint pass.
 - Vinext production build pass.
@@ -417,7 +420,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions cho 0.8.10: security audit run `33031815560` pass; Linux build run `33031815642` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `33031815598` pass và ProductVersion đọc trực tiếp là `0.8.10`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions cho 0.8.11: security audit run `33035036154` pass; Linux build run `33035036075` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `33035036056` pass và ProductVersion đọc trực tiếp là `0.8.11`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Sites
 
