@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source đã tăng lên `0.8.10` để sửa quét Windows Update/WSUS; Linux executable và Windows MSI trong repository vẫn là `0.8.9` trong lúc chờ GitHub Actions build source commit mới. Chỉ đổi dòng này sang “đã đồng bộ/bundle” sau khi tải, kiểm tra và commit artifact 0.8.10. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
+- Agent source, Linux executable và Windows MSI đã đồng bộ/bundle ở phiên bản `0.8.10` để sửa quét Windows Update/WSUS. Gói Linux vẫn self-contained, không cài Python/pip hoặc tải dependency lúc cài; unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -101,9 +101,9 @@
 
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Kích thước: `14,491,648` bytes.
-- Phiên bản MSI: `0.8.9`.
-- SHA-256: `4601845010FEC5C00E25E342DF9F47814FA115532C50BCABF536F7576E0EA113`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `cef5579d973694ab2e731c984e31d5d598a8dd62` trên GitHub Actions run `32921890255`; ProductVersion `0.8.9`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.8.10`.
+- SHA-256: `AC6F03E06B539391AC78C7A3B4C30D6E9902157502DDB2B41134DF1A77A50FC9`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `8a76a2888691257e7b82ef84f7145f85f3806062` trên GitHub Actions run `33031815598`; ProductVersion `0.8.10`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -113,9 +113,9 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; kích thước `16,676,784` bytes.
-- Phiên bản: `0.8.9`; SHA-256 `90875024287ADE454D48E79DB9537B9BD8A765249F1D159A8E70EC437C3DB836`.
-- GitHub Actions run `32921890196` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `cef5579d973694ab2e731c984e31d5d598a8dd62`.
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,675,624` bytes.
+- Phiên bản: `0.8.10`; SHA-256 `0FDA58597C66E302C44AAEA0763CE48E0BD81C2E9C8C69CE1DF71B0AE0CFB71B`.
+- GitHub Actions run `33031815642` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `8a76a2888691257e7b82ef84f7145f85f3806062`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
@@ -274,6 +274,8 @@ docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboar
 
 Sau khi endpoint lên 0.8.9, vào menu **Cấu hình cập nhật**, chọn một nhóm OS/version, tick nhiều máy rồi bấm **Đọc lại nguồn** trước khi áp dụng. Thử trên staging: Ubuntu phải giữ Docker/PPA; Oracle phải giữ EPEL/Docker/repo ứng dụng và chỉ nhận URL cho repo ID thật của chính máy đó; Windows WSUS phải hiện đúng URL và `UseWUServer=1`. Lưu cấu hình xong mỗi máy phải có job cấu hình riêng, tiếp theo là job đọc nguồn và quét patch mới. Thay đổi giao diện/API bulk không tăng Agent khỏi 0.8.9; nếu endpoint đã ở 0.8.9 thì chỉ cần rebuild/recreate `api dashboard`.
 
+Từ 0.8.9 lên 0.8.10 chỉ cần pull commit đã bundle artifact, rebuild/recreate API để website phát bộ cài mới, nâng Agent Windows rồi bấm **Quét lại** trong tab Cập nhật. Bản này buộc WUA thực hiện scan online thật trên nguồn đang cấu hình; cache rỗng có timestamp mới không còn làm UI kết luận nhầm là đã quét xong.
+
 Bản xử lý ANTT 20/08 chỉ đổi control plane/dashboard/proxy, không tăng Agent khỏi `0.8.8`. Sau pull phải render lại Nginx, rebuild/recreate `api`, `dashboard`, `caddy`, rồi đăng nhập lại vì token cũ chưa có `jti` bị từ chối chủ động:
 
 ```bash
@@ -363,7 +365,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.9`, Linux available và Windows MSI 0.8.9 available.
+- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.10`, Linux available và Windows MSI 0.8.10 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -380,7 +382,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.9 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.9`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.10 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.10`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -415,7 +417,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Python `py_compile` pass.
 - XML/YAML/PowerShell syntax pass.
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
-- GitHub Actions cho 0.8.9: security audit run `32921890208` pass; Linux build run `32921890196` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `32921890255` pass và ProductVersion đọc trực tiếp là `0.8.9`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
+- GitHub Actions cho 0.8.10: security audit run `33031815560` pass; Linux build run `33031815642` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `33031815598` pass và ProductVersion đọc trực tiếp là `0.8.10`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
 ## Sites
 
