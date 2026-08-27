@@ -149,7 +149,7 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.doesNotMatch(resources, /Nguồn cập nhật của máy chủ/);
   assert.doesNotMatch(resources, /patch\.source\.configure/);
   assert.match(source, /label: "Cấu hình cập nhật"/);
-  assert.match(updateSettings, /Cấu hình nguồn cập nhật hàng loạt/);
+  assert.match(updateSettings, /Cấu hình nguồn cập nhật/);
   assert.match(updateSettings, /Microsoft Update qua Internet/);
   assert.match(updateSettings, /Ép dùng WSUS/);
   assert.match(updateSettings, /Repo Oracle Linux nội bộ/);
@@ -163,7 +163,10 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(updateSettings, /repositories: ubuntuRepositorySuites/);
   assert.match(updateSettings, /\/api\/v1\/bulk-update-sources\/catalog/);
   assert.match(updateSettings, /"patch\.source\.configure"/);
-  assert.match(updateSettings, /Áp dụng cho \$\{selectedIds\.length\} máy/);
+  assert.match(updateSettings, /\/api\/v1\/settings\/update-sources/);
+  assert.match(updateSettings, /persistSourceProfile/);
+  assert.match(updateSettings, /Lưu cấu hình mẫu/);
+  assert.match(updateSettings, /Lưu và áp dụng cho \$\{selectedIds\.length\} máy/);
   assert.match(styles, /input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)/);
   assert.match(styles, /\.update-settings-layout\s*{[^}]*grid-template-columns:/s);
   assert.match(source, /"patch\.source\.read": "Đọc nguồn cập nhật"/);

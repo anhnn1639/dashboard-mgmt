@@ -640,6 +640,18 @@ class BulkUpdateCatalogRequest(BaseModel):
             raise ValueError("Duplicate target servers are not allowed")
         return values
 
+class UpdateSourceRepositorySettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    id: str = Field(min_length=1, max_length=128)
+    base_url: str = Field(min_length=1, max_length=2048)
+
+
+class UpdateSourceProfileSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    mode: Literal["internet", "wsus", "default", "custom"]
+    wsus_url: str = Field(default="", max_length=2048)
+    repositories: list[UpdateSourceRepositorySettingRequest] = Field(default_factory=list, max_length=20)
+
 
 class JobResultRequest(BaseModel):
     status: Literal["succeeded", "failed"]
@@ -3643,6 +3655,99 @@ def update_catalog_rows(payload: dict[str, Any]) -> dict[tuple[str, str], dict[s
     return rows
 
 
+UPDATE_SOURCE_PROFILE_DEFINITIONS: dict[str, dict[str, str]] = {
+    "windows-server": {"platform": "windows", "label": "Windows Server"},
+    "ubuntu-22.04": {"platform": "ubuntu", "label": "Ubuntu 22.04"},
+    "ubuntu-24.04": {"platform": "ubuntu", "label": "Ubuntu 24.04"},
+    "oracle-7": {"platform": "oracle", "label": "Oracle Linux 7"},
+    "oracle-8": {"platform": "oracle", "label": "Oracle Linux 8"},
+}
+UPDATE_SOURCE_PROFILE_SETTING_PREFIX = "update_source_profile:"
+
+
+def update_source_repository_url(value: Any) -> str:
+    normalized = str(value or "").strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or len(normalized) > 2048:
+        raise HTTPException(status_code=422, detail="Repository URL must be HTTP(S) without credentials, query or fragment")
+    return normalized
+
+
+def normalize_update_source_profile_setting(profile: str, value: Mapping[str, Any]) -> dict[str, Any]:
+    definition = UPDATE_SOURCE_PROFILE_DEFINITIONS.get(profile)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="Update-source profile was not found")
+    mode = str(value.get("mode") or "")
+    wsus_url = str(value.get("wsus_url") or "").strip()
+    raw_repositories = value.get("repositories", [])
+    if not isinstance(raw_repositories, list):
+        raise HTTPException(status_code=422, detail="Repository mappings must be a list")
+    repositories: dict[str, str] = {}
+    for item in raw_repositories:
+        if not isinstance(item, Mapping) or set(item) != {"id", "base_url"}:
+            raise HTTPException(status_code=422, detail="Repository mapping is invalid")
+        repository_id = str(item.get("id") or "").strip()
+        if repository_id in repositories:
+            raise HTTPException(status_code=422, detail="Repository mapping is duplicated")
+        repositories[repository_id] = update_source_repository_url(item.get("base_url"))
+
+    platform = definition["platform"]
+    if platform == "windows":
+        if mode not in {"internet", "wsus"} or repositories:
+            raise HTTPException(status_code=422, detail="Windows update-source configuration is invalid")
+        if mode == "wsus":
+            wsus_url = update_source_repository_url(wsus_url)
+        elif wsus_url:
+            raise HTTPException(status_code=422, detail="WSUS URL is allowed only when WSUS is enabled")
+        return {"mode": mode, "wsus_url": wsus_url, "repositories": []}
+
+    if wsus_url or mode not in {"default", "custom"}:
+        raise HTTPException(status_code=422, detail="Linux update-source configuration is invalid")
+    if mode == "default":
+        if repositories:
+            raise HTTPException(status_code=422, detail="Repository mappings are allowed only in custom mode")
+        return {"mode": "default", "wsus_url": "", "repositories": []}
+
+    if platform == "ubuntu":
+        codename = "jammy" if profile.endswith("22.04") else "noble"
+        suites = (codename, f"{codename}-updates", f"{codename}-security", f"{codename}-backports")
+        if not set(suites[:3]).issubset(repositories) or set(repositories) - set(suites) or len(repositories) not in {3, 4}:
+            raise HTTPException(status_code=422, detail="Ubuntu custom source requires Base, Updates and Security for the selected release; Backports is optional")
+        ordered = [{"id": suite, "base_url": repositories[suite]} for suite in suites if suite in repositories]
+        return {"mode": "custom", "wsus_url": "", "repositories": ordered}
+
+    major = profile.rsplit("-", 1)[-1]
+    if not 1 <= len(repositories) <= 20 or any(not re.fullmatch(rf"ol{major}_[A-Za-z0-9_.:-]{{1,120}}", repository_id) for repository_id in repositories):
+        raise HTTPException(status_code=422, detail=f"Oracle Linux {major} repository mappings are invalid")
+    ordered = [{"id": repository_id, "base_url": repositories[repository_id]} for repository_id in sorted(repositories, key=str.casefold)]
+    return {"mode": "custom", "wsus_url": "", "repositories": ordered}
+
+
+def update_source_profile_setting_json(db: Session, profile: str) -> dict[str, Any]:
+    definition = UPDATE_SOURCE_PROFILE_DEFINITIONS[profile]
+    default_mode = "internet" if definition["platform"] == "windows" else "default"
+    config = {"mode": default_mode, "wsus_url": "", "repositories": []}
+    setting = db.get(SystemSetting, f"{UPDATE_SOURCE_PROFILE_SETTING_PREFIX}{profile}")
+    saved = False
+    if setting is not None:
+        try:
+            parsed = json.loads(setting.value)
+            if isinstance(parsed, Mapping):
+                config = normalize_update_source_profile_setting(profile, parsed)
+                saved = True
+        except (TypeError, ValueError, HTTPException):
+            pass
+    return {
+        "profile": profile,
+        "platform": definition["platform"],
+        "label": definition["label"],
+        "mode": config["mode"],
+        "wsusUrl": config["wsus_url"],
+        "repositories": [{"id": item["id"], "baseUrl": item["base_url"]} for item in config["repositories"]],
+        "saved": saved,
+        "updatedAt": aware(setting.updated_at).isoformat() if saved and setting is not None else None,
+    }
+
 def update_source_profile(server: Server) -> tuple[str, str, str]:
     """Return the managed update-source profile used for safe bulk operations."""
     if server.os_family == "windows":
@@ -3754,6 +3859,39 @@ def bulk_update_catalog(payload: BulkUpdateCatalogRequest, user: User = Depends(
         "updates": updates,
     }
 
+
+@app.get("/api/v1/settings/update-sources")
+def list_update_source_profile_settings(_: User = Depends(require_permission("updates.manage")), db: Session = Depends(db_session)):
+    return {"items": [update_source_profile_setting_json(db, profile) for profile in UPDATE_SOURCE_PROFILE_DEFINITIONS]}
+
+
+@app.put("/api/v1/settings/update-sources/{profile}")
+def update_update_source_profile_setting(
+    profile: Literal["windows-server", "ubuntu-22.04", "ubuntu-24.04", "oracle-7", "oracle-8"],
+    payload: UpdateSourceProfileSettingRequest,
+    request: Request,
+    user: User = Depends(require_permission("updates.manage")),
+    db: Session = Depends(db_session),
+):
+    previous = update_source_profile_setting_json(db, profile)
+    config = normalize_update_source_profile_setting(profile, payload.model_dump())
+    db.merge(SystemSetting(key=f"{UPDATE_SOURCE_PROFILE_SETTING_PREFIX}{profile}", value=json.dumps(config, separators=(",", ":"))))
+    db.flush()
+    audit(
+        db,
+        user.username,
+        "settings.update_source_profile.update",
+        profile,
+        request,
+        detail={
+            "previousMode": previous["mode"] if previous["saved"] else None,
+            "currentMode": config["mode"],
+            "repositoryIds": [item["id"] for item in config["repositories"]],
+            "wsusConfigured": bool(config["wsus_url"]),
+        },
+    )
+    db.commit()
+    return update_source_profile_setting_json(db, profile)
 
 @app.post("/api/v1/bulk-update-sources/catalog")
 def bulk_update_source_catalog(payload: BulkUpdateCatalogRequest, user: User = Depends(require_permission("updates.manage")), db: Session = Depends(db_session)):

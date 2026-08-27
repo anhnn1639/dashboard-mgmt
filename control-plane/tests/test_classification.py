@@ -625,6 +625,58 @@ class ClassificationTests(unittest.TestCase):
             jobs = db.execute(select(Job).where(Job.server_id.in_(server_ids), Job.action == "patch.source.configure").order_by(Job.server_id)).scalars().all()
             self.assertEqual(len(jobs), 2)
             self.assertTrue(all(job.parameters["repositories"] == repositories for job in jobs))
+
+    def test_update_source_profile_settings_persist_and_validate_by_os(self):
+        key = "update_source_profile:ubuntu-24.04"
+        with SessionLocal() as db:
+            db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+            db.execute(delete(AuditEvent).where(AuditEvent.action == "settings.update_source_profile.update", AuditEvent.target == "ubuntu-24.04"))
+            db.commit()
+        try:
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/api/v1/settings/update-sources").status_code, 401)
+                headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                before = client.get("/api/v1/settings/update-sources", headers=headers)
+                self.assertEqual(before.status_code, 200, before.text)
+                self.assertEqual(len(before.json()["items"]), 5)
+                ubuntu_before = next(item for item in before.json()["items"] if item["profile"] == "ubuntu-24.04")
+                self.assertFalse(ubuntu_before["saved"])
+
+                repositories = [
+                    {"id": "noble", "base_url": "http://10.64.70.15/pulp/content/ubuntu/24.04/noble/"},
+                    {"id": "noble-updates", "base_url": "http://10.64.70.15/pulp/content/ubuntu/24.04/noble-updates/"},
+                    {"id": "noble-security", "base_url": "http://10.64.70.15/pulp/content/ubuntu/24.04/noble-security/"},
+                ]
+                saved = client.put("/api/v1/settings/update-sources/ubuntu-24.04", headers=headers, json={"mode": "custom", "repositories": repositories})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertTrue(saved.json()["saved"])
+                self.assertEqual(saved.json()["repositories"][0], {"id": "noble", "baseUrl": repositories[0]["base_url"].rstrip("/")})
+
+                after = client.get("/api/v1/settings/update-sources", headers=headers)
+                ubuntu_after = next(item for item in after.json()["items"] if item["profile"] == "ubuntu-24.04")
+                self.assertEqual(ubuntu_after["mode"], "custom")
+                self.assertEqual(len(ubuntu_after["repositories"]), 3)
+
+                invalid = client.put("/api/v1/settings/update-sources/ubuntu-24.04", headers=headers, json={
+                    "mode": "custom",
+                    "repositories": [
+                        {"id": "jammy", "base_url": "https://repo.internal/jammy"},
+                        {"id": "jammy-updates", "base_url": "https://repo.internal/jammy-updates"},
+                        {"id": "jammy-security", "base_url": "https://repo.internal/jammy-security"},
+                    ],
+                })
+                self.assertEqual(invalid.status_code, 422, invalid.text)
+            with SessionLocal() as db:
+                setting = db.get(SystemSetting, key)
+                self.assertIsNotNone(setting)
+                self.assertEqual(json.loads(setting.value)["mode"], "custom")
+                event = db.execute(select(AuditEvent).where(AuditEvent.action == "settings.update_source_profile.update", AuditEvent.target == "ubuntu-24.04")).scalars().first()
+                self.assertIsNotNone(event)
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+                db.commit()
+
     def test_bulk_oracle_update_source_uses_real_repository_ids_per_server(self):
         server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         with TestClient(app):

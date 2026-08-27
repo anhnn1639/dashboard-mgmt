@@ -5618,6 +5618,19 @@ textarea:focus-visible {
   width: 100%;
   min-width: 0;
 }
+.update-source-profile-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+.update-source-form-actions {
+  display: grid;
+  grid-template-columns: minmax(170px, .42fr) minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+}
+.update-source-form-actions .button,
 .update-source-submit {
   width: 100%;
 }
@@ -5658,8 +5671,12 @@ textarea:focus-visible {
   .update-settings-filter-grid {
     grid-template-columns: 1fr;
   }
-  .update-source-repository-list label {
+  .update-source-repository-list label,
+  .update-source-form-actions {
     grid-template-columns: 1fr;
+  }
+  .update-source-profile-badges {
+    justify-content: flex-start;
   }
   .update-source-server-list > label {
     grid-template-columns: auto minmax(0, 1fr);
@@ -5821,8 +5838,12 @@ textarea:focus-visible {
   }
   .resource-form-grid,
   .choice-grid,
-  .update-source-repository-list label {
+  .update-source-repository-list label,
+  .update-source-form-actions {
     grid-template-columns: 1fr;
+  }
+  .update-source-profile-badges {
+    justify-content: flex-start;
   }
   .account-identity-summary {
     grid-template-columns: 1fr;
