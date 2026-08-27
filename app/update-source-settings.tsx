@@ -254,22 +254,21 @@ export function UpdateSourceSettingsView({
   function sourceParameters(): Record<string, unknown> {
     if (!selectedProfile) return {};
     if (selectedProfile.platform === "windows") {
-      return { mode: mode === "wsus" ? "wsus" : "internet", wsus_url: mode === "wsus" ? wsusUrl.trim() : "", repositories: [] };
+      return { mode: mode === "wsus" ? "wsus" : "internet", wsus_url: mode === "wsus" ? wsusUrl.trim() : "" };
     }
     if (selectedProfile.platform === "ubuntu") {
       return mode === "custom"
         ? {
             mode: "custom",
-            wsus_url: "",
             repositories: ubuntuRepositorySuites(selectedProfile.key)
               .filter((suite) => !suite.optional || Boolean((ubuntuUrls[suite.id] ?? "").trim()))
               .map((suite) => ({ id: suite.id, base_url: (ubuntuUrls[suite.id] ?? "").trim() })),
           }
-        : { mode: "default", wsus_url: "", repositories: [] };
+        : { mode: "default", repositories: [] };
     }
     return mode === "custom"
-      ? { mode: "custom", wsus_url: "", repositories: oracleRepositoryItems.map((repository) => ({ id: repository.id, base_url: (oracleUrls[repository.id] ?? "").trim() })) }
-      : { mode: "default", wsus_url: "", repositories: [] };
+      ? { mode: "custom", repositories: oracleRepositoryItems.map((repository) => ({ id: repository.id, base_url: (oracleUrls[repository.id] ?? "").trim() })) }
+      : { mode: "default", repositories: [] };
   }
 
   async function persistSourceProfile(parameters: Record<string, unknown>) {
@@ -338,18 +337,14 @@ export function UpdateSourceSettingsView({
     const parameters = sourceParameters();
     setBusy("apply");
     setMessage("");
-    let configurationSaved = false;
     try {
-      await persistSourceProfile(parameters);
-      configurationSaved = true;
       await createBulkTask("patch.source.configure", parameters, reason.trim());
       setMessageError(false);
-      setMessage(`Đã lưu cấu hình mẫu và xếp hàng áp dụng cho ${selectedIds.length} máy. Agent sẽ đọc lại nguồn thực tế rồi quét patch đúng OS/version.`);
-      notify(`Đã lưu cấu hình và tạo ${selectedIds.length} công việc nguồn cập nhật`);
+      setMessage(`Đã xếp hàng áp dụng cho ${selectedIds.length} máy. Cấu hình mẫu đã lưu không bị thay đổi; Agent sẽ đọc lại nguồn thực tế rồi quét patch đúng OS/version.`);
+      notify(`Đã tạo ${selectedIds.length} công việc áp dụng nguồn cập nhật`);
     } catch (cause) {
       setMessageError(true);
-      const detail = cause instanceof Error ? cause.message : "Không thể áp dụng nguồn cập nhật";
-      setMessage(configurationSaved ? `Cấu hình mẫu đã được lưu nhưng chưa tạo được công việc: ${detail}` : detail);
+      setMessage(cause instanceof Error ? cause.message : "Không thể áp dụng nguồn cập nhật");
     } finally {
       setBusy("");
     }
@@ -411,7 +406,7 @@ export function UpdateSourceSettingsView({
         {message ? <div className={`source-message ${messageError ? "failed" : "success"}`}><span>{message}</span>{!messageError && message.includes("xếp hàng") ? <button type="button" onClick={openJobs}>Xem công việc</button> : null}</div> : null}
         <div className="update-source-form-actions">
           <button type="button" className="button ghost" disabled={Boolean(busy)} onClick={() => void saveSourceProfile()}>{busy === "save" ? "Đang lưu…" : "Lưu cấu hình mẫu"}</button>
-          <button type="submit" className="button primary update-source-submit" disabled={Boolean(busy)}>{busy === "apply" ? "Đang lưu và tạo công việc…" : `Lưu và áp dụng cho ${selectedIds.length} máy`}</button>
+          <button type="submit" className="button primary update-source-submit" disabled={Boolean(busy)}>{busy === "apply" ? "Đang tạo công việc…" : `Áp dụng (${selectedIds.length} máy)`}</button>
         </div>
       </form>
     </div>

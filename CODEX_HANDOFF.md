@@ -427,9 +427,10 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ### Cấu hình mẫu nguồn cập nhật theo OS (27/08/2026)
 
 - Menu Cấu hình cập nhật lưu bền vững một mẫu riêng trong PostgreSQL cho Windows Server, Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7 và Oracle Linux 8; chọn lại OS/version sẽ tự điền WSUS hoặc các URL Pulp đã lưu, kể cả khi profile hiện chưa có máy online.
-- Có hai thao tác tách biệt: `Lưu cấu hình mẫu` không cần chọn máy/ticket; `Lưu và áp dụng` lưu mẫu trước rồi mới tạo công việc riêng cho từng máy đã chọn.
+- Có hai thao tác độc lập: `Lưu cấu hình mẫu` chỉ lưu cấu hình dùng lại và không cần chọn máy/ticket; `Áp dụng (N máy)` chỉ tạo công việc cho các máy đang chọn, không lưu hoặc ghi đè cấu hình mẫu.
 - API `GET /api/v1/settings/update-sources` và `PUT /api/v1/settings/update-sources/{profile}` yêu cầu quyền `updates.manage`, xác thực mode/URL/repository ID đúng OS/version, cấm credentials/query/fragment trong URL và ghi audit nhưng không ghi secret.
 - Ubuntu bắt buộc Base/Updates/Security đúng jammy hoặc noble, Backports tùy chọn; Oracle dùng đúng repo ID `ol7_*`/`ol8_*`; Windows lưu Internet hoặc WSUS. Agent không đổi, phiên bản vẫn `0.8.11`.
+- Lỗi khung hồng `Only Ubuntu 22.04/24.04 default repository switching is supported` xuất hiện vì dashboard gửi thừa trường `wsus_url` của Windows trong payload Ubuntu/Oracle (và gửi `repositories` vào Windows), khiến API từ chối trước khi tạo công việc. Payload nay được tách đúng theo từng OS và lỗi kiểm tra tham số đã được Việt hóa.
 - Kiểm thử mới nhất: control-plane `50/50`, render `22/22`, ESLint, `py_compile` và production build đều pass.
 
 ### Xác minh dashboard đã deploy đúng build (27/08/2026)

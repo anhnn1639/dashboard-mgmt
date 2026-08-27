@@ -1033,8 +1033,10 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         major = str(server.os_version or "").split(".", 1)[0]
         if distribution == "ubuntu":
             version = str(server.os_version or "")
-            if not version.startswith(("22.04", "24.04")) or set(parameters) - {"mode", "repository_url", "repositories"} or mode not in {"custom", "default"}:
-                raise HTTPException(status_code=422, detail="Only Ubuntu 22.04/24.04 default repository switching is supported")
+            if not version.startswith(("22.04", "24.04")):
+                raise HTTPException(status_code=422, detail="Cấu hình nguồn cập nhật Ubuntu chỉ hỗ trợ phiên bản 22.04 hoặc 24.04")
+            if set(parameters) - {"mode", "repository_url", "repositories"} or mode not in {"custom", "default"}:
+                raise HTTPException(status_code=422, detail="Tham số cấu hình nguồn cập nhật Ubuntu không hợp lệ")
             repositories = parameters.get("repositories")
             legacy_url = parameters.get("repository_url")
             if mode == "default":

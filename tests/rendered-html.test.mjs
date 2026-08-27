@@ -166,7 +166,13 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(updateSettings, /\/api\/v1\/settings\/update-sources/);
   assert.match(updateSettings, /persistSourceProfile/);
   assert.match(updateSettings, /Lưu cấu hình mẫu/);
-  assert.match(updateSettings, /Lưu và áp dụng cho \$\{selectedIds\.length\} máy/);
+  assert.match(updateSettings, /Áp dụng \(\$\{selectedIds\.length\} máy\)/);
+  assert.doesNotMatch(updateSettings, /Lưu và áp dụng/);
+  const applySourceBody = updateSettings.match(/async function applySources[\s\S]*?\n\s{2}const savedProfile/)?.[0] ?? "";
+  assert.match(applySourceBody, /createBulkTask\("patch\.source\.configure"/);
+  assert.doesNotMatch(applySourceBody, /persistSourceProfile/);
+  assert.doesNotMatch(updateSettings, /mode: "custom",\s*wsus_url: "",\s*repositories: ubuntuRepositorySuites/);
+  assert.doesNotMatch(updateSettings, /wsusUrl\.trim\(\) : "", repositories: \[\]/);
   assert.match(styles, /input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)/);
   assert.match(styles, /\.update-settings-layout\s*{[^}]*grid-template-columns:/s);
   assert.match(source, /"patch\.source\.read": "Đọc nguồn cập nhật"/);

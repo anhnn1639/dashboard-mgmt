@@ -809,6 +809,12 @@ class ClassificationTests(unittest.TestCase):
             {"id": "noble-security", "base_url": "http://pulp.internal/ubuntu/noble-security"},
         ]}, ubuntu)
         validate_job_parameters("patch.source.configure", {"mode": "custom", "repositories": [{"id": "ol8_baseos_latest", "base_url": "https://repo.internal/ol8/baseos/$basearch"}]}, oracle)
+        with self.assertRaisesRegex(Exception, "Tham số cấu hình nguồn cập nhật Ubuntu không hợp lệ"):
+            validate_job_parameters("patch.source.configure", {"mode": "custom", "wsus_url": "", "repositories": [
+                {"id": "noble", "base_url": "http://pulp.internal/ubuntu/noble"},
+                {"id": "noble-updates", "base_url": "http://pulp.internal/ubuntu/noble-updates"},
+                {"id": "noble-security", "base_url": "http://pulp.internal/ubuntu/noble-security"},
+            ]}, ubuntu)
         self.assertEqual(AUTO_REFRESH_ACTIONS["patch.source.configure"], ("patch.source.read", "patch.scan"))
 
         invalid_payloads = [
