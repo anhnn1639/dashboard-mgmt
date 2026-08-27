@@ -256,7 +256,7 @@ Trong menu **Cấu hình cập nhật**, người có quyền `updates.manage` c
 
 Giá trị cấu hình phải lấy từ **Distribution** đã publish trong Pulp, không dùng `pulp_href` của Repository hoặc Repository Version:
 
-- Ubuntu: nhập một APT Distribution `base_url` chung, ví dụ `https://pulp.company.local/pulp/content/ubuntu-22.04/`. Bên dưới URL đó phải truy cập được `dists/jammy`, `dists/jammy-updates`, `dists/jammy-backports`, `dists/jammy-security` cho 22.04; thay `jammy` bằng `noble` cho 24.04. Nếu mỗi pocket đang publish ở một base path riêng thì phải publish lại dưới một gốc chung trước khi áp dụng.
+- Ubuntu: nhập URL APT Distribution riêng cho Base, Updates và Security; Backports là tùy chọn. Ví dụ Ubuntu 22.04 dùng lần lượt `.../jammy/`, `.../jammy-updates/` và `.../jammy-security/`; Ubuntu 24.04 dùng bộ `noble` tương ứng. Mỗi URL phải là gốc Distribution mà APT có thể đọc `dists/<suite>/Release`. Agent tạo một stanza Deb822 cho từng suite, vì vậy dùng trực tiếp được mô hình mỗi Pulp Distribution có một base path riêng và không thay đổi Docker/PPA/repository ứng dụng.
 - Oracle Linux: chọn máy cùng major version, bấm **Đọc lại nguồn**, đợi Agent trả về các ID thật như `ol7_latest`, `ol8_baseos_latest`, `ol8_appstream`; sau đó nhập `base_url` của RPM Distribution tương ứng cho từng ID. Mỗi URL phải truy cập được `repodata/repomd.xml`.
 - Windows: nhập URL dịch vụ WSUS gốc, ví dụ `http://wsus.company.local:8530` hoặc `https://wsus.company.local:8531`; không nhập URL trang quản trị, không thêm đường dẫn console. WSUS phải đồng bộ đúng product Windows Server, classification và ngôn ngữ cần dùng, đồng thời update phải được approve cho computer group chứa máy đích.
 

@@ -154,6 +154,9 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(updateSettings, /Ép dùng WSUS/);
   assert.match(updateSettings, /Repo Oracle Linux nội bộ/);
   assert.match(updateSettings, /Docker, PPA và repo ứng dụng khác được giữ nguyên/);
+  assert.match(updateSettings, /URL Pulp Distribution cho từng nguồn Ubuntu/);
+  assert.match(updateSettings, /Base, Updates và Security là bắt buộc; Backports để trống nếu chưa đồng bộ/);
+  assert.match(updateSettings, /repositories: ubuntuRepositorySuites/);
   assert.match(updateSettings, /\/api\/v1\/bulk-update-sources\/catalog/);
   assert.match(updateSettings, /"patch\.source\.configure"/);
   assert.match(updateSettings, /Áp dụng cho \$\{selectedIds\.length\} máy/);

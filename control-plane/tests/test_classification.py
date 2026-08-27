@@ -569,6 +569,62 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual({job.parameters["updates"][0]["revision"] for job in jobs}, {4, 5})
             self.assertTrue(all(job.parameters["updates"][0]["id"] == common_id for job in jobs))
 
+    def test_bulk_ubuntu_update_source_accepts_pulp_distribution_urls(self):
+        server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        with TestClient(app):
+            pass
+        repository_urls = {
+            "noble": "http://pulp.internal/pulp/content/ubuntu/24.04/noble",
+            "noble-updates": "http://pulp.internal/pulp/content/ubuntu/24.04/noble-updates",
+            "noble-security": "http://pulp.internal/pulp/content/ubuntu/24.04/noble-security",
+        }
+        with SessionLocal() as db:
+            for index, server_id in enumerate(server_ids):
+                db.add(Server(
+                    id=server_id,
+                    name=f"bulk-ubuntu-{index}",
+                    address=f"10.81.0.{index + 10}",
+                    os_family="linux",
+                    os_name="Ubuntu 24.04 LTS",
+                    os_version="24.04.2",
+                    distribution_id="ubuntu",
+                    architecture="x86_64",
+                ))
+                db.add(Job(
+                    server_id=server_id,
+                    action="patch.source.read",
+                    status="succeeded",
+                    risk="low",
+                    reason="read current sources",
+                    created_by="system",
+                    output=json.dumps({"platform": "ubuntu", "mode": "custom", "repositoryUrls": repository_urls}),
+                ))
+            db.commit()
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            catalog = client.post("/api/v1/bulk-update-sources/catalog", headers=headers, json={"os_family": "linux", "server_ids": server_ids})
+            self.assertEqual(catalog.status_code, 200, catalog.text)
+            body = catalog.json()
+            self.assertTrue(body["ready"])
+            self.assertEqual(body["profile"], "ubuntu-24.04")
+            rows = {item["id"]: item for item in body["repositories"]}
+            self.assertEqual(rows["noble-security"]["currentUrls"], [repository_urls["noble-security"]])
+            self.assertTrue(rows["noble-backports"]["optional"])
+
+            repositories = [{"id": suite, "base_url": url} for suite, url in repository_urls.items()]
+            created = client.post("/api/v1/bulk-tasks", headers=headers, json={
+                "os_family": "linux",
+                "server_ids": server_ids,
+                "action": "patch.source.configure",
+                "parameters": {"mode": "custom", "repositories": repositories},
+                "reason": "CHG-8200 switch Ubuntu hosts to Pulp distributions",
+            })
+            self.assertEqual(created.status_code, 201, created.text)
+            self.assertEqual(created.json()["targetCount"], 2)
+        with SessionLocal() as db:
+            jobs = db.execute(select(Job).where(Job.server_id.in_(server_ids), Job.action == "patch.source.configure").order_by(Job.server_id)).scalars().all()
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(all(job.parameters["repositories"] == repositories for job in jobs))
     def test_bulk_oracle_update_source_uses_real_repository_ids_per_server(self):
         server_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         with TestClient(app):
@@ -695,12 +751,26 @@ class ClassificationTests(unittest.TestCase):
         validate_job_parameters("patch.source.configure", {"mode": "internet", "wsus_url": ""}, windows)
         validate_job_parameters("patch.source.configure", {"mode": "wsus", "wsus_url": "http://wsus.internal:8530"}, windows)
         validate_job_parameters("patch.source.configure", {"mode": "custom", "repository_url": "https://repo.internal/ubuntu"}, ubuntu)
+        validate_job_parameters("patch.source.configure", {"mode": "custom", "repositories": [
+            {"id": "noble", "base_url": "http://pulp.internal/ubuntu/noble"},
+            {"id": "noble-updates", "base_url": "http://pulp.internal/ubuntu/noble-updates"},
+            {"id": "noble-security", "base_url": "http://pulp.internal/ubuntu/noble-security"},
+        ]}, ubuntu)
         validate_job_parameters("patch.source.configure", {"mode": "custom", "repositories": [{"id": "ol8_baseos_latest", "base_url": "https://repo.internal/ol8/baseos/$basearch"}]}, oracle)
         self.assertEqual(AUTO_REFRESH_ACTIONS["patch.source.configure"], ("patch.source.read", "patch.scan"))
 
         invalid_payloads = [
             (windows, {"mode": "wsus", "wsus_url": "https://user:secret@wsus.internal"}),
             (ubuntu, {"mode": "custom", "repository_url": "file:///srv/ubuntu"}),
+            (ubuntu, {"mode": "custom", "repositories": [
+                {"id": "noble", "base_url": "http://pulp.internal/ubuntu/noble"},
+                {"id": "noble-updates", "base_url": "http://pulp.internal/ubuntu/noble-updates"},
+            ]}),
+            (ubuntu, {"mode": "custom", "repositories": [
+                {"id": "jammy", "base_url": "http://pulp.internal/ubuntu/jammy"},
+                {"id": "jammy-updates", "base_url": "http://pulp.internal/ubuntu/jammy-updates"},
+                {"id": "jammy-security", "base_url": "http://pulp.internal/ubuntu/jammy-security"},
+            ]}),
             (oracle, {"mode": "custom", "repositories": [{"id": "docker-ce-stable", "base_url": "https://repo.internal/docker"}]}),
         ]
         for server, parameters in invalid_payloads:

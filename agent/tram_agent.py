@@ -2590,6 +2590,36 @@ def ubuntu_release_codename(inventory: dict[str, Any]) -> str:
     raise ValueError("Only Ubuntu 22.04 and Ubuntu 24.04 repository switching is supported")
 
 
+def ubuntu_repository_suites(inventory: dict[str, Any]) -> tuple[str, ...]:
+    codename = ubuntu_release_codename(inventory)
+    return (codename, f"{codename}-updates", f"{codename}-security", f"{codename}-backports")
+
+
+def validated_ubuntu_repository_mappings(parameters: dict[str, Any], inventory: dict[str, Any]) -> list[dict[str, str]]:
+    expected = ubuntu_repository_suites(inventory)
+    legacy_url = parameters.get("repository_url")
+    repositories = parameters.get("repositories")
+    if legacy_url not in {None, ""}:
+        if repositories not in (None, (), []):
+            raise ValueError("Use either the legacy Ubuntu repository URL or per-suite repository mappings")
+        base_url = validated_repository_url(legacy_url)
+        return [{"id": suite, "base_url": base_url} for suite in expected]
+    if not isinstance(repositories, list) or not 3 <= len(repositories) <= 4:
+        raise ValueError("Ubuntu custom repositories require Base, Updates and Security; Backports is optional")
+    mappings: dict[str, str] = {}
+    for item in repositories:
+        if not isinstance(item, dict) or set(item) != {"id", "base_url"}:
+            raise ValueError("Ubuntu repository mapping is invalid")
+        suite = str(item.get("id") or "")
+        if suite not in expected or suite in mappings:
+            raise ValueError("Ubuntu repository suite is invalid or duplicated")
+        mappings[suite] = validated_repository_url(item.get("base_url"))
+    required = set(expected[:3])
+    if not required.issubset(mappings):
+        raise ValueError("Ubuntu custom repositories require Base, Updates and Security")
+    return [{"id": suite, "base_url": mappings[suite]} for suite in expected if suite in mappings]
+
+
 def apt_source_files(apt_root: Path = APT_SOURCE_ROOT) -> list[Path]:
     candidates = [apt_root / "sources.list"]
     source_directory = apt_root / "sources.list.d"
@@ -2637,23 +2667,44 @@ def read_ubuntu_update_source(inventory: dict[str, Any], apt_root: Path = APT_SO
     managed = apt_root / "sources.list.d" / APT_MANAGED_SOURCE_NAME
     default_rows: list[dict[str, Any]] = []
     third_party: set[str] = set()
-    for path in [*apt_source_files(apt_root), managed]:
+    for path in apt_source_files(apt_root):
         if not path.is_file():
             continue
         content = path.read_text(encoding="utf-8", errors="replace")
         for url in apt_urls(content):
-            row = {"id": path.name, "url": url, "file": str(path), "managed": path == managed}
-            if path == managed or ubuntu_default_uri(url):
+            row = {"id": path.name, "url": url, "file": str(path), "managed": False}
+            if ubuntu_default_uri(url):
                 if row not in default_rows:
                     default_rows.append(row)
             else:
                 third_party.add(url)
+    managed_repositories: list[dict[str, Any]] = []
+    if managed.is_file():
+        content = managed.read_text(encoding="utf-8", errors="replace")
+        expected = set(ubuntu_repository_suites(inventory))
+        for stanza in re.split(r"\n\s*\n", content.strip()):
+            uri_match = re.search(r"(?mi)^URIs:\s*(.+)$", stanza)
+            suite_match = re.search(r"(?mi)^Suites:\s*(.+)$", stanza)
+            uris = uri_match.group(1).split() if uri_match else []
+            suites = suite_match.group(1).split() if suite_match else []
+            if not uris:
+                continue
+            url = uris[0].rstrip("/")
+            for suite in suites:
+                if suite not in expected:
+                    continue
+                row = {"id": suite, "url": url, "file": str(managed), "managed": True}
+                managed_repositories.append(row)
+                default_rows.append(row)
+    repository_urls = {row["id"]: row["url"] for row in managed_repositories}
+    unique_managed_urls = set(repository_urls.values())
     return {
         "platform": "ubuntu",
         "mode": "custom" if managed.is_file() else "default",
         "osVersion": str(inventory.get("os_version") or ""),
         "codename": codename,
-        "repositoryUrl": next((row["url"] for row in default_rows if row["managed"]), ""),
+        "repositoryUrl": next(iter(unique_managed_urls)) if len(unique_managed_urls) == 1 else "",
+        "repositoryUrls": repository_urls,
         "repositories": default_rows,
         "thirdPartyRepositoryCount": len(third_party),
         "preservesThirdPartyRepositories": True,
@@ -2664,7 +2715,7 @@ def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[s
     mode = str(parameters.get("mode") or "")
     if mode not in {"custom", "default"}:
         raise ValueError("Ubuntu update source mode must be custom or default")
-    codename = ubuntu_release_codename(inventory)
+    ubuntu_release_codename(inventory)
     managed = apt_root / "sources.list.d" / APT_MANAGED_SOURCE_NAME
     state_file = state_root / "ubuntu-default-sources.json"
     state: dict[str, Any] = {}
@@ -2690,7 +2741,7 @@ def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[s
             state_file.unlink()
         return 0, json.dumps(read_ubuntu_update_source(inventory, apt_root), ensure_ascii=False, separators=(",", ":"))
 
-    repository_url = validated_repository_url(parameters.get("repository_url"))
+    repository_mappings = validated_ubuntu_repository_mappings(parameters, inventory)
     source_files = apt_source_files(apt_root)
     targeted: dict[str, str] = {}
     for path in source_files:
@@ -2706,14 +2757,17 @@ def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[s
         path = Path(filename)
         disabled = disable_ubuntu_default_sources(content, deb822_default_file=path.suffix == ".sources")
         atomic_write_text(path, disabled)
-    managed_content = (
-        "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n"
-        "Types: deb\n"
-        f"URIs: {repository_url}\n"
-        f"Suites: {codename} {codename}-updates {codename}-backports {codename}-security\n"
-        "Components: main restricted universe multiverse\n"
-        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
-    )
+    stanzas = [
+        (
+            "Types: deb\n"
+            f"URIs: {mapping['base_url']}\n"
+            f"Suites: {mapping['id']}\n"
+            "Components: main restricted universe multiverse\n"
+            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+        )
+        for mapping in repository_mappings
+    ]
+    managed_content = "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n" + "\n\n".join(stanzas) + "\n"
     atomic_write_text(managed, managed_content)
     result = read_ubuntu_update_source(inventory, apt_root)
     return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))

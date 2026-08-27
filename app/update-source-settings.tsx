@@ -34,7 +34,7 @@ type SourceCatalog = {
   repositoryUrl: string;
   wsusUrl: string;
   servers: Array<{ id: string; name: string; address: string; status: string; readAt?: string | null; mode?: string | null }>;
-  repositories: Array<{ id: string; currentUrls: string[]; requiredOn: number }>;
+  repositories: Array<{ id: string; currentUrls: string[]; requiredOn: number; optional?: boolean }>;
 };
 
 function profileForServer(server: ManagedServer): Omit<SourceProfile, "servers"> | null {
@@ -59,6 +59,17 @@ function normalizeSearch(value: string) {
 
 function defaultMode(platform: SourcePlatform): SourceMode {
   return platform === "windows" ? "internet" : "default";
+}
+
+function ubuntuRepositorySuites(profileKey: string) {
+  const codename = profileKey === "ubuntu-22.04" ? "jammy" : "noble";
+  const version = profileKey === "ubuntu-22.04" ? "22.04" : "24.04";
+  return [
+    { id: codename, label: "Base", optional: false, placeholder: `http://pulp.internal/pulp/content/ubuntu/${version}/${codename}/` },
+    { id: `${codename}-updates`, label: "Updates", optional: false, placeholder: `http://pulp.internal/pulp/content/ubuntu/${version}/${codename}-updates/` },
+    { id: `${codename}-security`, label: "Security", optional: false, placeholder: `http://pulp.internal/pulp/content/ubuntu/${version}/${codename}-security/` },
+    { id: `${codename}-backports`, label: "Backports", optional: true, placeholder: `http://pulp.internal/pulp/content/ubuntu/${version}/${codename}-backports/` },
+  ];
 }
 
 export function UpdateSourceSettingsView({
@@ -92,7 +103,7 @@ export function UpdateSourceSettingsView({
   const [search, setSearch] = useState("");
   const [catalog, setCatalog] = useState<SourceCatalog | null>(null);
   const [mode, setMode] = useState<SourceMode>("default");
-  const [repositoryUrl, setRepositoryUrl] = useState("");
+  const [ubuntuUrls, setUbuntuUrls] = useState<Record<string, string>>({});
   const [wsusUrl, setWsusUrl] = useState("");
   const [oracleUrls, setOracleUrls] = useState<Record<string, string>>({});
   const [reason, setReason] = useState("");
@@ -110,7 +121,7 @@ export function UpdateSourceSettingsView({
       setSearch("");
       setCatalog(null);
       setMode(defaultMode(currentPlatform));
-      setRepositoryUrl("");
+      setUbuntuUrls({});
       setWsusUrl("");
       setOracleUrls({});
       setMessage("");
@@ -157,9 +168,13 @@ export function UpdateSourceSettingsView({
           ? nextCatalog.mode as SourceMode
           : defaultMode(nextCatalog.platform);
         setMode(nextMode);
-        setRepositoryUrl(nextCatalog.repositoryUrl || "");
+        const currentRepositoryUrls = Object.fromEntries(nextCatalog.repositories.map((repository) => [repository.id, repository.currentUrls.length === 1 ? repository.currentUrls[0] : ""]));
+        if (nextCatalog.platform === "ubuntu" && nextCatalog.repositoryUrl) {
+          for (const suite of ubuntuRepositorySuites(nextCatalog.profile)) currentRepositoryUrls[suite.id] ||= nextCatalog.repositoryUrl;
+        }
+        setUbuntuUrls(nextCatalog.platform === "ubuntu" ? currentRepositoryUrls : {});
         setWsusUrl(nextCatalog.wsusUrl || "");
-        setOracleUrls(Object.fromEntries(nextCatalog.repositories.map((repository) => [repository.id, repository.currentUrls.length === 1 ? repository.currentUrls[0] : ""])));
+        setOracleUrls(nextCatalog.platform === "oracle" ? currentRepositoryUrls : {});
       }
     } catch (cause) {
       setCatalog(null);
@@ -205,7 +220,14 @@ export function UpdateSourceSettingsView({
     if (selectedProfile.platform === "windows") {
       parameters = { mode: mode === "wsus" ? "wsus" : "internet", wsus_url: mode === "wsus" ? wsusUrl.trim() : "" };
     } else if (selectedProfile.platform === "ubuntu") {
-      parameters = { mode: mode === "custom" ? "custom" : "default", repository_url: mode === "custom" ? repositoryUrl.trim() : "" };
+      parameters = mode === "custom"
+        ? {
+            mode: "custom",
+            repositories: ubuntuRepositorySuites(selectedProfile.key)
+              .filter((suite) => !suite.optional || Boolean((ubuntuUrls[suite.id] ?? "").trim()))
+              .map((suite) => ({ id: suite.id, base_url: (ubuntuUrls[suite.id] ?? "").trim() })),
+          }
+        : { mode: "default", repositories: [] };
     } else {
       parameters = mode === "custom"
         ? { mode: "custom", repositories: (catalog?.repositories ?? []).map((repository) => ({ id: repository.id, base_url: (oracleUrls[repository.id] ?? "").trim() })) }
@@ -227,10 +249,14 @@ export function UpdateSourceSettingsView({
   }
 
   const oracleCustomReady = selectedProfile?.platform !== "oracle" || mode !== "custom" || Boolean(catalog?.ready && catalog.repositories.length && catalog.repositories.every((repository) => /^https?:\/\/[^\s]+$/i.test((oracleUrls[repository.id] ?? "").trim())));
+  const ubuntuCustomReady = selectedProfile?.platform !== "ubuntu" || mode !== "custom" || ubuntuRepositorySuites(selectedProfile.key).every((suite) => {
+    const url = (ubuntuUrls[suite.id] ?? "").trim();
+    return suite.optional ? !url || /^https?:\/\/[^\s]+$/i.test(url) : /^https?:\/\/[^\s]+$/i.test(url);
+  });
   const commonSourceReady = selectedProfile?.platform === "windows"
     ? mode !== "wsus" || /^https?:\/\/[^\s]+$/i.test(wsusUrl.trim())
     : selectedProfile?.platform === "ubuntu"
-      ? mode !== "custom" || /^https?:\/\/[^\s]+$/i.test(repositoryUrl.trim())
+      ? ubuntuCustomReady
       : oracleCustomReady;
 
   if (!profiles.length) {
@@ -257,7 +283,7 @@ export function UpdateSourceSettingsView({
         <div className="update-settings-section-head"><div><h3>Nguồn áp dụng</h3><p>{selectedProfile?.label}</p></div><span className="state-pill">{selectedServers.length} máy</span></div>
         {selectedProfile?.platform === "windows" ? <fieldset><legend>Chế độ Windows Update</legend><label className="source-choice" aria-label="Microsoft Update qua Internet"><input name="bulk-windows-source" type="radio" checked={mode !== "wsus"} onChange={() => setMode("internet")} /><span><b>Microsoft Update qua Internet</b><small>Gỡ thiết lập WSUS do Agent quản lý và dùng nguồn công khai của Windows.</small></span></label><label className="source-choice" aria-label="Ép dùng WSUS"><input name="bulk-windows-source" type="radio" checked={mode === "wsus"} onChange={() => setMode("wsus")} /><span><b>Ép dùng WSUS</b><small>Đồng bộ WUServer, WUStatusServer và UseWUServer trên toàn bộ máy đã chọn.</small></span></label></fieldset> : selectedProfile?.platform === "ubuntu" ? <fieldset><legend>Repository Ubuntu</legend><label className="source-choice" aria-label="Repo mặc định của Ubuntu"><input name="bulk-ubuntu-source" type="radio" checked={mode !== "custom"} onChange={() => setMode("default")} /><span><b>Repo mặc định của Ubuntu</b><small>Khôi phục nguồn Ubuntu trước lần thay đổi đầu tiên.</small></span></label><label className="source-choice" aria-label="Mirror Ubuntu nội bộ"><input name="bulk-ubuntu-source" type="radio" checked={mode === "custom"} onChange={() => setMode("custom")} /><span><b>Mirror Ubuntu nội bộ</b><small>Chỉ thay nguồn Ubuntu chuẩn; Docker, PPA và repo ứng dụng khác được giữ nguyên.</small></span></label></fieldset> : <fieldset><legend>Repository Oracle Linux</legend><label className="source-choice" aria-label="Repo mặc định của Oracle Linux"><input name="bulk-oracle-source" type="radio" checked={mode !== "custom"} onChange={() => setMode("default")} /><span><b>Repo mặc định của Oracle Linux</b><small>Khôi phục trạng thái các repo hệ điều hành trước lần cấu hình đầu tiên.</small></span></label><label className="source-choice" aria-label="Repo Oracle Linux nội bộ"><input name="bulk-oracle-source" type="radio" checked={mode === "custom"} onChange={() => setMode("custom")} /><span><b>Repo Oracle Linux nội bộ</b><small>Chỉ thay các repo ol7_*/ol8_* thật đang dùng trên từng máy; repo ứng dụng khác được giữ nguyên.</small></span></label></fieldset>}
         {selectedProfile?.platform === "windows" && mode === "wsus" ? <label>Địa chỉ WSUS<input value={wsusUrl} onChange={(event) => setWsusUrl(event.target.value)} placeholder="http://wsus.company.local:8530" spellCheck={false} required /></label> : null}
-        {selectedProfile?.platform === "ubuntu" && mode === "custom" ? <label>URL gốc của mirror Ubuntu<input value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)} placeholder="https://repo.company.local/ubuntu" spellCheck={false} required /><small>Mirror phải có đủ suite tương ứng với {selectedProfile.label}, updates, backports và security.</small></label> : null}
+        {selectedProfile?.platform === "ubuntu" && mode === "custom" ? <fieldset><legend>URL Pulp Distribution cho từng nguồn Ubuntu</legend><div className="update-source-repository-list">{ubuntuRepositorySuites(selectedProfile.key).map((suite) => <label key={suite.id}><span>{suite.label}<small>{suite.id}{suite.optional ? " · tùy chọn" : " · bắt buộc"}</small></span><input value={ubuntuUrls[suite.id] ?? ""} onChange={(event) => setUbuntuUrls((current) => ({ ...current, [suite.id]: event.target.value }))} placeholder={suite.placeholder} spellCheck={false} required={!suite.optional} /></label>)}</div><div className="resource-help">Dán đúng URL Distribution mà Pulp hiển thị cho từng suite. Base, Updates và Security là bắt buộc; Backports để trống nếu chưa đồng bộ. Agent tạo từng nguồn APT riêng và giữ nguyên Docker, PPA cùng repository ứng dụng.</div></fieldset> : null}
         {selectedProfile?.platform === "oracle" && mode === "custom" ? <fieldset><legend>URL cho từng repo Oracle đang dùng</legend><div className="update-source-repository-list">{catalog?.repositories.map((repository) => <label key={repository.id}><span>{repository.id}<small>{repository.requiredOn}/{selectedIds.length} máy cần repo này</small></span><input value={oracleUrls[repository.id] ?? ""} onChange={(event) => setOracleUrls((current) => ({ ...current, [repository.id]: event.target.value }))} placeholder={`https://repo.company.local/${repository.id}/$basearch`} spellCheck={false} required /></label>)}{!catalog?.ready || !catalog.repositories.length ? <div className="resource-help warning">Cần chọn máy, bấm “Đọc lại nguồn”, đợi công việc hoàn tất rồi “Làm mới dữ liệu” để lấy đúng ID repo từ từng Agent.</div> : null}</div></fieldset> : null}
         <label>Lý do / ticket<textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} minLength={5} maxLength={2000} required placeholder="CHG-1234 · Mục đích thay đổi nguồn cập nhật" /></label>
         <div className="resource-help">Mỗi máy nhận một công việc riêng và được kiểm tra lại theo OS/version trước khi chạy. Sau khi áp dụng thành công, Agent tự đọc lại nguồn thực tế rồi quét danh sách patch phù hợp.</div>

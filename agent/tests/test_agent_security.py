@@ -103,13 +103,49 @@ class AgentSecurityTests(unittest.TestCase):
             self.assertIn("# tram-os-default-disabled deb http://security.ubuntu.com/ubuntu", changed)
             self.assertIn("deb https://download.docker.com/linux/ubuntu jammy stable", changed)
             managed = apt_root / "sources.list.d" / tram_agent.APT_MANAGED_SOURCE_NAME
-            self.assertIn("Suites: jammy jammy-updates jammy-backports jammy-security", managed.read_text(encoding="utf-8"))
+            managed_content = managed.read_text(encoding="utf-8")
+            self.assertEqual(managed_content.count("URIs: https://repo.internal/ubuntu"), 4)
+            for suite in ("jammy", "jammy-updates", "jammy-security", "jammy-backports"):
+                self.assertIn(f"Suites: {suite}", managed_content)
 
             code, output = tram_agent.configure_ubuntu_update_source({"mode": "default"}, inventory, apt_root, state_root)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output)["mode"], "default")
             self.assertEqual(source.read_text(encoding="utf-8"), original)
             self.assertFalse(managed.exists())
+
+    def test_ubuntu_source_switch_accepts_separate_pulp_distribution_urls(self):
+        inventory = {"os_family": "linux", "distribution_id": "ubuntu", "os_version": "24.04.2"}
+        mappings = [
+            {"id": "noble", "base_url": "http://pulp.internal/pulp/content/ubuntu/24.04/noble/"},
+            {"id": "noble-updates", "base_url": "http://pulp.internal/pulp/content/ubuntu/24.04/noble-updates/"},
+            {"id": "noble-security", "base_url": "http://pulp.internal/pulp/content/ubuntu/24.04/noble-security/"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apt_root = root / "apt"
+            state_root = root / "state"
+            apt_root.mkdir()
+            (apt_root / "sources.list").write_text(
+                "deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse\n"
+                "deb https://download.docker.com/linux/ubuntu noble stable\n",
+                encoding="utf-8",
+            )
+            code, output = tram_agent.configure_ubuntu_update_source(
+                {"mode": "custom", "repositories": mappings}, inventory, apt_root, state_root
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(output)
+            self.assertEqual(payload["repositoryUrl"], "")
+            self.assertEqual(payload["repositoryUrls"], {item["id"]: item["base_url"].rstrip("/") for item in mappings})
+            managed_content = (apt_root / "sources.list.d" / tram_agent.APT_MANAGED_SOURCE_NAME).read_text(encoding="utf-8")
+            for item in mappings:
+                self.assertIn(f"URIs: {item['base_url'].rstrip('/')}\nSuites: {item['id']}", managed_content)
+            self.assertNotIn("noble-backports", managed_content)
+            with self.assertRaisesRegex(ValueError, "Base, Updates and Security"):
+                tram_agent.validated_ubuntu_repository_mappings(
+                    {"mode": "custom", "repositories": mappings[:2]}, inventory
+                )
 
     def test_ubuntu_deb822_switch_disables_only_official_stanza(self):
         content = (

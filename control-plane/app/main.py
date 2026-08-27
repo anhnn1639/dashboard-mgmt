@@ -1020,12 +1020,35 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         distribution = str(server.distribution_id or "").lower()
         major = str(server.os_version or "").split(".", 1)[0]
         if distribution == "ubuntu":
-            if not str(server.os_version or "").startswith(("22.04", "24.04")) or set(parameters) - {"mode", "repository_url"} or mode not in {"custom", "default"}:
+            version = str(server.os_version or "")
+            if not version.startswith(("22.04", "24.04")) or set(parameters) - {"mode", "repository_url", "repositories"} or mode not in {"custom", "default"}:
                 raise HTTPException(status_code=422, detail="Only Ubuntu 22.04/24.04 default repository switching is supported")
-            if mode == "custom":
-                repository_url(parameters.get("repository_url"))
-            elif parameters.get("repository_url") not in {None, ""}:
-                raise HTTPException(status_code=422, detail="Repository URL is allowed only in custom mode")
+            repositories = parameters.get("repositories")
+            legacy_url = parameters.get("repository_url")
+            if mode == "default":
+                if legacy_url not in {None, ""} or repositories not in (None, [], ()):
+                    raise HTTPException(status_code=422, detail="Ubuntu repository mappings are allowed only in custom mode")
+                return
+            if legacy_url not in {None, ""}:
+                if repositories not in (None, [], ()):
+                    raise HTTPException(status_code=422, detail="Use either one legacy Ubuntu URL or per-suite mappings")
+                repository_url(legacy_url)
+                return
+            codename = "jammy" if version.startswith("22.04") else "noble"
+            allowed_suites = (codename, f"{codename}-updates", f"{codename}-security", f"{codename}-backports")
+            if not isinstance(repositories, list) or not 3 <= len(repositories) <= 4:
+                raise HTTPException(status_code=422, detail="Ubuntu custom repositories require Base, Updates and Security; Backports is optional")
+            seen: set[str] = set()
+            for item in repositories:
+                if not isinstance(item, dict) or set(item) != {"id", "base_url"}:
+                    raise HTTPException(status_code=422, detail="Ubuntu repository mapping is invalid")
+                suite = str(item.get("id") or "")
+                if suite not in allowed_suites or suite in seen:
+                    raise HTTPException(status_code=422, detail="Ubuntu repository suite is invalid or duplicated")
+                seen.add(suite)
+                repository_url(item.get("base_url"))
+            if not set(allowed_suites[:3]).issubset(seen):
+                raise HTTPException(status_code=422, detail="Ubuntu custom repositories require Base, Updates and Security")
             return
         if distribution in {"ol", "oracle", "oraclelinux"} and major in {"7", "8"}:
             if set(parameters) - {"mode", "repositories"} or mode not in {"custom", "default"}:
@@ -3757,10 +3780,21 @@ def bulk_update_source_catalog(payload: BulkUpdateCatalogRequest, user: User = D
             repository_urls.add(repository_url)
         if wsus_url:
             wsus_urls.add(wsus_url)
+        if platform == "ubuntu" and ready:
+            codename = "jammy" if profile.endswith("22.04") else "noble"
+            suite_ids = (codename, f"{codename}-updates", f"{codename}-security", f"{codename}-backports")
+            reported_urls = source.get("repositoryUrls") if isinstance(source.get("repositoryUrls"), dict) else {}
+            legacy_url = str(source.get("repositoryUrl") or "")
+            for suite in suite_ids:
+                row = repository_rows.setdefault(suite, {"id": suite, "currentUrls": set(), "requiredOn": 0, "optional": suite.endswith("-backports")})
+                current_url = str(reported_urls.get(suite) or legacy_url)
+                if current_url:
+                    row["currentUrls"].add(current_url)
+                row["requiredOn"] += 1
         if platform == "oracle" and ready:
             major = profile.rsplit("-", 1)[-1]
             for repository in oracle_source_repositories(source, major):
-                row = repository_rows.setdefault(repository["id"], {"id": repository["id"], "currentUrls": set(), "requiredOn": 0})
+                row = repository_rows.setdefault(repository["id"], {"id": repository["id"], "currentUrls": set(), "requiredOn": 0, "optional": False})
                 if repository["url"]:
                     row["currentUrls"].add(repository["url"])
                 row["requiredOn"] += 1
@@ -3782,7 +3816,7 @@ def bulk_update_source_catalog(payload: BulkUpdateCatalogRequest, user: User = D
         "wsusUrl": next(iter(wsus_urls)) if len(wsus_urls) == 1 else "",
         "servers": server_rows,
         "repositories": [
-            {"id": row["id"], "currentUrls": sorted(row["currentUrls"]), "requiredOn": row["requiredOn"]}
+            {"id": row["id"], "currentUrls": sorted(row["currentUrls"]), "requiredOn": row["requiredOn"], "optional": bool(row.get("optional"))}
             for row in sorted(repository_rows.values(), key=lambda item: item["id"].casefold())
         ],
     }
@@ -3861,7 +3895,19 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
                 }
             if set(requested_urls) != required_union:
                 raise HTTPException(status_code=422, detail="Oracle Linux repository mappings do not match the selected servers")
-        summary = {"profile": profile, "osLabel": label, "mode": mode, "repositoryCount": len(requested.get("repositories") or []) if platform == "oracle" else 1 if mode in {"custom", "wsus"} else 0}
+        repository_count = 0
+        if mode == "custom" and platform in {"ubuntu", "oracle"}:
+            repository_count = len(requested.get("repositories") or [])
+            if platform == "ubuntu" and not repository_count and requested.get("repository_url"):
+                repository_count = 1
+        elif mode == "wsus":
+            repository_count = 1
+        summary = {
+            "profile": profile,
+            "osLabel": label,
+            "mode": mode,
+            "repositoryCount": repository_count,
+        }
     elif payload.action == "patch.install":
         requested_updates = requested.get("updates")
         if set(requested) != {"updates"} or not isinstance(requested_updates, list) or not 1 <= len(requested_updates) <= 100:
