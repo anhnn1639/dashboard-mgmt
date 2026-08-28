@@ -262,6 +262,27 @@ sudo journalctl -u tram-agent -n 150 --no-pager
 Luồng mới chờ stream Agent mTLS sẵn sàng rồi mới mở Guacamole, nên lỗi dịch vụ
 SSH local sẽ trả về dashboard trước khi trình duyệt chuyển sang màn hình Guacamole.
 
+## 14B. Cập nhật bản vá clipboard của phiên SSH/RDP
+
+Guacamole 1.6.0 có race condition khi tab remote lấy lại focus: clipboard mới có thể
+chưa đồng bộ xong nhưng phím hoặc chuột paste đã được gửi, khiến nội dung cũ được
+dán lại. Repository đóng gói extension `tram-clipboard-sync` vào image Guacamole
+tùy biến; extension chờ đồng bộ clipboard browser hoàn tất rồi mới chuyển tiếp input.
+Chiều remote về browser vẫn bị khóa.
+
+Sau khi pull commit có thay đổi extension, phải build và recreate riêng Guacamole:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml build --no-cache guacamole
+docker compose -f compose.yaml -f compose.test.yaml up -d --force-recreate guacamole
+docker compose -f compose.yaml -f compose.test.yaml logs --tail=100 guacamole
+```
+
+Log khởi động phải có extension namespace `tram-clipboard-sync`. Mở **phiên mới**,
+copy lần lượt hai chuỗi khác nhau ở máy quản trị rồi paste vào SSH/RDP; lần thứ hai
+phải nhận đúng chuỗi mới mà không cần dán qua thanh địa chỉ. Nếu trình duyệt hỏi
+quyền đọc clipboard, chọn **Cho phép** cho domain vận hành.
+
 ## 15A. Cập nhật bản test
 
 ```bash

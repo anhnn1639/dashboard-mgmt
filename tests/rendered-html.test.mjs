@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
 
 async function render() {
@@ -439,6 +441,9 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /--no-cache --build-arg SOURCE_REVISION="\$revision" dashboard/);
   assert.match(deployScript, /Dashboard build mismatch/);
   assert.match(deployScript, /Lưu cấu hình mẫu/);
+  assert.match(deployScript, /build --pull --no-cache guacamole/);
+  assert.match(deployScript, /force-recreate api dashboard guacamole/);
+  assert.match(deployScript, /tram-clipboard-sync\.jar/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -453,4 +458,132 @@ test("remote credentials are admin-managed and clipboard is paste-only", async (
   assert.match(apiSource, /"enable-sftp": "false"[\s\S]*"sftp-disable-upload": "true"[\s\S]*"sftp-disable-download": "true"/);
   assert.match(apiSource, /"enable-drive": "false"[\s\S]*"disable-upload": "true"[\s\S]*"disable-download": "true"/);
   assert.match(apiSource, /password_encrypted=job_fernet\(\)\.encrypt/);
+});
+
+test("Guacamole waits for the latest browser clipboard before forwarding input", async () => {
+  const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
+  const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
+  const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.js", import.meta.url), "utf8");
+
+  assert.equal(manifest.guacamoleVersion, "1.6.0");
+  assert.deepEqual(manifest.js, ["tram-clipboard-sync.js"]);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
+  assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
+  assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*service\.setClipboard\(new ClipboardData/);
+  assert.match(extension, /addEventListener\('focus', resyncIfNeeded, true\)/);
+  assert.match(extension, /pendingClipboardSync[\s\S]*sendKeyEventAfterClipboardSync/);
+  assert.match(extension, /pendingClipboardSync[\s\S]*sendMouseStateAfterClipboardSync/);
+
+  let configureClipboard;
+  let startClipboard;
+  const windowListeners = new Map();
+  const documentListeners = new Map();
+  const forwardedKeys = [];
+  const remoteWrites = [];
+  let browserClipboard = "A";
+  let remoteClipboard = "";
+  let holdNextRead = false;
+  let rejectNextRead = false;
+  let resolveRead = () => {};
+
+  const clipboardService = {
+    resyncClipboard() {},
+    setClipboard(data) {
+      remoteWrites.push(data.data);
+      remoteClipboard = data.data;
+      return Promise.resolve();
+    },
+  };
+  const clipboardModule = {
+    config(definition) {
+      configureClipboard = definition.at(-1);
+    },
+    run(definition) {
+      startClipboard = definition.at(-1);
+    },
+  };
+  const fakeWindow = {
+    navigator: {
+      clipboard: {
+        readText() {
+          if (rejectNextRead) {
+            rejectNextRead = false;
+            return Promise.reject(new Error("clipboard permission denied"));
+          }
+          if (!holdNextRead) return Promise.resolve(browserClipboard);
+          return new Promise((resolve) => {
+            resolveRead = resolve;
+          });
+        },
+      },
+    },
+    addEventListener(type, listener) {
+      windowListeners.set(type, listener);
+    },
+  };
+  const fakeDocument = {
+    visibilityState: "visible",
+    addEventListener(type, listener) {
+      documentListeners.set(type, listener);
+    },
+  };
+  function FakeClient() {}
+  FakeClient.prototype.sendKeyEvent = function sendKeyEvent(pressed, keysym) {
+    forwardedKeys.push({ pressed, keysym, clipboard: remoteClipboard });
+  };
+  FakeClient.prototype.sendMouseState = function sendMouseState() {};
+  class FakeMouseState {
+    constructor(x, y, left, middle, right, up, down) {
+      Object.assign(this, { x, y, left, middle, right, up, down });
+    }
+  }
+  class FakeClipboardData {
+    constructor(data) {
+      Object.assign(this, data);
+    }
+  }
+
+  runInNewContext(extension, {
+    angular: { module: () => clipboardModule },
+    Guacamole: { Client: FakeClient, Mouse: { State: FakeMouseState } },
+    Promise,
+  });
+  assert.equal(typeof configureClipboard, "function");
+  assert.equal(typeof startClipboard, "function");
+  configureClipboard({
+    decorator(name, definition) {
+      assert.equal(name, "clipboardService");
+      definition.at(-1)(clipboardService, fakeWindow, FakeClipboardData);
+    },
+  });
+  startClipboard([fakeDocument], fakeWindow, clipboardService);
+  await waitForImmediate();
+
+  windowListeners.get("blur")();
+  browserClipboard = "B";
+  holdNextRead = true;
+  windowListeners.get("focus")();
+  const client = new FakeClient();
+  client.sendKeyEvent(1, 0x56);
+  assert.deepEqual(forwardedKeys, [], "input must wait while clipboard B is being read");
+
+  resolveRead(browserClipboard);
+  await waitForImmediate();
+  assert.equal(remoteClipboard, "B");
+  assert.equal(forwardedKeys.length, 1);
+  assert.equal(forwardedKeys[0].pressed, 1);
+  assert.equal(forwardedKeys[0].keysym, 0x56);
+  assert.equal(forwardedKeys[0].clipboard, "B");
+  assert.deepEqual(remoteWrites, ["A", "B"]);
+
+  windowListeners.get("blur")();
+  holdNextRead = false;
+  rejectNextRead = true;
+  windowListeners.get("focus")();
+  client.sendKeyEvent(1, 0x43);
+  await waitForImmediate();
+  assert.deepEqual(remoteWrites, ["A", "B"], "a denied read must not write stale data");
+  assert.equal(forwardedKeys.length, 2);
 });

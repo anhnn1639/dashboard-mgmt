@@ -465,6 +465,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Kiểm thử local: Agent security `76/76`, control-plane `51/51`, ESLint, Vinext production build, render workspace `23/23` và `py_compile` đều pass. Số lượng control-plane hiện tại là số test thực tế được discovery trong repository tại commit này.
 - GitHub Actions của source commit `9a6c2d5`: Security audit run `33153009218`, Linux offline run `33153009229` và Windows MSI run `33153009301` đều pass. Bundle Linux SHA-256 `A9107B47F74094979B6284CC47405E2E0A7D4009B1396882A7026C2AC5C7F1EE`; MSI SHA-256 `56A7F12FF4092D8D9809E3EA4A8F585CC989D402A45362679DEDF41E94FC0D93`, ProductVersion đọc trực tiếp là `0.8.14`.
 
+### Đồng bộ clipboard mới nhất trên Guacamole 1.6.0 (28/08/2026)
+
+- Đã xác định lỗi paste A rồi copy B nhưng vẫn dán A là race condition upstream `GUACAMOLE-2175`: khi cửa sổ Guacamole lấy lại focus, đồng bộ clipboard chạy bất đồng bộ trong khi input chuột/phím được gửi ngay. Fix chính thức mới nằm ở staging 1.6.1, còn release/image ổn định mới nhất vẫn là 1.6.0.
+- Repository giữ `guacd`/Guacamole 1.6.0 và backport cơ chế chờ bằng extension JavaScript `tram-clipboard-sync`: đánh dấu clipboard có thể đổi khi blur/ẩn tab, đọc lại khi focus/hiện tab, và xếp hàng `sendKeyEvent`/`sendMouseState` đến khi cập nhật clipboard browser → remote hoàn tất. Không bật remote → browser.
+- Compose build image local `tram-guacamole:1.6.0-clipboard-sync` từ `deploy/guacamole/Dockerfile`; script `deploy/deploy-dashboard.sh` nay tự build/recreate Guacamole và xác minh extension đã nằm trong container. Sau deploy phải mở phiên SSH/RDP mới. Không cần đổi Agent 0.8.14.
+- Kiểm thử mới mô phỏng đúng chuỗi A → rời cửa sổ → copy B → quay lại paste: phím bị giữ đến khi B được gửi vào phiên remote. ESLint, production build, cú pháp script deploy và render workspace 24/24 đều pass; máy phát triển không có Docker nên image thực tế được build/xác minh bằng script deploy trên máy chủ.
+
 ### Cập nhật Extend và audit retention 2026-08-17
 
 - Dashboard luôn hiển thị nút `Extend` trên partition/LV. Nút bật khi Agent báo tối thiểu 1 MiB có thể mở rộng; root LV Linux được extend nhưng vẫn khóa xóa, còn partition boot/root trực tiếp tiếp tục được bảo vệ.

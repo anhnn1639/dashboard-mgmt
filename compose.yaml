@@ -178,7 +178,10 @@ services:
         aliases: [guacd]
 
   guacamole:
-    image: guacamole/guacamole:1.6.0
+    image: tram-guacamole:1.6.0-clipboard-sync
+    build:
+      context: ./deploy/guacamole
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       guacd:

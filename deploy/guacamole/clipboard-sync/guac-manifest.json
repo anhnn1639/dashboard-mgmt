@@ -1,0 +1,8 @@
+{
+  "guacamoleVersion": "1.6.0",
+  "name": "Tram clipboard synchronization",
+  "namespace": "tram-clipboard-sync",
+  "js": [
+    "tram-clipboard-sync.js"
+  ]
+}

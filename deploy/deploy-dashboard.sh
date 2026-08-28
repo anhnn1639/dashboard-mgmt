@@ -20,11 +20,12 @@ test -f "$override"
 git pull --ff-only origin main
 revision=$(git rev-parse HEAD)
 
-# Build both services from the checked-out source. The dashboard carries the
-# exact revision so a stale image/container is detectable after recreation.
+# Build all source-derived services from the checked-out revision. The dashboard
+# carries the exact revision, while Guacamole carries the clipboard-sync extension.
 docker compose -f compose.yaml -f "$override" build --pull --no-cache api
 docker compose -f compose.yaml -f "$override" build --pull --no-cache --build-arg SOURCE_REVISION="$revision" dashboard
-docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboard
+docker compose -f compose.yaml -f "$override" build --pull --no-cache guacamole
+docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboard guacamole
 
 docker compose -f compose.yaml -f "$override" exec -T dashboard \
   node -e "const fs=require('fs'); const info=JSON.parse(fs.readFileSync('/app/public/build-info.json','utf8')); if(info.buildId !== process.argv[1]) { console.error('Dashboard build mismatch:', info.buildId, '!=', process.argv[1]); process.exit(1); } console.log('Dashboard build:', info.buildId);" "$revision"
@@ -32,7 +33,9 @@ docker compose -f compose.yaml -f "$override" exec -T dashboard \
   grep -Fq 'Lưu cấu hình mẫu' /app/app/update-source-settings.tsx
 docker compose -f compose.yaml -f "$override" exec -T api \
   grep -Fq '/api/v1/settings/update-sources' /app/app/main.py
+docker compose -f compose.yaml -f "$override" exec -T guacamole \
+  test -r /etc/guacamole/extensions/tram-clipboard-sync.jar
 
-docker compose -f compose.yaml -f "$override" ps api dashboard
+docker compose -f compose.yaml -f "$override" ps api dashboard guacamole
 echo "Deployment verified at commit $revision"
 echo "Open a new tab or use the in-app reload prompt if an older tab is still open."
