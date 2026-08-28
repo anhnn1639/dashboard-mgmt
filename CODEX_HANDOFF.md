@@ -463,6 +463,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Menu **Tài khoản Remote** chỉ hiện với Administrator. Mật khẩu SSH/RDP được mã hóa phía server và không trả về browser/audit; Administrator được thêm/sửa/xóa và share từng credential cho user đã được share máy chủ. Người được share chỉ nhận ID/nhãn để chọn khi mở phiên, không thấy username/password và không gọi được API quản trị.
 - Session launch không còn nhận username/password từ browser; API giải mã credential đã chọn phía server, kiểm tra đúng máy/protocol/quyền share rồi mới mở tunnel mTLS.
 - Kiểm thử local: Agent security `76/76`, control-plane `51/51`, ESLint, Vinext production build, render workspace `23/23` và `py_compile` đều pass. Số lượng control-plane hiện tại là số test thực tế được discovery trong repository tại commit này.
+- GitHub Actions của source commit `9a6c2d5`: Security audit run `33153009218`, Linux offline run `33153009229` và Windows MSI run `33153009301` đều pass. Bundle Linux SHA-256 `A9107B47F74094979B6284CC47405E2E0A7D4009B1396882A7026C2AC5C7F1EE`; MSI SHA-256 `56A7F12FF4092D8D9809E3EA4A8F585CC989D402A45362679DEDF41E94FC0D93`, ProductVersion đọc trực tiếp là `0.8.14`.
 
 ### Cập nhật Extend và audit retention 2026-08-17
 
