@@ -125,7 +125,7 @@
 - Agent outbound WebSocket mTLS `9443`; API/Guacamole không kết nối trực tiếp IP máy đích.
 - Agent chỉ relay `127.0.0.1:22` cho SSH hoặc `127.0.0.1:3389` cho RDP, tối đa 4 tunnel; không fallback trực tiếp.
 - API gửi lệnh mở tunnel và chờ Agent gắn stream mTLS thành công trước khi trả relay port cho Guacamole. Điều này loại bỏ race khiến `guacd` kết nối trước Agent và biến lỗi sshd/RDP local thành HTTP 409 có hướng dẫn; Agent 0.4.2 phải được cập nhật trên endpoint để gửi đúng SSH host key.
-- Pin SSH host key/RDP certificate, tắt clipboard/SFTP/RDP drive/printing, giữ recording.
+- Pin SSH host key/RDP certificate, chỉ mở clipboard một chiều browser → remote để paste; khóa copy ngược/SFTP/RDP drive/upload/download/printing và giữ recording.
 - File một chiều: giới hạn 1 GiB, ClamAV trung tâm, AES-GCM theo khối trong PostgreSQL, job trực tiếp, SHA-256 và Defender/ClamAV endpoint; không auto-run/overwrite/server-to-server. Agent cũ trước 0.8.8 vẫn từ chối file trên 50 MiB, vì vậy endpoint phải được nâng trước khi test file lớn.
 - Payload file xóa sau kết quả hoặc hết hạn 24 giờ; scanner lỗi thì fail-closed.
 
@@ -388,7 +388,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.12 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.12`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.14 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.14`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -402,7 +402,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 6. Reboot Windows, xác nhận service và tunnel tự online lại.
 7. Đổi tên một MSI mới trước khi cài: bootstrap phải fail, không enroll nhầm control plane.
 8. Xác nhận claim Windows không dùng được trên Linux và replay bị từ chối.
-9. Retest SSH/RDP recording và file sạch/EICAR/scanner offline. Khi mở SSH, xác nhận API có log `agent stream prepared`; nếu còn lỗi Guacamole, lấy đồng thời log `api guacamole guacd` để tách lỗi credential/host-key/recording.
+9. Retest SSH/RDP recording, paste một chiều và file sạch/EICAR/scanner offline. Xác nhận browser có thể paste văn bản vào SSH/RDP nhưng không copy dữ liệu từ máy chủ về browser; SFTP/RDP drive/upload/download/printing vẫn bị khóa. Khi mở SSH, xác nhận API có log `agent stream prepared`; nếu còn lỗi Guacamole, lấy đồng thời log `api guacamole guacd` để tách lỗi credential/host-key/recording.
 10. Test uninstall/upgrade MSI và xác nhận không để lộ claim/private key trong log.
 11. Trên Windows, Ubuntu, Red Hat và Oracle Linux staging, quét từng tab mới; xác nhận danh sách là dữ liệu thật của endpoint, action mutation tự sinh job quét lại và UI cập nhật sau check-in kế tiếp.
 12. Với Disk, chỉ test extend/shrink/create/delete trên disk dữ liệu staging đã snapshot/backup. Riêng Windows layout đang chụp phải bật Extend cho C: với đúng 10 GiB liền kề (không cộng 10 GiB sau Recovery), Shrink phải mở modal và DiskPart phải tạo segment mới ngay bên phải C:. Xác nhận EFI/MSR/Recovery/OEM bị khóa, capacity vượt giới hạn bị chặn và filesystem/mount/fstab sau reboot đúng như UI. Không dùng Shrink để cố di chuyển Recovery.
@@ -456,6 +456,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - MSI 0.8.13 đặt `REINSTALL=ALL` và `REINSTALLMODE=amusv` cho maintenance không phải uninstall, buộc Windows dùng source MSI vừa chạy, làm mới file và ghi lại `BootstrapSource` trong HKLM. Nâng 0.8.12 lên 0.8.13 vẫn đi theo MajorUpgrade bình thường.
 - Agent chỉ log `package_id` đang enroll, tuyệt đối không log secret. Control plane vẫn trả thông báo `401` chung cho client nhưng ghi audit nội bộ `agent.package.claim.denied` với nguyên nhân `secret_mismatch`, `already_used` hoặc `expired` để chẩn đoán chính xác.
 - Kiểm thử local: Agent security `75/75`, control-plane `50/50`. GitHub Actions MSI run `33142009167` pass; artifact 0.8.13 có SHA-256 `C2C8F421F9AB966084CC7C068D9A187E32EDE3EA9880A3DECD60219A28BC134C`; cần dùng đúng file MSI mới tải từ website và không đổi tên.
+### Windows patch, clipboard một chiều và tài khoản Remote 0.8.14 (28/08/2026)
+
+- Catalog Windows chỉ mang các update mà WUA xác nhận còn thiếu trên chính máy đích (`IsInstalled=0 and IsHidden=0`), không phải toàn bộ catalog WSUS. Trước khi cài, Agent quét lại đúng update ID/revision; nếu lần quét hoàn tất cho thấy gói đã thay đổi hoặc không còn thiếu, job trả thành công dạng `no_longer_applicable`, không cài nhầm/partial và control plane tự xếp hàng quét lại danh sách. Lần quét chưa hoàn tất vẫn fail-closed.
+- Guacamole cho phép clipboard đúng một chiều browser → SSH/RDP để paste lệnh; chiều máy chủ → browser bị khóa. SFTP, RDP drive, upload/download và printing vẫn tắt.
+- Menu **Tài khoản Remote** chỉ hiện với Administrator. Mật khẩu SSH/RDP được mã hóa phía server và không trả về browser/audit; Administrator được thêm/sửa/xóa và share từng credential cho user đã được share máy chủ. Người được share chỉ nhận ID/nhãn để chọn khi mở phiên, không thấy username/password và không gọi được API quản trị.
+- Session launch không còn nhận username/password từ browser; API giải mã credential đã chọn phía server, kiểm tra đúng máy/protocol/quyền share rồi mới mở tunnel mTLS.
+- Kiểm thử local: Agent security `76/76`, control-plane `51/51`, ESLint, Vinext production build, render workspace `23/23` và `py_compile` đều pass. Số lượng control-plane hiện tại là số test thực tế được discovery trong repository tại commit này.
 
 ### Cập nhật Extend và audit retention 2026-08-17
 
@@ -480,6 +487,6 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Không thêm shell/PowerShell tùy ý hoặc destination tunnel tùy ý.
 - Không bỏ mTLS, request signature, TLS pin/hostname verification, RBAC, MFA hoặc audit.
 - Không log/commit `.env`, password, raw claim, token, private key, DB URL có password, PFX hoặc recording.
-- Không cho file tự chạy và không bật lại clipboard/SFTP/RDP drive.
+- Không cho file tự chạy và không bật clipboard hai chiều. Chỉ cho browser → SSH/RDP để paste văn bản; tiếp tục khóa remote → browser, SFTP, RDP drive/upload/download/printing.
 - Không public ClamAV, guacd, PostgreSQL hoặc relay.
 - Không sửa bytes MSI riêng theo từng server vì sẽ phá chữ ký; locator dùng một lần phải nằm trong tên file.

@@ -53,6 +53,7 @@ fake_linux_agent[18:20] = b"\x3e\x00"
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
 from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, RecordingDeletionRequest, RemoteSession, RevokedSessionToken, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import RemoteCredential, RemoteCredentialUserShare  # noqa: E402
 from app.main import app, engine  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -124,6 +125,7 @@ class ClassificationTests(unittest.TestCase):
                 "/api/v1/me",
                 "/api/v1/users",
                 "/api/v1/platform-groups",
+                "/api/v1/remote-credentials",
                 "/api/v1/roles",
                 "/api/v1/settings/ldap",
                 "/api/v1/settings/ldap/groups",
@@ -142,6 +144,50 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(response.headers.get("x-frame-options"), "DENY")
             self.assertEqual(client.post("/api/v1/settings/ldap/users/sync").status_code, 401)
 
+    def test_remote_credentials_are_admin_managed_encrypted_and_selection_only(self):
+        with TestClient(app) as client:
+            admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            viewer_id = str(uuid.uuid4())
+            server_id = str(uuid.uuid4())
+            clear_password = "Remote-only-secret-123!"
+            with SessionLocal() as db:
+                viewer = User(id=viewer_id, username=f"remote-operator-{viewer_id[:8]}", password_hash="!test", display_name="Remote Operator", role="operator", enabled=True)
+                server = Server(id=server_id, name=f"remote-win-{server_id[:8]}", address="10.60.1.15", os_family="windows", os_name="Windows Server 2022", status="online")
+                db.add_all([viewer, server])
+                db.commit()
+                viewer_headers = {"Authorization": f"Bearer {issue_jwt(viewer)}"}
+
+            shared = client.put(f"/api/v1/servers/{server_id}/shares", headers=admin_headers, json={"user_ids": [viewer_id], "group_ids": []})
+            self.assertEqual(shared.status_code, 200, shared.text)
+            created = client.post(
+                "/api/v1/remote-credentials",
+                headers=admin_headers,
+                json={"server_id": server_id, "protocol": "rdp", "label": "Tài khoản vận hành", "username": "svc-remote", "password": clear_password, "user_ids": [viewer_id]},
+            )
+            self.assertEqual(created.status_code, 201, created.text)
+            credential_id = created.json()["id"]
+            self.assertEqual(created.json()["username"], "svc-remote")
+            self.assertNotIn("password", created.json())
+            with SessionLocal() as db:
+                stored = db.get(RemoteCredential, credential_id)
+                self.assertIsNotNone(stored)
+                self.assertNotEqual(stored.password_encrypted, clear_password)
+                self.assertNotIn(clear_password, stored.password_encrypted)
+                self.assertIsNotNone(db.get(RemoteCredentialUserShare, {"credential_id": credential_id, "user_id": viewer_id}))
+                created_audit = db.execute(select(AuditEvent).where(AuditEvent.action == "remote_credential.create", AuditEvent.target == credential_id)).scalar_one()
+                audit_text = json.dumps(created_audit.detail, ensure_ascii=False)
+                self.assertNotIn(clear_password, audit_text)
+                self.assertNotIn("svc-remote", audit_text)
+
+            choices = client.get(f"/api/v1/servers/{server_id}/remote-credentials?protocol=rdp", headers=viewer_headers)
+            self.assertEqual(choices.status_code, 200, choices.text)
+            self.assertEqual(choices.json()["items"], [{"id": credential_id, "label": "Tài khoản vận hành", "protocol": "rdp"}])
+            raw_launch = client.post("/api/v1/sessions/launch", headers=viewer_headers, json={"server_id": server_id, "protocol": "rdp", "username": "svc-remote", "password": clear_password, "width": 1280, "height": 720})
+            self.assertEqual(raw_launch.status_code, 422, raw_launch.text)
+            self.assertEqual(client.get("/api/v1/remote-credentials", headers=viewer_headers).status_code, 403)
+            self.assertEqual(client.put(f"/api/v1/remote-credentials/{credential_id}", headers=viewer_headers, json={"label": "Changed", "username": "attacker", "password": "x", "user_ids": []}).status_code, 403)
+            deleted = client.delete(f"/api/v1/remote-credentials/{credential_id}", headers=admin_headers)
+            self.assertEqual(deleted.status_code, 200, deleted.text)
     def test_server_visibility_comes_only_from_direct_or_group_share(self):
         with TestClient(app) as client:
             admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}

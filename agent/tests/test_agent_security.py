@@ -1083,6 +1083,22 @@ trusted
         self.assertIn("Start-Service -Name $serviceName", scripts[0])
         self.assertIn("$download.ResultCode -notin 2,3", scripts[0])
 
+    def test_windows_update_install_treats_a_completed_missing_result_as_safe_noop(self):
+        scan = json.dumps({
+            "updates": [],
+            "diagnostics": {"currentScanComplete": True, "catalogScope": "missing_on_this_server"},
+        })
+        with patch.object(tram_agent, "scan_updates", return_value=(0, scan)), patch.object(tram_agent, "powershell") as powershell_mock:
+            code, output = tram_agent.install_updates(
+                {"updates": [{"id": "obsolete-update-id", "version": "KB5012345"}]},
+                {"os_family": "windows"},
+            )
+        parsed = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["status"], "skipped")
+        self.assertEqual(parsed["reason"], "no_longer_applicable")
+        self.assertEqual(parsed["currentMissingCount"], 0)
+        powershell_mock.assert_not_called()
     def test_windows_update_install_rejects_an_incomplete_wua_scan(self):
         scan = json.dumps({
             "updates": [{"id": "wua-update-id", "revision": 4, "name": "Cached update", "version": "KB5012345", "manager": "wua", "serviceId": ""}],

@@ -6444,3 +6444,48 @@ html[data-theme="light"] ::placeholder {
     display: none;
   }
 }
+
+.remote-credentials-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.remote-credentials-head {
+  align-items: flex-start;
+  gap: 16px;
+}
+.remote-credentials-head .resource-toolbar-actions,
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.remote-credentials-panel .resource-table-scroll {
+  max-height: min(610px, calc(100vh - 330px));
+}
+.remote-share-grid label span,
+.remote-share-grid label b,
+.remote-share-grid label small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.empty-state.compact {
+  min-height: 0;
+  padding: 12px;
+}
+@media (max-width: 760px) {
+  .remote-credentials-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .remote-credentials-head .resource-toolbar-actions,
+  .remote-credentials-head .button {
+    width: 100%;
+  }
+  .remote-share-grid {
+    grid-template-columns: 1fr;
+  }
+}

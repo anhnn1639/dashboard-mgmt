@@ -440,3 +440,17 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /Dashboard build mismatch/);
   assert.match(deployScript, /Lưu cấu hình mẫu/);
 });
+
+test("remote credentials are admin-managed and clipboard is paste-only", async () => {
+  const consoleSource = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const credentialSource = await readFile(new URL("../app/remote-credentials.tsx", import.meta.url), "utf8");
+  const apiSource = await readFile(new URL("../control-plane/app/main.py", import.meta.url), "utf8");
+  assert.match(consoleSource, /label: "Tài khoản Remote"[\s\S]*adminOnly: true/);
+  assert.match(consoleSource, /body: JSON\.stringify\(\{ server_id: server\.id, protocol, credential_id: credentialId, width, height \}\)/);
+  assert.match(credentialSource, /Chỉ Administrator quản lý/);
+  assert.match(credentialSource, /Mật khẩu được mã hóa ở máy chủ Trạm vận hành, không trả về trình duyệt và không ghi vào nhật ký/);
+  assert.match(apiSource, /"disable-copy": "true", "disable-paste": "false"/);
+  assert.match(apiSource, /"enable-sftp": "false"[\s\S]*"sftp-disable-upload": "true"[\s\S]*"sftp-disable-download": "true"/);
+  assert.match(apiSource, /"enable-drive": "false"[\s\S]*"disable-upload": "true"[\s\S]*"disable-download": "true"/);
+  assert.match(apiSource, /password_encrypted=job_fernet\(\)\.encrypt/);
+});

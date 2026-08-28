@@ -279,6 +279,27 @@ class Server(Base):
     jobs: Mapped[list["Job"]] = relationship(back_populates="server")
 
 
+class RemoteCredential(Base):
+    __tablename__ = "remote_credentials"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
+    protocol: Mapped[str] = mapped_column(String(10), index=True)
+    label: Mapped[str] = mapped_column(String(100))
+    username: Mapped[str] = mapped_column(String(128))
+    password_encrypted: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+class RemoteCredentialUserShare(Base):
+    __tablename__ = "remote_credential_user_shares"
+    credential_id: Mapped[str] = mapped_column(ForeignKey("remote_credentials.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by: Mapped[str] = mapped_column(String(36))
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class EnrollmentToken(Base):
     __tablename__ = "enrollment_tokens"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -664,12 +685,30 @@ class LogSourcesUpdateRequest(BaseModel):
 
 
 class SessionLaunchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     server_id: str
     protocol: Literal["ssh", "rdp"]
-    username: str = Field(min_length=1, max_length=128)
-    password: str = Field(min_length=1, max_length=1024)
+    credential_id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     width: int = Field(default=1440, ge=800, le=7680)
     height: int = Field(default=900, ge=600, le=4320)
+
+
+class RemoteCredentialCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    server_id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    protocol: Literal["ssh", "rdp"]
+    label: str = Field(min_length=2, max_length=100)
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+    user_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class RemoteCredentialUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    label: str = Field(min_length=2, max_length=100)
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(default="", max_length=1024)
+    user_ids: list[str] = Field(default_factory=list, max_length=500)
 
 
 class RecordingDeletionCreateRequest(BaseModel):
@@ -2491,6 +2530,7 @@ def delete_platform_users(payload: PlatformUsersDeleteRequest, request: Request,
     db.execute(delete(MFACredential).where(MFACredential.user_id.in_(user_ids)))
     db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.user_id.in_(user_ids)))
     db.execute(delete(ServerUserShare).where(ServerUserShare.user_id.in_(user_ids)))
+    db.execute(delete(RemoteCredentialUserShare).where(RemoteCredentialUserShare.user_id.in_(user_ids)))
     db.execute(delete(User).where(User.id.in_(user_ids)))
     audit(db, actor.username, "identity.user.delete", "platform-users", request, detail={"users": [{"id": user.id, "username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local"} for user in users]})
     db.commit()
@@ -2812,9 +2852,13 @@ def delete_server(server_id: str, payload: ServerDeleteRequest, request: Request
     db.execute(update(Job).where(Job.server_id == server.id, Job.status == "queued").values(status="failed", finished_at=now(), exit_code=410, output="Server retired by Administrator"))
     db.execute(delete(ServerUserShare).where(ServerUserShare.server_id == server.id))
     db.execute(delete(ServerGroupShare).where(ServerGroupShare.server_id == server.id))
+    credential_ids = list(db.execute(select(RemoteCredential.id).where(RemoteCredential.server_id == server.id)).scalars().all())
+    if credential_ids:
+        db.execute(delete(RemoteCredentialUserShare).where(RemoteCredentialUserShare.credential_id.in_(credential_ids)))
+        db.execute(delete(RemoteCredential).where(RemoteCredential.id.in_(credential_ids)))
     db.add(ServerRetirement(server_id=server.id, retired_by=user.id, reason=payload.reason.strip()))
     server.status = "retired"
-    audit(db, user.username, "server.delete", server.id, request, detail={"name": server.name, "reason": payload.reason.strip(), "retained_for_audit": True})
+    audit(db, user.username, "server.delete", server.id, request, detail={"name": server.name, "reason": payload.reason.strip(), "retained_for_audit": True, "remote_credentials_deleted": len(credential_ids)})
     db.commit()
     return {"deleted": server.id, "retainedForAudit": True}
 
@@ -4238,7 +4282,7 @@ def list_sessions(user: User = Depends(require_permission("recordings.view")), d
     for item, server_name in rows:
         paths, recording_status = recording_probe(item.id)
         path = paths[0] if paths else None
-        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username, "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "recordingStatus": recording_status, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
+        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username if user.role == "admin" else "Tài khoản được quản trị", "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "recordingStatus": recording_status, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
     return {"items": items}
 
 
@@ -4408,6 +4452,138 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
     return recording_deletion_json(deletion, db)
 
 
+def require_remote_credential_admin(user: User) -> None:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được quản lý tài khoản xác thực remote")
+
+
+def remote_credential_share_ids(db: Session, credential_id: str) -> list[str]:
+    return list(db.execute(select(RemoteCredentialUserShare.user_id).where(RemoteCredentialUserShare.credential_id == credential_id).order_by(RemoteCredentialUserShare.user_id)).scalars().all())
+
+
+def remote_credential_json(db: Session, credential: RemoteCredential, server: Server) -> dict[str, Any]:
+    return {
+        "id": credential.id,
+        "serverId": credential.server_id,
+        "serverName": server.name,
+        "serverAddress": server.address,
+        "protocol": credential.protocol,
+        "label": credential.label,
+        "username": credential.username,
+        "userIds": remote_credential_share_ids(db, credential.id),
+        "passwordConfigured": True,
+        "createdAt": aware(credential.created_at).isoformat(),
+        "updatedAt": aware(credential.updated_at).isoformat(),
+    }
+
+
+def validate_remote_credential_target(server: Server, protocol: str) -> None:
+    expected = "rdp" if server.os_family == "windows" else "ssh"
+    if protocol != expected:
+        raise HTTPException(status_code=422, detail=f"Máy chủ này chỉ hỗ trợ tài khoản {expected.upper()}")
+
+
+def validate_remote_credential_users(db: Session, server: Server, user_ids: list[str]) -> list[str]:
+    normalized = list(dict.fromkeys(user_ids))
+    if len(normalized) != len(user_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id) for user_id in normalized):
+        raise HTTPException(status_code=422, detail="Danh sách người dùng được chia sẻ không hợp lệ hoặc bị trùng")
+    users = db.execute(select(User).where(User.id.in_(normalized))).scalars().all() if normalized else []
+    if len(users) != len(normalized):
+        raise HTTPException(status_code=404, detail="Có người dùng được chia sẻ không còn tồn tại")
+    invisible = [target.username for target in users if target.role != "admin" and server.id not in visible_server_ids(db, target)]
+    if invisible:
+        raise HTTPException(status_code=409, detail="Hãy share máy chủ cho người dùng trước khi share tài khoản remote")
+    return normalized
+
+
+def replace_remote_credential_shares(db: Session, credential: RemoteCredential, user_ids: list[str], actor: User) -> None:
+    server = db.get(Server, credential.server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Máy chủ không tồn tại")
+    normalized = validate_remote_credential_users(db, server, user_ids)
+    db.execute(delete(RemoteCredentialUserShare).where(RemoteCredentialUserShare.credential_id == credential.id))
+    for user_id in normalized:
+        db.add(RemoteCredentialUserShare(credential_id=credential.id, user_id=user_id, granted_by=actor.id))
+
+
+def decrypt_remote_credential_password(credential: RemoteCredential) -> str:
+    try:
+        return job_fernet().decrypt(credential.password_encrypted.encode()).decode()
+    except (InvalidToken, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Không thể giải mã tài khoản remote; hãy đặt lại mật khẩu trong trang quản trị") from exc
+
+
+@app.get("/api/v1/remote-credentials")
+def list_remote_credentials(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    require_remote_credential_admin(user)
+    active_ids = visible_server_ids(db, user)
+    rows = db.execute(select(RemoteCredential, Server).join(Server, Server.id == RemoteCredential.server_id).where(RemoteCredential.server_id.in_(active_ids)).order_by(Server.name, RemoteCredential.label)).all()
+    return {"items": [remote_credential_json(db, credential, server) for credential, server in rows]}
+
+
+@app.post("/api/v1/remote-credentials", status_code=201)
+def create_remote_credential(payload: RemoteCredentialCreateRequest, request: Request, actor: User = Depends(current_user), db: Session = Depends(db_session)):
+    require_remote_credential_admin(actor)
+    server = visible_server(db, actor, payload.server_id)
+    validate_remote_credential_target(server, payload.protocol)
+    duplicate = db.execute(select(RemoteCredential).where(RemoteCredential.server_id == server.id, RemoteCredential.protocol == payload.protocol, func.lower(RemoteCredential.label) == payload.label.lower())).scalar_one_or_none()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Tên tài khoản remote đã tồn tại trên máy chủ")
+    credential = RemoteCredential(server_id=server.id, protocol=payload.protocol, label=payload.label, username=payload.username, password_encrypted=job_fernet().encrypt(payload.password.encode()).decode(), created_by=actor.id)
+    db.add(credential)
+    db.flush()
+    replace_remote_credential_shares(db, credential, payload.user_ids, actor)
+    audit(db, actor.username, "remote_credential.create", credential.id, request, detail={"server_id": server.id, "protocol": credential.protocol, "label": credential.label, "shared_user_count": len(payload.user_ids)})
+    db.commit()
+    return remote_credential_json(db, credential, server)
+
+
+@app.put("/api/v1/remote-credentials/{credential_id}")
+def update_remote_credential(credential_id: str, payload: RemoteCredentialUpdateRequest, request: Request, actor: User = Depends(current_user), db: Session = Depends(db_session)):
+    require_remote_credential_admin(actor)
+    credential = db.get(RemoteCredential, credential_id)
+    if not credential or credential.server_id not in visible_server_ids(db, actor):
+        raise HTTPException(status_code=404, detail="Tài khoản remote không tồn tại")
+    duplicate = db.execute(select(RemoteCredential).where(RemoteCredential.server_id == credential.server_id, RemoteCredential.protocol == credential.protocol, func.lower(RemoteCredential.label) == payload.label.lower(), RemoteCredential.id != credential.id)).scalar_one_or_none()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Tên tài khoản remote đã tồn tại trên máy chủ")
+    credential.label = payload.label
+    credential.username = payload.username
+    if payload.password:
+        credential.password_encrypted = job_fernet().encrypt(payload.password.encode()).decode()
+    credential.updated_at = now()
+    replace_remote_credential_shares(db, credential, payload.user_ids, actor)
+    audit(db, actor.username, "remote_credential.update", credential.id, request, detail={"server_id": credential.server_id, "protocol": credential.protocol, "label": credential.label, "password_changed": bool(payload.password), "shared_user_count": len(payload.user_ids)})
+    db.commit()
+    return remote_credential_json(db, credential, db.get(Server, credential.server_id))
+
+
+@app.delete("/api/v1/remote-credentials/{credential_id}")
+def delete_remote_credential(credential_id: str, request: Request, actor: User = Depends(current_user), db: Session = Depends(db_session)):
+    require_remote_credential_admin(actor)
+    credential = db.get(RemoteCredential, credential_id)
+    if not credential or credential.server_id not in visible_server_ids(db, actor):
+        raise HTTPException(status_code=404, detail="Tài khoản remote không tồn tại")
+    detail = {"server_id": credential.server_id, "protocol": credential.protocol, "label": credential.label}
+    db.execute(delete(RemoteCredentialUserShare).where(RemoteCredentialUserShare.credential_id == credential.id))
+    db.delete(credential)
+    audit(db, actor.username, "remote_credential.delete", credential_id, request, detail=detail)
+    db.commit()
+    return {"deleted": credential_id}
+
+
+@app.get("/api/v1/servers/{server_id}/remote-credentials")
+def list_available_remote_credentials(server_id: str, protocol: Literal["ssh", "rdp"], user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
+    server = visible_server(db, user, server_id)
+    validate_remote_credential_target(server, protocol)
+    query = select(RemoteCredential).where(RemoteCredential.server_id == server.id, RemoteCredential.protocol == protocol).order_by(RemoteCredential.label)
+    if user.role != "admin":
+        shared_ids = select(RemoteCredentialUserShare.credential_id).where(RemoteCredentialUserShare.user_id == user.id)
+        query = query.where(RemoteCredential.id.in_(shared_ids))
+    credentials = db.execute(query).scalars().all()
+    return {"items": [{"id": credential.id, "label": credential.label, "protocol": credential.protocol} for credential in credentials]}
+
+
 @app.get("/api/v1/sessions/{session_id}/recording")
 def read_recording(session_id: str, request: Request, user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
     session = db.get(RemoteSession, session_id)
@@ -4428,6 +4604,19 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
         raise HTTPException(status_code=400, detail="RDP is reserved for Windows servers")
     if payload.protocol == "ssh" and server.os_family != "linux":
         raise HTTPException(status_code=400, detail="SSH is reserved for Linux servers")
+    credential = db.get(RemoteCredential, payload.credential_id)
+    if not credential or credential.server_id != server.id or credential.protocol != payload.protocol:
+        raise HTTPException(status_code=404, detail="Tài khoản remote không tồn tại trên máy chủ này")
+    if user.role != "admin":
+        shared = db.execute(
+            select(RemoteCredentialUserShare).where(
+                RemoteCredentialUserShare.credential_id == credential.id,
+                RemoteCredentialUserShare.user_id == user.id,
+            )
+        ).scalar_one_or_none()
+        if not shared:
+            raise HTTPException(status_code=403, detail="Tài khoản remote này chưa được chia sẻ cho bạn")
+    remote_password = decrypt_remote_credential_password(credential)
     if not tunnel_hub.is_online(server.id):
         raise HTTPException(status_code=409, detail="Kênh tunnel mTLS của agent đang offline; hệ thống không fallback sang 22/3389 trực tiếp")
     session_id = str(uuid.uuid4())
@@ -4439,7 +4628,7 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
             status_code=409,
             detail=f"Agent không thể chuẩn bị kết nối tới {target}. Kiểm tra dịch vụ local và log Agent; không mở trực tiếp cổng quản trị ra mạng.",
         ) from exc
-    common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": payload.username, "password": payload.password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "true"}
+    common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": credential.username, "password": remote_password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "false"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript", "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true"})
         known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, relay_port, server.ssh_host_key)
@@ -4456,8 +4645,8 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     try:
         guac_payload = {"username": user.username, "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000), "connections": {server.name: {"protocol": payload.protocol, "parameters": common}}}
         encrypted = encrypt_guacamole_json(guac_payload)
-        db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=payload.username, created_by=user.username, status="waiting", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
-        audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "transport": "agent-mtls-tunnel", "target_port": 22 if payload.protocol == "ssh" else 3389, "recording": True, "clipboard": "disabled", "native_file_transfer": "disabled"})
+        db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=credential.username, created_by=user.username, status="waiting", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
+        audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "credential_id": credential.id, "credential_label": credential.label, "transport": "agent-mtls-tunnel", "target_port": 22 if payload.protocol == "ssh" else 3389, "recording": True, "clipboard": "paste-only", "native_file_transfer": "disabled"})
         db.commit()
     except Exception:
         await tunnel_hub.cancel(session_id, "launch-failed")

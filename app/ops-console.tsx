@@ -4,6 +4,7 @@ import Guacamole from "guacamole-common-js";
 import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 import { UpdateSourceSettingsView } from "./update-source-settings";
+import { RemoteCredentialsView } from "./remote-credentials";
 
 type OSFamily = "linux" | "windows";
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -85,7 +86,7 @@ type JobListRow = {
 const COOKIE_SESSION_MARKER = "cookie-session";
 const CURRENT_DASHBOARD_BUILD = typeof __TRAM_BUILD_ID__ === "string" ? __TRAM_BUILD_ID__ : "development";
 
-const navItems = [
+const navItems: Array<{ id: string; icon: string; label: string; group: string; permissions: string[]; count?: number; adminOnly?: boolean }> = [
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
   { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
   { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3, group: "infrastructure", permissions: ["servers.view"] },
@@ -94,6 +95,7 @@ const navItems = [
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
   { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
   { id: "update-settings", icon: "↥", label: "Cấu hình cập nhật", group: "administration", permissions: ["updates.manage"] },
+  { id: "remote-credentials", icon: "⌁", label: "Tài khoản Remote", group: "administration", permissions: ["sessions.launch"], adminOnly: true },
   { id: "agents", icon: "↓", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
 ];
 
@@ -223,6 +225,11 @@ const operationLabels: Record<string, string> = {
   "settings.recording_retention.update": "Cập nhật thời gian lưu recording",
   "auth.logout": "Đăng xuất và thu hồi phiên",
   "security.authorization.denied": "Từ chối truy cập do thiếu quyền",
+  "remote_credential.create": "Tạo tài khoản Remote",
+  "remote_credential.update": "Cập nhật tài khoản Remote",
+  "remote_credential.delete": "Xóa tài khoản Remote",
+  "session.ssh.launch": "Mở phiên SSH",
+  "session.rdp.launch": "Mở phiên Remote Desktop",
   "session.recording.view": "Xem lại recording",
   "session.recording.delete.request": "Yêu cầu xóa recording",
   "session.recording.delete.approve": "Duyệt xóa recording",
@@ -806,7 +813,7 @@ export function OpsConsole() {
 
   const scope = active === "linux" || active === "windows" ? active : null;
   const visibleNavItems = useMemo(
-    () => navItems.filter((item) => item.permissions.some((permission) => currentUser?.permissions.includes(permission))),
+    () => navItems.filter((item) => (!item.adminOnly || currentUser?.role === "admin") && item.permissions.some((permission) => currentUser?.permissions.includes(permission))),
     [currentUser],
   );
   const infrastructureNavigation = visibleNavItems.filter((item) => item.group === "infrastructure");
@@ -924,6 +931,8 @@ export function OpsConsole() {
                 ? "Người dùng & vai trò"
                 : active === "update-settings"
                   ? "Cấu hình cập nhật"
+                  : active === "remote-credentials"
+                    ? "Tài khoản Remote"
                 : active === "agents"
                   ? "Tạo bộ cài Agent"
                 : "Trung tâm vận hành";
@@ -1305,6 +1314,8 @@ export function OpsConsole() {
             <AccessView token={token} currentUser={currentUser} />
           ) : active === "update-settings" ? (
             <UpdateSourceSettingsView servers={servers} token={token} notify={notify} openJobs={() => navigateSection("jobs")} />
+          ) : active === "remote-credentials" ? (
+            <RemoteCredentialsView servers={servers} token={token} notify={notify} />
           ) : active === "agents" ? (
             <AgentPackagesView token={token} />
           ) : (
@@ -1375,6 +1386,11 @@ export function OpsConsole() {
           notify={notify}
           server={selected}
           token={token}
+          isAdmin={currentUser.role === "admin"}
+          manageCredentials={() => {
+            setModal(null);
+            navigateSection("remote-credentials");
+          }}
         />
       )}
       {modal === "command" && (
@@ -4514,60 +4530,71 @@ function SessionModal({
   notify,
   server,
   token,
+  isAdmin,
+  manageCredentials,
 }: {
   close: () => void;
   notify: (message: string) => void;
   server: Server;
   token: string;
+  isAdmin: boolean;
+  manageCredentials: () => void;
 }) {
+  const protocol = server.osFamily === "windows" ? "rdp" : "ssh";
   const [busy, setBusy] = useState(false);
+  const [loadingCredentials, setLoadingCredentials] = useState(true);
+  const [credentialId, setCredentialId] = useState("");
+  const [credentialChoices, setCredentialChoices] = useState<Array<{ id: string; label: string; protocol: "ssh" | "rdp" }>>([]);
+  const [credentialError, setCredentialError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/v1/servers/${server.id}/remote-credentials?protocol=${protocol}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail ?? "Không thể đọc tài khoản Remote");
+        return payload.items ?? [];
+      })
+      .then((items) => {
+        if (cancelled) return;
+        setCredentialChoices(items);
+        setCredentialId(items[0]?.id ?? "");
+        setCredentialError("");
+      })
+      .catch((reason) => {
+        if (!cancelled) setCredentialError(reason instanceof Error ? reason.message : "Không thể đọc tài khoản Remote");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingCredentials(false);
+      });
+    return () => { cancelled = true; };
+  }, [protocol, server.id, token]);
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!credentialId) return;
     setBusy(true);
-    const form = new FormData(event.currentTarget);
-    const protocol = server.osFamily === "windows" ? "rdp" : "ssh";
     const sessionWindow = window.open("about:blank", "_blank");
     if (sessionWindow) sessionWindow.opener = null;
     const pixelRatio = window.devicePixelRatio || 1;
-    const width = Math.min(
-      7680,
-      Math.max(800, Math.round(window.screen.width * pixelRatio)),
-    );
-    const height = Math.min(
-      4320,
-      Math.max(600, Math.round(window.screen.height * pixelRatio)),
-    );
+    const width = Math.min(7680, Math.max(800, Math.round(window.screen.width * pixelRatio)));
+    const height = Math.min(4320, Math.max(600, Math.round(window.screen.height * pixelRatio)));
     try {
       const response = await fetch("/api/v1/sessions/launch", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          server_id: server.id,
-          protocol,
-          username: form.get("username"),
-          password: form.get("password"),
-          width,
-          height,
-        }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ server_id: server.id, protocol, credential_id: credentialId, width, height }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Không thể tạo phiên");
       close();
-      // Guacamole persists its own token across tabs in origin-wide
-      // localStorage. A stale token from a previous/manual Guacamole login
-      // takes precedence over the encrypted JSON connection in the new URL,
-      // causing the valid temporary connection to appear missing. Dashboard
-      // Dashboard authentication remains in a Secure HttpOnly cookie and is
-      // independent from Guacamole's origin-wide localStorage token.
       window.localStorage.removeItem("GUAC_AUTH_TOKEN");
       if (sessionWindow) sessionWindow.location.href = data.url;
       else window.location.href = data.url;
-      notify(
-        `Đã tạo phiên ${protocol.toUpperCase()} có ghi lại ở độ phân giải ${width}×${height}.`,
-      );
+      notify(`Đã tạo phiên ${protocol.toUpperCase()} có ghi lại. Cho phép paste vào phiên; chặn copy dữ liệu từ máy chủ ra ngoài.`);
     } catch (reason) {
       sessionWindow?.close();
       notify(reason instanceof Error ? reason.message : "Không thể tạo phiên");
@@ -4575,74 +4602,21 @@ function SessionModal({
       setBusy(false);
     }
   }
+
   return (
     <div className="modal-backdrop">
-      <button
-        className="modal-dismiss"
-        type="button"
-        aria-label="Đóng hộp thoại"
-        onClick={close}
-      />
+      <button className="modal-dismiss" type="button" aria-label="Đóng hộp thoại" onClick={close} />
       <form className="modal" onSubmit={submit}>
-        <div className="modal-head">
-          <div>
-            <span className="modal-icon">↗</span>
-            <div>
-              <h2>
-                {server.osFamily === "windows" ? "Remote Desktop" : "Phiên SSH"}
-              </h2>
-              <p>{server.name} · phiên được ghi lại</p>
-            </div>
-          </div>
-          <button type="button" onClick={close}>
-            ×
-          </button>
-        </div>
-        <label>
-          Tên đăng nhập
-          <input
-            name="username"
-            required
-            autoComplete="username"
-            placeholder={
-              server.osFamily === "linux" ? "Ví dụ: ubuntu" : undefined
-            }
-          />
-        </label>
-        <label>
-          Mật khẩu phiên
-          <input
-            type="password"
-            name="password"
-            required
-            autoComplete="current-password"
-          />
-        </label>
-        <div className="warning-box">
-          <b>
-            {server.osFamily === "linux"
-              ? "Không dùng root trên Ubuntu mặc định"
-              : "Thông tin xác thực dùng một lần"}
-          </b>
-          <p>
-            {server.osFamily === "linux"
-              ? "Hệ thống sẽ kiểm tra dịch vụ SSH trên máy đích trước khi mở phiên. Dùng tài khoản thường đã đặt mật khẩu, ví dụ ubuntu."
-              : "Mật khẩu chỉ được sử dụng để khởi tạo phiên và không xuất hiện trong nhật ký thao tác."}
-          </p>
-        </div>
-        <div className="modal-actions">
-          <button type="button" className="button ghost" onClick={close}>
-            Hủy
-          </button>
-          <button className="button primary" disabled={busy}>
-            {busy ? "Đang kiểm tra tunnel và dịch vụ local…" : "Mở phiên & bắt đầu ghi"}
-          </button>
-        </div>
+        <div className="modal-head"><div><span className="modal-icon">↗</span><div><h2>{server.osFamily === "windows" ? "Remote Desktop" : "Phiên SSH"}</h2><p>{server.name} · phiên được ghi lại</p></div></div><button type="button" onClick={close}>×</button></div>
+        {credentialError && <div className="danger-panel">{credentialError}</div>}
+        <label>Tài khoản truy cập<select required value={credentialId} disabled={loadingCredentials || !credentialChoices.length} onChange={(event) => setCredentialId(event.target.value)}><option value="">{loadingCredentials ? "Đang đọc tài khoản…" : "Chọn tài khoản…"}</option>{credentialChoices.map((credential) => <option key={credential.id} value={credential.id}>{credential.label}</option>)}</select></label>
+        {!loadingCredentials && !credentialChoices.length && <div className="warning-box"><b>Chưa có tài khoản được phép sử dụng</b><p>{isAdmin ? "Hãy tạo tài khoản Remote cho máy chủ này." : "Administrator cần share một tài khoản Remote cho bạn."}</p>{isAdmin && <button type="button" className="button ghost compact" onClick={manageCredentials}>Quản lý tài khoản Remote</button>}</div>}
+        <div className="resource-help"><b>Clipboard một chiều:</b> có thể paste văn bản từ máy của bạn vào phiên SSH/RDP. Copy từ máy chủ về trình duyệt và truyền file native vẫn bị khóa.</div>
+        <div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary" disabled={busy || loadingCredentials || !credentialId}>{busy ? "Đang kiểm tra tunnel và dịch vụ local…" : "Mở phiên & bắt đầu ghi"}</button></div>
       </form>
     </div>
   );
 }
-
 function CommandPalette({
   close,
   servers,

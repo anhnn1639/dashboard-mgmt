@@ -3388,6 +3388,8 @@ def scan_windows_updates() -> tuple[int, str]:
         "connectivityEndpoint": connectivity.get("endpoint"),
         "connectivityHttpStatus": connectivity.get("httpStatus", 0),
         "applicabilityCriteria": "WUA applicability for the installed Windows host",
+        "catalogScope": "missing_on_this_server",
+        "searchCriteria": "IsInstalled=0 and IsHidden=0",
         "configMgrCount": len(configmgr_rows),
         "configMgrStatus": "ok" if configmgr_rows else "not_installed_or_empty",
     })
@@ -3409,14 +3411,34 @@ def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tu
     if scan_code != 0:
         return scan_code, scan_output
     scan_payload = json.loads(scan_output)
+    diagnostics = scan_payload.get("diagnostics") if isinstance(scan_payload.get("diagnostics"), dict) else {}
+    if inventory["os_family"] == "windows" and diagnostics.get("currentScanComplete") is False:
+        raise ValueError("Windows Update scan is incomplete; resolve the update source or policy and scan again")
     available = {str(item.get("id")): item for item in scan_payload.get("updates", []) if isinstance(item, dict)}
     selected: list[dict[str, Any]] = []
+    unavailable: list[str] = []
     for requested in raw:
         identifier = str(requested.get("id", ""))
         current = available.get(identifier)
         if not current or str(requested.get("version", "")) != str(current.get("version", "")):
-            raise ValueError("An update changed or is no longer available; scan again")
+            unavailable.append(identifier)
+            continue
         selected.append(current)
+    if unavailable:
+        if inventory["os_family"] == "windows":
+            return 0, json.dumps(
+                {
+                    "status": "skipped",
+                    "reason": "no_longer_applicable",
+                    "message": "Không cài đặt: bản cập nhật đã thay đổi hoặc không còn thiếu trên máy Windows này. Danh sách sẽ được quét lại.",
+                    "requestedCount": len(raw),
+                    "currentMissingCount": len(available),
+                    "unavailableUpdateIds": unavailable,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        raise ValueError("An update changed or is no longer available; scan again")
     if inventory["os_family"] == "windows":
         managers = {str(item.get("manager", "wua")) for item in selected}
         if len(managers) != 1:
@@ -3425,9 +3447,6 @@ def install_updates(parameters: dict[str, Any], inventory: dict[str, Any]) -> tu
             encoded = base64.b64encode(json.dumps([str(item["id"]) for item in selected]).encode()).decode()
             script = f"$wanted=@([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))|ConvertFrom-Json);$updates=@(Get-CimInstance -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdate -ErrorAction Stop|Where-Object{{$_.ComplianceState -eq 0 -and $wanted -contains [string]$_.UpdateID}});if($updates.Count -ne $wanted.Count){{throw 'Selected updates changed; scan again'}};$result=Invoke-CimMethod -Namespace 'root\\ccm\\ClientSDK' -ClassName CCM_SoftwareUpdatesManager -MethodName InstallUpdates -Arguments @{{CCMUpdates=[ciminstance[]]$updates}} -ErrorAction Stop;[pscustomobject]@{{manager='configmgr';returnValue=[int]$result.ReturnValue;count=$updates.Count}}|ConvertTo-Json -Compress"
             return powershell(script, timeout=7200)
-        diagnostics = scan_payload.get("diagnostics") if isinstance(scan_payload.get("diagnostics"), dict) else {}
-        if diagnostics.get("currentScanComplete") is False:
-            raise ValueError("Windows Update scan is incomplete; resolve the update source or policy and scan again")
         service_ids = {str(item.get("serviceId", "")) for item in selected}
         if len(service_ids) != 1:
             raise ValueError("Select Windows updates from one update service per operation")
