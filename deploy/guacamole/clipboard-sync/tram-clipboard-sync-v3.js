@@ -10,6 +10,56 @@
     var pendingClipboardSync = null;
     var clipboardMayHaveChanged = true;
 
+    function afterClipboardSync(callback) {
+        var sync = pendingClipboardSync;
+        if (!sync)
+            return callback();
+        sync.finally(function clipboardSyncSettled() {
+            // An explicit paste may have queued a second read behind the
+            // focus-triggered read. Do not forward input until the newest
+            // synchronization in the chain has also settled.
+            if (pendingClipboardSync && pendingClipboardSync !== sync)
+                return afterClipboardSync(callback);
+            return callback();
+        });
+    }
+
+    function installClientInputGate(client) {
+        if (!client || client.__tramClipboardSyncInstalled)
+            return client;
+
+        // Guacamole.Client defines these functions on each client instance,
+        // not on the shared constructor prototype. Gate the real instance
+        // created by ManagedClient so this also works in production SSH/RDP sessions.
+        var sendKeyEvent = client.sendKeyEvent.bind(client);
+        var sendMouseState = client.sendMouseState.bind(client);
+
+        client.sendKeyEvent = function sendKeyEventAfterClipboardSync() {
+            var args = Array.prototype.slice.call(arguments);
+            return afterClipboardSync(function forwardKeyEvent() {
+                return sendKeyEvent.apply(client, args);
+            });
+        };
+
+        client.sendMouseState = function sendMouseStateAfterClipboardSync(state, force) {
+            var stateSnapshot = new Guacamole.Mouse.State(
+                state.x,
+                state.y,
+                state.left,
+                state.middle,
+                state.right,
+                state.up,
+                state.down
+            );
+            return afterClipboardSync(function forwardMouseState() {
+                return sendMouseState(stateSnapshot, force);
+            });
+        };
+
+        client.__tramClipboardSyncInstalled = true;
+        return client;
+    }
+
     angular.module('clipboard').config(['$provide', function configureClipboardSync($provide) {
         $provide.decorator('clipboardService', ['$delegate', '$window', 'ClipboardData',
                 function decorateClipboardService(service, $window, ClipboardData) {
@@ -68,6 +118,18 @@
         }]);
     }]);
 
+    angular.module('client').config(['$provide', function configureManagedClientSync($provide) {
+        $provide.decorator('ManagedClient', ['$delegate', function decorateManagedClient(ManagedClient) {
+            var getInstance = ManagedClient.getInstance;
+            ManagedClient.getInstance = function getSynchronizedManagedClient() {
+                var managedClient = getInstance.apply(this, arguments);
+                installClientInputGate(managedClient.client);
+                return managedClient;
+            };
+            return ManagedClient;
+        }]);
+    }]);
+
     angular.module('clipboard').run(['$document', '$window', 'clipboardService',
             function startClipboardSync($document, $window, clipboardService) {
 
@@ -113,50 +175,27 @@
         }
 
         document.addEventListener('keydown', resyncForKeyboard, true);
-        document.addEventListener('mousedown', resyncIfNeeded, true);
+        function isMousePasteButton(event) {
+            var button = Number(event.button);
+            var buttons = Number(event.buttons || 0);
 
-        function afterClipboardSync(callback) {
-            var sync = pendingClipboardSync;
-            if (!sync)
-                return callback();
-            sync.finally(function clipboardSyncSettled() {
-                // An explicit paste may have queued a second read behind the
-                // focus-triggered read. Do not forward input until the newest
-                // synchronization in the chain has also settled.
-                if (pendingClipboardSync && pendingClipboardSync !== sync)
-                    return afterClipboardSync(callback);
-                return callback();
-            });
+            // Remote terminals commonly paste on either the right button or
+            // the middle button. A browser paste event is not emitted for
+            // either action, so the native mouse event must trigger the read.
+            return button === 1 || button === 2
+                || (buttons & 4) !== 0 || (buttons & 2) !== 0;
         }
 
-        // Backport the behavior of GUACAMOLE-2175 and cover keyboard paste as
-        // well: input is queued in original order until clipboard sync ends.
-        var clientPrototype = Guacamole.Client.prototype;
-        if (!clientPrototype.__tramClipboardSyncInstalled) {
-            var sendKeyEvent = clientPrototype.sendKeyEvent;
-            var sendMouseState = clientPrototype.sendMouseState;
-
-            clientPrototype.sendKeyEvent = function sendKeyEventAfterClipboardSync() {
-                var args = Array.prototype.slice.call(arguments);
-                var forwardKeyEvent = sendKeyEvent.bind.apply(sendKeyEvent, [this].concat(args));
-                return afterClipboardSync(forwardKeyEvent);
-            };
-
-            clientPrototype.sendMouseState = function sendMouseStateAfterClipboardSync(state, force) {
-                var stateSnapshot = new Guacamole.Mouse.State(
-                    state.x,
-                    state.y,
-                    state.left,
-                    state.middle,
-                    state.right,
-                    state.up,
-                    state.down
-                );
-                return afterClipboardSync(sendMouseState.bind(this, stateSnapshot, force));
-            };
-
-            clientPrototype.__tramClipboardSyncInstalled = true;
+        function resyncForMouse(event) {
+            if (isMousePasteButton(event))
+                return clipboardService.resyncClipboard(true);
+            return resyncIfNeeded();
         }
+
+        // Capture mousedown before Guacamole converts it to remote input. The
+        // sendMouseState wrapper below then holds that input until the forced
+        // browser clipboard read has reached the remote clipboard.
+        document.addEventListener('mousedown', resyncForMouse, true);
 
         resyncIfNeeded();
     }]);

@@ -444,6 +444,7 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /build --pull --no-cache guacamole/);
   assert.match(deployScript, /force-recreate api dashboard guacamole/);
   assert.match(deployScript, /tram-clipboard-sync\.jar/);
+  assert.match(deployScript, /tram-clipboard-sync-v3\.js/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -464,25 +465,30 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v2.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v3.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.equal(manifest.namespace, "tram-clipboard-sync-v2");
-  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v2.js"]);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.2[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v3");
+  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v3.js"]);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.3[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
   assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*service\.setClipboard\(new ClipboardData/);
   assert.match(extension, /addEventListener\('focus', resyncIfNeeded, true\)/);
   assert.match(extension, /isPasteShortcut[\s\S]*resyncClipboard\(true\)/);
+  assert.match(extension, /isMousePasteButton[\s\S]*resyncClipboard\(true\)/);
+  assert.match(extension, /ManagedClient[\s\S]*getInstance[\s\S]*installClientInputGate/);
+  assert.doesNotMatch(extension, /Guacamole\.Client\.prototype/);
   assert.match(extension, /pendingClipboardSync[\s\S]*sendKeyEventAfterClipboardSync/);
   assert.match(extension, /pendingClipboardSync[\s\S]*sendMouseStateAfterClipboardSync/);
 
   let configureClipboard;
+  let configureManagedClient;
   let startClipboard;
   const windowListeners = new Map();
   const documentListeners = new Map();
   const forwardedKeys = [];
+  const forwardedMouse = [];
   const remoteWrites = [];
   let browserClipboard = "A";
   let remoteClipboard = "";
@@ -504,6 +510,11 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
     },
     run(definition) {
       startClipboard = definition.at(-1);
+    },
+  };
+  const clientModule = {
+    config(definition) {
+      configureManagedClient = definition.at(-1);
     },
   };
   const fakeWindow = {
@@ -531,11 +542,22 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
       documentListeners.set(type, listener);
     },
   };
-  function FakeClient() {}
-  FakeClient.prototype.sendKeyEvent = function sendKeyEvent(pressed, keysym) {
-    forwardedKeys.push({ pressed, keysym, clipboard: remoteClipboard });
+  function FakeClient() {
+    // Apache Guacamole defines these as own methods on every Client instance.
+    this.sendKeyEvent = function sendKeyEvent(pressed, keysym) {
+      forwardedKeys.push({ pressed, keysym, clipboard: remoteClipboard });
+    };
+    this.sendMouseState = function sendMouseState(state, force) {
+      forwardedMouse.push({ state, force, clipboard: remoteClipboard });
+    };
+  }
+  assert.equal(FakeClient.prototype.sendKeyEvent, undefined);
+  assert.equal(FakeClient.prototype.sendMouseState, undefined);
+  const ManagedClient = {
+    getInstance(id) {
+      return { id, client: new FakeClient() };
+    },
   };
-  FakeClient.prototype.sendMouseState = function sendMouseState() {};
   class FakeMouseState {
     constructor(x, y, left, middle, right, up, down) {
       Object.assign(this, { x, y, left, middle, right, up, down });
@@ -548,16 +570,29 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   }
 
   runInNewContext(extension, {
-    angular: { module: () => clipboardModule },
+    angular: {
+      module(name) {
+        if (name === "clipboard") return clipboardModule;
+        if (name === "client") return clientModule;
+        throw new Error(`Unexpected Angular module: ${name}`);
+      },
+    },
     Guacamole: { Client: FakeClient, Mouse: { State: FakeMouseState } },
     Promise,
   });
   assert.equal(typeof configureClipboard, "function");
+  assert.equal(typeof configureManagedClient, "function");
   assert.equal(typeof startClipboard, "function");
   configureClipboard({
     decorator(name, definition) {
       assert.equal(name, "clipboardService");
       definition.at(-1)(clipboardService, fakeWindow, FakeClipboardData);
+    },
+  });
+  configureManagedClient({
+    decorator(name, definition) {
+      assert.equal(name, "ManagedClient");
+      definition.at(-1)(ManagedClient);
     },
   });
   startClipboard([fakeDocument], fakeWindow, clipboardService);
@@ -567,7 +602,7 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   browserClipboard = "B";
   holdNextRead = true;
   windowListeners.get("focus")();
-  const client = new FakeClient();
+  const client = ManagedClient.getInstance("test").client;
   client.sendKeyEvent(1, 0x56);
   assert.deepEqual(forwardedKeys, [], "input must wait while clipboard B is being read");
 
@@ -608,4 +643,30 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   assert.equal(forwardedKeys.length, 3);
   assert.equal(forwardedKeys[2].clipboard, "C");
   assert.deepEqual(remoteWrites, ["A", "B", "B", "C"]);
+
+  // A right-click paste does not emit a browser paste event. Chrome may also
+  // have returned C during focus while the system clipboard has already moved
+  // on to D. The captured right mousedown must therefore force another read
+  // and hold the remote mouse event until D has been synchronized.
+  holdNextRead = false;
+  windowListeners.get("blur")();
+  browserClipboard = "C";
+  windowListeners.get("focus")();
+  await waitForImmediate();
+  browserClipboard = "D";
+  holdNextRead = true;
+  documentListeners.get("mousedown")({ button: 2, buttons: 2 });
+  const rightClickState = new FakeMouseState(10, 20, false, false, true, false, false);
+  client.sendMouseState(rightClickState, true);
+  rightClickState.right = false;
+  assert.deepEqual(forwardedMouse, [], "right-click must wait for a forced fresh read");
+
+  resolveRead(browserClipboard);
+  await waitForImmediate();
+  assert.equal(remoteClipboard, "D");
+  assert.equal(forwardedMouse.length, 1);
+  assert.equal(forwardedMouse[0].clipboard, "D");
+  assert.equal(forwardedMouse[0].state.right, true);
+  assert.equal(forwardedMouse[0].force, true);
+  assert.deepEqual(remoteWrites, ["A", "B", "B", "C", "C", "D"]);
 });
