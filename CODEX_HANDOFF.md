@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent source hiện ở phiên bản `0.8.15`; Linux executable và Windows MSI đang chờ GitHub Actions tạo artifact mới. Bản bundle ổn định gần nhất là `0.8.14`. Gói Linux tiếp tục self-contained, không cài Python/pip hoặc tải dependency lúc cài và unit systemd giữ `AF_NETLINK`.
+- Agent `0.8.15` đã đồng bộ source, Linux executable và Windows MSI trong repository. Gói Linux tiếp tục self-contained, không cài Python/pip hoặc tải dependency lúc cài và unit systemd giữ `AF_NETLINK`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -102,10 +102,10 @@
 ## MSI artifact
 
 - File: `agent/windows/TramVanHanhAgent.msi`
-- Kích thước: `14,491,648` bytes.
-- Phiên bản MSI: `0.8.12`.
-- SHA-256: `A35743B621B3E4F4A92F730A64E64F23469E108998BB17653DE2A9A75A4A8209`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `8c85f3a3436d49d21aa890da8e81d17b0fde883a` trên GitHub Actions run `33137805166`; ProductVersion `0.8.12`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
+- Kích thước: `14,495,744` bytes.
+- Phiên bản MSI: `0.8.15`.
+- SHA-256: `AD64B663E3622C047E54C42C53C062AD32978BAF5D2EC6C6B9F2D5497B8D774A`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `90fa0ebc9da9cca4769a4e1c5a5c8d00980a992b` trên GitHub Actions run `33184537666`; ProductVersion `0.8.15`, kích thước và SHA-256 ở trên đã được kiểm tra trực tiếp sau khi tải artifact bằng GitHub CLI.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -115,9 +115,9 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; kích thước `16,674,592` bytes.
-- Phiên bản: `0.8.12`; SHA-256 `32FC0373E4B09E48756AF5F9864A2054843956FA1EC0B8CBD06C8728AB887C9D`.
-- GitHub Actions run `33137805168` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `8c85f3a3436d49d21aa890da8e81d17b0fde883a`.
+- File: `agent/linux/x86_64/tram-agent`; kích thước `16,683,008` bytes.
+- Phiên bản: `0.8.15`; SHA-256 `0869F9F7684C6593245FECF534617E96B78CD1040AF168253D988803361B3A7E`.
+- GitHub Actions run `33184537597` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `90fa0ebc9da9cca4769a4e1c5a5c8d00980a992b`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
@@ -282,6 +282,14 @@ Từ 0.8.10 lên 0.8.11 phải pull commit đã bundle artifact, rebuild/recreat
 
 Từ 0.8.11 lên 0.8.12 phải pull commit đã bundle artifact và rebuild/recreate API để website phát MSI mới. Gỡ/cancel lần cài Windows đang treo nếu cần, tải một package Windows mới và giữ nguyên tên file khi chạy bằng Administrator. MSI phải hoàn tất mà không chờ mạng; theo dõi bootstrap tại `%ProgramData%\TramVanHanh\agent.log` và bảo đảm LocalSystem kết nối HTTPS 443 tới dashboard.
 
+Từ 0.8.14 lên 0.8.15 phải pull commit đã bundle artifact và rebuild/recreate API để website phát đúng Linux `.run`/Windows MSI mới. Cài đè gói 0.8.15 trên endpoint đã enroll sẽ giữ identity và restart service; sau đó mở tab Tiến trình và đo CPU thật trên Linux.
+
+```bash
+git pull --ff-only origin main
+docker compose -f compose.yaml -f compose.test.yaml up -d --build --force-recreate api
+docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent-assets/VERSION
+```
+
 Bản xử lý ANTT 20/08 chỉ đổi control plane/dashboard/proxy, không tăng Agent khỏi `0.8.8`. Sau pull phải render lại Nginx, rebuild/recreate `api`, `dashboard`, `caddy`, rồi đăng nhập lại vì token cũ chưa có `jti` bị từ chối chủ động:
 
 ```bash
@@ -371,7 +379,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Kết quả mong đợi:
 
-- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.12`, Linux available và Windows MSI 0.8.12 available.
+- Trang **Bộ cài Agent** phải hiển thị đúng URL production, Agent `0.8.15`, Linux available và Windows MSI 0.8.15 available.
 - `agentTlsCaAvailable=true`; không còn cảnh báo CA và label/ô nhập không dính nhau.
 - Tải Linux trả `.run`; tải Windows trả MSI có tên dài bắt đầu `TramAgent--`.
 - Không có domain `example` trong config sinh ra nếu `dashboard_url` đã đặt đúng.
@@ -388,7 +396,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 ## Smoke test bắt buộc
 
 1. Mở dashboard bằng domain thật, vào **Bộ cài Agent**, lưu đúng URL HTTPS.
-2. Sau khi artifact 0.8.14 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.14`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
+2. Sau khi artifact 0.8.15 được bundle, tải từng Linux `.run` mới, cài khi chặn Internet trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL 7/8 staging; xác nhận không còn warning tar epoch, claim trả 201, service running, agent `0.8.15`, unit có `AF_NETLINK`, tự vào Linux và `tunnelOnline=true`. Package cũ đã hết hạn/đã dùng thì phải tạo package mới.
 3. Dùng lại cùng `.run` trên máy khác: claim phải bị `401`.
 4. Tải MSI, giữ nguyên tên, cài bằng Administrator trên Windows Server 2025 staging.
 5. Kiểm tra:
@@ -472,6 +480,7 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Heartbeat không còn chờ `psutil.cpu_percent(interval=1)`, chỉ đọc disk tối đa mỗi 30 giây, không quét inventory hai lần lúc khởi động hoặc quét lại inventory trong mỗi lần retry. Chứng thư/private key được parse và kiểm tra khớp một lần theo mtime/kích thước; kết nối HTTPS được tái sử dụng nhưng tự tạo lại khi certificate/key/server CA đổi.
 - Benchmark phát triển trước sửa với 387 process mất khoảng 7,3 giây wall/6,8 giây CPU cho một `process.list`; sau sửa phép đo cục bộ không còn thời gian chờ và giảm đáng kể số syscall. Mục tiêu smoke test trên máy Linux thật 700+ process là CPU Agent nhàn rỗi dưới 1% một core, lúc mở realtime trung bình dưới 3% và không duy trì trên 5%; đo bằng `pidstat -p $(pidof tram-agent) 1 60` sau khi cài 0.8.15.
 - Kiểm thử local Agent `82/82` pass, gồm single-pass/delta CPU, PID reuse, cache snapshot, hai request đồng thời chỉ quét một lần, process Windows bị từ chối username vẫn hiện, host metric không chặn/cache disk, cache cặp certificate-key và reuse inventory/HTTPS session. Workflow security audit nay chạy toàn bộ bộ test Agent trên Linux ở mỗi push.
+- Security audit run `33185037592` pass trên Ubuntu sau khi cô lập test firewall khỏi command có sẵn của runner. Linux build run `33184537597` và Windows MSI run `33184537666` pass từ source commit `90fa0ebc9da9cca4769a4e1c5a5c8d00980a992b`; bundle tương ứng có SHA-256 `0869F9F7684C6593245FECF534617E96B78CD1040AF168253D988803361B3A7E` và `AD64B663E3622C047E54C42C53C062AD32978BAF5D2EC6C6B9F2D5497B8D774A`.
 ### Đồng bộ clipboard mới nhất trên Guacamole 1.6.0 (28/08/2026)
 
 - Đã xác định lỗi paste A rồi copy B nhưng vẫn dán A là race condition upstream `GUACAMOLE-2175`: khi cửa sổ Guacamole lấy lại focus, đồng bộ clipboard chạy bất đồng bộ trong khi input chuột/phím được gửi ngay. Fix chính thức mới nằm ở staging 1.6.1, còn release/image ổn định mới nhất vẫn là 1.6.0.
