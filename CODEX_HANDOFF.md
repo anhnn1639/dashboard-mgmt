@@ -273,7 +273,7 @@ docker compose -f compose.yaml -f compose.test.yaml exec api cat /opt/tram-agent
 docker compose -f compose.yaml -f compose.test.yaml logs --tail=200 api dashboard
 ```
 
-Sau khi endpoint lên 0.8.9, vào menu **Cấu hình cập nhật**, chọn một nhóm OS/version, tick nhiều máy rồi bấm **Đọc lại nguồn** trước khi áp dụng. Thử trên staging: Ubuntu phải giữ Docker/PPA; Oracle phải giữ EPEL/Docker/repo ứng dụng và chỉ nhận URL cho repo ID thật của chính máy đó; Windows WSUS phải hiện đúng URL và `UseWUServer=1`. Lưu cấu hình xong mỗi máy phải có job cấu hình riêng, tiếp theo là job đọc nguồn và quét patch mới. Thay đổi giao diện/API bulk không tăng Agent khỏi 0.8.9; nếu endpoint đã ở 0.8.9 thì chỉ cần rebuild/recreate `api dashboard`.
+Sau khi endpoint lên 0.8.9, vào menu **Cấu hình cập nhật**, chọn một nhóm OS/version, tick nhiều máy rồi bấm **Đọc lại nguồn** trước khi áp dụng; dashboard tự chờ Agent và điền nguồn khi công việc hoàn tất. Thử trên staging: Ubuntu phải giữ Docker/PPA; Oracle phải giữ EPEL/Docker/repo ứng dụng và chỉ nhận URL cho repo ID thật của chính máy đó; Windows WSUS phải hiện đúng URL và `UseWUServer=1`. Lưu cấu hình xong mỗi máy phải có job cấu hình riêng, tiếp theo là job đọc nguồn và quét patch mới. Thay đổi giao diện/API bulk không tăng Agent khỏi 0.8.9; nếu endpoint đã ở 0.8.9 thì chỉ cần rebuild/recreate `api dashboard`.
 
 Từ 0.8.9 lên 0.8.10 chỉ cần pull commit đã bundle artifact, rebuild/recreate API để website phát bộ cài mới, nâng Agent Windows rồi bấm **Quét lại** trong tab Cập nhật. Bản này buộc WUA thực hiện scan online thật trên nguồn đang cấu hình; cache rỗng có timestamp mới không còn làm UI kết luận nhầm là đã quét xong.
 
@@ -424,12 +424,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - Máy phát triển không có Docker; `compose.yaml` đã parse/kiểm tra cấu trúc bằng PyYAML, còn `docker compose config` và recreate thực tế phải xác nhận trên Ubuntu deployment.
 - GitHub Actions cho 0.8.11: security audit run `33035036154` pass; Linux build run `33035036075` pass `--help` và `diagnose` trên đủ sáu image OS; MSI run `33035036056` pass và ProductVersion đọc trực tiếp là `0.8.11`. Bước ký EXE/MSI được skip đúng thiết kế vì repository chưa cấu hình code-signing secrets.
 
-### Cấu hình mẫu nguồn cập nhật theo OS (27/08/2026)
+### Cấu hình mẫu nguồn cập nhật theo OS (28/08/2026)
 
 - Menu Cấu hình cập nhật lưu bền vững một mẫu riêng trong PostgreSQL cho Windows Server, Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7 và Oracle Linux 8; chọn lại OS/version sẽ tự điền WSUS hoặc các URL Pulp đã lưu, kể cả khi profile hiện chưa có máy online.
 - Có hai thao tác độc lập: `Lưu cấu hình mẫu` chỉ lưu cấu hình dùng lại và không cần chọn máy/ticket; `Áp dụng (N máy)` chỉ tạo công việc cho các máy đang chọn, không lưu hoặc ghi đè cấu hình mẫu.
 - API `GET /api/v1/settings/update-sources` và `PUT /api/v1/settings/update-sources/{profile}` yêu cầu quyền `updates.manage`, xác thực mode/URL/repository ID đúng OS/version, cấm credentials/query/fragment trong URL và ghi audit nhưng không ghi secret.
 - Ubuntu bắt buộc Base/Updates/Security đúng jammy hoặc noble, Backports tùy chọn; Oracle dùng đúng repo ID `ol7_*`/`ol8_*`; Windows lưu Internet hoặc WSUS. Agent không đổi, phiên bản vẫn `0.8.11`.
+- Đọc nguồn Oracle không còn buộc quản trị viên mở Công việc rồi quay lại bấm làm mới thủ công: dashboard tự theo dõi catalog mỗi 2,5 giây trong tối đa 2 phút, tự điền các repo ID/URL khi Agent hoàn tất và báo riêng trạng thái đang chờ, thất bại, hết hạn hoặc timeout. Bước đọc nguồn vẫn bắt buộc để chỉ thay đúng repo `ol7_*`/`ol8_*` đang bật và giữ nguyên Docker/EPEL/repo ứng dụng.
 - Lỗi khung hồng `Only Ubuntu 22.04/24.04 default repository switching is supported` xuất hiện vì dashboard gửi thừa trường `wsus_url` của Windows trong payload Ubuntu/Oracle (và gửi `repositories` vào Windows), khiến API từ chối trước khi tạo công việc. Payload nay được tách đúng theo từng OS và lỗi kiểm tra tham số đã được Việt hóa.
 - Kiểm thử mới nhất: control-plane `50/50`, render `22/22`, ESLint, `py_compile` và production build đều pass.
 

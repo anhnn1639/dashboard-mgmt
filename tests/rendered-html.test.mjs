@@ -167,6 +167,10 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.match(updateSettings, /persistSourceProfile/);
   assert.match(updateSettings, /Lưu cấu hình mẫu/);
   assert.match(updateSettings, /Áp dụng \(\$\{selectedIds\.length\} máy\)/);
+  assert.match(updateSettings, /SOURCE_READ_POLL_INTERVAL_MS/);
+  assert.match(updateSettings, /Đang chờ Agent đọc nguồn/);
+  assert.match(updateSettings, /Kết quả và các ô URL sẽ tự xuất hiện/);
+  assert.match(updateSettings, /setSourceReadWatch\(\{ profileKey: selectedProfile\.key/);
   assert.doesNotMatch(updateSettings, /Lưu và áp dụng/);
   const applySourceBody = updateSettings.match(/async function applySources[\s\S]*?\n\s{2}const savedProfile/)?.[0] ?? "";
   assert.match(applySourceBody, /createBulkTask\("patch\.source\.configure"/);

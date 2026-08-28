@@ -48,6 +48,15 @@ type SavedSourceProfile = {
   updatedAt: string | null;
 };
 
+type SourceReadWatch = {
+  profileKey: string;
+  osFamily: OSFamily;
+  serverIds: string[];
+};
+
+const SOURCE_READ_POLL_INTERVAL_MS = 2_500;
+const SOURCE_READ_POLL_TIMEOUT_MS = 120_000;
+
 function profileForServer(server: ManagedServer): Omit<SourceProfile, "servers"> | null {
   if (server.osFamily === "windows") {
     return { key: "windows-server", label: "Windows Server", platform: "windows", osFamily: "windows" };
@@ -123,6 +132,7 @@ export function UpdateSourceSettingsView({
   const [oracleUrls, setOracleUrls] = useState<Record<string, string>>({});
   const [reason, setReason] = useState("");
   const [savedProfiles, setSavedProfiles] = useState<Record<string, SavedSourceProfile>>({});
+  const [sourceReadWatch, setSourceReadWatch] = useState<SourceReadWatch | null>(null);
   const [busy, setBusy] = useState<"catalog" | "read" | "save" | "apply" | "">("");
   const [message, setMessage] = useState("");
   const [messageError, setMessageError] = useState(false);
@@ -140,6 +150,7 @@ export function UpdateSourceSettingsView({
       setUbuntuUrls({});
       setWsusUrl("");
       setOracleUrls({});
+      setSourceReadWatch(null);
       setMessage("");
     }, 0);
     return () => window.clearTimeout(timer);
@@ -178,6 +189,79 @@ export function UpdateSourceSettingsView({
     return () => window.clearTimeout(timer);
   }, [currentProfileKey, savedProfiles]);
 
+  useEffect(() => {
+    if (!sourceReadWatch) return;
+    let active = true;
+    let timer = 0;
+    const startedAt = Date.now();
+
+    async function poll() {
+      try {
+        const response = await fetch("/api/v1/bulk-update-sources/catalog", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ os_family: sourceReadWatch?.osFamily, server_ids: sourceReadWatch?.serverIds }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.detail ?? "Không thể theo dõi kết quả đọc nguồn cập nhật");
+        if (!active) return;
+        const nextCatalog = data as SourceCatalog;
+        if (nextCatalog.profile !== sourceReadWatch?.profileKey) throw new Error("Kết quả đọc nguồn không khớp nhóm hệ điều hành đang theo dõi");
+        setCatalog(nextCatalog);
+        const completeCount = nextCatalog.servers.filter((server) => server.status === "complete").length;
+        const failedServers = nextCatalog.servers.filter((server) => ["failed", "cancelled", "expired", "succeeded"].includes(server.status));
+        if (nextCatalog.ready) {
+          const saved = savedProfiles[nextCatalog.profile];
+          const nextMode = saved?.saved
+            ? saved.mode
+            : ["internet", "wsus", "default", "custom"].includes(nextCatalog.mode)
+              ? nextCatalog.mode as SourceMode
+              : defaultMode(nextCatalog.platform);
+          const currentRepositoryUrls = saved?.saved
+            ? Object.fromEntries(saved.repositories.map((repository) => [repository.id, repository.baseUrl]))
+            : Object.fromEntries(nextCatalog.repositories.map((repository) => [repository.id, repository.currentUrls.length === 1 ? repository.currentUrls[0] : ""]));
+          if (!saved?.saved && nextCatalog.platform === "ubuntu" && nextCatalog.repositoryUrl) {
+            for (const suite of ubuntuRepositorySuites(nextCatalog.profile)) currentRepositoryUrls[suite.id] ||= nextCatalog.repositoryUrl;
+          }
+          setMode(nextMode);
+          setUbuntuUrls(nextCatalog.platform === "ubuntu" ? currentRepositoryUrls : {});
+          setWsusUrl(saved?.saved ? saved.wsusUrl : nextCatalog.wsusUrl || "");
+          setOracleUrls(nextCatalog.platform === "oracle" ? currentRepositoryUrls : {});
+          setMessageError(false);
+          setMessage(`Đã đọc nguồn thành công trên ${completeCount}/${nextCatalog.servers.length} máy. Các repository đang dùng đã được điền tự động.`);
+          setSourceReadWatch(null);
+          return;
+        }
+        if (failedServers.length) {
+          setMessageError(true);
+          setMessage(`Không đọc được nguồn trên ${failedServers.map((server) => server.name).join(", ")}. Mở Công việc để xem lỗi Agent rồi thử lại.`);
+          setSourceReadWatch(null);
+          return;
+        }
+        if (Date.now() - startedAt >= SOURCE_READ_POLL_TIMEOUT_MS) {
+          setMessageError(true);
+          setMessage(`Agent chưa trả kết quả sau 2 phút (${completeCount}/${nextCatalog.servers.length} máy hoàn tất). Kiểm tra kết nối Agent hoặc mở Công việc để xem trạng thái.`);
+          setSourceReadWatch(null);
+          return;
+        }
+        setMessageError(false);
+        setMessage(`Đang chờ Agent đọc nguồn: ${completeCount}/${nextCatalog.servers.length} máy hoàn tất. Kết quả sẽ tự cập nhật tại đây.`);
+        timer = window.setTimeout(() => void poll(), SOURCE_READ_POLL_INTERVAL_MS);
+      } catch (cause) {
+        if (!active) return;
+        setMessageError(true);
+        setMessage(cause instanceof Error ? cause.message : "Không thể theo dõi kết quả đọc nguồn cập nhật");
+        setSourceReadWatch(null);
+      }
+    }
+
+    timer = window.setTimeout(() => void poll(), 800);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [savedProfiles, sourceReadWatch, token]);
+
   const selectedServers = selectedProfile?.servers.filter((server) => selectedIds.includes(server.id)) ?? [];
   const visibleServers = selectedProfile?.servers.filter((server) => {
     const needle = normalizeSearch(search);
@@ -186,6 +270,7 @@ export function UpdateSourceSettingsView({
 
   function toggleServer(serverId: string) {
     setSelectedIds((current) => current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId]);
+    setSourceReadWatch(null);
     setCatalog(null);
     setMessage("");
   }
@@ -194,6 +279,7 @@ export function UpdateSourceSettingsView({
     const visibleIds = visibleServers.map((server) => server.id);
     const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
     setSelectedIds((current) => allSelected ? current.filter((id) => !visibleIds.includes(id)) : Array.from(new Set([...current, ...visibleIds])));
+    setSourceReadWatch(null);
     setCatalog(null);
     setMessage("");
   }
@@ -311,12 +397,14 @@ export function UpdateSourceSettingsView({
   }
 
   async function readSources() {
+    if (!selectedProfile || !selectedIds.length) return;
     setBusy("read");
     setMessage("");
     try {
       await createBulkTask("patch.source.read", {}, `Đọc nguồn cập nhật trên ${selectedIds.length} máy cùng hệ điều hành`);
       setMessageError(false);
-      setMessage(`Đã xếp hàng ${selectedIds.length} công việc đọc nguồn. Mở Công việc để theo dõi, sau đó làm mới dữ liệu tại đây.`);
+      setMessage(`Đã xếp hàng ${selectedIds.length} công việc đọc nguồn. Hệ thống đang chờ Agent và sẽ tự điền repository khi hoàn tất.`);
+      setSourceReadWatch({ profileKey: selectedProfile.key, osFamily: selectedProfile.osFamily, serverIds: [...selectedIds] });
       notify(`Đã xếp hàng đọc nguồn cập nhật cho ${selectedIds.length} máy`);
     } catch (cause) {
       setMessageError(true);
@@ -377,11 +465,14 @@ export function UpdateSourceSettingsView({
   if (sourceValidationMessage) formProblems.push(sourceValidationMessage);
   if (reason.trim().length < 5) formProblems.push("Nhập lý do hoặc mã ticket tối thiểu 5 ký tự.");
   const formValidationMessage = formProblems.join(" ");
+  const sourceReadCompleteCount = catalog?.servers.filter((server) => server.status === "complete").length ?? 0;
+  const sourceReadFailedCount = catalog?.servers.filter((server) => ["failed", "cancelled", "expired", "succeeded"].includes(server.status)).length ?? 0;
+  const sourceReadWaitingCount = catalog ? Math.max(0, catalog.servers.length - sourceReadCompleteCount - sourceReadFailedCount) : 0;
 
   return <section className="panel update-source-settings-page">
     <div className="update-settings-toolbar">
       <div><h2>Cấu hình nguồn cập nhật</h2><p>Lưu một cấu hình mẫu riêng cho từng OS/version; khi chọn lại nhóm, hệ thống tự điền mirror hoặc WSUS đã lưu.</p></div>
-      <div className="update-settings-toolbar-actions"><button type="button" className="button ghost" disabled={Boolean(busy) || !selectedIds.length} onClick={() => void loadCatalog(true)}>{busy === "catalog" ? "Đang đọc…" : "↻ Làm mới dữ liệu"}</button><button type="button" className="button ghost" disabled={Boolean(busy) || !selectedIds.length} onClick={() => void readSources()}>{busy === "read" ? "Đang tạo…" : `Đọc lại nguồn (${selectedIds.length})`}</button></div>
+      <div className="update-settings-toolbar-actions"><button type="button" className="button ghost" disabled={Boolean(busy) || !selectedIds.length} onClick={() => void loadCatalog(true)}>{busy === "catalog" ? "Đang đọc…" : "↻ Làm mới dữ liệu"}</button><button type="button" className="button ghost" disabled={Boolean(busy) || Boolean(sourceReadWatch) || !selectedIds.length} onClick={() => void readSources()}>{busy === "read" ? "Đang tạo…" : sourceReadWatch ? "Đang chờ Agent…" : `Đọc lại nguồn (${selectedIds.length})`}</button></div>
     </div>
     <div className="update-settings-filter-grid">
       <label>Nhóm hệ điều hành<select value={selectedProfile?.key ?? ""} onChange={(event) => setProfileKey(event.target.value)}>{profiles.map((profile) => <option key={profile.key} value={profile.key}>{profile.label} · {profile.servers.length} máy</option>)}</select></label>
@@ -392,14 +483,14 @@ export function UpdateSourceSettingsView({
       <section className="update-settings-targets">
         <div className="update-settings-section-head"><div><h3>Máy chủ đích</h3><p>{selectedIds.length}/{selectedProfile?.servers.length ?? 0} máy đã chọn</p></div><button type="button" onClick={toggleVisible}>{visibleServers.length > 0 && visibleServers.every((server) => selectedIds.includes(server.id)) ? "Bỏ chọn kết quả" : "Chọn kết quả"}</button></div>
         <div className="update-source-server-list">{visibleServers.map((server) => <label key={server.id}><input type="checkbox" checked={selectedIds.includes(server.id)} onChange={() => toggleServer(server.id)} /><span><b>{server.name}</b><small>{server.address} · {server.os} {server.version}</small></span><em className={server.health}>{server.health === "offline" ? "Chờ kết nối" : "Sẵn sàng"}</em></label>)}{!visibleServers.length ? <div className="empty-state">Không có máy phù hợp bộ lọc.</div> : null}</div>
-        {catalog ? <div className="update-source-read-state"><b>Nguồn hiện tại</b><span>{catalog.servers.filter((server) => server.status === "complete").length}/{catalog.servers.length} máy đã đọc thành công</span>{catalog.mode === "mixed" ? <small>Các máy đang dùng nguồn khác nhau; lựa chọn bên phải sẽ đồng bộ lại toàn bộ máy đã chọn.</small> : null}</div> : <div className="update-source-read-state muted"><span>Nhấn “Làm mới dữ liệu” để đối chiếu nguồn hiện tại của các máy đã chọn.</span></div>}
+        {catalog ? <div className="update-source-read-state"><b>Nguồn hiện tại</b><span>{sourceReadCompleteCount}/{catalog.servers.length} máy đã đọc thành công</span>{sourceReadFailedCount ? <small>{sourceReadFailedCount} máy đọc thất bại; mở Công việc để xem chi tiết.</small> : sourceReadWaitingCount ? <small>{sourceReadWaitingCount} máy đang chờ hoặc đang được Agent xử lý; hệ thống tự cập nhật kết quả.</small> : catalog.mode === "mixed" ? <small>Các máy đang dùng nguồn khác nhau; lựa chọn bên phải sẽ đồng bộ lại toàn bộ máy đã chọn.</small> : null}</div> : <div className="update-source-read-state muted"><span>Nhấn “Làm mới dữ liệu” để đối chiếu nguồn hiện tại của các máy đã chọn.</span></div>}
       </section>
       <form className="resource-form update-source-bulk-form" onSubmit={applySources} noValidate>
         <div className="update-settings-section-head"><div><h3>Nguồn áp dụng</h3><p>{selectedProfile?.label}</p></div><div className="update-source-profile-badges"><span className={`state-pill ${savedProfile?.saved ? "healthy" : "warning"}`}>{savedProfile?.saved ? "Đã lưu mẫu" : "Chưa lưu mẫu"}</span><span className="state-pill">{selectedServers.length} máy</span></div></div>
         {selectedProfile?.platform === "windows" ? <fieldset><legend>Chế độ Windows Update</legend><label className="source-choice" aria-label="Microsoft Update qua Internet"><input name="bulk-windows-source" type="radio" checked={mode !== "wsus"} onChange={() => setMode("internet")} /><span><b>Microsoft Update qua Internet</b><small>Gỡ thiết lập WSUS do Agent quản lý và dùng nguồn công khai của Windows.</small></span></label><label className="source-choice" aria-label="Ép dùng WSUS"><input name="bulk-windows-source" type="radio" checked={mode === "wsus"} onChange={() => setMode("wsus")} /><span><b>Ép dùng WSUS</b><small>Đồng bộ WUServer, WUStatusServer và UseWUServer trên toàn bộ máy đã chọn.</small></span></label></fieldset> : selectedProfile?.platform === "ubuntu" ? <fieldset><legend>Repository Ubuntu</legend><label className="source-choice" aria-label="Repo mặc định của Ubuntu"><input name="bulk-ubuntu-source" type="radio" checked={mode !== "custom"} onChange={() => setMode("default")} /><span><b>Repo mặc định của Ubuntu</b><small>Khôi phục nguồn Ubuntu trước lần thay đổi đầu tiên.</small></span></label><label className="source-choice" aria-label="Mirror Ubuntu nội bộ"><input name="bulk-ubuntu-source" type="radio" checked={mode === "custom"} onChange={() => setMode("custom")} /><span><b>Mirror Ubuntu nội bộ</b><small>Chỉ thay nguồn Ubuntu chuẩn; Docker, PPA và repo ứng dụng khác được giữ nguyên.</small></span></label></fieldset> : <fieldset><legend>Repository Oracle Linux</legend><label className="source-choice" aria-label="Repo mặc định của Oracle Linux"><input name="bulk-oracle-source" type="radio" checked={mode !== "custom"} onChange={() => setMode("default")} /><span><b>Repo mặc định của Oracle Linux</b><small>Khôi phục trạng thái các repo hệ điều hành trước lần cấu hình đầu tiên.</small></span></label><label className="source-choice" aria-label="Repo Oracle Linux nội bộ"><input name="bulk-oracle-source" type="radio" checked={mode === "custom"} onChange={() => setMode("custom")} /><span><b>Repo Oracle Linux nội bộ</b><small>Chỉ thay các repo ol7_*/ol8_* thật đang dùng trên từng máy; repo ứng dụng khác được giữ nguyên.</small></span></label></fieldset>}
         {selectedProfile?.platform === "windows" && mode === "wsus" ? <label>Địa chỉ WSUS<input value={wsusUrl} onChange={(event) => setWsusUrl(event.target.value)} placeholder="http://wsus.company.local:8530" spellCheck={false} required /></label> : null}
         {selectedProfile?.platform === "ubuntu" && mode === "custom" ? <fieldset><legend>URL Pulp Distribution cho từng nguồn Ubuntu</legend><div className="update-source-repository-list">{ubuntuRepositorySuites(selectedProfile.key).map((suite) => <label key={suite.id}><span>{suite.label}<small>{suite.id}{suite.optional ? " · tùy chọn" : " · bắt buộc"}</small></span><input value={ubuntuUrls[suite.id] ?? ""} onChange={(event) => setUbuntuUrls((current) => ({ ...current, [suite.id]: event.target.value }))} placeholder={suite.placeholder} spellCheck={false} required={!suite.optional} /></label>)}</div><div className="resource-help">Chữ màu xám trong ô chỉ là ví dụ, không phải dữ liệu đã lưu. Dán đúng URL Distribution mà Pulp hiển thị cho từng suite. Base, Updates và Security là bắt buộc; Backports để trống nếu chưa đồng bộ. Agent tạo từng nguồn APT riêng và giữ nguyên Docker, PPA cùng repository ứng dụng.</div></fieldset> : null}
-        {selectedProfile?.platform === "oracle" && mode === "custom" ? <fieldset><legend>URL cho từng repo Oracle đang dùng</legend><div className="update-source-repository-list">{oracleRepositoryItems.map((repository) => <label key={repository.id}><span>{repository.id}<small>{repository.requiredOn}/{selectedIds.length} máy cần repo này</small></span><input value={oracleUrls[repository.id] ?? ""} onChange={(event) => setOracleUrls((current) => ({ ...current, [repository.id]: event.target.value }))} placeholder={`https://repo.company.local/${repository.id}/$basearch`} spellCheck={false} required /></label>)}{!oracleRepositoryItems.length ? <div className="resource-help warning">Cần chọn máy, bấm “Đọc lại nguồn”, đợi công việc hoàn tất rồi “Làm mới dữ liệu” để lấy đúng ID repo từ từng Agent.</div> : null}</div></fieldset> : null}
+        {selectedProfile?.platform === "oracle" && mode === "custom" ? <fieldset><legend>URL cho từng repo Oracle đang dùng</legend><div className="update-source-repository-list">{oracleRepositoryItems.map((repository) => <label key={repository.id}><span>{repository.id}<small>{repository.requiredOn}/{selectedIds.length} máy cần repo này</small></span><input value={oracleUrls[repository.id] ?? ""} onChange={(event) => setOracleUrls((current) => ({ ...current, [repository.id]: event.target.value }))} placeholder={`https://repo.company.local/${repository.id}/$basearch`} spellCheck={false} required /></label>)}{!oracleRepositoryItems.length ? <div className="resource-help warning">Bấm “Đọc lại nguồn” để Agent xác định đúng các repo ol7_*/ol8_* đang bật. Kết quả và các ô URL sẽ tự xuất hiện khi công việc hoàn tất.</div> : null}</div></fieldset> : null}
         <label>Lý do / ticket (chỉ cần khi áp dụng xuống máy)<textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} minLength={5} maxLength={2000} required placeholder="CHG-1234 · Mục đích thay đổi nguồn cập nhật" /></label>
         <div className="resource-help">Mỗi máy nhận một công việc riêng và được kiểm tra lại theo OS/version trước khi chạy. Sau khi áp dụng thành công, Agent tự đọc lại nguồn thực tế rồi quét danh sách patch phù hợp.</div>
         {sourceValidationMessage ? <div className="resource-help warning update-source-validation" role="status">{sourceValidationMessage}</div> : null}
