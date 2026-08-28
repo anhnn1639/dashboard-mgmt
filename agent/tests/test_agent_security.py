@@ -69,6 +69,16 @@ class AgentSecurityTests(unittest.TestCase):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Version="$(var.AgentVersion)"', wix_source)
 
+    def test_windows_installer_does_not_wait_for_network_enrollment(self):
+        wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
+        self.assertIn('Wait="no"', wix_source)
+        agent_source = MODULE_PATH.read_text(encoding="utf-8")
+        service_source = agent_source.split("def run_windows_service", 1)[1].split("\ndef main", 1)[0]
+        self.assertLess(
+            service_source.index("set_status(SERVICE_RUNNING)"),
+            service_source.index("bootstrap_from_windows_installer"),
+        )
+
     def test_repository_url_rejects_embedded_credentials_and_query(self):
         self.assertEqual(tram_agent.validated_repository_url("http://repo.internal/ubuntu/"), "http://repo.internal/ubuntu")
         for value in ("ftp://repo.internal/ubuntu", "https://user:secret@repo.internal/ubuntu", "https://repo.internal/ubuntu?token=secret", "https://repo.internal/ubuntu#latest"):

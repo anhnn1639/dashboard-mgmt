@@ -4161,16 +4161,21 @@ def run_windows_service(config: Config, log_file: str | None) -> None:
         status_handle = advapi32.RegisterServiceCtrlHandlerExW(service_name, control_handler, None)
         if not status_handle:
             return
-        set_status(SERVICE_START_PENDING, wait_hint=120_000)
+        # Enrollment can require outbound TLS and must never hold the Windows
+        # Installer in StartServices. Report the service as running as soon as
+        # its control handler is ready; bounded bootstrap continues here and
+        # failures are logged before SCM applies the configured restart policy.
+        set_status(SERVICE_RUNNING)
         exit_code = 0
         try:
             enrolled = all(path.exists() for path in (config.cert_file, config.key_file, config.ca_file))
             if not enrolled:
+                LOG.info("Windows service is enrolling with the control plane")
                 bootstrap_from_windows_installer(config, read_windows_bootstrap_source())
+                LOG.info("Windows service enrollment completed")
             delete_windows_bootstrap_source()
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             service_child = subprocess.Popen(child_agent_command(config, log_file), creationflags=creation_flags, text=True)
-            set_status(SERVICE_RUNNING)
             while not service_stop.wait(1):
                 result = service_child.poll()
                 if result is not None:

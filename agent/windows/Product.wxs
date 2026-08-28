@@ -35,7 +35,7 @@
                           Start="install"
                           Stop="both"
                           Remove="uninstall"
-                          Wait="yes" />
+                          Wait="no" />
         </Component>
       </Directory>
     </StandardDirectory>
