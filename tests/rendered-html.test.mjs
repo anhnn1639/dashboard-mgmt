@@ -464,15 +464,17 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v2.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.deepEqual(manifest.js, ["tram-clipboard-sync.js"]);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v2");
+  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v2.js"]);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.2[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
   assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*service\.setClipboard\(new ClipboardData/);
   assert.match(extension, /addEventListener\('focus', resyncIfNeeded, true\)/);
+  assert.match(extension, /isPasteShortcut[\s\S]*resyncClipboard\(true\)/);
   assert.match(extension, /pendingClipboardSync[\s\S]*sendKeyEventAfterClipboardSync/);
   assert.match(extension, /pendingClipboardSync[\s\S]*sendMouseStateAfterClipboardSync/);
 
@@ -586,4 +588,24 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   await waitForImmediate();
   assert.deepEqual(remoteWrites, ["A", "B"], "a denied read must not write stale data");
   assert.equal(forwardedKeys.length, 2);
+
+  // Chrome may return the previous clipboard value during the focus event.
+  // Ctrl+V must force a second read and hold the V key until that read has
+  // synchronized the newer value.
+  windowListeners.get("blur")();
+  browserClipboard = "B";
+  windowListeners.get("focus")();
+  await waitForImmediate();
+  browserClipboard = "C";
+  holdNextRead = true;
+  documentListeners.get("keydown")({ ctrlKey: true, key: "v", code: "KeyV", keyCode: 86 });
+  client.sendKeyEvent(1, 0x76);
+  assert.equal(forwardedKeys.length, 2, "first Ctrl+V must wait for a forced fresh read");
+
+  resolveRead(browserClipboard);
+  await waitForImmediate();
+  assert.equal(remoteClipboard, "C");
+  assert.equal(forwardedKeys.length, 3);
+  assert.equal(forwardedKeys[2].clipboard, "C");
+  assert.deepEqual(remoteWrites, ["A", "B", "B", "C"]);
 });

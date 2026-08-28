@@ -35,6 +35,8 @@ docker compose -f compose.yaml -f "$override" exec -T api \
   grep -Fq '/api/v1/settings/update-sources' /app/app/main.py
 docker compose -f compose.yaml -f "$override" exec -T guacamole \
   test -r /etc/guacamole/extensions/tram-clipboard-sync.jar
+docker compose -f compose.yaml -f "$override" exec -T guacamole \
+  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v2.js"
 
 docker compose -f compose.yaml -f "$override" ps api dashboard guacamole
 echo "Deployment verified at commit $revision"

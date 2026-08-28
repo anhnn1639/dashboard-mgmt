@@ -16,9 +16,22 @@
 
             var originalResyncClipboard = service.resyncClipboard.bind(service);
 
-            service.resyncClipboard = function resyncClipboard() {
-                if (pendingClipboardSync)
-                    return pendingClipboardSync;
+            service.resyncClipboard = function resyncClipboard(force) {
+                if (pendingClipboardSync) {
+                    if (!force)
+                        return pendingClipboardSync;
+
+                    // A focus-triggered read can complete with the clipboard
+                    // value that Chrome cached before the tab became active.
+                    // Queue one more read for an explicit paste shortcut and
+                    // let input wait for that newer read as well.
+                    var currentSync = pendingClipboardSync;
+                    return currentSync.then(function readClipboardAgain() {
+                        if (pendingClipboardSync && pendingClipboardSync !== currentSync)
+                            return pendingClipboardSync;
+                        return service.resyncClipboard(true);
+                    });
+                }
 
                 var browserClipboard = $window.navigator && $window.navigator.clipboard;
                 if (!browserClipboard || !browserClipboard.readText) {
@@ -82,14 +95,38 @@
                 resyncIfNeeded();
         }, true);
         document.addEventListener('pointerenter', resyncIfNeeded, true);
-        document.addEventListener('keydown', resyncIfNeeded, true);
+        function isPasteShortcut(event) {
+            var key = String(event.key || '').toLowerCase();
+            var code = String(event.code || '').toLowerCase();
+            var keyCode = Number(event.keyCode || event.which || 0);
+            var pasteWithControl = (event.ctrlKey || event.metaKey)
+                && (key === 'v' || code === 'keyv' || keyCode === 86);
+            var pasteWithInsert = event.shiftKey
+                && (key === 'insert' || code === 'insert' || keyCode === 45);
+            return pasteWithControl || pasteWithInsert;
+        }
+
+        function resyncForKeyboard(event) {
+            if (isPasteShortcut(event))
+                return clipboardService.resyncClipboard(true);
+            return resyncIfNeeded();
+        }
+
+        document.addEventListener('keydown', resyncForKeyboard, true);
         document.addEventListener('mousedown', resyncIfNeeded, true);
 
         function afterClipboardSync(callback) {
             var sync = pendingClipboardSync;
             if (!sync)
                 return callback();
-            sync.finally(callback);
+            sync.finally(function clipboardSyncSettled() {
+                // An explicit paste may have queued a second read behind the
+                // focus-triggered read. Do not forward input until the newest
+                // synchronization in the chain has also settled.
+                if (pendingClipboardSync && pendingClipboardSync !== sync)
+                    return afterClipboardSync(callback);
+                return callback();
+            });
         }
 
         // Backport the behavior of GUACAMOLE-2175 and cover keyboard paste as
