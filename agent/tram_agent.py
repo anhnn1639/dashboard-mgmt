@@ -73,6 +73,8 @@ MAX_TRANSFER_BYTES = 1024 * 1024 * 1024
 MAX_CONCURRENT_TUNNELS = 4
 MAX_CONCURRENT_JOBS = 4
 LINUX_BLOCK_SECTOR_BYTES = 512
+PROCESS_SNAPSHOT_CACHE_SECONDS = 1.0
+HOST_DISK_METRIC_INTERVAL_SECONDS = 30.0
 WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
 WINDOWS_UPDATE_METRIC_TIMEOUT_SECONDS = 30
 UPDATE_SOURCE_STATE_ROOT = Path("/var/lib/tram-agent/update-sources")
@@ -130,6 +132,10 @@ class Config:
         self.server_ca_file = Path(raw["server_ca_file"]) if raw.get("server_ca_file") else None
         self.interval = max(15, int(raw.get("interval", 30)))
         self.inventory_interval = max(300, int(raw.get("inventory_interval", 1800)))
+        self._signing_lock = threading.Lock()
+        self._signing_stamp: tuple[int, int, int, int] | None = None
+        self._signing_certificate_header = ""
+        self._signing_private_key: ec.EllipticCurvePrivateKey | None = None
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,18 +144,54 @@ class Config:
     def tls_verify(self) -> bool | str:
         return str(self.server_ca_file) if self.server_ca_file else True
 
+    def tls_material_stamp(self) -> tuple[tuple[str, int, int], ...]:
+        paths = [self.cert_file, self.key_file]
+        if self.server_ca_file:
+            paths.append(self.server_ca_file)
+        stamps = []
+        for path in paths:
+            stat = path.stat()
+            stamps.append((str(path), stat.st_mtime_ns, stat.st_size))
+        return tuple(stamps)
+
+    def signing_material(self) -> tuple[str, ec.EllipticCurvePrivateKey]:
+        """Load the endpoint identity once and reload it after atomic rotation."""
+        with self._signing_lock:
+            certificate_stat = self.cert_file.stat()
+            key_stat = self.key_file.stat()
+            stamp = (
+                certificate_stat.st_mtime_ns,
+                certificate_stat.st_size,
+                key_stat.st_mtime_ns,
+                key_stat.st_size,
+            )
+            if self._signing_stamp != stamp or self._signing_private_key is None:
+                certificate = x509.load_pem_x509_certificate(self.cert_file.read_bytes())
+                private_key = serialization.load_pem_private_key(self.key_file.read_bytes(), password=None)
+                if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+                    raise RuntimeError("Agent private key must be an EC key")
+                certificate_key = certificate.public_key()
+                if (
+                    not isinstance(certificate_key, ec.EllipticCurvePublicKey)
+                    or certificate_key.public_numbers() != private_key.public_key().public_numbers()
+                ):
+                    raise RuntimeError("Agent certificate does not match the private key")
+                self._signing_certificate_header = base64.b64encode(
+                    certificate.public_bytes(serialization.Encoding.DER)
+                ).decode()
+                self._signing_private_key = private_key
+                self._signing_stamp = stamp
+            return self._signing_certificate_header, self._signing_private_key
+
 
 def signed_headers(config: Config, method: str, url: str, body: bytes = b"") -> dict[str, str]:
     timestamp = str(int(time.time()))
     path = urlsplit(url).path
     message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
-    certificate = x509.load_pem_x509_certificate(config.cert_file.read_bytes())
-    private_key = serialization.load_pem_private_key(config.key_file.read_bytes(), password=None)
-    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
-        raise RuntimeError("Agent private key must be an EC key")
+    certificate_header, private_key = config.signing_material()
     signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
     return {
-        "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
+        "X-Tram-Agent-Certificate": certificate_header,
         "X-Tram-Agent-Timestamp": timestamp,
         "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
     }
@@ -391,10 +433,146 @@ def services_running(os_family: str) -> int:
         return 0
 
 
+class HostMetricsSampler:
+    """Collect lightweight heartbeat metrics without blocking the Agent loop."""
+
+    def __init__(self, disk_interval: float = HOST_DISK_METRIC_INTERVAL_SECONDS, clock: Any = time.monotonic):
+        self.disk_interval = disk_interval
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._disk_percent = 0.0
+        self._disk_sampled_at: float | None = None
+        self._boot_time = psutil.boot_time()
+
+    def prime_cpu(self) -> None:
+        with self._lock:
+            psutil.cpu_percent(interval=None)
+
+    def collect(self) -> dict[str, Any]:
+        with self._lock:
+            sampled_at = self.clock()
+            if self._disk_sampled_at is None or sampled_at - self._disk_sampled_at >= self.disk_interval:
+                self._disk_percent = max(
+                    (
+                        usage.percent
+                        for partition in psutil.disk_partitions(all=False)
+                        if (usage := safe_disk_usage(partition.mountpoint)) is not None
+                    ),
+                    default=0,
+                )
+                self._disk_sampled_at = sampled_at
+            memory_percent = psutil.virtual_memory().percent
+            return {
+                "cpu_percent": psutil.cpu_percent(interval=None),
+                "memory_percent": memory_percent,
+                "disk_percent": self._disk_percent,
+                "uptime_seconds": max(0, int(time.time() - self._boot_time)),
+                "alerts": int(self._disk_percent >= 90) + int(memory_percent >= 90),
+            }
+
+
+def linux_username_for_uid(uid: int) -> str:
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return str(uid)
+
+
+class ProcessSampler:
+    """Build one non-blocking process snapshot and calculate CPU from deltas."""
+
+    def __init__(self, cache_ttl: float = PROCESS_SNAPSHOT_CACHE_SECONDS, clock: Any = time.monotonic):
+        self.cache_ttl = cache_ttl
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._sampled_at: float | None = None
+        self._rows: list[dict[str, Any]] = []
+        self._cpu_samples: dict[tuple[int, float], tuple[float, float]] = {}
+        self._usernames: dict[tuple[int, float], str | None] = {}
+
+    def collect(self) -> list[dict[str, Any]]:
+        with self._lock:
+            sampled_at = self.clock()
+            if self._sampled_at is not None and sampled_at - self._sampled_at < self.cache_ttl:
+                return [row.copy() for row in self._rows]
+
+            linux = platform.system().lower() == "linux"
+            attrs = ["pid", "name", "create_time", "cpu_times", "memory_info"]
+            if linux:
+                attrs.append("uids")
+            total_memory = max(1, int(psutil.virtual_memory().total))
+            rows: list[dict[str, Any]] = []
+            cpu_samples: dict[tuple[int, float], tuple[float, float]] = {}
+            usernames: dict[tuple[int, float], str | None] = {}
+            uid_names: dict[int, str] = {}
+
+            for process in psutil.process_iter(attrs, ad_value=None):
+                try:
+                    info = process.info
+                    name = info.get("name")
+                    created = info.get("create_time")
+                    cpu_times = info.get("cpu_times")
+                    memory = info.get("memory_info")
+                    if not name or created is None or cpu_times is None or memory is None:
+                        continue
+                    key = (int(process.pid), float(created))
+                    cpu_total = float(cpu_times.user) + float(cpu_times.system)
+                    previous = self._cpu_samples.get(key)
+                    cpu_percent = 0.0
+                    if previous is not None:
+                        elapsed = sampled_at - previous[0]
+                        if elapsed > 0:
+                            cpu_percent = max(0.0, (cpu_total - previous[1]) * 100.0 / elapsed)
+                    cpu_samples[key] = (sampled_at, cpu_total)
+
+                    if key in self._usernames:
+                        username = self._usernames[key]
+                    elif linux:
+                        uids = info.get("uids")
+                        uid = int(uids.real) if uids is not None else -1
+                        if uid not in uid_names:
+                            uid_names[uid] = linux_username_for_uid(uid)
+                        username = uid_names[uid]
+                    else:
+                        try:
+                            username = process.username()
+                        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+                            username = None
+                    usernames[key] = username
+                    rss = int(memory.rss)
+                    rows.append(
+                        {
+                            "pid": int(process.pid),
+                            "name": str(name),
+                            "created": float(created),
+                            "username": username,
+                            "cpuPercent": round(cpu_percent, 2),
+                            "memoryPercent": round(rss * 100.0 / total_memory, 2),
+                            "memoryBytes": rss,
+                        }
+                    )
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError, ValueError):
+                    continue
+
+            rows.sort(key=lambda item: (-float(item["cpuPercent"]), -int(item["memoryBytes"]), int(item["pid"])))
+            self._cpu_samples = cpu_samples
+            self._usernames = usernames
+            self._rows = rows[:2000]
+            self._sampled_at = sampled_at
+            return [row.copy() for row in self._rows]
+
+
+_HOST_METRICS_SAMPLER = HostMetricsSampler()
+_PROCESS_SAMPLER = ProcessSampler()
+
+
 def collect_metrics(inventory: dict[str, Any], include_expensive: bool) -> dict[str, Any]:
-    disk = max((usage.percent for part in psutil.disk_partitions(all=False) if (usage := safe_disk_usage(part.mountpoint)) is not None), default=0)
-    memory = psutil.virtual_memory().percent
-    return {"cpu_percent": psutil.cpu_percent(interval=1), "memory_percent": memory, "disk_percent": disk, "uptime_seconds": max(0, int(time.time() - psutil.boot_time())), "pending_updates": pending_updates(inventory) if include_expensive else None, "services_running": services_running(inventory["os_family"]) if include_expensive else None, "alerts": int(disk >= 90) + int(memory >= 90)}
+    metrics = _HOST_METRICS_SAMPLER.collect()
+    metrics["pending_updates"] = pending_updates(inventory) if include_expensive else None
+    metrics["services_running"] = services_running(inventory["os_family"]) if include_expensive else None
+    return metrics
 
 
 def safe_disk_usage(path: str):
@@ -3693,34 +3871,7 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
     if action == "logs.read":
         return read_logs(parameters, windows)
     if action == "process.list":
-        processes: list[psutil.Process] = []
-        for process in psutil.process_iter(["pid", "name", "create_time", "username"]):
-            try:
-                if process.info.get("name"):
-                    process.cpu_percent(interval=None)
-                    processes.append(process)
-            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-                continue
-        # A short sample gives meaningful per-process CPU without making the
-        # dashboard wait for the next scheduled Agent collection.
-        time.sleep(0.35)
-        rows = []
-        for process in processes:
-            try:
-                memory = process.memory_info()
-                rows.append({
-                    "pid": process.pid,
-                    "name": process.info["name"],
-                    "created": process.info.get("create_time"),
-                    "username": process.info.get("username"),
-                    "cpuPercent": round(process.cpu_percent(interval=None), 2),
-                    "memoryPercent": round(process.memory_percent(), 2),
-                    "memoryBytes": int(memory.rss),
-                })
-            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-                continue
-        rows.sort(key=lambda item: (-float(item["cpuPercent"]), -int(item["memoryBytes"]), int(item["pid"])))
-        return 0, json.dumps(rows[:2000], ensure_ascii=False)
+        return 0, json.dumps(_PROCESS_SAMPLER.collect(), ensure_ascii=False)
     if action == "process.kill":
         return kill_processes(parameters)
     if action == "firewall.list":
@@ -3972,10 +4123,17 @@ def ensure_server_ca(config: Config) -> None:
     LOG.info("installed control-plane server CA")
 
 
-def post_result(config: Config, job_id: str, exit_code: int, output: str) -> None:
+def post_result(
+    config: Config,
+    job_id: str,
+    exit_code: int,
+    output: str,
+    session: requests.Session | None = None,
+) -> None:
     url = f"{config.agent_endpoint}/jobs/{job_id}/result"
     body, headers = signed_request(config, "POST", url, {"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output})
-    response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
+    client = session or requests
+    response = client.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
     response.raise_for_status()
 
 
@@ -3999,29 +4157,46 @@ def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[
 def loop(config: Config, once: bool = False) -> None:
     if not all(path.exists() for path in [config.cert_file, config.key_file, config.ca_file]):
         raise RuntimeError("Agent is not enrolled")
-    last_inventory = 0.0
+    _HOST_METRICS_SAMPLER.prime_cpu()
     inventory = collect_inventory()
+    last_inventory = time.time()
+    inventory_pending = True
     expensive_metrics_pending = False
     backoff = config.interval
     active_jobs: dict[str, tuple[dict[str, Any], Future[tuple[int, str]]]] = {}
     worker = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="tram-job")
+    control_session: requests.Session | None = None
+    control_session_stamp: tuple[tuple[str, int, int], ...] | None = None
+
+    def current_control_session() -> requests.Session:
+        nonlocal control_session, control_session_stamp
+        material_stamp = config.tls_material_stamp()
+        if control_session is None or material_stamp != control_session_stamp:
+            if control_session is not None:
+                control_session.close()
+            control_session = requests.Session()
+            control_session_stamp = material_stamp
+        return control_session
+
     if not once:
         threading.Thread(target=tunnel_control_loop, args=(config,), name="tram-tunnel-control", daemon=True).start()
     try:
         while True:
             try:
-                for job_id, (active_job, active_future) in list(active_jobs.items()):
+                for job_id, (_active_job, active_future) in list(active_jobs.items()):
                     if not active_future.done():
                         continue
                     exit_code, output = active_future.result()
-                    post_result(config, job_id, exit_code, output)
+                    post_result(config, job_id, exit_code, output, session=current_control_session())
                     del active_jobs[job_id]
 
                 ensure_server_ca(config)
                 timestamp = time.time()
-                send_inventory = timestamp - last_inventory >= config.inventory_interval
-                if send_inventory:
+                send_inventory = inventory_pending
+                if not inventory_pending and timestamp - last_inventory >= config.inventory_interval:
                     inventory = collect_inventory()
+                    inventory_pending = True
+                    send_inventory = True
                 include_expensive = expensive_metrics_pending and not send_inventory
                 active_job_ids = list(active_jobs)
                 payload: dict[str, Any] = {
@@ -4035,11 +4210,19 @@ def loop(config: Config, once: bool = False) -> None:
                     payload["active_job_ids"] = active_job_ids
                 url = config.agent_endpoint + "/checkin"
                 body, headers = signed_request(config, "POST", url, payload)
-                response = requests.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=240)
+                response = current_control_session().post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    cert=(str(config.cert_file), str(config.key_file)),
+                    verify=config.tls_verify(),
+                    timeout=240,
+                )
                 response.raise_for_status()
                 data = response.json()
                 if send_inventory:
                     last_inventory = timestamp
+                    inventory_pending = False
                     expensive_metrics_pending = True
                 elif include_expensive:
                     expensive_metrics_pending = False
@@ -4047,7 +4230,7 @@ def loop(config: Config, once: bool = False) -> None:
                 if once and jobs:
                     one_job = jobs[0]
                     exit_code, output = execute_dispatched_job(config, one_job, inventory)
-                    post_result(config, one_job["id"], exit_code, output)
+                    post_result(config, one_job["id"], exit_code, output, session=current_control_session())
                     return
                 for job in jobs:
                     job_id = str(job.get("id", ""))
@@ -4080,6 +4263,8 @@ def loop(config: Config, once: bool = False) -> None:
                 backoff = min(300, backoff * 2)
     finally:
         worker.shutdown(wait=once, cancel_futures=False)
+        if control_session is not None:
+            control_session.close()
 
 
 def default_config_path() -> str:

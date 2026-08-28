@@ -5,8 +5,9 @@ import os
 import subprocess
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -1169,6 +1170,208 @@ trusted
         with self.assertRaisesRegex(ValueError, "protected"):
             tram_agent.kill_processes({"processes": [{"pid": tram_agent.os.getpid(), "name": "python", "created": 1.0}]})
 
+    def test_process_sampler_is_single_pass_cached_and_handles_pid_reuse(self):
+        now = [10.0]
+        process = SimpleNamespace(
+            pid=101,
+            info={
+                "pid": 101,
+                "name": "worker",
+                "create_time": 1.0,
+                "cpu_times": SimpleNamespace(user=1.0, system=1.0),
+                "memory_info": SimpleNamespace(rss=100),
+                "uids": SimpleNamespace(real=1000),
+            },
+            username=MagicMock(return_value="unexpected"),
+        )
+        sampler = tram_agent.ProcessSampler(cache_ttl=1.0, clock=lambda: now[0])
+        with (
+            patch.object(tram_agent.platform, "system", return_value="Linux"),
+            patch.object(tram_agent.psutil, "process_iter", return_value=[process]) as process_iter,
+            patch.object(tram_agent.psutil, "virtual_memory", return_value=SimpleNamespace(total=1000)),
+            patch.object(tram_agent, "linux_username_for_uid", return_value="operator") as resolve_uid,
+            patch.object(tram_agent.time, "sleep") as sleep,
+        ):
+            first = sampler.collect()
+            cached = sampler.collect()
+            self.assertEqual(process_iter.call_count, 1)
+            self.assertEqual(first, cached)
+            self.assertEqual(first[0]["cpuPercent"], 0.0)
+            self.assertEqual(first[0]["memoryPercent"], 10.0)
+
+            now[0] = 15.0
+            process.info["cpu_times"] = SimpleNamespace(user=1.3, system=1.2)
+            second = sampler.collect()
+            self.assertEqual(process_iter.call_count, 2)
+            self.assertEqual(second[0]["cpuPercent"], 10.0)
+            self.assertEqual(resolve_uid.call_count, 1)
+
+            now[0] = 20.0
+            process.info["create_time"] = 2.0
+            process.info["cpu_times"] = SimpleNamespace(user=9.0, system=1.0)
+            reused = sampler.collect()
+            self.assertEqual(reused[0]["cpuPercent"], 0.0)
+            self.assertEqual(len(sampler._cpu_samples), 1)
+            process.username.assert_not_called()
+            sleep.assert_not_called()
+
+    def test_host_metrics_sampler_is_non_blocking_and_caches_disk_usage(self):
+        now = [200.0]
+        with (
+            patch.object(tram_agent.psutil, "boot_time", return_value=100.0),
+            patch.object(tram_agent.psutil, "cpu_percent", side_effect=[0.0, 12.5, 13.5]) as cpu_percent,
+            patch.object(tram_agent.psutil, "virtual_memory", return_value=SimpleNamespace(percent=50.0)),
+            patch.object(tram_agent.psutil, "disk_partitions", return_value=[SimpleNamespace(mountpoint="/")]) as partitions,
+            patch.object(tram_agent, "safe_disk_usage", return_value=SimpleNamespace(percent=40.0)) as disk_usage,
+            patch.object(tram_agent.time, "time", return_value=1000.0),
+        ):
+            sampler = tram_agent.HostMetricsSampler(disk_interval=30.0, clock=lambda: now[0])
+            sampler.prime_cpu()
+            first = sampler.collect()
+            now[0] = 205.0
+            second = sampler.collect()
+
+        self.assertEqual(first["cpu_percent"], 12.5)
+        self.assertEqual(second["cpu_percent"], 13.5)
+        self.assertEqual(second["disk_percent"], 40.0)
+        self.assertEqual(second["uptime_seconds"], 900)
+        self.assertEqual(partitions.call_count, 1)
+        self.assertEqual(disk_usage.call_count, 1)
+        self.assertEqual(cpu_percent.call_count, 3)
+        for call in cpu_percent.call_args_list:
+            self.assertIsNone(call.kwargs["interval"])
+
+    def test_signing_material_is_reused_until_identity_files_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = tram_agent.ec.generate_private_key(tram_agent.ec.SECP256R1())
+            subject = tram_agent.x509.Name([
+                tram_agent.x509.NameAttribute(tram_agent.NameOID.COMMON_NAME, "agent-test"),
+            ])
+            now = datetime.now(UTC)
+            certificate = (
+                tram_agent.x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(subject)
+                .public_key(private_key.public_key())
+                .serial_number(tram_agent.x509.random_serial_number())
+                .not_valid_before(now - timedelta(minutes=1))
+                .not_valid_after(now + timedelta(days=1))
+                .sign(private_key, tram_agent.hashes.SHA256())
+            )
+            (root / "agent.crt").write_bytes(certificate.public_bytes(tram_agent.serialization.Encoding.PEM))
+            (root / "agent.key").write_bytes(
+                private_key.private_bytes(
+                    tram_agent.serialization.Encoding.PEM,
+                    tram_agent.serialization.PrivateFormat.PKCS8,
+                    tram_agent.serialization.NoEncryption(),
+                )
+            )
+            config = tram_agent.Config(str(root / "agent.json"))
+            with (
+                patch.object(
+                    tram_agent.x509,
+                    "load_pem_x509_certificate",
+                    wraps=tram_agent.x509.load_pem_x509_certificate,
+                ) as certificate_loader,
+                patch.object(
+                    tram_agent.serialization,
+                    "load_pem_private_key",
+                    wraps=tram_agent.serialization.load_pem_private_key,
+                ) as key_loader,
+            ):
+                first = tram_agent.signed_headers(config, "POST", "https://control.example/api/checkin", b"one")
+                second = tram_agent.signed_headers(config, "POST", "https://control.example/api/checkin", b"two")
+
+            self.assertEqual(certificate_loader.call_count, 1)
+            self.assertEqual(key_loader.call_count, 1)
+            self.assertEqual(first["X-Tram-Agent-Certificate"], second["X-Tram-Agent-Certificate"])
+            self.assertNotEqual(first["X-Tram-Agent-Signature"], second["X-Tram-Agent-Signature"])
+
+    def test_one_shot_loop_reuses_initial_inventory_and_http_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename in ("agent.crt", "agent.key", "agent-ca.crt"):
+                (root / filename).write_text("test", encoding="ascii")
+            config = tram_agent.Config(str(root / "agent.json"))
+            config.agent_endpoint = "https://control.example/api/v1/agent"
+            response = MagicMock()
+            response.json.return_value = {"jobs": []}
+            session = MagicMock()
+            session.post.return_value = response
+            inventory = {"os_family": "linux", "distribution_id": "ubuntu"}
+            with (
+                patch.object(tram_agent.requests, "Session", return_value=session),
+                patch.object(tram_agent, "collect_inventory", return_value=inventory) as collect_inventory,
+                patch.object(tram_agent, "collect_metrics", return_value={}),
+                patch.object(tram_agent, "ensure_server_ca"),
+                patch.object(tram_agent, "signed_request", return_value=(b"{}", {})),
+                patch.object(tram_agent._HOST_METRICS_SAMPLER, "prime_cpu"),
+            ):
+                tram_agent.loop(config, once=True)
+
+            self.assertEqual(collect_inventory.call_count, 1)
+            self.assertEqual(session.post.call_count, 1)
+            session.close.assert_called_once_with()
+    def test_process_sampler_coalesces_concurrent_requests(self):
+        entered = tram_agent.threading.Event()
+        release = tram_agent.threading.Event()
+        process = SimpleNamespace(
+            pid=202,
+            info={
+                "pid": 202,
+                "name": "worker",
+                "create_time": 2.0,
+                "cpu_times": SimpleNamespace(user=1.0, system=0.0),
+                "memory_info": SimpleNamespace(rss=10),
+                "uids": SimpleNamespace(real=1000),
+            },
+        )
+
+        def processes(*_args, **_kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return [process]
+
+        sampler = tram_agent.ProcessSampler(cache_ttl=1.0, clock=lambda: 10.0)
+        with (
+            patch.object(tram_agent.platform, "system", return_value="Linux"),
+            patch.object(tram_agent.psutil, "process_iter", side_effect=processes) as process_iter,
+            patch.object(tram_agent.psutil, "virtual_memory", return_value=SimpleNamespace(total=100)),
+            patch.object(tram_agent, "linux_username_for_uid", return_value="operator"),
+            tram_agent.ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(sampler.collect)
+            self.assertTrue(entered.wait(2))
+            second = executor.submit(sampler.collect)
+            release.set()
+            self.assertEqual(first.result(timeout=2), second.result(timeout=2))
+
+        self.assertEqual(process_iter.call_count, 1)
+
+    def test_process_sampler_keeps_windows_process_when_username_is_denied(self):
+        process = SimpleNamespace(
+            pid=303,
+            info={
+                "pid": 303,
+                "name": "System",
+                "create_time": 3.0,
+                "cpu_times": SimpleNamespace(user=0.0, system=1.0),
+                "memory_info": SimpleNamespace(rss=50),
+            },
+            username=MagicMock(side_effect=tram_agent.psutil.AccessDenied(pid=303)),
+        )
+        sampler = tram_agent.ProcessSampler(cache_ttl=1.0, clock=lambda: 10.0)
+        with (
+            patch.object(tram_agent.platform, "system", return_value="Windows"),
+            patch.object(tram_agent.psutil, "process_iter", return_value=[process]),
+            patch.object(tram_agent.psutil, "virtual_memory", return_value=SimpleNamespace(total=1000)),
+        ):
+            rows = sampler.collect()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pid"], 303)
+        self.assertIsNone(rows[0]["username"])
 
 if __name__ == "__main__":
     unittest.main()
