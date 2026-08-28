@@ -1307,6 +1307,19 @@ def token_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def bootstrap_claim_failure_reason(record: AgentBootstrapPackage | None, supplied_hash: str) -> str | None:
+    """Classify a bootstrap denial for server-side audit without exposing it to the caller."""
+    if record is None:
+        return "package_not_found"
+    if not hmac.compare_digest(record.secret_hash, supplied_hash):
+        return "secret_mismatch"
+    if record.used_at is not None:
+        return "already_used"
+    if aware(record.expires_at) < now():
+        return "expired"
+    return None
+
+
 def job_fernet() -> Fernet:
     try:
         return Fernet(settings.job_secret_key.encode())
@@ -3230,7 +3243,26 @@ def claim_agent_package(payload: AgentBootstrapClaimRequest, request: Request, d
         raise HTTPException(status_code=401, detail="Bootstrap claim is invalid or expired") from exc
     record = db.execute(select(AgentBootstrapPackage).where(AgentBootstrapPackage.id == payload.package_id).with_for_update()).scalar_one_or_none()
     supplied_hash = token_digest(payload.package_secret)
-    if not record or not hmac.compare_digest(record.secret_hash, supplied_hash) or record.used_at is not None or aware(record.expires_at) < now():
+    failure_reason = bootstrap_claim_failure_reason(record, supplied_hash)
+    if failure_reason is not None:
+        if record is not None:
+            audit(
+                db,
+                f"bootstrap:{record.id}",
+                "agent.package.claim.denied",
+                record.id,
+                request,
+                "blocked",
+                {
+                    "reason": failure_reason,
+                    "label": record.label,
+                    "os_family": record.expected_os_family,
+                    "created_at": aware(record.created_at).isoformat(),
+                    "expires_at": aware(record.expires_at).isoformat(),
+                    "used_at": aware(record.used_at).isoformat() if record.used_at else None,
+                },
+            )
+            db.commit()
         raise HTTPException(status_code=401, detail="Bootstrap claim is invalid or expired")
     family, _ = classify_os(payload.inventory)
     if family != record.expected_os_family:

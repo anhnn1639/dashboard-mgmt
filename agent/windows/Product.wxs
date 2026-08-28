@@ -10,6 +10,25 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Tram Van Hanh Agent is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!--
+      A generated Windows package carries its one-time bootstrap claim in the
+      MSI source filename. When an operator launches another generated MSI of
+      the same Agent version, Windows enters maintenance mode. Force that
+      maintenance run to use the newly launched source and rewrite machine
+      registry values; otherwise BootstrapSource can keep the expired filename
+      from the first installation.
+    -->
+    <SetProperty Id="REINSTALL"
+                 Value="ALL"
+                 Before="CostInitialize"
+                 Sequence="both"
+                 Condition="Installed AND NOT (REMOVE ~= &quot;ALL&quot;)" />
+    <SetProperty Id="REINSTALLMODE"
+                 Value="amusv"
+                 Before="CostInitialize"
+                 Sequence="both"
+                 Condition="Installed AND NOT (REMOVE ~= &quot;ALL&quot;)" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="TramVanHanhAgent">
         <Component Id="AgentServiceComponent" Guid="8D57A94B-8461-49D4-B3A4-6D0E076767CD" Bitness="always64">

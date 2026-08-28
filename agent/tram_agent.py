@@ -3845,6 +3845,11 @@ def bootstrap_enroll(config: Config, package_id: str, package_secret: str) -> No
         response = exc.response
         status = response.status_code if response is not None else "unknown"
         detail = http_error_detail(response) if response is not None else ""
+        if status == 401:
+            detail = (
+                f"{detail}; package_id={package_id}. "
+                "The one-time installer claim was rejected; generate a new installer package and run that file without renaming it."
+            ).strip("; ")
         suffix = f": {detail}" if detail else ""
         raise RuntimeError(f"Bootstrap enrollment failed (HTTP {status}){suffix}") from exc
     except requests.RequestException as exc:
@@ -4170,8 +4175,10 @@ def run_windows_service(config: Config, log_file: str | None) -> None:
         try:
             enrolled = all(path.exists() for path in (config.cert_file, config.key_file, config.ca_file))
             if not enrolled:
-                LOG.info("Windows service is enrolling with the control plane")
-                bootstrap_from_windows_installer(config, read_windows_bootstrap_source())
+                bootstrap_source = read_windows_bootstrap_source()
+                _, bootstrap_package_id, _, _ = parse_windows_installer_source(bootstrap_source)
+                LOG.info("Windows service is enrolling with package %s", bootstrap_package_id)
+                bootstrap_from_windows_installer(config, bootstrap_source)
                 LOG.info("Windows service enrollment completed")
             delete_windows_bootstrap_source()
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

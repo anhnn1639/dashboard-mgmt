@@ -450,6 +450,13 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 
 ## Ưu tiên sau smoke test
 
+### Sửa claim Windows MSI 0.8.13 (28/08/2026)
+
+- Nguyên nhân `POST /api/v1/agent-bootstrap/claim` trả `401` sau khi chạy MSI mới là Windows Installer đi vào maintenance/repair khi cài lại cùng ProductVersion và giữ `BootstrapSource` cũ. Vì claim một lần nằm trong tên file MSI, service tiếp tục gửi package/claim cũ đã dùng hoặc hết hạn dù quản trị viên vừa tải gói mới.
+- MSI 0.8.13 đặt `REINSTALL=ALL` và `REINSTALLMODE=amusv` cho maintenance không phải uninstall, buộc Windows dùng source MSI vừa chạy, làm mới file và ghi lại `BootstrapSource` trong HKLM. Nâng 0.8.12 lên 0.8.13 vẫn đi theo MajorUpgrade bình thường.
+- Agent chỉ log `package_id` đang enroll, tuyệt đối không log secret. Control plane vẫn trả thông báo `401` chung cho client nhưng ghi audit nội bộ `agent.package.claim.denied` với nguyên nhân `secret_mismatch`, `already_used` hoặc `expired` để chẩn đoán chính xác.
+- Kiểm thử local: Agent security `75/75`, control-plane `50/50`; cần dùng đúng file MSI 0.8.13 mới tải từ website và không đổi tên.
+
 ### Cập nhật Extend và audit retention 2026-08-17
 
 - Dashboard luôn hiển thị nút `Extend` trên partition/LV. Nút bật khi Agent báo tối thiểu 1 MiB có thể mở rộng; root LV Linux được extend nhưng vẫn khóa xóa, còn partition boot/root trực tiếp tiếp tục được bảo vệ.

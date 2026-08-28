@@ -1197,6 +1197,16 @@ class ClassificationTests(unittest.TestCase):
                 self.assertTrue(all(len(job.created_by) <= 36 for job in initial_jobs))
             replay = client.post("/api/v1/agent-bootstrap/claim", json=linux_claim)
             self.assertEqual(replay.status_code, 401)
+            with SessionLocal() as db:
+                denial = db.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.action == "agent.package.claim.denied", AuditEvent.target == bootstrap["package_id"])
+                    .order_by(AuditEvent.occurred_at.desc())
+                    .limit(1)
+                ).scalar_one()
+                self.assertEqual(denial.result, "blocked")
+                self.assertEqual(denial.detail["reason"], "already_used")
+                self.assertNotIn("secret", denial.detail)
 
             windows_package = client.post(
                 "/api/v1/agent-packages",

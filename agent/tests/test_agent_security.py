@@ -72,6 +72,11 @@ class AgentSecurityTests(unittest.TestCase):
     def test_windows_installer_does_not_wait_for_network_enrollment(self):
         wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
         self.assertIn('Wait="no"', wix_source)
+        self.assertIn('Id="REINSTALL"', wix_source)
+        self.assertIn('Value="ALL"', wix_source)
+        self.assertIn('Id="REINSTALLMODE"', wix_source)
+        self.assertIn('Value="amusv"', wix_source)
+        self.assertIn('Condition="Installed AND NOT (REMOVE ~= &quot;ALL&quot;)"', wix_source)
         agent_source = MODULE_PATH.read_text(encoding="utf-8")
         service_source = agent_source.split("def run_windows_service", 1)[1].split("\ndef main", 1)[0]
         self.assertLess(
@@ -261,6 +266,23 @@ class AgentSecurityTests(unittest.TestCase):
             with patch.object(tram_agent, "create_agent_identity", return_value=(MagicMock(), csr)), patch.object(tram_agent, "collect_inventory", return_value={"os_family": "linux"}), patch.object(tram_agent.requests, "post", return_value=response):
                 with self.assertRaisesRegex(RuntimeError, r"HTTP 500.*Initial server scan"):
                     tram_agent.bootstrap_enroll(config, "89d17447-bbd7-4f3c-a9a8-6796c9348b1a", "a" * 43)
+
+    def test_bootstrap_unauthorized_error_identifies_package_without_secret(self):
+        response = tram_agent.requests.Response()
+        response.status_code = 401
+        response.url = "https://ops.example.com/api/v1/agent-bootstrap/claim"
+        response._content = b'{"detail":"Bootstrap claim is invalid or expired"}'
+        package_id = "89d17447-bbd7-4f3c-a9a8-6796c9348b1a"
+        package_secret = "a" * 43
+        csr = MagicMock()
+        csr.public_bytes.return_value = b"test-csr"
+        with tempfile.TemporaryDirectory() as directory:
+            config = tram_agent.Config(str(Path(directory) / "agent.json"))
+            config.server_url = "https://ops.example.com"
+            with patch.object(tram_agent, "create_agent_identity", return_value=(MagicMock(), csr)), patch.object(tram_agent, "collect_inventory", return_value={"os_family": "windows"}), patch.object(tram_agent.requests, "post", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, rf"HTTP 401.*package_id={package_id}") as raised:
+                    tram_agent.bootstrap_enroll(config, package_id, package_secret)
+        self.assertNotIn(package_secret, str(raised.exception))
 
     def test_windows_pending_update_metric_is_cache_only_and_bounded(self):
         calls = []
