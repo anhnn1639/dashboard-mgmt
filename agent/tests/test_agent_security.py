@@ -540,7 +540,7 @@ trusted
                 return 0, "-P INPUT ACCEPT\n-A INPUT -s 10.64.83.172/32 -p tcp --dport 22 -j ACCEPT\n-A FORWARD -j DOCKER-USER"
             return 1, f"Table {table} does not exist"
 
-        with patch.object(tram_agent.shutil, "which", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
+        with patch.object(tram_agent, "find_system_command", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
             code, output = tram_agent.linux_firewall_rules()
         payload = json.loads(output)
         self.assertEqual(code, 0)
@@ -735,7 +735,7 @@ trusted
             commands.append(command)
             return (0, output) if command[-2:] == ["-S", "INPUT"] else (0, "ok")
 
-        with patch.object(tram_agent.shutil, "which", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
+        with patch.object(tram_agent, "find_system_command", side_effect=fake_which), patch.object(tram_agent, "run", side_effect=fake_run):
             code, _ = tram_agent.reorder_iptables_rule({"rule": rules[1], "before": rules[0]})
         self.assertEqual(code, 0)
         self.assertEqual(commands[1][:8], ["/usr/sbin/iptables", "-w", "-t", "filter", "-I", "INPUT", "1", "-p"])
