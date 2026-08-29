@@ -1,4 +1,4 @@
-# Bàn giao Codex — 28/08/2026
+# Bàn giao Codex — 29/08/2026
 
 ## Repository và trạng thái
 
@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Agent `0.8.15` đã đồng bộ source, Linux executable và Windows MSI trong repository. Gói Linux tiếp tục self-contained, không cài Python/pip hoặc tải dependency lúc cài và unit systemd giữ `AF_NETLINK`.
+- Source Agent/API/dashboard đã nâng lên `0.8.16` cho self-update và bảo vệ gỡ cài đặt. Hai binary đang bundle trong repository vẫn là `0.8.15` cho tới khi workflow của source commit 0.8.16 hoàn tất và sidecar provenance được kiểm tra/commit; không deploy image API ở commit trung gian thiếu artifact 0.8.16.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -119,6 +119,17 @@
 - Phiên bản: `0.8.15`; SHA-256 `0869F9F7684C6593245FECF534617E96B78CD1040AF168253D988803361B3A7E`.
 - GitHub Actions run `33184537597` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose`/inventory thật trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. Artifact sinh từ source commit `90fa0ebc9da9cca4769a4e1c5a5c8d00980a992b`.
 - `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
+
+## Self-update Agent và bảo vệ gỡ cài đặt 0.8.16
+
+- Trang **Bộ cài Agent** có bảng phiên bản toàn fleet, tìm kiếm/lọc/chọn tối đa 100 máy và xếp hàng cập nhật Windows/Linux theo lô. Agent `0.8.15` trở xuống phải cài đè thủ công đúng một lần lên bridge `0.8.16`; từ `0.8.16` trở đi website mới cho self-update, không cho downgrade và không nhận hệ điều hành/kiến trúc ngoài Windows/Linux x86_64.
+- API chỉ chọn artifact server-side và chỉ phát khi binary có sidecar `*.provenance.json` khớp chính xác release/version/kind/SHA-256/kích thước/source commit. Manifest ECDSA ký bằng Agent CA ràng buộc job, agent, platform, version và hash. Artifact tải qua mTLS 9443, cấm redirect, giới hạn 256 MiB và Agent kiểm lại header/kích thước/hash trước preflight. Docker image giữ assets `root:root`, directory `0555`, file `0444` và Linux binary `0555`; tiến trình API `ops` không thể sửa artifact lúc chạy.
+- Update là hàng rào độc quyền: chờ các job đang chạy xong, chặn dispatch job phía sau, báo `prepared` trước rồi mới chạy updater tách process/service. Linux giữ backup và rollback nếu service mới không lên. Windows dùng MSI; cả hai chỉ thành công khi runtime/check-in báo đúng version đích. Timeout 45 phút đánh dấu failed đúng một lần, không tự cài lại vô hạn; kết quả/check-in đúng version đến muộn vẫn được đối soát thành công.
+- Builtin Administrator đặt/luân phiên mật khẩu chống gỡ trong cùng trang. PostgreSQL chỉ lưu PBKDF2-SHA256 salt/verifier 600.000 vòng; đổi policy phải nhập mật khẩu hiện tại, có throttle namespace riêng với login, serialized bằng database lock, revision tăng đơn điệu và rollout retry tối đa ba lần với exponential backoff. Secret policy trong job được mã hóa; API/audit/browser không trả mật khẩu thô.
+- Windows MSI ẩn Remove/Modify và custom action từ chối uninstall thiếu permit HMAC dùng một lần, hết hạn ba phút; lệnh Agent hỏi mật khẩu qua TTY/stdin rồi mới gọi MSI. Linux bắt buộc root, Windows bắt buộc elevated Administrator. Agent cố gắng gửi denied/authorized/completed/failed bằng request ký số; completed thu hồi ngay fingerprint trong PostgreSQL rồi endpoint xóa identity/policy/permit/update staging. Nếu control plane mất kết nối sau khi OS đã gỡ binary, completed có thể không tới được và quản trị viên phải retire endpoint thủ công. Root/Local Administrator/SYSTEM vẫn có thể cưỡng ép xóa file nên production phải kết hợp EDR/WDAC/AppLocker/SELinux và quản lý đặc quyền.
+- Workflow Linux chạy `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL UBI 7/8 rồi upload binary cùng provenance. Workflow Windows kiểm runtime frozen, MSI ProductVersion, ký Authenticode khi có secrets và upload MSI cùng provenance. Artifact 0.8.16 chỉ được bundle sau khi đối chiếu sidecar `sourceCommit` đúng source SHA, hash/size, ELF x86_64, MSI ProductVersion và chữ ký nếu metadata báo signed.
+- Hardening còn lại: Agent CA hiện là online manifest signer và Authenticode chưa bắt buộc, nên môi trường high-assurance cần release key offline/độc lập, endpoint verify chữ ký release và enforce Authenticode; bổ sung per-Agent quota/rate limit cho artifact download để giảm DoS nếu một endpoint đã bị compromise.
+- Kiểm thử local trước source commit: Agent security `95/95`, control-plane `60/60`, render workspace `25/25`, ESLint, Vinext production build, `py_compile`, YAML và `git diff --check` đều pass. Lỗi validation `422` đã được redaction toàn cục nên không echo `input`/password; test bao phủ current/new/confirm password. Test chuyển nguồn Ubuntu có retry cleanup chỉ cho Windows `ERROR_DIR_NOT_EMPTY` transient đã tái hiện độc lập; không đổi mã production và không che lỗi cleanup khác.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
 

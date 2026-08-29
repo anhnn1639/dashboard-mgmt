@@ -424,6 +424,30 @@ test("Linux package is advertised as a self-contained offline installer", async 
   assert.match(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
 });
 
+test("Agent packages expose fleet self-update and uninstall password protection", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const controlPlaneDockerfile = await readFile(new URL("../control-plane/Dockerfile", import.meta.url), "utf8");
+  assert.match(source, /\/api\/v1\/agent-upgrades\/status/);
+  assert.match(source, /\/api\/v1\/agent-upgrades/);
+  assert.match(source, /Cập nhật Agent trực tiếp/);
+  assert.match(source, /Cần nâng thủ công 1 lần/);
+  assert.match(source, /Bảo vệ gỡ cài đặt Agent/);
+  assert.match(source, /\/api\/v1\/settings\/agent-uninstall-protection/);
+  assert.match(source, /canManageUninstallProtection && <article className="panel agent-uninstall-panel"/);
+  assert.match(source, /Mật khẩu gỡ Agent hiện tại<input name="current_password"/);
+  assert.match(source, /Mật khẩu gỡ Agent mới<input name="new_password"/);
+  assert.match(source, /const queued = Array\.isArray\(data\.queued\)/);
+  assert.match(source, /Agent bị bỏ qua và vẫn được giữ chọn/);
+  assert.match(source, /uninstallLoadFailed \? "Không tải được chính sách"/);
+  assert.match(source, /uninstallLoading \? "Đang thử lại…" : "Thử lại"/);
+  assert.match(source, /Cần xử lý lỗi/);
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(styles, /html\[data-theme="light"\][\s\S]*\.agent-upgrade-summary > span/);
+  assert.match(styles, /html\[data-theme="light"\] \.agent-upgrade-confirm-list > div/);
+  assert.match(controlPlaneDockerfile, /chown -R root:root \/opt\/tram-agent-assets/);
+  assert.match(controlPlaneDockerfile, /find \/opt\/tram-agent-assets -type f -exec chmod 0444/);
+});
+
 test("dashboard exposes build freshness and deployment verification", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");

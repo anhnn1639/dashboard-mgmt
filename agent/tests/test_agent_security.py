@@ -1,9 +1,13 @@
 import importlib.util
 import base64
+import contextlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +22,96 @@ tram_agent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tram_agent)
 
 
+@contextlib.contextmanager
+def temporary_directory_with_windows_cleanup_retry():
+    """Retry only the transient ERROR_DIR_NOT_EMPTY seen after atomic replaces."""
+    directory = Path(tempfile.mkdtemp())
+    try:
+        yield str(directory)
+    finally:
+        for attempt in range(5):
+            try:
+                shutil.rmtree(directory)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) != 145 or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
+
 class AgentSecurityTests(unittest.TestCase):
+    @staticmethod
+    def signed_upgrade_fixture(root: Path, os_family: str = "linux", architecture: str = "x86_64"):
+        private_key = tram_agent.ec.generate_private_key(tram_agent.ec.SECP256R1())
+        subject = tram_agent.x509.Name([
+            tram_agent.x509.NameAttribute(tram_agent.NameOID.COMMON_NAME, "agent-release-test-ca"),
+        ])
+        now = datetime.now(UTC)
+        certificate = (
+            tram_agent.x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(private_key.public_key())
+            .serial_number(tram_agent.x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .sign(private_key, tram_agent.hashes.SHA256())
+        )
+        config = tram_agent.Config(str(root / "agent.json"))
+        config.agent_endpoint = "https://control.example:9443/api/v1/agent"
+        config.ca_file.write_bytes(certificate.public_bytes(tram_agent.serialization.Encoding.PEM))
+        current = tram_agent.semantic_version(tram_agent.AGENT_VERSION)
+        target_version = f"{current[0]}.{current[1]}.{current[2] + 1}"
+        job_id = str(tram_agent.uuid.uuid4())
+        release_id = str(tram_agent.uuid.uuid4())
+        payload = b"standalone-agent-release"
+        artifact_key = "windows-amd64" if os_family == "windows" else "linux-x86_64"
+        manifest = {
+            "schema": 1,
+            "jobId": job_id,
+            "agentId": config.agent_id,
+            "releaseId": release_id,
+            "version": target_version,
+            "artifacts": {
+                artifact_key: {
+                    "sha256": tram_agent.hashlib.sha256(payload).hexdigest(),
+                    "size": len(payload),
+                    "osFamily": os_family,
+                    "architecture": architecture,
+                }
+            },
+        }
+        signature = base64.b64encode(
+            private_key.sign(tram_agent.canonical_json(manifest), tram_agent.ec.ECDSA(tram_agent.hashes.SHA256()))
+        ).decode()
+        return config, private_key, job_id, manifest, signature, payload
+
+    @staticmethod
+    def sign_upgrade_manifest(private_key, manifest: dict) -> str:
+        return base64.b64encode(
+            private_key.sign(tram_agent.canonical_json(manifest), tram_agent.ec.ECDSA(tram_agent.hashes.SHA256()))
+        ).decode()
+
+    @staticmethod
+    def uninstall_policy(password: str, revision: int = 1, salt: bytes = b"0123456789abcdef") -> dict:
+        verifier = tram_agent.hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            tram_agent.UNINSTALL_PBKDF2_ITERATIONS,
+            dklen=32,
+        )
+        return {
+            "revision": revision,
+            "enabled": True,
+            "algorithm": "pbkdf2-sha256",
+            "iterations": tram_agent.UNINSTALL_PBKDF2_ITERATIONS,
+            "salt": base64.b64encode(salt).decode(),
+            "verifier": base64.b64encode(verifier).decode(),
+        }
+
     def test_common_firewall_rule_auto_detects_supported_operating_system_backends(self):
         common = {"name": "SSH from jump", "direction": "in", "action": "allow", "protocol": "tcp", "local_port": 22, "remote_port": "any", "source": "any", "destination": "any", "family": "ipv4"}
         windows = {"os_family": "windows", "distribution_id": "windows"}
@@ -85,6 +178,520 @@ class AgentSecurityTests(unittest.TestCase):
             service_source.index("bootstrap_from_windows_installer"),
         )
 
+    def test_windows_installer_requires_a_short_lived_uninstall_permit(self):
+        wix_source = (MODULE_PATH.parent / "windows" / "Product.wxs").read_text(encoding="utf-8")
+        self.assertIn('<Property Id="ARPNOREMOVE" Value="1"', wix_source)
+        self.assertIn('<Property Id="ARPNOMODIFY" Value="1"', wix_source)
+        self.assertIn('<Property Id="TRAM_UNINSTALL_PERMIT" Hidden="yes" Secure="yes"', wix_source)
+        self.assertIn('<RegistryValue Name="ProductCode" Type="string" Value="[ProductCode]"', wix_source)
+        self.assertIn("consume-uninstall-permit --permit", wix_source)
+        self.assertIn('Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE"', wix_source)
+        custom_action = wix_source.split('<CustomAction Id="ValidateUninstallPermit"', 1)[1].split("</InstallExecuteSequence>", 1)[0]
+        self.assertNotIn("PASSWORD", custom_action.upper())
+
+    def test_signed_upgrade_manifest_is_bound_to_job_agent_platform_and_newer_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, private_key, job_id, manifest, signature, _payload = self.signed_upgrade_fixture(Path(directory))
+            inventory = {"os_family": "linux", "architecture": "x86_64"}
+            release = tram_agent.verify_upgrade_manifest(
+                config,
+                job_id,
+                {"manifest": manifest, "signature": signature},
+                inventory,
+            )
+            self.assertEqual(release["version"], manifest["version"])
+            self.assertEqual(release["artifact_key"], "linux-x86_64")
+
+            tampered = json.loads(json.dumps(manifest))
+            tampered["version"] = "99.99.99"
+            with self.assertRaisesRegex(ValueError, "signature is invalid"):
+                tram_agent.verify_upgrade_manifest(
+                    config,
+                    job_id,
+                    {"manifest": tampered, "signature": signature},
+                    inventory,
+                )
+
+            wrong_agent = json.loads(json.dumps(manifest))
+            wrong_agent["agentId"] = str(tram_agent.uuid.uuid4())
+            with self.assertRaisesRegex(ValueError, "not bound"):
+                tram_agent.verify_upgrade_manifest(
+                    config,
+                    job_id,
+                    {"manifest": wrong_agent, "signature": self.sign_upgrade_manifest(private_key, wrong_agent)},
+                    inventory,
+                )
+
+            same_version = json.loads(json.dumps(manifest))
+            same_version["version"] = tram_agent.AGENT_VERSION
+            with self.assertRaisesRegex(ValueError, "downgrade or same-version"):
+                tram_agent.verify_upgrade_manifest(
+                    config,
+                    job_id,
+                    {"manifest": same_version, "signature": self.sign_upgrade_manifest(private_key, same_version)},
+                    inventory,
+                )
+
+            wrong_platform = json.loads(json.dumps(manifest))
+            wrong_platform["artifacts"]["linux-x86_64"]["osFamily"] = "windows"
+            with self.assertRaisesRegex(ValueError, "platform does not match"):
+                tram_agent.verify_upgrade_manifest(
+                    config,
+                    job_id,
+                    {"manifest": wrong_platform, "signature": self.sign_upgrade_manifest(private_key, wrong_platform)},
+                    inventory,
+                )
+
+            with self.assertRaisesRegex(ValueError, "x86_64/AMD64 only"):
+                tram_agent.verify_upgrade_manifest(
+                    config,
+                    job_id,
+                    {"manifest": manifest, "signature": signature},
+                    {"os_family": "linux", "architecture": "aarch64"},
+                )
+
+    def test_upgrade_download_requires_signed_metadata_and_forbids_redirects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, _private_key, job_id, manifest, _signature, payload = self.signed_upgrade_fixture(root)
+            artifact = manifest["artifacts"]["linux-x86_64"]
+            release = {
+                "version": manifest["version"],
+                "sha256": artifact["sha256"],
+                "size": artifact["size"],
+                "artifact_key": "linux-x86_64",
+            }
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.__exit__.return_value = False
+            response.is_redirect = False
+            response.is_permanent_redirect = False
+            response.headers = {
+                "Content-Length": str(len(payload)),
+                "X-Tram-Agent-Version": release["version"],
+                "X-Tram-SHA256": release["sha256"],
+            }
+            response.iter_content.return_value = [payload[:7], payload[7:]]
+            with (
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(tram_agent, "signed_headers", return_value={"X-Test": "signed"}),
+                patch.object(tram_agent.requests, "get", return_value=response) as get,
+            ):
+                destination = tram_agent.download_upgrade_artifact(config, job_id, release, False)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertFalse(get.call_args.kwargs["allow_redirects"])
+            self.assertEqual(get.call_args.kwargs["cert"], (str(config.cert_file), str(config.key_file)))
+
+            redirected = MagicMock()
+            redirected.__enter__.return_value = redirected
+            redirected.__exit__.return_value = False
+            redirected.is_redirect = True
+            redirected.is_permanent_redirect = False
+            with (
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(tram_agent, "signed_headers", return_value={}),
+                patch.object(tram_agent.requests, "get", return_value=redirected),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "redirects are forbidden"):
+                    tram_agent.download_upgrade_artifact(config, str(tram_agent.uuid.uuid4()), release, False)
+
+    def test_linux_upgrade_is_scheduled_only_after_preparation_result_can_be_posted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = tram_agent.Config(str(root / "agent.json"))
+            job_id = str(tram_agent.uuid.uuid4())
+            artifact = root / "tram-agent"
+            artifact.write_bytes(b"ELF test")
+            release = {"version": "99.0.0", "sha256": "a" * 64, "size": artifact.stat().st_size, "artifact_key": "linux-x86_64"}
+            scheduled = SimpleNamespace(returncode=0, stderr="")
+            with (
+                patch.object(tram_agent, "verify_upgrade_manifest", return_value=release),
+                patch.object(tram_agent, "download_upgrade_artifact", return_value=artifact),
+                patch.object(tram_agent, "run", return_value=(0, json.dumps({"agent_version": release["version"]}))),
+                patch.object(tram_agent, "find_system_command", return_value="/usr/bin/systemd-run"),
+                patch.object(tram_agent.subprocess, "run", return_value=scheduled) as run,
+            ):
+                prepared = tram_agent.prepare_agent_upgrade(
+                    config,
+                    {"id": job_id, "parameters": {}},
+                    {"os_family": "linux", "architecture": "x86_64"},
+                )
+                self.assertIsInstance(prepared, tram_agent.DeferredJobResult)
+                self.assertEqual(run.call_count, 0)
+                self.assertTrue(json.loads(prepared.output)["prepared"])
+                prepared.after_result()
+            command = run.call_args.args[0]
+            self.assertEqual(command[:4], ["/usr/bin/systemd-run", "--unit", f"tram-agent-upgrade-{job_id}", "--collect"])
+            self.assertIn("apply-linux-update", command)
+            self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_linux_upgrade_records_success_and_rolls_back_a_failed_service_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job_id = str(tram_agent.uuid.uuid4())
+            stage = root / "updates" / job_id
+            stage.mkdir(parents=True)
+            source = stage / "tram-agent"
+            source.write_bytes(b"new frozen Agent")
+            open_context = MagicMock()
+            open_context.__enter__.return_value.fileno.return_value = 3
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with (
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+                patch.object(tram_agent.os, "geteuid", return_value=0, create=True),
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(Path, "read_text", return_value=tram_agent.AGENT_VERSION),
+                patch.object(Path, "open", return_value=open_context),
+                patch.object(Path, "chmod"),
+                patch.object(tram_agent.shutil, "copy2") as copy2,
+                patch.object(tram_agent.os, "fsync"),
+                patch.object(tram_agent.os, "replace") as replace,
+                patch.object(tram_agent, "atomic_write_text") as atomic_write,
+                patch.object(tram_agent, "find_system_command", return_value="/usr/bin/systemctl"),
+                patch.object(tram_agent.subprocess, "run", return_value=completed) as run,
+                patch.object(tram_agent, "write_pending_update_result") as pending,
+            ):
+                self.assertEqual(tram_agent.apply_linux_update(job_id, source, "99.0.0"), 0)
+            self.assertGreaterEqual(copy2.call_count, 2)
+            replace.assert_called_once()
+            atomic_write.assert_called_once_with(Path("/opt/tram-agent/VERSION"), "99.0.0\n", 0o644)
+            pending.assert_called_once()
+            self.assertEqual(pending.call_args.args[:2], (job_id, 0))
+            self.assertEqual(json.loads(pending.call_args.args[2]), {"updated": True, "version": "99.0.0"})
+            self.assertFalse(pending.call_args.args[3])
+            self.assertIn(["/usr/bin/systemctl", "is-active", "--quiet", "tram-agent.service"], [call.args[0] for call in run.call_args_list])
+
+            def failed_active(command, **_kwargs):
+                return SimpleNamespace(returncode=1 if "is-active" in command else 0, stdout="", stderr="")
+
+            with (
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+                patch.object(tram_agent.os, "geteuid", return_value=0, create=True),
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(Path, "read_text", return_value=tram_agent.AGENT_VERSION),
+                patch.object(Path, "open", return_value=open_context),
+                patch.object(Path, "chmod"),
+                patch.object(tram_agent.shutil, "copy2") as rollback_copy,
+                patch.object(tram_agent.os, "fsync"),
+                patch.object(tram_agent.os, "replace") as rollback_replace,
+                patch.object(tram_agent, "atomic_write_text") as rollback_write,
+                patch.object(tram_agent, "find_system_command", return_value="/usr/bin/systemctl"),
+                patch.object(tram_agent.subprocess, "run", side_effect=failed_active),
+                patch.object(tram_agent, "write_pending_update_result") as pending,
+            ):
+                self.assertEqual(tram_agent.apply_linux_update(job_id, source, "99.0.0"), 1)
+            self.assertGreaterEqual(rollback_copy.call_count, 3)
+            self.assertEqual(rollback_replace.call_count, 2)
+            self.assertEqual(
+                [call.args[1] for call in rollback_write.call_args_list],
+                ["99.0.0\n", tram_agent.AGENT_VERSION + "\n"],
+            )
+            pending.assert_called_once()
+            self.assertEqual(pending.call_args.args[:2], (job_id, 1))
+            self.assertIn("rolled back", pending.call_args.args[2])
+            self.assertFalse(pending.call_args.args[3])
+
+    def test_windows_upgrade_reports_only_the_exact_installed_version_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = tram_agent.Config(str(root / "identity" / "agent.json"))
+            job_id = str(tram_agent.uuid.uuid4())
+            stage = root / "updates" / job_id
+            stage.mkdir(parents=True)
+            msi = stage / "TramVanHanhAgent.msi"
+            msi.write_bytes(b"test MSI")
+            installed_agent = root / "Program Files" / "TramVanHanhAgent" / "tram-agent.exe"
+            installed_agent.parent.mkdir(parents=True)
+            installed_agent.write_bytes(b"installed Agent")
+
+            def successful_run(command, **_kwargs):
+                if command[0] == str(installed_agent):
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"agent_version": "99.0.0"}), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.dict(tram_agent.os.environ, {"ProgramFiles": str(root / "Program Files"), "SystemRoot": str(root / "Windows")}),
+                patch.object(tram_agent.platform, "system", return_value="Windows"),
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(tram_agent.time, "sleep"),
+                patch.object(tram_agent.subprocess, "run", side_effect=successful_run),
+                patch.object(tram_agent, "write_pending_update_result") as pending,
+            ):
+                self.assertEqual(tram_agent.apply_windows_update(config, job_id, msi, "99.0.0"), 0)
+            pending.assert_called_once()
+            self.assertEqual(pending.call_args.args[:2], (job_id, 0))
+            self.assertEqual(json.loads(pending.call_args.args[2])["installedVersion"], "99.0.0")
+            self.assertTrue(pending.call_args.args[3])
+
+            def mismatched_run(command, **_kwargs):
+                if command[0] == str(installed_agent):
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"agent_version": "98.0.0"}), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.dict(tram_agent.os.environ, {"ProgramFiles": str(root / "Program Files"), "SystemRoot": str(root / "Windows")}),
+                patch.object(tram_agent.platform, "system", return_value="Windows"),
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(tram_agent.time, "sleep"),
+                patch.object(tram_agent.subprocess, "run", side_effect=mismatched_run),
+                patch.object(tram_agent, "write_pending_update_result") as pending,
+            ):
+                self.assertEqual(tram_agent.apply_windows_update(config, job_id, msi, "99.0.0"), 1)
+            pending.assert_called_once()
+            self.assertEqual(pending.call_args.args[:2], (job_id, 1))
+            self.assertEqual(json.loads(pending.call_args.args[2])["installedVersion"], "98.0.0")
+            self.assertTrue(pending.call_args.args[3])
+
+            installed_agent.unlink()
+            with (
+                patch.dict(tram_agent.os.environ, {"ProgramFiles": str(root / "Program Files"), "SystemRoot": str(root / "Windows")}),
+                patch.object(tram_agent.platform, "system", return_value="Windows"),
+                patch.object(tram_agent, "update_root", return_value=root / "updates"),
+                patch.object(tram_agent.time, "sleep"),
+                patch.object(tram_agent.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
+                patch.object(tram_agent, "write_pending_update_result") as pending,
+            ):
+                self.assertEqual(tram_agent.apply_windows_update(config, job_id, msi, "99.0.0"), 1)
+            self.assertEqual(pending.call_args.args[:2], (job_id, 1))
+            self.assertEqual(json.loads(pending.call_args.args[2])["installedVersion"], "")
+
+    def test_agent_update_staging_cleanup_removes_only_old_uuid_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "updates"
+            root.mkdir()
+            cleanup_id = str(tram_agent.uuid.uuid4())
+            cleanup_stage = root / cleanup_id
+            cleanup_stage.mkdir()
+            (cleanup_stage / "artifact").write_bytes(b"release")
+            with patch.object(tram_agent, "update_root", return_value=root):
+                tram_agent.cleanup_update_stage(cleanup_id, False)
+                self.assertFalse(cleanup_stage.exists())
+                with self.assertRaises(ValueError):
+                    tram_agent.cleanup_update_stage("../outside", False)
+
+            stale = root / str(tram_agent.uuid.uuid4())
+            fresh = root / str(tram_agent.uuid.uuid4())
+            invalid = root / "not-a-job-id"
+            for path in (stale, fresh, invalid):
+                path.mkdir()
+            current_time = 10_000.0
+            os.utime(stale, (current_time - 500, current_time - 500))
+            os.utime(fresh, (current_time - 5, current_time - 5))
+            os.utime(invalid, (current_time - 500, current_time - 500))
+            with (
+                patch.object(tram_agent, "update_root", return_value=root),
+                patch.object(tram_agent.time, "time", return_value=current_time),
+            ):
+                tram_agent.prune_update_staging(False, minimum_age_seconds=60)
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(invalid.exists())
+
+    def test_uninstall_policy_stores_only_a_verifier_and_rejects_stale_revisions(self):
+        password = "Long-Uninstall-Password!"
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "uninstall-policy.json"
+            first = self.uninstall_policy(password, revision=1)
+            with (
+                patch.object(tram_agent, "uninstall_policy_path", return_value=policy_path),
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+            ):
+                code, output = tram_agent.install_uninstall_policy({"secret": json.dumps(first)})
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(output)["revision"], 1)
+                stored_text = policy_path.read_text(encoding="utf-8")
+                stored = json.loads(stored_text)
+                self.assertNotIn(password, stored_text)
+                self.assertEqual(len(base64.b64decode(stored["permit_secret"])), 32)
+                self.assertEqual(tram_agent.verify_uninstall_password(password)["revision"], 1)
+
+                code, output = tram_agent.install_uninstall_policy({"policy": first})
+                self.assertEqual(code, 0)
+                self.assertTrue(json.loads(output)["unchanged"])
+
+                second = self.uninstall_policy(password, revision=2, salt=b"fedcba9876543210")
+                tram_agent.install_uninstall_policy(second)
+                with self.assertRaisesRegex(ValueError, "stale"):
+                    tram_agent.install_uninstall_policy(first)
+
+    def test_uninstall_password_failures_are_rate_limited_and_permits_are_single_use(self):
+        password = "Another-Long-Uninstall-Password!"
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "uninstall-policy.json"
+            with (
+                patch.object(tram_agent, "uninstall_policy_path", return_value=policy_path),
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+            ):
+                tram_agent.install_uninstall_policy(self.uninstall_policy(password))
+                with self.assertRaisesRegex(RuntimeError, "incorrect"):
+                    tram_agent.verify_uninstall_password("wrong password")
+                failure_path = policy_path.with_name("uninstall-failures.json")
+                failure = json.loads(failure_path.read_text(encoding="utf-8"))
+                self.assertGreater(failure["blocked_until"], tram_agent.time.time())
+                with self.assertRaisesRegex(RuntimeError, "Too many invalid attempts"):
+                    tram_agent.verify_uninstall_password(password)
+
+                failure_path.unlink()
+                policy = tram_agent.verify_uninstall_password(password)
+                permit = tram_agent.create_windows_uninstall_permit(policy)
+                self.assertEqual(tram_agent.consume_windows_uninstall_permit(permit), 0)
+                self.assertFalse(permit.exists())
+                with self.assertRaisesRegex(RuntimeError, "permit is invalid"):
+                    tram_agent.consume_windows_uninstall_permit(permit)
+
+                tampered = tram_agent.create_windows_uninstall_permit(policy)
+                body = json.loads(tampered.read_text(encoding="utf-8"))
+                body["expires"] = 0
+                tampered.write_text(json.dumps(body), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "invalid or expired"):
+                    tram_agent.consume_windows_uninstall_permit(tampered)
+
+    def test_pending_upgrade_result_reports_runtime_version_and_survives_network_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending_path = root / "update-result.json"
+            config = tram_agent.Config(str(root / "agent.json"))
+            job_id = str(tram_agent.uuid.uuid4())
+            pending_path.write_text(
+                json.dumps({"job_id": job_id, "exit_code": 0, "output": '{"updated":true}'}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(tram_agent, "pending_update_result_path", return_value=pending_path),
+                patch.object(tram_agent, "post_result") as post_result,
+                patch.object(tram_agent, "cleanup_update_stage") as cleanup,
+            ):
+                self.assertTrue(tram_agent.report_pending_update_result(config))
+            post_result.assert_called_once_with(
+                config,
+                job_id,
+                0,
+                '{"updated":true}',
+                session=None,
+                agent_version=tram_agent.AGENT_VERSION,
+            )
+            self.assertFalse(pending_path.exists())
+            cleanup.assert_called_once_with(job_id, os.name == "nt")
+
+            pending_path.write_text(
+                json.dumps({"job_id": job_id, "exit_code": 1, "output": "rollback"}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(tram_agent, "pending_update_result_path", return_value=pending_path),
+                patch.object(tram_agent, "post_result", side_effect=tram_agent.requests.ConnectionError("offline")),
+                patch.object(tram_agent, "cleanup_update_stage") as cleanup,
+            ):
+                with self.assertRaises(tram_agent.requests.ConnectionError):
+                    tram_agent.report_pending_update_result(config)
+            self.assertTrue(pending_path.exists())
+            cleanup.assert_not_called()
+
+    def test_uninstall_audit_is_signed_and_network_failure_does_not_block_local_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = tram_agent.Config(str(root / "agent.json"))
+            config.agent_endpoint = "https://control.example:9443/api/v1/agent"
+            response = MagicMock()
+            with (
+                patch.object(tram_agent, "signed_request", return_value=(b"signed", {"X-Signature": "test"})) as signed,
+                patch.object(tram_agent.requests, "post", return_value=response) as post,
+            ):
+                self.assertTrue(tram_agent.report_uninstall_event(config, "authorized", "administrator", "manual removal"))
+            signed.assert_called_once_with(
+                config,
+                "POST",
+                "https://control.example:9443/api/v1/agent/uninstall-event",
+                {"agent_id": config.agent_id, "event": "authorized", "os_user": "administrator", "detail": "manual removal"},
+            )
+            post.assert_called_once()
+            self.assertEqual(post.call_args.kwargs["data"], b"signed")
+            self.assertEqual(post.call_args.kwargs["cert"], (str(config.cert_file), str(config.key_file)))
+            response.raise_for_status.assert_called_once()
+
+            with (
+                patch.object(tram_agent, "signed_request", return_value=(b"signed", {})),
+                patch.object(tram_agent.requests, "post", side_effect=tram_agent.requests.ConnectionError("offline")),
+            ):
+                self.assertFalse(tram_agent.report_uninstall_event(config, "completed", "administrator"))
+            with self.assertRaisesRegex(ValueError, "Unsupported uninstall event"):
+                tram_agent.report_uninstall_event(config, "password", "administrator")
+
+    def test_uninstall_removes_identity_policy_permits_and_update_staging_but_keeps_other_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity_root = Path(directory) / "identity"
+            identity_root.mkdir()
+            config = tram_agent.Config(str(identity_root / "agent.json"))
+            config.server_ca_file = identity_root / "server-ca.crt"
+            protected_names = [
+                config.path,
+                config.cert_file,
+                config.key_file,
+                config.ca_file,
+                config.server_ca_file,
+                identity_root / "bootstrap.json",
+                identity_root / "uninstall-policy.json",
+                identity_root / "uninstall-failures.json",
+                identity_root / "update-result.json",
+            ]
+            for path in protected_names:
+                path.write_text("secret", encoding="utf-8")
+            valid_permit = identity_root / f"uninstall-permit-{tram_agent.uuid.uuid4()}.json"
+            valid_permit.write_text("permit", encoding="utf-8")
+            unrelated = identity_root / "agent.log"
+            unrelated.write_text("audit log", encoding="utf-8")
+            invalid_permit = identity_root / "uninstall-permit-manual.json"
+            invalid_permit.write_text("keep", encoding="utf-8")
+            updates = identity_root / "updates"
+            (updates / str(tram_agent.uuid.uuid4())).mkdir(parents=True)
+            with (
+                patch.object(tram_agent, "pending_update_result_path", return_value=identity_root / "update-result.json"),
+                patch.object(tram_agent, "update_root", return_value=updates),
+            ):
+                tram_agent.remove_agent_sensitive_state(config, False)
+            for path in protected_names:
+                self.assertFalse(path.exists(), str(path))
+            self.assertFalse(valid_permit.exists())
+            self.assertFalse(updates.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(invalid_permit.exists())
+
+    def test_linux_uninstall_audits_denied_and_completed_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = tram_agent.Config(str(Path(directory) / "agent.json"))
+            with (
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+                patch.object(tram_agent.os, "geteuid", return_value=0, create=True),
+                patch.object(tram_agent.sys, "stdin", io.StringIO("wrong password\n")),
+                patch.object(tram_agent, "verify_uninstall_password", side_effect=RuntimeError("incorrect")),
+                patch.object(tram_agent, "report_uninstall_event") as report,
+                patch.object(tram_agent, "local_uninstall_user", return_value="root"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "incorrect"):
+                    tram_agent.uninstall_agent(config, True)
+            report.assert_called_once_with(config, "denied", "root", "Password verification failed or was rate-limited")
+
+            with (
+                patch.object(tram_agent.platform, "system", return_value="Linux"),
+                patch.object(tram_agent.os, "geteuid", return_value=0, create=True),
+                patch.object(tram_agent.sys, "stdin", io.StringIO("correct password\n")),
+                patch.object(tram_agent, "verify_uninstall_password", return_value={"revision": 1}),
+                patch.object(tram_agent, "report_uninstall_event") as report,
+                patch.object(tram_agent, "local_uninstall_user", return_value="root"),
+                patch.object(tram_agent, "find_system_command", return_value=None),
+                patch.object(tram_agent.shutil, "rmtree"),
+                patch.object(tram_agent, "remove_agent_sensitive_state") as remove_sensitive,
+            ):
+                self.assertEqual(tram_agent.uninstall_agent(config, True), 0)
+            self.assertEqual(
+                [call.args[1] for call in report.call_args_list],
+                ["authorized", "completed"],
+            )
+            self.assertEqual(
+                [call.args for call in remove_sensitive.call_args_list],
+                [(config, False, True), (config, False)],
+            )
+
     def test_repository_url_rejects_embedded_credentials_and_query(self):
         self.assertEqual(tram_agent.validated_repository_url("http://repo.internal/ubuntu/"), "http://repo.internal/ubuntu")
         for value in ("ftp://repo.internal/ubuntu", "https://user:secret@repo.internal/ubuntu", "https://repo.internal/ubuntu?token=secret", "https://repo.internal/ubuntu#latest"):
@@ -98,7 +705,7 @@ class AgentSecurityTests(unittest.TestCase):
             "deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse\n"
             "deb https://download.docker.com/linux/ubuntu jammy stable\n"
         )
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_with_windows_cleanup_retry() as directory:
             root = Path(directory)
             apt_root = root / "apt"
             state_root = root / "state"

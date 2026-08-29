@@ -88,6 +88,7 @@ def _tar_entry(archive: tarfile.TarFile, name: str, content: bytes, mode: int) -
 def linux_run_bundle(
     assets_root: Path,
     *,
+    agent_content: bytes | None = None,
     dashboard_url: str,
     package_id: str,
     package_secret: str,
@@ -102,10 +103,24 @@ def linux_run_bundle(
         "install-linux.sh": 0o750,
     }
     root = assets_root.resolve()
-    validate_linux_agent(root / LINUX_AGENT_PATH)
+    if agent_content is None:
+        agent_content = validate_linux_agent(root / LINUX_AGENT_PATH)
+    elif (
+        len(agent_content) < 1024 * 1024
+        or not agent_content.startswith(LINUX_ELF_MAGIC)
+        or agent_content[4:6] != b"\x02\x01"
+        or agent_content[18:20] != b"\x3e\x00"
+    ):
+        raise ValueError("The standalone Linux x86_64 agent artifact is invalid")
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
         for name, mode in required.items():
+            if name == str(LINUX_AGENT_PATH).replace("\\", "/"):
+                # The caller may supply the exact bytes already validated
+                # against release provenance. Never reopen that executable
+                # between validation and packaging.
+                _tar_entry(archive, name, agent_content, mode)
+                continue
             source = (assets_root / name).resolve()
             try:
                 source.relative_to(root)

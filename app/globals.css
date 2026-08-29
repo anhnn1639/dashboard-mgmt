@@ -4355,14 +4355,207 @@ textarea:focus-visible {
   border: 1px solid #273548;
   background: #0d1622;
 }
+.agent-fleet-panel,
+.agent-uninstall-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 22px;
+}
+.agent-management-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.agent-management-head h2 {
+  margin: 4px 0 7px;
+  color: #eef5ff;
+  font-size: calc(18px + var(--font-size-increase));
+}
+.agent-management-head p:not(.eyebrow) {
+  max-width: 850px;
+  margin: 0;
+  color: #8fa2b8;
+  line-height: 1.55;
+}
+.agent-management-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex: 0 0 auto;
+}
+.agent-upgrade-summary,
+.agent-protection-rollout {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 9px;
+}
+.agent-upgrade-summary > span,
+.agent-protection-rollout > span {
+  display: grid;
+  gap: 3px;
+  padding: 12px 14px;
+  border: 1px solid #29394d;
+  border-radius: 8px;
+  background: #0d1723;
+}
+.agent-upgrade-summary b,
+.agent-protection-rollout b {
+  color: #edf5ff;
+  font-size: calc(17px + var(--font-size-increase));
+}
+.agent-upgrade-summary small,
+.agent-protection-rollout small {
+  color: #73869d;
+  font-size: calc(8px + var(--font-size-increase));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.agent-upgrade-filters {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, 0.28fr) minmax(190px, 0.36fr);
+  gap: 9px;
+}
+.agent-upgrade-filters input,
+.agent-upgrade-filters select {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  padding: 0 11px;
+  border: 1px solid #314258;
+  border-radius: 7px;
+  color: #dce8f7;
+  background: #0b1521;
+}
+.agent-upgrade-table-wrap {
+  max-height: min(520px, 58vh);
+}
+.agent-upgrade-table {
+  min-width: 940px;
+}
+.agent-upgrade-table td {
+  vertical-align: middle;
+}
+.agent-upgrade-table td b,
+.agent-upgrade-table td small {
+  display: block;
+}
+.agent-upgrade-table td small {
+  margin-top: 3px;
+  color: #6f8299;
+}
+.os-family-badge {
+  display: inline-flex;
+  padding: 4px 7px;
+  border: 1px solid #2b4565;
+  border-radius: 999px;
+  color: #78aeef;
+  background: #13263e;
+  font-size: calc(8px + var(--font-size-increase));
+}
+.os-family-badge.linux {
+  border-color: #285044;
+  color: #71c9aa;
+  background: #123129;
+}
+.agent-upgrade-state.eligible,
+.agent-upgrade-state.update_available,
+.agent-upgrade-state.failed {
+  color: #f0b769;
+  border-color: #654b26;
+  background: rgba(235, 161, 56, 0.1);
+}
+.agent-upgrade-state.queued,
+.agent-upgrade-state.dispatched,
+.agent-upgrade-state.installing {
+  color: #78b6ff;
+  border-color: #2a5180;
+  background: rgba(52, 133, 230, 0.1);
+}
+.agent-upgrade-state.current,
+.agent-upgrade-state.succeeded {
+  color: #71c9aa;
+  border-color: #285044;
+  background: rgba(57, 213, 159, 0.07);
+}
+.agent-upgrade-state.manual_required,
+.agent-upgrade-state.offline,
+.agent-upgrade-state.unsupported,
+.agent-upgrade-state.newer {
+  color: #a4b2c2;
+  border-color: #39485a;
+  background: #17202c;
+}
+.agent-upgrade-reason {
+  display: block;
+  max-width: 420px;
+  color: #8ea2ba;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.agent-upgrade-confirm-list {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  padding: 9px;
+  overflow: auto;
+  border: 1px solid #2c3e54;
+  border-radius: 8px;
+  background: #0c1622;
+}
+.agent-upgrade-confirm-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 9px;
+  border-bottom: 1px solid #223146;
+}
+.agent-upgrade-confirm-list > div:last-child {
+  border-bottom: 0;
+}
+.agent-upgrade-confirm-list span,
+.agent-protection-updated {
+  color: #7f93aa;
+}
+.agent-protection-updated {
+  margin: 0;
+  font-size: calc(9px + var(--font-size-increase));
+}
 @media (max-width: 980px) {
   .agent-package-layout {
     grid-template-columns: 1fr;
+  }
+  .agent-upgrade-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+  .agent-upgrade-filters input {
+    grid-column: 1 / -1;
   }
 }
 @media (max-width: 620px) {
   .agent-package-options {
     grid-template-columns: 1fr;
+  }
+  .agent-management-head,
+  .agent-management-actions,
+  .agent-upgrade-confirm-list > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .agent-management-actions .button {
+    width: 100%;
+  }
+  .agent-upgrade-summary,
+  .agent-protection-rollout,
+  .agent-upgrade-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+  .agent-upgrade-filters input,
+  .agent-upgrade-filters select:last-child {
+    grid-column: 1 / -1;
   }
   .server-workspace .drawer-actions,
   .account-columns {
@@ -5988,6 +6181,9 @@ html[data-theme="light"] :where(
   .secure-file-form,
   .recording-player,
   .package-security-note,
+  .agent-upgrade-summary > span,
+  .agent-protection-rollout > span,
+  .agent-upgrade-confirm-list,
   .storage-summary-grid > div,
   .storage-tree,
   .vg-card,
@@ -6066,6 +6262,48 @@ html[data-theme="light"] :where(
   color: var(--ink);
 }
 
+html[data-theme="light"] .agent-upgrade-confirm-list > div {
+  border-color: var(--line-soft) !important;
+}
+
+html[data-theme="light"] .os-family-badge,
+html[data-theme="light"] :where(
+  .agent-upgrade-state.queued,
+  .agent-upgrade-state.dispatched,
+  .agent-upgrade-state.installing
+) {
+  background: #e8f1fc !important;
+  border-color: #afc9e7 !important;
+}
+
+html[data-theme="light"] .os-family-badge.linux,
+html[data-theme="light"] :where(
+  .agent-upgrade-state.current,
+  .agent-upgrade-state.succeeded
+) {
+  background: #e8f6f0 !important;
+  border-color: #afd8c8 !important;
+}
+
+html[data-theme="light"] :where(
+  .agent-upgrade-state.eligible,
+  .agent-upgrade-state.update_available,
+  .agent-upgrade-state.failed
+) {
+  background: #fff4df !important;
+  border-color: #e6c68b !important;
+}
+
+html[data-theme="light"] :where(
+  .agent-upgrade-state.manual_required,
+  .agent-upgrade-state.offline,
+  .agent-upgrade-state.unsupported,
+  .agent-upgrade-state.newer
+) {
+  background: #edf1f5 !important;
+  border-color: #c7d1dc !important;
+}
+
 html[data-theme="light"] :where(
   input:not([type="checkbox"]):not([type="radio"]),
   select,
@@ -6129,6 +6367,12 @@ html[data-theme="light"] :where(
   .log-source-list small,
   .permission-groups small,
   .role-manager > aside small,
+  .agent-management-head p:not(.eyebrow),
+  .agent-upgrade-summary small,
+  .agent-protection-rollout small,
+  .agent-upgrade-confirm-list span,
+  .agent-upgrade-reason,
+  .agent-protection-updated,
   .setup-intro > p:not(.login-eyebrow),
   .login-copy,
   .access-note,

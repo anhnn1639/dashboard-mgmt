@@ -27,7 +27,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import psutil
@@ -70,6 +70,8 @@ WINDOWS_RESERVED_FILENAMES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 MAX_TRANSFER_BYTES = 1024 * 1024 * 1024
+MAX_AGENT_UPDATE_BYTES = 256 * 1024 * 1024
+UNINSTALL_PBKDF2_ITERATIONS = 600_000
 MAX_CONCURRENT_TUNNELS = 4
 MAX_CONCURRENT_JOBS = 4
 LINUX_BLOCK_SECTOR_BYTES = 512
@@ -93,6 +95,7 @@ ALLOWED_ACTIONS = {
     "user.list", "group.list", "group.remove_user", "storage.list", "storage.extend", "storage.shrink",
     "storage.create", "storage.delete",
     "firewall.rule.add", "firewall.rule.add.auto", "firewall.rule.remove", "firewall.rule.reorder", "network.list", "file.deliver",
+    "agent.upgrade", "agent.uninstall.policy",
 }
 READ_ONLY_ACTIONS = {
     "inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "patch.source.read", "logs.sources", "logs.read",
@@ -1712,6 +1715,255 @@ def deliver_file(config: Config, parameters: dict[str, Any], inventory: dict[str
         with contextlib.suppress(OSError):
             temporary.unlink()
         return 4, f"Secure file delivery failed: {exc}"
+
+
+def semantic_version(value: str) -> tuple[int, int, int]:
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        raise ValueError("Agent release version must use MAJOR.MINOR.PATCH")
+    return tuple(int(item) for item in value.split("."))  # type: ignore[return-value]
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def platform_artifact_key(inventory: dict[str, Any]) -> str:
+    architecture = str(inventory.get("architecture", "")).lower()
+    if architecture not in {"amd64", "x86_64"}:
+        raise ValueError("Agent self-update supports x86_64/AMD64 only")
+    os_family = str(inventory.get("os_family", ""))
+    if os_family not in {"windows", "linux"}:
+        raise ValueError("Agent self-update supports Windows and Linux only")
+    return "windows-amd64" if os_family == "windows" else "linux-x86_64"
+
+
+def verify_upgrade_manifest(config: Config, job_id: str, parameters: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+    manifest = parameters.get("manifest")
+    signature_text = parameters.get("signature")
+    if not isinstance(manifest, dict) or not isinstance(signature_text, str):
+        raise ValueError("Signed release manifest is required")
+    try:
+        signature = base64.b64decode(signature_text, validate=True)
+        ca_certificate = x509.load_pem_x509_certificate(config.ca_file.read_bytes())
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("Agent release signature material is invalid") from exc
+    public_key = ca_certificate.public_key()
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise ValueError("Agent CA does not support ECDSA release signatures")
+    try:
+        public_key.verify(signature, canonical_json(manifest), ec.ECDSA(hashes.SHA256()))
+    except Exception as exc:
+        raise ValueError("Agent release signature is invalid") from exc
+
+    artifact_key = platform_artifact_key(inventory)
+    artifacts = manifest.get("artifacts")
+    artifact = artifacts.get(artifact_key) if isinstance(artifacts, dict) else None
+    if not isinstance(artifact, dict):
+        raise ValueError("Release does not contain an artifact for this host")
+    target_version = str(manifest.get("version", ""))
+    expected_hash = str(artifact.get("sha256", "")).lower()
+    expected_size = artifact.get("size")
+    if manifest.get("schema") != 1 or str(manifest.get("jobId", "")) != job_id or str(manifest.get("agentId", "")) != config.agent_id:
+        raise ValueError("Release manifest is not bound to this job and Agent")
+    try:
+        uuid.UUID(job_id)
+        uuid.UUID(str(manifest.get("releaseId", "")))
+        target_tuple = semantic_version(target_version)
+    except ValueError as exc:
+        raise ValueError("Release manifest identity or version is invalid") from exc
+    if target_tuple <= semantic_version(AGENT_VERSION):
+        raise ValueError("Agent downgrade or same-version reinstall is forbidden")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or isinstance(expected_size, bool) or not isinstance(expected_size, int) or not 1 <= expected_size <= MAX_AGENT_UPDATE_BYTES:
+        raise ValueError("Release artifact integrity metadata is invalid")
+    if str(artifact.get("osFamily", "")) != inventory.get("os_family") or str(artifact.get("architecture", "")).lower() not in {"amd64", "x86_64"}:
+        raise ValueError("Release artifact platform does not match this Agent")
+    return {"version": target_version, "sha256": expected_hash, "size": expected_size, "artifact_key": artifact_key}
+
+
+def update_root(windows: bool) -> Path:
+    return (Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "TramVanHanh/Updates") if windows else Path("/var/lib/tram-agent/updates")
+
+
+def pending_update_result_path(windows: bool) -> Path:
+    return update_root(windows).parent / "update-result.json"
+
+
+def cleanup_update_stage(job_id: str, windows: bool) -> None:
+    uuid.UUID(job_id)
+    root = update_root(windows).resolve()
+    stage = (root / job_id).resolve()
+    if stage.parent != root:
+        raise RuntimeError("Agent update stage path is invalid")
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def prune_update_staging(windows: bool, minimum_age_seconds: int = 3600) -> None:
+    root = update_root(windows)
+    if not root.is_dir():
+        return
+    cutoff = time.time() - minimum_age_seconds
+    for stage in root.iterdir():
+        if not stage.is_dir():
+            continue
+        try:
+            uuid.UUID(stage.name)
+            resolved = stage.resolve()
+            if resolved.parent != root.resolve() or stage.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(resolved, ignore_errors=True)
+        except (OSError, ValueError):
+            continue
+
+
+def secure_directory(path: Path, windows: bool) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+    if windows:
+        completed = subprocess.run(
+            ["icacls.exe", str(path), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError("Cannot protect the Agent update directory")
+
+
+def download_upgrade_artifact(config: Config, job_id: str, release: dict[str, Any], windows: bool) -> Path:
+    root = update_root(windows)
+    secure_directory(root, windows)
+    stage = root / job_id
+    if stage.exists():
+        shutil.rmtree(stage)
+    secure_directory(stage, windows)
+    destination = stage / ("TramVanHanhAgent.msi" if windows else "tram-agent")
+    temporary = stage / ".artifact.part"
+    url = f"{config.agent_endpoint}/upgrades/{job_id}/artifact?agent_id={config.agent_id}"
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with requests.get(
+            url,
+            headers=signed_headers(config, "GET", url),
+            cert=(str(config.cert_file), str(config.key_file)),
+            verify=config.tls_verify(),
+            timeout=600,
+            stream=True,
+            allow_redirects=False,
+        ) as response:
+            if response.is_redirect or response.is_permanent_redirect:
+                raise RuntimeError("Agent release download redirects are forbidden")
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length", "")
+            if not content_length.isdigit() or int(content_length) != release["size"]:
+                raise RuntimeError("Agent release Content-Length mismatch")
+            if response.headers.get("X-Tram-Agent-Version", "") != release["version"] or not hmac.compare_digest(response.headers.get("X-Tram-SHA256", "").lower(), release["sha256"]):
+                raise RuntimeError("Agent release response metadata mismatch")
+            with temporary.open("xb") as output:
+                for chunk in response.iter_content(128 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > release["size"] or written > MAX_AGENT_UPDATE_BYTES:
+                        raise RuntimeError("Agent release exceeds its signed size")
+                    output.write(chunk)
+                    digest.update(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        if written != release["size"] or not hmac.compare_digest(digest.hexdigest(), release["sha256"]):
+            raise RuntimeError("Agent release size or SHA-256 mismatch")
+        temporary.chmod(0o600 if windows else 0o700)
+        os.replace(temporary, destination)
+        return destination
+    except Exception:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
+class DeferredJobResult:
+    def __init__(self, exit_code: int, output: str, after_result: Callable[[], None]):
+        self.exit_code = exit_code
+        self.output = output
+        self.after_result = after_result
+
+
+def prepare_agent_upgrade(config: Config, job: dict[str, Any], inventory: dict[str, Any]) -> DeferredJobResult:
+    job_id = str(job.get("id", ""))
+    release = verify_upgrade_manifest(config, job_id, job.get("parameters", {}), inventory)
+    windows = inventory.get("os_family") == "windows"
+    artifact = download_upgrade_artifact(config, job_id, release, windows)
+    if windows:
+        with artifact.open("rb") as handle:
+            msi_magic = handle.read(8)
+        if msi_magic != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            raise RuntimeError("Downloaded Windows Agent package is not an MSI")
+    else:
+        code, output = run([str(artifact), "--config", str(config.path), "diagnose"], timeout=90)
+        try:
+            diagnosed_version = str(json.loads(output).get("agent_version", "")) if code == 0 else ""
+        except (TypeError, ValueError):
+            diagnosed_version = ""
+        if diagnosed_version != release["version"]:
+            raise RuntimeError("New Linux Agent failed version preflight")
+
+    def launch() -> None:
+        if windows:
+            if not getattr(sys, "frozen", False):
+                raise RuntimeError("Windows self-update requires the frozen Agent executable")
+            updater = artifact.parent / "tram-agent-updater.exe"
+            shutil.copy2(sys.executable, updater)
+            command = [str(updater), "--config", str(config.path), "apply-windows-update", "--job-id", job_id, "--msi", str(artifact), "--target-version", release["version"]]
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(command, creationflags=flags, close_fds=True)
+            return
+        systemd_run = find_system_command("systemd-run")
+        if not systemd_run:
+            raise RuntimeError("systemd-run is required for atomic Agent update")
+        unit = f"tram-agent-upgrade-{job_id}"
+        command = [systemd_run, "--unit", unit, "--collect", str(artifact), "--config", str(config.path), "apply-linux-update", "--job-id", job_id, "--source", str(artifact), "--target-version", release["version"]]
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=60, check=False)
+        if completed.returncode:
+            raise RuntimeError(f"Cannot schedule Linux Agent update: {completed.stderr.strip()[-1000:]}")
+
+    return DeferredJobResult(0, json.dumps({"prepared": True, "targetVersion": release["version"], "sha256": release["sha256"]}, separators=(",", ":")), launch)
+
+
+def uninstall_policy_path() -> Path:
+    if platform.system().lower() == "windows":
+        return Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "TramVanHanh/uninstall-policy.json"
+    return Path("/etc/tram-agent/uninstall-policy.json")
+
+
+def install_uninstall_policy(parameters: dict[str, Any]) -> tuple[int, str]:
+    raw = parameters.get("secret", parameters.get("policy", parameters))
+    try:
+        policy = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        revision = int(policy["revision"])
+        enabled = policy["enabled"] is True
+        iterations = int(policy["iterations"])
+        salt = base64.b64decode(str(policy["salt"]), validate=True)
+        verifier = base64.b64decode(str(policy["verifier"]), validate=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Uninstall policy is invalid") from exc
+    if set(policy) != {"revision", "enabled", "algorithm", "iterations", "salt", "verifier"} or policy.get("algorithm") != "pbkdf2-sha256" or revision < 1 or iterations != UNINSTALL_PBKDF2_ITERATIONS or len(salt) != 16 or len(verifier) != 32:
+        raise ValueError("Uninstall policy is invalid")
+    current_path = uninstall_policy_path()
+    current: dict[str, Any] = {}
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+    current_revision = int(current.get("revision", 0))
+    comparable = {key: policy[key] for key in ("revision", "enabled", "algorithm", "iterations", "salt", "verifier")}
+    if current_revision == revision:
+        if all(current.get(key) == value for key, value in comparable.items()):
+            return 0, json.dumps({"installed": True, "revision": revision, "enabled": enabled, "unchanged": True}, separators=(",", ":"))
+        raise ValueError("Uninstall policy revision conflicts with the installed policy")
+    if current_revision > revision:
+        raise ValueError("Uninstall policy revision is stale")
+    stored = {**policy, "enabled": enabled, "permit_secret": base64.b64encode(os.urandom(32)).decode()}
+    if platform.system().lower() == "windows":
+        secure_directory(current_path.parent, True)
+    atomic_write_text(current_path, json.dumps(stored, sort_keys=True, separators=(",", ":")), 0o600)
+    return 0, json.dumps({"installed": True, "revision": revision, "enabled": enabled}, separators=(",", ":"))
 
 
 def json_rows(output: str) -> list[dict[str, Any]]:
@@ -3768,6 +4020,10 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
         return 126, "Action is not allowlisted by this agent"
     if action == "file.deliver":
         return 126, "File delivery requires the signed agent download channel"
+    if action == "agent.upgrade":
+        return 126, "Agent upgrade requires the signed release channel"
+    if action == "agent.uninstall.policy":
+        return install_uninstall_policy(parameters)
     windows = inventory["os_family"] == "windows"
     if action == "inventory.collect":
         return 0, json.dumps(collect_inventory(), ensure_ascii=False, indent=2)
@@ -4129,20 +4385,48 @@ def post_result(
     exit_code: int,
     output: str,
     session: requests.Session | None = None,
+    agent_version: str | None = None,
 ) -> None:
     url = f"{config.agent_endpoint}/jobs/{job_id}/result"
-    body, headers = signed_request(config, "POST", url, {"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output})
+    payload: dict[str, Any] = {"status": "succeeded" if exit_code == 0 else "failed", "exit_code": exit_code, "output": output}
+    if agent_version:
+        payload["agent_version"] = agent_version
+    body, headers = signed_request(config, "POST", url, payload)
     client = session or requests
     response = client.post(url, data=body, headers=headers, cert=(str(config.cert_file), str(config.key_file)), verify=config.tls_verify(), timeout=60)
     response.raise_for_status()
 
 
-def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str]:
+def report_pending_update_result(config: Config, session: requests.Session | None = None) -> bool:
+    windows = platform.system().lower() == "windows"
+    pending_path = pending_update_result_path(windows)
+    if not pending_path.is_file():
+        return False
+    try:
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        job_id = str(pending["job_id"])
+        uuid.UUID(job_id)
+        exit_code = int(pending["exit_code"])
+        output = str(pending["output"])
+    except (OSError, ValueError, TypeError, KeyError):
+        LOG.exception("invalid pending Agent update result")
+        with contextlib.suppress(OSError):
+            pending_path.unlink()
+        return False
+    post_result(config, job_id, exit_code, output, session=session, agent_version=AGENT_VERSION)
+    pending_path.unlink()
+    cleanup_update_stage(job_id, windows)
+    return True
+
+
+def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[str, Any]) -> tuple[int, str] | DeferredJobResult:
     LOG.info("job %s action=%s", job["id"], job["action"])
     try:
         def execute() -> tuple[int, str]:
             if job["action"] == "file.deliver":
                 return deliver_file(config, job.get("parameters", {}), inventory)
+            if job["action"] == "agent.upgrade":
+                return prepare_agent_upgrade(config, job, inventory)  # type: ignore[return-value]
             return execute_job(job["action"], job.get("parameters", {}), inventory)
 
         if job["action"] in READ_ONLY_ACTIONS:
@@ -4157,13 +4441,20 @@ def execute_dispatched_job(config: Config, job: dict[str, Any], inventory: dict[
 def loop(config: Config, once: bool = False) -> None:
     if not all(path.exists() for path in [config.cert_file, config.key_file, config.ca_file]):
         raise RuntimeError("Agent is not enrolled")
+    try:
+        report_pending_update_result(config)
+    except requests.RequestException:
+        LOG.warning("pending Agent update result could not be reported yet")
+    windows_host = platform.system().lower() == "windows"
+    prune_update_staging(windows_host)
+    last_update_cleanup = time.time()
     _HOST_METRICS_SAMPLER.prime_cpu()
     inventory = collect_inventory()
     last_inventory = time.time()
     inventory_pending = True
     expensive_metrics_pending = False
     backoff = config.interval
-    active_jobs: dict[str, tuple[dict[str, Any], Future[tuple[int, str]]]] = {}
+    active_jobs: dict[str, tuple[dict[str, Any], Future[tuple[int, str] | DeferredJobResult]]] = {}
     worker = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="tram-job")
     control_session: requests.Session | None = None
     control_session_stamp: tuple[tuple[str, int, int], ...] | None = None
@@ -4183,12 +4474,26 @@ def loop(config: Config, once: bool = False) -> None:
     try:
         while True:
             try:
+                if time.time() - last_update_cleanup >= 3600:
+                    prune_update_staging(windows_host)
+                    last_update_cleanup = time.time()
+                report_pending_update_result(config, current_control_session())
                 for job_id, (_active_job, active_future) in list(active_jobs.items()):
                     if not active_future.done():
                         continue
-                    exit_code, output = active_future.result()
-                    post_result(config, job_id, exit_code, output, session=current_control_session())
-                    del active_jobs[job_id]
+                    result = active_future.result()
+                    if isinstance(result, DeferredJobResult):
+                        post_result(config, job_id, result.exit_code, result.output, session=current_control_session())
+                        del active_jobs[job_id]
+                        try:
+                            result.after_result()
+                        except Exception as exc:
+                            LOG.exception("prepared Agent update could not be scheduled")
+                            post_result(config, job_id, 1, f"Agent update scheduling failed: {type(exc).__name__}: {exc}", session=current_control_session(), agent_version=AGENT_VERSION)
+                    else:
+                        exit_code, output = result
+                        post_result(config, job_id, exit_code, output, session=current_control_session())
+                        del active_jobs[job_id]
 
                 ensure_server_ca(config)
                 timestamp = time.time()
@@ -4229,8 +4534,17 @@ def loop(config: Config, once: bool = False) -> None:
                 jobs = data.get("jobs", [])
                 if once and jobs:
                     one_job = jobs[0]
-                    exit_code, output = execute_dispatched_job(config, one_job, inventory)
-                    post_result(config, one_job["id"], exit_code, output, session=current_control_session())
+                    result = execute_dispatched_job(config, one_job, inventory)
+                    if isinstance(result, DeferredJobResult):
+                        post_result(config, one_job["id"], result.exit_code, result.output, session=current_control_session())
+                        try:
+                            result.after_result()
+                        except Exception as exc:
+                            LOG.exception("prepared Agent update could not be scheduled")
+                            post_result(config, one_job["id"], 1, f"Agent update scheduling failed: {type(exc).__name__}: {exc}", session=current_control_session(), agent_version=AGENT_VERSION)
+                    else:
+                        exit_code, output = result
+                        post_result(config, one_job["id"], exit_code, output, session=current_control_session())
                     return
                 for job in jobs:
                     job_id = str(job.get("id", ""))
@@ -4416,6 +4730,291 @@ def run_windows_service(config: Config, log_file: str | None) -> None:
         raise RuntimeError(f"Cannot connect to Windows Service Control Manager ({ctypes.get_last_error()})")
 
 
+def write_pending_update_result(job_id: str, exit_code: int, output: str, windows: bool) -> None:
+    path = pending_update_result_path(windows)
+    atomic_write_text(path, json.dumps({"job_id": job_id, "exit_code": exit_code, "output": output}, separators=(",", ":")), 0o600)
+
+
+def apply_linux_update(job_id: str, source: Path, target_version: str) -> int:
+    if platform.system().lower() == "windows" or os.geteuid() != 0:
+        raise RuntimeError("Linux Agent update requires root")
+    uuid.UUID(job_id)
+    semantic_version(target_version)
+    stage = update_root(False) / job_id
+    source = source.resolve()
+    if source.parent != stage.resolve() or source.name != "tram-agent" or not source.is_file():
+        raise RuntimeError("Linux Agent update source is outside the secure staging directory")
+    installed = Path("/opt/tram-agent/tram-agent")
+    version_file = Path("/opt/tram-agent/VERSION")
+    backup = stage / "tram-agent.previous"
+    temporary = installed.with_name(".tram-agent.update")
+    try:
+        previous_version = version_file.read_text(encoding="ascii").strip()
+        semantic_version(previous_version)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Installed Agent VERSION is unavailable") from exc
+    shutil.copy2(installed, backup)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.chmod(0o755)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        systemctl = find_system_command("systemctl")
+        if not systemctl:
+            raise RuntimeError("systemctl is required for Agent update")
+        subprocess.run([systemctl, "stop", "tram-agent.service"], timeout=60, check=False)
+        os.replace(temporary, installed)
+        atomic_write_text(version_file, target_version + "\n", 0o644)
+        started = subprocess.run([systemctl, "start", "tram-agent.service"], text=True, capture_output=True, timeout=60, check=False)
+        active = subprocess.run([systemctl, "is-active", "--quiet", "tram-agent.service"], timeout=30, check=False)
+        if started.returncode or active.returncode:
+            raise RuntimeError("Updated Agent service did not become active")
+        write_pending_update_result(job_id, 0, json.dumps({"updated": True, "version": target_version}, separators=(",", ":")), False)
+        return 0
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            shutil.copy2(backup, temporary)
+            temporary.chmod(0o755)
+            os.replace(temporary, installed)
+            atomic_write_text(version_file, previous_version + "\n", 0o644)
+        systemctl = find_system_command("systemctl")
+        if systemctl:
+            subprocess.run([systemctl, "start", "tram-agent.service"], timeout=60, check=False)
+        write_pending_update_result(job_id, 1, f"Agent update rolled back: {type(exc).__name__}: {exc}", False)
+        return 1
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def apply_windows_update(config: Config, job_id: str, msi: Path, target_version: str) -> int:
+    if platform.system().lower() != "windows":
+        raise RuntimeError("Windows Agent update is available only on Windows")
+    uuid.UUID(job_id)
+    semantic_version(target_version)
+    stage = update_root(True) / job_id
+    msi = msi.resolve()
+    if msi.parent != stage.resolve() or msi.name != "TramVanHanhAgent.msi" or not msi.is_file():
+        raise RuntimeError("Windows Agent update source is outside the secure staging directory")
+    time.sleep(5)
+    msiexec = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/msiexec.exe"
+    completed = subprocess.run([str(msiexec), "/i", str(msi), "/qn", "/norestart"], timeout=1800, check=False)
+    accepted = completed.returncode in {0, 1641, 3010}
+    installed_version = ""
+    installed_agent = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "TramVanHanhAgent/tram-agent.exe"
+    if accepted:
+        accepted = installed_agent.is_file()
+        if accepted:
+            diagnostic = subprocess.run([str(installed_agent), "--config", str(config.path), "diagnose"], text=True, capture_output=True, timeout=180, check=False, encoding="utf-8", errors="replace")
+            try:
+                installed_version = str(json.loads(diagnostic.stdout).get("agent_version", "")) if diagnostic.returncode == 0 else ""
+            except (TypeError, ValueError):
+                installed_version = ""
+            accepted = installed_version == target_version
+    output = json.dumps({"updated": accepted, "version": target_version, "installedVersion": installed_version, "msiExitCode": completed.returncode}, separators=(",", ":"))
+    write_pending_update_result(job_id, 0 if accepted else 1, output, True)
+    return 0 if accepted else 1
+
+
+def load_uninstall_policy() -> dict[str, Any]:
+    try:
+        policy = json.loads(uninstall_policy_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Uninstall password policy is not configured") from exc
+    if policy.get("enabled") is not True:
+        raise RuntimeError("Agent uninstall is disabled until an Administrator configures its password")
+    try:
+        if (
+            set(policy) != {"revision", "enabled", "algorithm", "iterations", "salt", "verifier", "permit_secret"}
+            or policy.get("algorithm") != "pbkdf2-sha256"
+            or int(policy.get("revision", 0)) < 1
+            or int(policy.get("iterations", 0)) != UNINSTALL_PBKDF2_ITERATIONS
+            or len(base64.b64decode(str(policy.get("salt", "")), validate=True)) != 16
+            or len(base64.b64decode(str(policy.get("verifier", "")), validate=True)) != 32
+            or len(base64.b64decode(str(policy.get("permit_secret", "")), validate=True)) != 32
+        ):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Stored uninstall policy is invalid") from exc
+    return policy
+
+
+def verify_uninstall_password(candidate: str) -> dict[str, Any]:
+    policy = load_uninstall_policy()
+    failure_path = uninstall_policy_path().with_name("uninstall-failures.json")
+    failures: dict[str, Any] = {}
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        failures = json.loads(failure_path.read_text(encoding="utf-8"))
+    blocked_until = float(failures.get("blocked_until", 0))
+    if blocked_until > time.time():
+        raise RuntimeError(f"Too many invalid attempts; retry in {int(blocked_until - time.time()) + 1} seconds")
+    try:
+        iterations = int(policy["iterations"])
+        salt = base64.b64decode(policy["salt"], validate=True)
+        expected = base64.b64decode(policy["verifier"], validate=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Stored uninstall policy is invalid") from exc
+    actual = hashlib.pbkdf2_hmac("sha256", candidate.encode("utf-8"), salt, iterations, dklen=32)
+    if not hmac.compare_digest(actual, expected):
+        count = min(20, int(failures.get("count", 0)) + 1)
+        delay = min(900, 2 ** min(count, 9))
+        atomic_write_text(failure_path, json.dumps({"count": count, "blocked_until": time.time() + delay}, separators=(",", ":")), 0o600)
+        LOG.warning("Agent uninstall password rejected")
+        raise RuntimeError("Uninstall password is incorrect")
+    with contextlib.suppress(OSError):
+        failure_path.unlink()
+    LOG.info("Agent uninstall password accepted")
+    return policy
+
+
+def create_windows_uninstall_permit(policy: dict[str, Any]) -> Path:
+    permit_id = str(uuid.uuid4())
+    expires = int(time.time()) + 180
+    body = {"id": permit_id, "expires": expires, "action": "uninstall"}
+    secret = base64.b64decode(policy["permit_secret"], validate=True)
+    body["mac"] = hmac.new(secret, canonical_json(body), hashlib.sha256).hexdigest()
+    path = uninstall_policy_path().parent / f"uninstall-permit-{permit_id}.json"
+    atomic_write_text(path, json.dumps(body, sort_keys=True, separators=(",", ":")), 0o600)
+    return path
+
+
+def consume_windows_uninstall_permit(path: Path) -> int:
+    policy = load_uninstall_policy()
+    resolved = path.resolve()
+    expected_parent = uninstall_policy_path().parent.resolve()
+    if resolved.parent != expected_parent or not re.fullmatch(r"uninstall-permit-[0-9a-f-]{36}\.json", resolved.name):
+        raise RuntimeError("Uninstall permit path is invalid")
+    try:
+        body = json.loads(resolved.read_text(encoding="utf-8"))
+        mac = str(body.pop("mac"))
+        secret = base64.b64decode(policy["permit_secret"], validate=True)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError("Uninstall permit is invalid") from exc
+    valid = hmac.compare_digest(mac, hmac.new(secret, canonical_json(body), hashlib.sha256).hexdigest())
+    if not valid or body.get("action") != "uninstall" or int(body.get("expires", 0)) < int(time.time()):
+        raise RuntimeError("Uninstall permit is invalid or expired")
+    resolved.unlink()
+    return 0
+
+
+def local_uninstall_user() -> str:
+    candidate = os.environ.get("SUDO_USER", "").strip() or getpass.getuser().strip()
+    return candidate[:128] if candidate and not any(ord(character) < 32 for character in candidate) else "unknown"
+
+
+def report_uninstall_event(config: Config, event: str, os_user: str, detail: str = "") -> bool:
+    if event not in {"denied", "authorized", "completed", "failed"}:
+        raise ValueError("Unsupported uninstall event")
+    url = config.agent_endpoint + "/uninstall-event"
+    payload = {"agent_id": config.agent_id, "event": event, "os_user": os_user[:128], "detail": detail[:500]}
+    try:
+        body, headers = signed_request(config, "POST", url, payload)
+        response = requests.post(
+            url,
+            data=body,
+            headers=headers,
+            cert=(str(config.cert_file), str(config.key_file)),
+            verify=config.tls_verify(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        return True
+    except (OSError, ValueError, requests.RequestException) as exc:
+        LOG.warning("central uninstall audit could not be delivered: %s", type(exc).__name__)
+        return False
+
+
+def remove_agent_sensitive_state(config: Config, windows: bool, preserve_reporting_identity: bool = False) -> None:
+    identity_root = config.path.parent.resolve()
+    candidates = [
+        identity_root / "bootstrap.json",
+        identity_root / "uninstall-policy.json",
+        identity_root / "uninstall-failures.json",
+    ]
+    if not preserve_reporting_identity:
+        candidates.extend([config.path, config.cert_file, config.key_file, config.ca_file])
+        if config.server_ca_file:
+            candidates.append(config.server_ca_file)
+    for path in candidates:
+        resolved = Path(path).resolve()
+        if resolved == identity_root or identity_root not in resolved.parents:
+            raise RuntimeError("Agent sensitive-state path escaped its identity directory")
+        resolved.unlink(missing_ok=True)
+    for permit in identity_root.glob("uninstall-permit-*.json"):
+        if re.fullmatch(r"uninstall-permit-[0-9a-f-]{36}\.json", permit.name):
+            permit.unlink()
+    update_directory = update_root(windows).resolve()
+    update_state_root = update_directory.parent
+    expected_linux_state_root = Path("/var/lib/tram-agent").resolve()
+    if update_state_root != identity_root and (windows or update_state_root != expected_linux_state_root):
+        raise RuntimeError("Agent update-state path escaped its managed directory")
+    pending_result = pending_update_result_path(windows).resolve()
+    if pending_result.parent != update_state_root or pending_result.name != "update-result.json":
+        raise RuntimeError("Agent pending-update result path is invalid")
+    pending_result.unlink(missing_ok=True)
+    if update_directory.exists():
+        shutil.rmtree(update_directory)
+
+
+def windows_process_is_elevated() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def uninstall_agent(config: Config, password_stdin: bool) -> int:
+    windows = platform.system().lower() == "windows"
+    if windows and not windows_process_is_elevated():
+        raise RuntimeError("Run Agent uninstall from an elevated Administrator terminal")
+    if not windows and os.geteuid() != 0:
+        raise RuntimeError("Run Agent uninstall as root")
+    os_user = local_uninstall_user()
+    candidate = sys.stdin.readline().rstrip("\r\n") if password_stdin else getpass.getpass("Agent uninstall password: ")
+    try:
+        policy = verify_uninstall_password(candidate)
+    except RuntimeError:
+        report_uninstall_event(config, "denied", os_user, "Password verification failed or was rate-limited")
+        raise
+    finally:
+        candidate = ""
+    report_uninstall_event(config, "authorized", os_user)
+    try:
+        if windows:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TramVanHanh\Agent", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                product_code, _ = winreg.QueryValueEx(key, "ProductCode")
+            permit = create_windows_uninstall_permit(policy)
+            msiexec = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/msiexec.exe"
+            completed = subprocess.run([str(msiexec), "/x", str(product_code), "/qn", "/norestart", f"TRAM_UNINSTALL_PERMIT={permit}"], timeout=1800, check=False)
+            if completed.returncode not in {0, 1641, 3010}:
+                raise RuntimeError(f"Windows Installer failed ({completed.returncode})")
+            remove_agent_sensitive_state(config, True, True)
+            report_uninstall_event(config, "completed", os_user)
+            remove_agent_sensitive_state(config, True)
+            return 0
+        systemctl = find_system_command("systemctl")
+        if systemctl:
+            subprocess.run([systemctl, "disable", "--now", "tram-agent.service"], timeout=60, check=False)
+        for path in (Path("/etc/systemd/system/tram-agent.service"), Path("/opt/tram-agent/tram-agent"), Path("/opt/tram-agent/VERSION")):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        runtime_state = Path("/var/lib/tram-agent")
+        if runtime_state.exists():
+            shutil.rmtree(runtime_state)
+        if systemctl:
+            subprocess.run([systemctl, "daemon-reload"], timeout=60, check=False)
+        remove_agent_sensitive_state(config, False, True)
+        report_uninstall_event(config, "completed", os_user)
+        remove_agent_sensitive_state(config, False)
+        with contextlib.suppress(OSError):
+            Path("/etc/tram-agent").rmdir()
+        return 0
+    except Exception as exc:
+        report_uninstall_event(config, "failed", os_user, type(exc).__name__)
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trạm Vận Hành agent")
     parser.add_argument("--config", default=default_config_path())
@@ -4431,6 +5030,18 @@ def main() -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--once", action="store_true")
     sub.add_parser("service")
+    uninstall_parser = sub.add_parser("uninstall", help="Remove the Agent after verifying the dashboard-configured password")
+    uninstall_parser.add_argument("--password-stdin", action="store_true", help="Read one password line from stdin without exposing it in process arguments")
+    linux_update = sub.add_parser("apply-linux-update", help=argparse.SUPPRESS)
+    linux_update.add_argument("--job-id", required=True)
+    linux_update.add_argument("--source", required=True)
+    linux_update.add_argument("--target-version", required=True)
+    windows_update = sub.add_parser("apply-windows-update", help=argparse.SUPPRESS)
+    windows_update.add_argument("--job-id", required=True)
+    windows_update.add_argument("--msi", required=True)
+    windows_update.add_argument("--target-version", required=True)
+    permit_parser = sub.add_parser("consume-uninstall-permit", help=argparse.SUPPRESS)
+    permit_parser.add_argument("--permit", required=True)
     args = parser.parse_args()
     configure_logging(args.log_file)
     config = Config(args.config)
@@ -4465,6 +5076,14 @@ def main() -> int:
     if args.command == "service":
         run_windows_service(config, args.log_file)
         return 0
+    if args.command == "apply-linux-update":
+        return apply_linux_update(args.job_id, Path(args.source), args.target_version)
+    if args.command == "apply-windows-update":
+        return apply_windows_update(config, args.job_id, Path(args.msi), args.target_version)
+    if args.command == "consume-uninstall-permit":
+        return consume_windows_uninstall_permit(Path(args.permit))
+    if args.command == "uninstall":
+        return uninstall_agent(config, args.password_stdin)
     loop(config, args.once)
     return 0
 

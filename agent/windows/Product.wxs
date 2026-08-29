@@ -9,6 +9,9 @@
            Compressed="yes">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Tram Van Hanh Agent is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="ARPNOREMOVE" Value="1" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="TRAM_UNINSTALL_PERMIT" Hidden="yes" Secure="yes" />
 
     <!--
       A generated Windows package carries its one-time bootstrap claim in the
@@ -69,6 +72,7 @@
       <CreateFolder />
       <RegistryKey Root="HKLM" Key="SOFTWARE\TramVanHanh\Agent">
         <RegistryValue Name="BootstrapSource" Type="string" Value="[OriginalDatabase]" KeyPath="yes" />
+        <RegistryValue Name="ProductCode" Type="string" Value="[ProductCode]" />
       </RegistryKey>
     </Component>
 
@@ -81,5 +85,23 @@
       <ComponentRef Id="AgentBootstrapComponent" />
       <ComponentRef Id="AgentInboxComponent" />
     </Feature>
+
+    <!--
+      Supported removal is initiated by `tram-agent uninstall`, which validates
+      the dashboard-managed password without placing it in process arguments
+      and creates a three-minute, machine-protected permit. Direct ARP and
+      silent uninstall attempts fail here. MajorUpgrade removal is exempt so a
+      signed Agent upgrade cannot deadlock itself.
+    -->
+    <CustomAction Id="ValidateUninstallPermit"
+                  FileRef="AgentExecutable"
+                  ExeCommand="--config &quot;[CommonAppDataFolder]TramVanHanh\agent.json&quot; consume-uninstall-permit --permit &quot;[TRAM_UNINSTALL_PERMIT]&quot;"
+                  Execute="immediate"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="ValidateUninstallPermit"
+              Before="StopServices"
+              Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

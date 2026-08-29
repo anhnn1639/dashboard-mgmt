@@ -10,6 +10,8 @@ Control plane tự host để giám sát và vận hành tập trung Windows Ser
 - Agent outbound cho Windows Server 2025, Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat Enterprise Linux 7/8.
 - Enrollment một lần bằng token; agent tự tạo private key/CSR trên máy đích.
 - Giao diện **Bộ cài Agent** tự sinh Linux `.run` hoặc Windows `.msi` theo đúng domain HTTPS/CA của control plane; không sửa domain bằng tay trên máy đích.
+- Cập nhật Agent Windows/Linux theo lô ngay trên website bằng artifact ràng buộc phiên bản, manifest ký số, SHA-256, mTLS và xác nhận phiên bản sau restart; Agent cũ cần nâng thủ công một lần lên bản cầu nối `0.8.16`.
+- Mật khẩu chống gỡ Agent được thiết lập/luân phiên trên website, chỉ lưu verifier và đồng bộ theo revision; MSI từ chối uninstall trực tiếp nếu thiếu permit dùng một lần.
 - Agent API riêng ở TCP `9443`, bắt buộc **mTLS** và xác minh certificate bằng CA nội bộ.
 - Nginx trên host giữ public TCP `80/443`; Caddy chỉ xuất HTTPS web trên `127.0.0.1:3000`. Port `80` của Nginx chỉ chuyển hướng sang HTTPS.
 - RBAC (`admin`, `operator`, `viewer`, `auditor`), đăng nhập Local/LDAP Domain, MFA TOTP bắt buộc, JWT mặc định 60 phút và Argon2 password hashing. Trình duyệt nhận session bằng cookie `Secure`/`HttpOnly`/`SameSite=Strict`, không lưu access token trong Web Storage; logout thu hồi `jti` trong PostgreSQL. Bearer token chỉ giữ cho API/CLI tương thích.
@@ -189,6 +191,32 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 Máy sẽ tự xuất hiện trong **Máy chủ Windows**. RDP phải được bật và gắn certificate; firewall không cần cho phép `3389` từ control plane vì agent chỉ nối tới listener cục bộ. Microsoft Defender phải hoạt động để nhận file.
+
+## Cập nhật Agent từ website và bảo vệ gỡ cài đặt
+
+Administrator mở **Bộ cài Agent** để xem phiên bản hiện tại của toàn bộ máy Windows/Linux, tìm kiếm/lọc máy, chọn tối đa 100 Agent mỗi lượt rồi bấm **Cập nhật đã chọn**. Backend tự chọn artifact đúng hệ điều hành/kiến trúc; trình duyệt không được truyền URL tải, phiên bản hoặc hash. Manifest phát hành được ký bằng khóa Agent CA, ràng buộc với đúng job/máy đích và Agent chỉ tải qua mTLS `9443`, cấm redirect, kiểm tra kích thước/SHA-256, preflight rồi mới thay binary/MSI. Job chỉ hoàn tất khi Agent mới khởi động và báo đúng phiên bản; Linux tự rollback binary cũ nếu service mới không lên. Nếu trạng thái `installing` quá 45 phút, backend đánh dấu thất bại và chờ Administrator chủ động thử lại, không tự chạy installer lặp vô hạn; kết quả thành công đến muộn hoặc check-in đúng phiên bản vẫn được đối soát thành công.
+
+Mỗi binary phát hành phải đi kèm file `*.provenance.json` do workflow build tạo, khóa chính xác version, SHA-256, kích thước và source commit. API từ chối phát gói khi binary và metadata không khớp. Trạng thái `manifestSigned` và `authenticodeSigned` được tách riêng: manifest ECDSA + mTLS/SHA-256 luôn bảo vệ kênh update; Windows Authenticode chỉ là `true` khi repository đã cấu hình certificate signing trong GitHub Actions. Trong image API, toàn bộ artifact/provenance thuộc `root`, chỉ đọc đối với tiến trình `ops`; API đóng gói/phát đúng mảng byte đã xác minh thay vì mở lại file sau kiểm tra để loại bỏ cửa sổ TOCTOU. Production vẫn nên dùng thêm khóa release offline chuyên dụng và giữ mọi artifact volume ngoài container ở chế độ read-only.
+
+Agent `0.8.15` và cũ hơn chưa biết action self-update nên cần cài đè thủ công **một lần** lên bản cầu nối `0.8.16`. Cài đè `.run`/MSI mới giữ nguyên `agent_id`, certificate, private key và cấu hình đã enroll. Từ bản sau `0.8.16`, các lần nâng tiếp theo thực hiện trực tiếp từ website. Dashboard hiển thị rõ `Cần nâng thủ công 1 lần` và không giả lập self-update cho Agent cũ.
+
+Trong cùng màn hình, mục **Bảo vệ gỡ cài đặt Agent** chỉ hiển thị cho builtin Administrator và cho phép thiết lập hoặc đổi mật khẩu dùng chung cho fleet. Control plane chỉ lưu salt/verifier PBKDF2-SHA256 trong PostgreSQL; mật khẩu thô không được trả về browser, đưa vào job/audit hoặc truyền trong command line. Khi đổi mật khẩu phải nhập mật khẩu gỡ hiện tại; thử sai bị giới hạn tốc độ. Policy có revision và được đồng bộ tới từng Agent tương thích qua job mTLS có audit. Mỗi máy retry tối đa ba lần với backoff; sau đó dashboard báo **Cần xử lý lỗi** và chỉ revision mới do Administrator lưu mới khởi động lại rollout.
+
+Gỡ đúng quy trình tại endpoint:
+
+```bash
+# Linux — chạy bằng root; Agent hỏi mật khẩu bằng TTY
+sudo /opt/tram-agent/tram-agent --config /etc/tram-agent/agent.json uninstall
+```
+
+```powershell
+# Windows — chạy PowerShell bằng Administrator; Agent hỏi mật khẩu, sau đó
+# cấp permit HMAC dùng một lần cho Windows Installer.
+& "$env:ProgramFiles\TramVanHanhAgent\tram-agent.exe" `
+  --config "$env:ProgramData\TramVanHanh\agent.json" uninstall
+```
+
+Nút Remove/Modify chuẩn trong Programs and Features bị ẩn và uninstall MSI trực tiếp bị từ chối nếu không có permit hợp lệ. Khi mật khẩu bị từ chối, được chấp nhận, uninstall hoàn tất hoặc thất bại, Agent cố gắng gửi sự kiện ký số về audit trung tâm; sau uninstall thành công, certificate, private key, cấu hình, policy, permit và staging update được dọn khỏi endpoint. Nếu control plane không thể truy cập trong lúc người có quyền hệ điều hành gỡ Agent, thao tác local vẫn tiếp tục nhưng audit completed/thu hồi certificate tự động có thể không tới server; quản trị viên phải retire endpoint đó trên website ngay khi kết nối phục hồi. Hãy lưu mật khẩu này trong vault doanh nghiệp vì không thể xem lại. Đây là tamper protection cho quy trình vận hành, không phải ranh giới chống người đã kiểm soát hệ điều hành: `root` trên Linux hoặc `Local Administrator/SYSTEM` trên Windows vẫn có thể thay/xóa file và vô hiệu hóa service. Kết hợp với MFA, RBAC, EDR/application allowlisting và quản lý đặc quyền endpoint.
 
 ## SSH/RDP và recording
 

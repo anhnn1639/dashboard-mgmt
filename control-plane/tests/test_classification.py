@@ -24,6 +24,28 @@ from fastapi import HTTPException
 from fastapi.routing import APIRoute
 from sqlalchemy import delete, select
 
+
+def write_artifact_provenance(path: Path, version: str, artifact_kind: str, *, authenticode_signed: bool = False, source_commit: str = "1" * 40) -> Path:
+    content = path.read_bytes()
+    provenance_path = path.with_name(path.name + ".provenance.json")
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "version": version,
+                "artifactKind": artifact_kind,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "sizeBytes": len(content),
+                "sourceCommit": source_commit,
+                "authenticodeSigned": authenticode_signed,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return provenance_path
+
+
 tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
 os.environ["JWT_SECRET"] = "test-secret-that-is-not-used-in-production"
@@ -49,12 +71,19 @@ for asset_name in ("VERSION", "install-linux.sh", "tram-agent.service"):
 fake_linux_agent = bytearray(1024 * 1024)
 fake_linux_agent[:6] = b"\x7fELF\x02\x01"
 fake_linux_agent[18:20] = b"\x3e\x00"
-(test_agent_assets / "linux/x86_64/tram-agent").write_bytes(fake_linux_agent)
+fake_linux_agent_path = test_agent_assets / "linux/x86_64/tram-agent"
+fake_linux_agent_path.write_bytes(fake_linux_agent)
+write_artifact_provenance(
+    fake_linux_agent_path,
+    (test_agent_assets / "VERSION").read_text(encoding="ascii").strip(),
+    "linux_elf",
+)
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
-from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, RecordingDeletionRequest, RemoteSession, RevokedSessionToken, Server, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
+from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AgentUninstallPolicyState, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, PlatformRole, RecordingDeletionRequest, RemoteSession, RevokedSessionToken, Server, ServerUserShare, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
 from app.main import RemoteCredential, RemoteCredentialUserShare  # noqa: E402
 from app.main import app, engine  # noqa: E402
+from app.agent_packages import LINUX_AGENT_PATH, linux_run_bundle  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
@@ -68,6 +97,53 @@ def signed_agent_request(private_key: ec.EllipticCurvePrivateKey, certificate: x
         "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
         "X-Tram-Agent-Timestamp": timestamp,
         "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
+    }
+
+
+def signed_agent_http_request(private_key: ec.EllipticCurvePrivateKey, certificate: x509.Certificate, method: str, path: str, body: bytes = b"") -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    return {
+        "X-Tram-Agent-Certificate": base64.b64encode(certificate.public_bytes(serialization.Encoding.DER)).decode(),
+        "X-Tram-Agent-Timestamp": timestamp,
+        "X-Tram-Agent-Signature": base64.b64encode(signature).decode(),
+    }
+
+
+def make_agent_identity(agent_id: str) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate, str]:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id)])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
+        .not_valid_after(datetime.now(UTC) + timedelta(hours=1))
+        .sign(ca_key, hashes.SHA256())
+    )
+    return private_key, certificate, certificate.fingerprint(hashes.SHA256()).hex()
+
+
+def agent_checkin_payload(agent_id: str, version: str, *, active_job_ids: list[str] | None = None, uptime_seconds: int = 3600) -> dict:
+    active = list(active_job_ids or [])
+    return {
+        "agent_id": agent_id,
+        "agent_version": version,
+        "active_job_id": active[0] if active else None,
+        "active_job_ids": active,
+        "inventory": None,
+        "metrics": {
+            "cpu_percent": 1,
+            "memory_percent": 2,
+            "disk_percent": 3,
+            "uptime_seconds": uptime_seconds,
+            "pending_updates": 0,
+            "services_running": 1,
+            "alerts": 0,
+        },
     }
 
 
@@ -92,6 +168,857 @@ class ClassificationTests(unittest.TestCase):
             raise AssertionError(verified.text)
         cls.access_token = verified.json()["access_token"]
         return cls.access_token
+
+    def test_agent_artifact_provenance_must_match_release_and_bytes(self):
+        provenance_path = fake_linux_agent_path.with_name(fake_linux_agent_path.name + ".provenance.json")
+        original_provenance = provenance_path.read_text(encoding="utf-8")
+        try:
+            with TestClient(app) as client:
+                headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                valid = client.get("/api/v1/agent-upgrades/status", headers=headers)
+                self.assertEqual(valid.status_code, 200, valid.text)
+                linux = valid.json()["artifacts"]["linux"]
+                self.assertTrue(linux["ready"])
+                self.assertTrue(linux["manifestSigned"])
+                self.assertFalse(linux["authenticodeSigned"])
+                self.assertEqual(linux["sourceCommit"], "1" * 40)
+
+                mismatched_version = json.loads(original_provenance)
+                mismatched_version["version"] = "9.9.9"
+                provenance_path.write_text(json.dumps(mismatched_version), encoding="utf-8")
+                rejected_version = client.get("/api/v1/agent-upgrades/status", headers=headers)
+                self.assertEqual(rejected_version.status_code, 200, rejected_version.text)
+                self.assertFalse(rejected_version.json()["artifacts"]["linux"]["ready"])
+
+                mismatched_hash = json.loads(original_provenance)
+                mismatched_hash["sha256"] = "0" * 64
+                provenance_path.write_text(json.dumps(mismatched_hash), encoding="utf-8")
+                rejected_hash = client.get("/api/v1/agent-upgrades/status", headers=headers)
+                self.assertEqual(rejected_hash.status_code, 200, rejected_hash.text)
+                self.assertFalse(rejected_hash.json()["artifacts"]["linux"]["ready"])
+
+                provenance_path.unlink()
+                rejected_missing = client.get("/api/v1/agent-upgrades/status", headers=headers)
+                self.assertEqual(rejected_missing.status_code, 200, rejected_missing.text)
+                self.assertFalse(rejected_missing.json()["artifacts"]["linux"]["ready"])
+        finally:
+            provenance_path.write_text(original_provenance, encoding="utf-8")
+
+    def test_linux_manual_package_uses_the_exact_provenance_validated_agent_bytes(self):
+        original = fake_linux_agent_path.read_bytes()
+        validated = bytearray(original)
+        validated[-1] = 0x41
+        replaced_on_disk = bytearray(original)
+        replaced_on_disk[-1] = 0x42
+        try:
+            fake_linux_agent_path.write_bytes(replaced_on_disk)
+            bundle = linux_run_bundle(
+                test_agent_assets,
+                agent_content=bytes(validated),
+                dashboard_url="https://ops.example.test",
+                package_id=str(uuid.uuid4()),
+                package_secret="test-only-package-secret",
+                ca_certificate="",
+                ca_fingerprint="system",
+            )
+            marker = b"__TRAM_AGENT_ARCHIVE__\n"
+            self.assertIn(marker, bundle)
+            archive_payload = bundle.split(marker, 1)[1]
+            with tarfile.open(fileobj=io.BytesIO(archive_payload), mode="r:gz") as archive:
+                member = archive.extractfile(str(LINUX_AGENT_PATH).replace("\\", "/"))
+                self.assertIsNotNone(member)
+                self.assertEqual(member.read(), bytes(validated))
+        finally:
+            fake_linux_agent_path.write_bytes(original)
+
+    def test_agent_upgrade_management_uses_signed_artifact_and_two_phase_completion(self):
+        agent_id = str(uuid.uuid4())
+        legacy_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        provenance_path = fake_linux_agent_path.with_name(fake_linux_agent_path.name + ".provenance.json")
+        original_provenance = provenance_path.read_text(encoding="utf-8")
+        # The application lifespan owns schema creation and built-in role seeding.
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            db.add_all(
+                [Server(
+                    id=agent_id,
+                    name=f"upgrade-linux-{agent_id[:8]}",
+                    address="10.71.1.10",
+                    os_family="linux",
+                    os_name="Ubuntu 24.04",
+                    os_version="24.04",
+                    distribution_id="ubuntu",
+                    architecture="x86_64",
+                    agent_version="0.8.16",
+                    cert_fingerprint=fingerprint,
+                    last_seen=datetime.now(UTC),
+                    status="online",
+                ), Server(
+                    id=legacy_id,
+                    name=f"legacy-upgrade-{legacy_id[:8]}",
+                    address="10.71.1.11",
+                    os_family="linux",
+                    os_name="Ubuntu 22.04",
+                    os_version="22.04",
+                    distribution_id="ubuntu",
+                    architecture="x86_64",
+                    agent_version="0.8.15",
+                    last_seen=datetime.now(UTC),
+                    status="online",
+                )]
+            )
+            db.commit()
+
+        try:
+            write_artifact_provenance(fake_linux_agent_path, "0.8.17", "linux_elf")
+            with patch("app.main.RELEASE_VERSION", "0.8.17"), TestClient(app) as client:
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                self.assertEqual(client.get("/api/v1/agent-upgrades/status").status_code, 401)
+
+                operator_id = str(uuid.uuid4())
+                with SessionLocal() as db:
+                    operator = User(id=operator_id, username=f"upgrade-operator-{operator_id[:8]}", password_hash="!test", display_name="Upgrade operator", role="operator", enabled=True)
+                    db.add(operator)
+                    db.commit()
+                    operator_headers = {"Authorization": f"Bearer {issue_jwt(operator)}"}
+                self.assertEqual(client.get("/api/v1/agent-upgrades/status", headers=operator_headers).status_code, 403)
+
+                status = client.get("/api/v1/agent-upgrades/status", headers=admin_headers)
+                self.assertEqual(status.status_code, 200, status.text)
+                self.assertEqual(status.json()["targetVersion"], "0.8.17")
+                item = next(entry for entry in status.json()["items"] if entry["serverId"] == agent_id)
+                self.assertEqual(item["eligibility"], "eligible")
+                self.assertTrue(item["online"])
+                legacy_item = next(entry for entry in status.json()["items"] if entry["serverId"] == legacy_id)
+                self.assertEqual(legacy_item["eligibility"], "manual_required")
+                self.assertIn("0.8.16", legacy_item["reason"])
+                self.assertTrue(status.json()["artifacts"]["linux"]["ready"])
+
+                generic = client.post(
+                    "/api/v1/jobs",
+                    headers=admin_headers,
+                    json={"server_id": agent_id, "action": "agent.upgrade", "parameters": {}, "reason": "Must use dedicated lifecycle route"},
+                )
+                self.assertEqual(generic.status_code, 400, generic.text)
+
+                queued = client.post(
+                    "/api/v1/agent-upgrades",
+                    headers=admin_headers,
+                    json={"server_ids": [agent_id, legacy_id], "reason": "Upgrade the staging Agent from the website"},
+                )
+                self.assertEqual(queued.status_code, 201, queued.text)
+                self.assertEqual(queued.json()["targetVersion"], "0.8.17")
+                self.assertEqual(len(queued.json()["queued"]), 1)
+                self.assertEqual(queued.json()["skipped"][0]["serverId"], legacy_id)
+                job_id = queued.json()["queued"][0]["jobId"]
+
+                with SessionLocal() as db:
+                    job = db.get(Job, job_id)
+                    self.assertIsNotNone(job)
+                    self.assertEqual(job.status, "queued")
+                    self.assertEqual(job.risk, "critical")
+                    manifest = job.parameters["manifest"]
+                    self.assertEqual(manifest["jobId"], job_id)
+                    self.assertEqual(manifest["agentId"], agent_id)
+                    self.assertEqual(manifest["version"], "0.8.17")
+                    artifact = manifest["artifacts"]["linux-x86_64"]
+                    self.assertEqual(artifact["osFamily"], "linux")
+                    self.assertEqual(artifact["architecture"], "x86_64")
+                    self.assertRegex(artifact["sha256"], r"^[0-9a-f]{64}$")
+                    self.assertGreater(artifact["size"], 0)
+                    self.assertNotIn("private", json.dumps(job.parameters).lower())
+                    job.status = "dispatched"
+                    db.commit()
+
+                artifact_path = f"/api/v1/agent/upgrades/{job_id}/artifact"
+                download_headers = signed_agent_http_request(agent_key, agent_certificate, "GET", artifact_path)
+                download = client.get(f"{artifact_path}?agent_id={agent_id}", headers=download_headers)
+                self.assertEqual(download.status_code, 200, download.text)
+                self.assertEqual(download.headers["x-tram-agent-version"], "0.8.17")
+                self.assertEqual(hashlib.sha256(download.content).hexdigest(), download.headers["x-tram-sha256"])
+
+                result_path = f"/api/v1/agent/jobs/{job_id}/result"
+                prepared_payload = {"status": "succeeded", "exit_code": 0, "output": "Artifact verified and updater scheduled"}
+                prepared_body, prepared_headers = signed_agent_request(agent_key, agent_certificate, result_path, prepared_payload)
+                prepared = client.post(result_path, headers=prepared_headers, content=prepared_body)
+                self.assertEqual(prepared.status_code, 200, prepared.text)
+                self.assertEqual(prepared.json()["status"], "installing")
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, job_id).status, "installing")
+
+                wrong_payload = {"status": "succeeded", "exit_code": 0, "output": "Wrong binary", "agent_version": "0.8.18"}
+                wrong_body, wrong_headers = signed_agent_request(agent_key, agent_certificate, result_path, wrong_payload)
+                wrong = client.post(result_path, headers=wrong_headers, content=wrong_body)
+                self.assertEqual(wrong.status_code, 409, wrong.text)
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, job_id).status, "installing")
+                    self.assertEqual(db.get(Server, agent_id).agent_version, "0.8.16")
+
+                complete_payload = {"status": "succeeded", "exit_code": 0, "output": "Agent 0.8.17 is running", "agent_version": "0.8.17"}
+                complete_body, complete_headers = signed_agent_request(agent_key, agent_certificate, result_path, complete_payload)
+                complete = client.post(result_path, headers=complete_headers, content=complete_body)
+                self.assertEqual(complete.status_code, 200, complete.text)
+                self.assertEqual(complete.json()["status"], "succeeded")
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, job_id).status, "succeeded")
+                    self.assertEqual(db.get(Server, agent_id).agent_version, "0.8.17")
+
+                refreshed = client.get("/api/v1/agent-upgrades/status", headers=admin_headers)
+                refreshed_item = next(entry for entry in refreshed.json()["items"] if entry["serverId"] == agent_id)
+                self.assertEqual(refreshed_item["eligibility"], "current")
+                self.assertIsNone(refreshed_item["activeJobId"])
+        finally:
+            provenance_path.write_text(original_provenance, encoding="utf-8")
+            with SessionLocal() as db:
+                task_ids = db.execute(select(BulkTaskItem.bulk_task_id).where(BulkTaskItem.server_id == agent_id)).scalars().all()
+                db.execute(delete(BulkTaskItem).where(BulkTaskItem.server_id == agent_id))
+                if task_ids:
+                    db.execute(delete(BulkTask).where(BulkTask.id.in_(task_ids)))
+                db.execute(delete(AgentUninstallPolicyState).where(AgentUninstallPolicyState.server_id.in_([agent_id, legacy_id])))
+                db.execute(delete(Job).where(Job.server_id.in_([agent_id, legacy_id])))
+                db.execute(delete(Server).where(Server.id.in_([agent_id, legacy_id])))
+                db.execute(delete(User).where(User.username.like("upgrade-operator-%")))
+                db.commit()
+
+    def test_agent_uninstall_password_is_hashed_rotated_and_applied_only_to_compatible_agents(self):
+        compatible_id = str(uuid.uuid4())
+        legacy_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(compatible_id)
+        password_v1 = "Uninstall-stage-secret-v1!"
+        password_v2 = "Uninstall-stage-secret-v2!"
+        setting_key = "agent_uninstall_password_v1"
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            previous = db.get(SystemSetting, setting_key)
+            previous_value = previous.value if previous else None
+            if previous:
+                db.delete(previous)
+            db.add_all(
+                [
+                    Server(id=compatible_id, name=f"protected-{compatible_id[:8]}", os_family="windows", os_name="Windows Server 2022", architecture="AMD64", agent_version="0.8.16", cert_fingerprint=fingerprint, status="online", last_seen=datetime.now(UTC)),
+                    Server(id=legacy_id, name=f"legacy-{legacy_id[:8]}", os_family="linux", os_name="Ubuntu 24.04", architecture="x86_64", agent_version="0.8.15", status="online", last_seen=datetime.now(UTC)),
+                ]
+            )
+            db.commit()
+
+        try:
+            with TestClient(app) as client:
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                self.assertEqual(client.get("/api/v1/settings/agent-uninstall-protection").status_code, 401)
+
+                leaked_candidates = ["new-leak", "confirm-leak", "current-leak-" + ("x" * 1100)]
+                invalid_secret = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={
+                        "new_password": leaked_candidates[0],
+                        "confirm_password": leaked_candidates[1],
+                        "current_password": leaked_candidates[2],
+                        "reason": "Validate that rejected secrets are always redacted",
+                    },
+                )
+                self.assertEqual(invalid_secret.status_code, 422, invalid_secret.text)
+                for candidate in leaked_candidates:
+                    self.assertNotIn(candidate, invalid_secret.text)
+                self.assertNotIn('"input"', invalid_secret.text)
+
+                mismatch = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={"new_password": password_v1, "confirm_password": password_v2, "reason": "Configure protected uninstall on managed endpoints"},
+                )
+                self.assertEqual(mismatch.status_code, 422, mismatch.text)
+
+                configured = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={"new_password": password_v1, "confirm_password": password_v1, "reason": "Configure protected uninstall on managed endpoints"},
+                )
+                self.assertEqual(configured.status_code, 200, configured.text)
+                self.assertTrue(configured.json()["configured"])
+                self.assertEqual(configured.json()["revision"], 1)
+                compatible_item = next(entry for entry in configured.json()["items"] if entry["serverId"] == compatible_id)
+                legacy_item = next(entry for entry in configured.json()["items"] if entry["serverId"] == legacy_id)
+                self.assertEqual(compatible_item["status"], "queued")
+                self.assertEqual(legacy_item["status"], "manual_required")
+
+                with SessionLocal() as db:
+                    stored = db.get(SystemSetting, setting_key)
+                    self.assertIsNotNone(stored)
+                    self.assertNotIn(password_v1, stored.value)
+                    policy = json.loads(stored.value)
+                    self.assertEqual(set(policy), {"version", "revision", "algorithm", "iterations", "salt", "verifier", "updated_at", "updated_by"})
+                    self.assertEqual(policy["algorithm"], "pbkdf2-sha256")
+                    self.assertEqual(policy["iterations"], 600_000)
+                    first_job = db.execute(select(Job).where(Job.server_id == compatible_id, Job.action == "agent.uninstall.policy").order_by(Job.created_at.desc())).scalars().first()
+                    self.assertIsNotNone(first_job)
+                    first_job_id = first_job.id
+                    raw_parameters = json.dumps(first_job.parameters)
+                    self.assertNotIn(password_v1, raw_parameters)
+                    self.assertIn("__tram_encrypted__", raw_parameters)
+                    self.assertIsNone(db.execute(select(Job).where(Job.server_id == legacy_id, Job.action == "agent.uninstall.policy")).scalar_one_or_none())
+                    # Simulate the real race: revision 1 has already left the
+                    # queue when an administrator rotates to revision 2.
+                    first_job.status = "dispatched"
+                    first_job.started_at = datetime.now(UTC)
+                    db.commit()
+
+                denied = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={"current_password": "not-the-current-password", "new_password": password_v2, "confirm_password": password_v2, "reason": "Rotate protected uninstall credential"},
+                )
+                self.assertEqual(denied.status_code, 401, denied.text)
+
+                rotated = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={"current_password": password_v1, "new_password": password_v2, "confirm_password": password_v2, "reason": "Rotate protected uninstall credential"},
+                )
+                self.assertEqual(rotated.status_code, 200, rotated.text)
+                self.assertEqual(rotated.json()["revision"], 2)
+
+                with SessionLocal() as db:
+                    first_job = db.get(Job, first_job_id)
+                    self.assertEqual(first_job.status, "dispatched")
+                    self.assertEqual(
+                        db.execute(select(Job).where(Job.server_id == compatible_id, Job.action == "agent.uninstall.policy", Job.id != first_job_id)).scalars().all(),
+                        [],
+                    )
+                    state = db.get(AgentUninstallPolicyState, compatible_id)
+                    self.assertEqual(state.desired_revision, 2)
+                    self.assertEqual(state.job_id, first_job_id)
+                    self.assertEqual(state.status, "dispatched")
+                    stored_text = db.get(SystemSetting, setting_key).value
+                    audit_text = json.dumps(
+                        [
+                            {"action": event.action, "result": event.result, "detail": event.detail}
+                            for event in db.execute(select(AuditEvent).where(AuditEvent.action.in_(["agent.uninstall.protection.update", "agent.uninstall.policy.queued"]))).scalars().all()
+                        ],
+                        ensure_ascii=False,
+                    )
+                    self.assertNotIn(password_v1, stored_text + audit_text + json.dumps(first_job.parameters))
+                    self.assertNotIn(password_v2, stored_text + audit_text + json.dumps(first_job.parameters))
+
+                first_result_path = f"/api/v1/agent/jobs/{first_job_id}/result"
+                first_result_payload = {"status": "succeeded", "exit_code": 0, "output": "Uninstall protection revision 1 installed"}
+                first_result_body, first_result_headers = signed_agent_request(agent_key, agent_certificate, first_result_path, first_result_payload)
+                first_result = client.post(first_result_path, headers=first_result_headers, content=first_result_body)
+                self.assertEqual(first_result.status_code, 200, first_result.text)
+                with SessionLocal() as db:
+                    state = db.get(AgentUninstallPolicyState, compatible_id)
+                    self.assertEqual(state.desired_revision, 2)
+                    self.assertEqual(state.applied_revision, 1)
+                    self.assertEqual(state.status, "pending")
+                    self.assertIsNone(state.job_id)
+
+                checkin_payload = agent_checkin_payload(compatible_id, "0.8.16", uptime_seconds=3601)
+                checkin_body, checkin_headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/checkin", checkin_payload)
+                checkin = client.post("/api/v1/agent/checkin", headers=checkin_headers, content=checkin_body)
+                self.assertEqual(checkin.status_code, 200, checkin.text)
+                policy_jobs = [job for job in checkin.json()["jobs"] if job["action"] == "agent.uninstall.policy"]
+                self.assertEqual(len(policy_jobs), 1)
+                second_job_id = policy_jobs[0]["id"]
+                self.assertEqual(policy_jobs[0]["parameters"]["revision"], 2)
+
+                second_result_path = f"/api/v1/agent/jobs/{second_job_id}/result"
+                second_result_payload = {"status": "succeeded", "exit_code": 0, "output": "Uninstall protection revision 2 installed"}
+                second_result_body, second_result_headers = signed_agent_request(agent_key, agent_certificate, second_result_path, second_result_payload)
+                second_result = client.post(second_result_path, headers=second_result_headers, content=second_result_body)
+                self.assertEqual(second_result.status_code, 200, second_result.text)
+
+                applied = client.get("/api/v1/settings/agent-uninstall-protection", headers=admin_headers)
+                self.assertEqual(applied.status_code, 200, applied.text)
+                applied_item = next(entry for entry in applied.json()["items"] if entry["serverId"] == compatible_id)
+                self.assertEqual(applied_item["status"], "applied")
+                self.assertEqual(applied_item["appliedRevision"], 2)
+
+                generic = client.post(
+                    "/api/v1/jobs",
+                    headers=admin_headers,
+                    json={"server_id": compatible_id, "action": "agent.uninstall.policy", "parameters": {"revision": 99, "secret": "not-allowed"}, "reason": "Must use dedicated lifecycle route"},
+                )
+                self.assertEqual(generic.status_code, 400, generic.text)
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(AgentUninstallPolicyState).where(AgentUninstallPolicyState.server_id.in_([compatible_id, legacy_id])))
+                db.execute(delete(Job).where(Job.server_id.in_([compatible_id, legacy_id])))
+                db.execute(delete(Server).where(Server.id.in_([compatible_id, legacy_id])))
+                current = db.get(SystemSetting, setting_key)
+                if previous_value is None:
+                    if current:
+                        db.delete(current)
+                else:
+                    db.merge(SystemSetting(key=setting_key, value=previous_value))
+                db.commit()
+
+    def test_agent_uninstall_policy_retries_with_backoff_and_stops_after_three_failures(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        setting_key = "agent_uninstall_password_v1"
+        password = "Retry-policy-secret-123!"
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            previous = db.get(SystemSetting, setting_key)
+            previous_value = previous.value if previous else None
+            if previous:
+                db.delete(previous)
+            db.add(
+                Server(
+                    id=agent_id,
+                    name=f"retry-policy-{agent_id[:8]}",
+                    os_family="linux",
+                    os_name="Ubuntu 24.04",
+                    architecture="x86_64",
+                    agent_version="0.8.16",
+                    cert_fingerprint=fingerprint,
+                    status="online",
+                    last_seen=datetime.now(UTC),
+                )
+            )
+            db.commit()
+
+        uptime = 4100
+
+        def checkin(client: TestClient) -> dict:
+            nonlocal uptime
+            uptime += 1
+            payload = agent_checkin_payload(agent_id, "0.8.16", uptime_seconds=uptime)
+            body, headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/checkin", payload)
+            response = client.post("/api/v1/agent/checkin", headers=headers, content=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        try:
+            with TestClient(app) as client:
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                configured = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=admin_headers,
+                    json={"new_password": password, "confirm_password": password, "reason": "Test bounded policy delivery retries"},
+                )
+                self.assertEqual(configured.status_code, 200, configured.text)
+                with SessionLocal() as db:
+                    state = db.get(AgentUninstallPolicyState, agent_id)
+                    self.assertIsNotNone(state)
+                    current_job_id = state.job_id
+
+                dispatched = checkin(client)
+                policy_jobs = [job for job in dispatched["jobs"] if job["action"] == "agent.uninstall.policy"]
+                self.assertEqual([job["id"] for job in policy_jobs], [current_job_id])
+
+                for attempt in range(1, 4):
+                    result_path = f"/api/v1/agent/jobs/{current_job_id}/result"
+                    result_payload = {"status": "failed", "exit_code": 1, "output": f"policy sync failure {attempt}"}
+                    result_body, result_headers = signed_agent_request(agent_key, agent_certificate, result_path, result_payload)
+                    result = client.post(result_path, headers=result_headers, content=result_body)
+                    self.assertEqual(result.status_code, 200, result.text)
+                    with SessionLocal() as db:
+                        state = db.get(AgentUninstallPolicyState, agent_id)
+                        self.assertEqual(state.status, "failed")
+                        failure = json.loads(state.error)
+                        self.assertEqual(failure["attempts"], attempt)
+                        self.assertEqual(failure["message"], f"policy sync failure {attempt}")
+
+                    immediate = checkin(client)
+                    self.assertFalse(any(job["action"] == "agent.uninstall.policy" for job in immediate["jobs"]))
+
+                    with SessionLocal() as db:
+                        state = db.get(AgentUninstallPolicyState, agent_id)
+                        # Move beyond even the third exponential backoff. The
+                        # first two attempts may retry; the third must remain
+                        # terminal until an administrator creates a new policy revision.
+                        state.updated_at = datetime.now(UTC) - timedelta(hours=2)
+                        db.commit()
+                    retry = checkin(client)
+                    retry_jobs = [job for job in retry["jobs"] if job["action"] == "agent.uninstall.policy"]
+                    if attempt < 3:
+                        self.assertEqual(len(retry_jobs), 1)
+                        current_job_id = retry_jobs[0]["id"]
+                    else:
+                        self.assertEqual(retry_jobs, [])
+
+                summary = client.get("/api/v1/settings/agent-uninstall-protection", headers=admin_headers)
+                self.assertEqual(summary.status_code, 200, summary.text)
+                self.assertEqual(summary.json()["failedAgents"], 1)
+                item = next(entry for entry in summary.json()["items"] if entry["serverId"] == agent_id)
+                self.assertEqual(item["status"], "failed")
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(AgentUninstallPolicyState).where(AgentUninstallPolicyState.server_id == agent_id))
+                db.execute(delete(Job).where(Job.server_id == agent_id))
+                db.execute(delete(Server).where(Server.id == agent_id))
+                current = db.get(SystemSetting, setting_key)
+                if previous_value is None:
+                    if current:
+                        db.delete(current)
+                else:
+                    db.merge(SystemSetting(key=setting_key, value=previous_value))
+                db.commit()
+
+    def test_agent_upgrade_timeout_accepts_late_result_and_target_version_checkin(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        late_job_id = str(uuid.uuid4())
+        checkin_job_id = str(uuid.uuid4())
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            db.add(
+                Server(
+                    id=agent_id,
+                    name=f"timeout-upgrade-{agent_id[:8]}",
+                    os_family="linux",
+                    os_name="Ubuntu 24.04",
+                    architecture="x86_64",
+                    agent_version="0.8.16",
+                    cert_fingerprint=fingerprint,
+                    status="online",
+                    last_seen=datetime.now(UTC),
+                )
+            )
+            db.add(
+                Job(
+                    id=late_job_id,
+                    server_id=agent_id,
+                    action="agent.upgrade",
+                    parameters={"manifest": {"version": "0.8.17"}},
+                    reason="Exercise timeout reconciliation by late result",
+                    status="installing",
+                    risk="critical",
+                    created_by="system-test",
+                    started_at=datetime.now(UTC) - timedelta(minutes=46),
+                )
+            )
+            db.commit()
+
+        try:
+            with TestClient(app) as client:
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                status = client.get("/api/v1/agent-upgrades/status", headers=admin_headers)
+                self.assertEqual(status.status_code, 200, status.text)
+                with SessionLocal() as db:
+                    timed_out = db.get(Job, late_job_id)
+                    self.assertEqual(timed_out.status, "failed")
+                    self.assertEqual(timed_out.exit_code, 124)
+                    self.assertEqual(json.loads(timed_out.output)["timeout"], "agent-upgrade-install-timeout-v1")
+
+                late_path = f"/api/v1/agent/jobs/{late_job_id}/result"
+                late_payload = {"status": "succeeded", "exit_code": 0, "output": "Agent restarted after a delayed report", "agent_version": "0.8.17"}
+                late_body, late_headers = signed_agent_request(agent_key, agent_certificate, late_path, late_payload)
+                late = client.post(late_path, headers=late_headers, content=late_body)
+                self.assertEqual(late.status_code, 200, late.text)
+                self.assertEqual(late.json()["status"], "succeeded")
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, late_job_id).status, "succeeded")
+                    self.assertEqual(db.get(Server, agent_id).agent_version, "0.8.17")
+                    db.add(
+                        Job(
+                            id=checkin_job_id,
+                            server_id=agent_id,
+                            action="agent.upgrade",
+                            parameters={"manifest": {"version": "0.8.18"}},
+                            reason="Exercise timeout reconciliation by check-in",
+                            status="installing",
+                            risk="critical",
+                            created_by="system-test",
+                            started_at=datetime.now(UTC) - timedelta(minutes=46),
+                        )
+                    )
+                    db.commit()
+
+                checkin_payload = agent_checkin_payload(agent_id, "0.8.18", uptime_seconds=5100)
+                checkin_body, checkin_headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/checkin", checkin_payload)
+                checkin = client.post("/api/v1/agent/checkin", headers=checkin_headers, content=checkin_body)
+                self.assertEqual(checkin.status_code, 200, checkin.text)
+                self.assertFalse(any(job["action"] == "agent.upgrade" for job in checkin.json()["jobs"]))
+                with SessionLocal() as db:
+                    reconciled = db.get(Job, checkin_job_id)
+                    self.assertEqual(reconciled.status, "succeeded")
+                    self.assertEqual(reconciled.exit_code, 0)
+                    self.assertTrue(json.loads(reconciled.output)["confirmedAfterTimeout"])
+                    timeout_audits = db.execute(
+                        select(AuditEvent).where(
+                            AuditEvent.action == "agent.upgrade.timeout.failed",
+                            AuditEvent.target.in_([late_job_id, checkin_job_id]),
+                        )
+                    ).scalars().all()
+                    self.assertEqual({event.target for event in timeout_audits}, {late_job_id, checkin_job_id})
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(AgentUninstallPolicyState).where(AgentUninstallPolicyState.server_id == agent_id))
+                db.execute(delete(Job).where(Job.server_id == agent_id))
+                db.execute(delete(Server).where(Server.id == agent_id))
+                db.commit()
+
+    def test_agent_upgrade_waits_for_active_work_and_blocks_later_dispatch(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        active_read_id = str(uuid.uuid4())
+        upgrade_id = str(uuid.uuid4())
+        later_read_id = str(uuid.uuid4())
+        with TestClient(app):
+            pass
+        created = datetime.now(UTC)
+        with SessionLocal() as db:
+            db.add(
+                Server(
+                    id=agent_id,
+                    name=f"upgrade-drain-{agent_id[:8]}",
+                    os_family="linux",
+                    os_name="Ubuntu 24.04",
+                    architecture="x86_64",
+                    agent_version="0.8.16",
+                    cert_fingerprint=fingerprint,
+                    status="online",
+                    last_seen=created,
+                )
+            )
+            db.add_all(
+                [
+                    Job(
+                        id=active_read_id,
+                        server_id=agent_id,
+                        action="service.list",
+                        parameters={},
+                        reason="Read already active before the upgrade",
+                        status="dispatched",
+                        risk="low",
+                        created_by="system-test",
+                        created_at=created,
+                        started_at=created,
+                    ),
+                    Job(
+                        id=upgrade_id,
+                        server_id=agent_id,
+                        action="agent.upgrade",
+                        parameters={"manifest": {"version": "0.8.17"}},
+                        reason="Upgrade must drain all existing work",
+                        status="queued",
+                        risk="critical",
+                        created_by="system-test",
+                        created_at=created + timedelta(seconds=1),
+                    ),
+                    Job(
+                        id=later_read_id,
+                        server_id=agent_id,
+                        action="process.list",
+                        parameters={},
+                        reason="Read queued after the upgrade barrier",
+                        status="queued",
+                        risk="low",
+                        created_by="system-test",
+                        created_at=created + timedelta(seconds=2),
+                    ),
+                ]
+            )
+            db.commit()
+
+        def checkin(client: TestClient, active: list[str]) -> dict:
+            body, headers = signed_agent_request(
+                agent_key,
+                agent_certificate,
+                "/api/v1/agent/checkin",
+                agent_checkin_payload(agent_id, "0.8.16", active_job_ids=active, uptime_seconds=6200),
+            )
+            response = client.post("/api/v1/agent/checkin", headers=headers, content=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        try:
+            with TestClient(app) as client:
+                draining = checkin(client, [active_read_id])
+                self.assertEqual(draining["jobs"], [])
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, later_read_id).status, "queued")
+
+                result_path = f"/api/v1/agent/jobs/{active_read_id}/result"
+                result_body, result_headers = signed_agent_request(
+                    agent_key,
+                    agent_certificate,
+                    result_path,
+                    {"status": "succeeded", "exit_code": 0, "output": "[]"},
+                )
+                result = client.post(result_path, headers=result_headers, content=result_body)
+                self.assertEqual(result.status_code, 200, result.text)
+
+                dispatched = checkin(client, [])
+                self.assertEqual([job["id"] for job in dispatched["jobs"]], [upgrade_id])
+                with SessionLocal() as db:
+                    upgrade = db.get(Job, upgrade_id)
+                    upgrade.status = "installing"
+                    upgrade.started_at = datetime.now(UTC)
+                    db.commit()
+
+                blocked = checkin(client, [])
+                self.assertEqual(blocked["jobs"], [])
+                with SessionLocal() as db:
+                    self.assertEqual(db.get(Job, later_read_id).status, "queued")
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(Job).where(Job.server_id == agent_id))
+                db.execute(delete(Server).where(Server.id == agent_id))
+                db.commit()
+
+    def test_agent_uninstall_event_requires_signed_identity_and_is_audited(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            db.add(
+                Server(
+                    id=agent_id,
+                    name=f"uninstall-audit-{agent_id[:8]}",
+                    os_family="windows",
+                    os_name="Windows Server 2022",
+                    architecture="AMD64",
+                    agent_version="0.8.16",
+                    cert_fingerprint=fingerprint,
+                    status="online",
+                    last_seen=datetime.now(UTC),
+                )
+            )
+            db.commit()
+        payload = {"agent_id": agent_id, "event": "denied", "os_user": "LAB\\operator", "detail": "invalid uninstall password"}
+        try:
+            with TestClient(app) as client:
+                self.assertEqual(client.post("/api/v1/agent/uninstall-event", json=payload).status_code, 401)
+                body, headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/uninstall-event", payload)
+                accepted = client.post("/api/v1/agent/uninstall-event", headers=headers, content=body)
+                self.assertEqual(accepted.status_code, 202, accepted.text)
+                with SessionLocal() as db:
+                    event = db.execute(
+                        select(AuditEvent)
+                        .where(AuditEvent.action == "agent.uninstall.denied", AuditEvent.target == agent_id)
+                        .order_by(AuditEvent.occurred_at.desc())
+                    ).scalars().first()
+                    self.assertIsNotNone(event)
+                    self.assertEqual(event.actor, f"agent:{agent_id}")
+                    self.assertEqual(event.result, "denied")
+                    self.assertEqual(event.detail["os_user"], "LAB\\operator")
+
+                completed_payload = {"agent_id": agent_id, "event": "completed", "os_user": "LAB\\operator", "detail": "supported uninstaller finished"}
+                completed_body, completed_headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/uninstall-event", completed_payload)
+                completed = client.post("/api/v1/agent/uninstall-event", headers=completed_headers, content=completed_body)
+                self.assertEqual(completed.status_code, 202, completed.text)
+                with SessionLocal() as db:
+                    server = db.get(Server, agent_id)
+                    self.assertEqual(server.cert_fingerprint, "")
+                    self.assertEqual(server.status, "uninstalled")
+                    completed_event = db.execute(
+                        select(AuditEvent)
+                        .where(AuditEvent.action == "agent.uninstall.completed", AuditEvent.target == agent_id)
+                        .order_by(AuditEvent.occurred_at.desc())
+                    ).scalars().first()
+                    self.assertIsNotNone(completed_event)
+                    self.assertEqual(completed_event.result, "success")
+
+                admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+                upgrade_status = client.get("/api/v1/agent-upgrades/status", headers=admin_headers)
+                self.assertEqual(upgrade_status.status_code, 200, upgrade_status.text)
+                self.assertNotIn(agent_id, {item["serverId"] for item in upgrade_status.json()["items"]})
+                uninstall_status = client.get("/api/v1/settings/agent-uninstall-protection", headers=admin_headers)
+                self.assertEqual(uninstall_status.status_code, 200, uninstall_status.text)
+                self.assertNotIn(agent_id, {item["serverId"] for item in uninstall_status.json()["items"]})
+
+                replay_body, replay_headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/uninstall-event", {**completed_payload, "event": "authorized"})
+                replay = client.post("/api/v1/agent/uninstall-event", headers=replay_headers, content=replay_body)
+                self.assertEqual(replay.status_code, 401, replay.text)
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(AuditEvent).where(AuditEvent.target == agent_id))
+                db.execute(delete(Server).where(Server.id == agent_id))
+                db.commit()
+
+    def test_custom_agent_manager_is_share_scoped_and_cannot_manage_uninstall_password(self):
+        role_name = f"agentmgr-{uuid.uuid4().hex[:8]}"
+        user_id = str(uuid.uuid4())
+        visible_id = str(uuid.uuid4())
+        hidden_id = str(uuid.uuid4())
+        provenance_path = fake_linux_agent_path.with_name(fake_linux_agent_path.name + ".provenance.json")
+        original_provenance = provenance_path.read_text(encoding="utf-8")
+        with TestClient(app):
+            pass
+        with SessionLocal() as db:
+            role = PlatformRole(
+                name=role_name,
+                display_name="Scoped Agent manager",
+                description="Test role with Agent lifecycle permission",
+                permissions=["agents.manage"],
+                system=False,
+            )
+            user = User(
+                id=user_id,
+                username=f"agentmgr-{user_id[:8]}",
+                password_hash="!test",
+                display_name="Scoped Agent manager",
+                role=role_name,
+                enabled=True,
+            )
+            db.add_all(
+                [
+                    role,
+                    user,
+                    Server(id=visible_id, name=f"visible-{visible_id[:8]}", os_family="linux", os_name="Ubuntu 24.04", architecture="x86_64", agent_version="0.8.16", status="online", last_seen=datetime.now(UTC)),
+                    Server(id=hidden_id, name=f"hidden-{hidden_id[:8]}", os_family="linux", os_name="Ubuntu 24.04", architecture="x86_64", agent_version="0.8.16", status="online", last_seen=datetime.now(UTC)),
+                ]
+            )
+            db.flush()
+            db.add(ServerUserShare(server_id=visible_id, user_id=user_id, granted_by="system-test"))
+            db.commit()
+            headers = {"Authorization": f"Bearer {issue_jwt(user)}"}
+        try:
+            with TestClient(app) as client:
+                status = client.get("/api/v1/agent-upgrades/status", headers=headers)
+                self.assertEqual(status.status_code, 200, status.text)
+                self.assertEqual({item["serverId"] for item in status.json()["items"]}, {visible_id})
+                write_artifact_provenance(fake_linux_agent_path, "0.8.17", "linux_elf")
+                with patch("app.main.RELEASE_VERSION", "0.8.17"):
+                    hidden = client.post(
+                        "/api/v1/agent-upgrades",
+                        headers=headers,
+                        json={"server_ids": [hidden_id], "reason": "A scoped manager cannot target a hidden server"},
+                    )
+                    self.assertEqual(hidden.status_code, 404, hidden.text)
+                    visible = client.post(
+                        "/api/v1/agent-upgrades",
+                        headers=headers,
+                        json={"server_ids": [visible_id], "reason": "Upgrade the one directly shared server"},
+                    )
+                    self.assertEqual(visible.status_code, 201, visible.text)
+                    self.assertEqual([item["serverId"] for item in visible.json()["queued"]], [visible_id])
+                    with SessionLocal() as db:
+                        self.assertIsNone(db.execute(select(Job).where(Job.server_id == hidden_id, Job.action == "agent.upgrade")).scalar_one_or_none())
+                        self.assertIsNotNone(db.execute(select(Job).where(Job.server_id == visible_id, Job.action == "agent.upgrade")).scalar_one_or_none())
+                self.assertEqual(client.get("/api/v1/settings/agent-uninstall-protection", headers=headers).status_code, 403)
+                denied = client.put(
+                    "/api/v1/settings/agent-uninstall-protection",
+                    headers=headers,
+                    json={
+                        "new_password": "Unauthorized-uninstall-secret!",
+                        "confirm_password": "Unauthorized-uninstall-secret!",
+                        "reason": "A custom role must not rotate the global uninstall password",
+                    },
+                )
+                self.assertEqual(denied.status_code, 403, denied.text)
+        finally:
+            provenance_path.write_text(original_provenance, encoding="utf-8")
+            with SessionLocal() as db:
+                task_ids = db.execute(select(BulkTaskItem.bulk_task_id).where(BulkTaskItem.server_id.in_([visible_id, hidden_id]))).scalars().all()
+                db.execute(delete(BulkTaskItem).where(BulkTaskItem.server_id.in_([visible_id, hidden_id])))
+                if task_ids:
+                    db.execute(delete(BulkTask).where(BulkTask.id.in_(task_ids)))
+                db.execute(delete(ServerUserShare).where(ServerUserShare.user_id == user_id))
+                db.execute(delete(Job).where(Job.server_id.in_([visible_id, hidden_id])))
+                db.execute(delete(Server).where(Server.id.in_([visible_id, hidden_id])))
+                db.execute(delete(User).where(User.id == user_id))
+                db.execute(delete(PlatformRole).where(PlatformRole.name == role_name))
+                db.commit()
 
     def test_windows_is_classified_as_windows(self):
         family, verification = classify_os(Inventory(hostname="win-01", os_family="windows", os_name="Microsoft Windows Server 2025", distribution_id="windows"))
@@ -1191,6 +2118,11 @@ class ClassificationTests(unittest.TestCase):
             db.commit()
         fake_msi = Path(tmp.name) / "TramVanHanhAgent.msi"
         fake_msi.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 8192)
+        write_artifact_provenance(
+            fake_msi,
+            (Path(settings.agent_assets_root) / "VERSION").read_text(encoding="ascii").strip(),
+            "windows_msi",
+        )
         settings.windows_agent_msi = str(fake_msi)
 
         with TestClient(app) as client:

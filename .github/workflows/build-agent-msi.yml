@@ -31,6 +31,11 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir -r agent/requirements.txt pyinstaller==6.16.0
           pyinstaller --noconfirm --clean --onefile --name tram-agent --add-data "agent/VERSION:." agent/tram_agent.py
+          $expectedVersion = (Get-Content agent/VERSION -Raw).Trim()
+          $diagnostic = & dist/tram-agent.exe diagnose | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $diagnostic.agent_version -ne $expectedVersion -or $diagnostic.os_family -ne 'windows') {
+            throw "Frozen Windows Agent does not report the requested release version"
+          }
 
       - name: Detect optional code-signing certificate
         id: signing
@@ -76,6 +81,14 @@ jobs:
           New-Item -ItemType Directory -Force agent/windows/out | Out-Null
           $agentVersion = (Get-Content agent/VERSION -Raw).Trim()
           wix build agent/windows/Product.wxs -arch x64 -ext WixToolset.Util.wixext -d AgentExe="$pwd/dist/tram-agent.exe" -d AgentVersion="$agentVersion" -o agent/windows/out/TramVanHanhAgent.msi
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase((Resolve-Path 'agent/windows/out/TramVanHanhAgent.msi').Path, 0)
+          $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'")
+          $view.Execute()
+          $record = $view.Fetch()
+          if ($null -eq $record -or $record.StringData(1) -ne $agentVersion) {
+            throw "MSI ProductVersion does not match agent/VERSION"
+          }
 
       - name: Sign MSI
         if: steps.signing.outputs.enabled == 'true'
@@ -94,9 +107,27 @@ jobs:
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Write release provenance
+        shell: pwsh
+        run: |
+          $path = Resolve-Path 'agent/windows/out/TramVanHanhAgent.msi'
+          $payload = [ordered]@{
+            schema = 1
+            version = (Get-Content agent/VERSION -Raw).Trim()
+            artifactKind = 'windows_msi'
+            sha256 = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            sizeBytes = (Get-Item $path).Length
+            sourceCommit = '${{ github.sha }}'
+            authenticodeSigned = ('${{ steps.signing.outputs.enabled }}' -eq 'true')
+          }
+          $payload | ConvertTo-Json -Compress | Set-Content -Encoding utf8 'agent/windows/out/TramVanHanhAgent.msi.provenance.json'
+          Get-Content 'agent/windows/out/TramVanHanhAgent.msi.provenance.json'
+
       - name: Upload generic MSI
         uses: actions/upload-artifact@v4
         with:
           name: TramVanHanhAgent-msi
-          path: agent/windows/out/TramVanHanhAgent.msi
+          path: |
+            agent/windows/out/TramVanHanhAgent.msi
+            agent/windows/out/TramVanHanhAgent.msi.provenance.json
           if-no-files-found: error

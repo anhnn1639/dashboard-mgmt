@@ -17,6 +17,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
@@ -34,8 +35,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from ldap3 import ALL, BASE, SUBTREE, Connection, Server as LDAPServer, Tls
 from ldap3.utils.conv import escape_filter_chars
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -113,6 +115,13 @@ def read_release_version() -> str:
 
 
 RELEASE_VERSION = read_release_version()
+SELF_UPDATE_MIN_VERSION = "0.8.16"
+AGENT_UPGRADE_INSTALL_TIMEOUT = timedelta(minutes=45)
+AGENT_UPGRADE_TIMEOUT_MARKER = "agent-upgrade-install-timeout-v1"
+AGENT_UNINSTALL_POLICY_KEY = "agent_uninstall_password_v1"
+AGENT_UNINSTALL_PBKDF2_ITERATIONS = 600_000
+AGENT_UNINSTALL_POLICY_MAX_ATTEMPTS = 3
+AGENT_UNINSTALL_POLICY_RETRY_BASE = timedelta(minutes=5)
 AGENT_SERVER_CA_UNAVAILABLE = (
     "Chứng thư bảo mật của kênh Agent chưa sẵn sàng; hãy đồng bộ lại dịch vụ bảo mật và thử lại."
 )
@@ -322,6 +331,17 @@ class AgentBootstrapPackage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentUninstallPolicyState(Base):
+    __tablename__ = "agent_uninstall_policy_states"
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), primary_key=True)
+    desired_revision: Mapped[int] = mapped_column(Integer, default=0)
+    applied_revision: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
 
 
 class Job(Base):
@@ -624,6 +644,14 @@ class CheckinRequest(BaseModel):
         return values
 
 
+class AgentUninstallEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    agent_id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    event: Literal["denied", "authorized", "completed", "failed"]
+    os_user: str = Field(default="", max_length=128)
+    detail: str = Field(default="", max_length=500)
+
+
 class JobCreateRequest(BaseModel):
     server_id: str
     action: str
@@ -678,6 +706,35 @@ class JobResultRequest(BaseModel):
     status: Literal["succeeded", "failed"]
     exit_code: int
     output: str = Field(default="", max_length=5_000_000)
+    agent_version: str = Field(default="", max_length=30, pattern=r"^(?:|[0-9]+\.[0-9]+\.[0-9]+)$")
+
+
+class AgentUpgradeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server_ids: list[str] = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=5, max_length=2000)
+
+    @field_validator("server_ids")
+    @classmethod
+    def valid_server_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", value) for value in values):
+            raise ValueError("Target server IDs are invalid or duplicated")
+        return values
+
+
+class AgentUninstallProtectionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    new_password: str = Field(min_length=14, max_length=1024)
+    confirm_password: str = Field(min_length=14, max_length=1024)
+    current_password: str | None = Field(default=None, max_length=1024)
+    reason: str = Field(min_length=5, max_length=1000)
+
+    @field_validator("new_password", "confirm_password", "current_password")
+    @classmethod
+    def valid_uninstall_password(cls, value: str | None) -> str | None:
+        if value is not None and any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("Agent uninstall password cannot contain control characters")
+        return value
 
 
 class LogSourcesUpdateRequest(BaseModel):
@@ -790,6 +847,8 @@ SAFE_ACTIONS: dict[str, dict[str, Any]] = {
     "storage.delete": {"roles": {"admin", "operator"}, "risk": "critical"},
     "network.list": {"roles": {"admin", "operator", "viewer"}, "risk": "low"},
     "system.reboot": {"roles": {"admin", "operator"}, "risk": "critical"},
+    "agent.upgrade": {"roles": {"admin"}, "risk": "critical"},
+    "agent.uninstall.policy": {"roles": {"admin"}, "risk": "critical"},
 }
 
 MAX_CONCURRENT_AGENT_JOBS = 4
@@ -859,6 +918,8 @@ ACTION_PERMISSIONS: dict[str, str] = {
     "network.list": "resources.view",
     "system.reboot": "system.reboot",
     "file.deliver": "files.manage",
+    "agent.upgrade": "agents.manage",
+    "agent.uninstall.policy": "agents.manage",
 }
 
 ALL_PLATFORM_PERMISSIONS = set(PERMISSION_CATALOG)
@@ -991,6 +1052,14 @@ def validate_firewall_job_parameters(action: str, parameters: dict[str, Any]) ->
 def validate_job_parameters(action: str, parameters: dict[str, Any], server: Server) -> None:
     if len(json.dumps(parameters, ensure_ascii=False)) > 250_000:
         raise HTTPException(status_code=422, detail="Job parameters are too large")
+    if action == "agent.upgrade":
+        if set(parameters) != {"manifest", "signature"} or not isinstance(parameters.get("manifest"), dict) or not isinstance(parameters.get("signature"), str):
+            raise HTTPException(status_code=422, detail="Agent upgrade manifest is invalid")
+        return
+    if action == "agent.uninstall.policy":
+        if set(parameters) != {"revision", "secret"} or isinstance(parameters.get("revision"), bool) or not isinstance(parameters.get("revision"), int) or parameters["revision"] < 1 or not isinstance(parameters.get("secret"), str):
+            raise HTTPException(status_code=422, detail="Agent uninstall policy is invalid")
+        return
     if action.startswith("firewall."):
         validate_firewall_job_parameters(action, parameters)
         return
@@ -1197,6 +1266,23 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def redact_request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's default 422 response includes Pydantic's `input` value. That
+    # would echo passwords and other secrets when a constraint rejects them.
+    errors = [
+        {
+            "type": str(error.get("type", "value_error")),
+            "loc": list(error.get("loc", ())),
+            "msg": str(error.get("msg", "Invalid request value")),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 origins = [item.strip() for item in settings.allowed_origins.split(",") if item.strip()]
 if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -1389,6 +1475,185 @@ def reveal_parameters(value: Any) -> Any:
     return value
 
 
+def semantic_agent_version(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value.strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def normalized_agent_architecture(value: str) -> str:
+    normalized = value.strip().lower()
+    return "x86_64" if normalized in {"x86_64", "amd64", "x64"} else normalized
+
+
+def validate_agent_artifact_provenance(path: Path, content: bytes, artifact_kind: str) -> dict[str, Any]:
+    provenance_path = path.with_name(path.name + ".provenance.json")
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise FileNotFoundError(f"Agent provenance is missing for {path.name}") from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Agent provenance is invalid for {path.name}") from exc
+    required = {"schema", "version", "artifactKind", "sha256", "sizeBytes", "sourceCommit", "authenticodeSigned"}
+    digest = hashlib.sha256(content).hexdigest()
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) != required
+        or provenance.get("schema") != 1
+        or provenance.get("version") != RELEASE_VERSION
+        or provenance.get("artifactKind") != artifact_kind
+        or provenance.get("sha256") != digest
+        or provenance.get("sizeBytes") != len(content)
+        or not re.fullmatch(r"[0-9a-f]{40}", str(provenance.get("sourceCommit", "")))
+        or not isinstance(provenance.get("authenticodeSigned"), bool)
+        or (artifact_kind != "windows_msi" and provenance.get("authenticodeSigned") is not False)
+    ):
+        raise ValueError(f"Agent provenance does not match release {RELEASE_VERSION} for {path.name}")
+    return provenance
+
+
+@lru_cache(maxsize=8)
+def cached_agent_release_artifact(path_text: str, kind: str, filename: str, mtime_ns: int, size_bytes: int, release_version: str) -> dict[str, Any]:
+    path = Path(path_text)
+    content = validate_windows_msi(path) if kind == "windows_msi" else validate_linux_agent(path)
+    if len(content) != size_bytes or release_version != RELEASE_VERSION:
+        raise ValueError("Agent release changed while it was being validated")
+    return {
+        "path": path,
+        "content": content,
+        "artifact_kind": kind,
+        "filename": filename,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+    }
+
+
+def agent_release_artifact(os_family: str) -> dict[str, Any]:
+    if os_family == "windows":
+        path = Path(settings.windows_agent_msi)
+        kind = "windows_msi"
+        filename = "TramVanHanhAgent.msi"
+    elif os_family == "linux":
+        path = Path(settings.agent_assets_root) / LINUX_AGENT_PATH
+        kind = "linux_elf"
+        filename = "tram-agent"
+    else:
+        raise ValueError("Unsupported Agent release operating system")
+    stat = path.stat()
+    artifact = cached_agent_release_artifact(
+        str(path.resolve()),
+        kind,
+        filename,
+        stat.st_mtime_ns,
+        stat.st_size,
+        RELEASE_VERSION,
+    )
+    # Provenance is small and security-sensitive, so validate it on every
+    # request even while the larger binary bytes/hash remain cached by stat.
+    provenance = validate_agent_artifact_provenance(path, artifact["content"], kind)
+    return {
+        **artifact,
+        "source_commit": provenance["sourceCommit"],
+        "authenticode_signed": provenance["authenticodeSigned"],
+    }
+
+
+def agent_ca_signing_material() -> tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]:
+    try:
+        certificate = x509.load_pem_x509_certificate(Path(settings.agent_ca_cert).read_bytes())
+        private_key = serialization.load_pem_private_key(Path(settings.agent_ca_key).read_bytes(), password=None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=503, detail="Agent signing authority is unavailable") from exc
+    public_key = certificate.public_key()
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey) or not isinstance(public_key, ec.EllipticCurvePublicKey) or private_key.public_key().public_numbers() != public_key.public_numbers():
+        raise HTTPException(status_code=503, detail="Agent signing authority is invalid")
+    return private_key, public_key
+
+
+def canonical_agent_upgrade_manifest(manifest: dict[str, Any]) -> bytes:
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def sign_agent_upgrade_manifest(manifest: dict[str, Any]) -> str:
+    private_key, _ = agent_ca_signing_material()
+    signature = private_key.sign(canonical_agent_upgrade_manifest(manifest), ec.ECDSA(hashes.SHA256()))
+    return base64.b64encode(signature).decode()
+
+
+def verify_agent_upgrade_manifest(manifest: dict[str, Any], signature: str) -> None:
+    _, public_key = agent_ca_signing_material()
+    try:
+        decoded = base64.b64decode(signature, validate=True)
+        public_key.verify(decoded, canonical_agent_upgrade_manifest(manifest), ec.ECDSA(hashes.SHA256()))
+    except (ValueError, binascii.Error, InvalidSignature) as exc:
+        raise HTTPException(status_code=409, detail="Agent upgrade manifest signature is invalid") from exc
+
+
+def build_agent_upgrade_manifest(job_id: str, server: Server, artifact: dict[str, Any]) -> dict[str, Any]:
+    artifact_key = "windows-amd64" if server.os_family == "windows" else "linux-x86_64"
+    return {
+        "schema": 1,
+        "jobId": job_id,
+        "agentId": server.id,
+        "releaseId": str(uuid.uuid4()),
+        "version": RELEASE_VERSION,
+        "artifacts": {
+            artifact_key: {
+                "sha256": artifact["sha256"],
+                "size": artifact["size_bytes"],
+                "osFamily": server.os_family,
+                "architecture": "amd64" if server.os_family == "windows" else "x86_64",
+            }
+        },
+    }
+
+
+def agent_upgrade_eligibility(server: Server, artifacts: dict[str, dict[str, Any]]) -> tuple[str, str]:
+    current = semantic_agent_version(server.agent_version)
+    target = semantic_agent_version(RELEASE_VERSION)
+    minimum = semantic_agent_version(SELF_UPDATE_MIN_VERSION)
+    if server.status == "uninstalled":
+        return "inactive", "Agent đã được gỡ khỏi máy chủ"
+    if server.os_family not in {"windows", "linux"} or normalized_agent_architecture(server.architecture) != "x86_64":
+        return "unsupported", "Hệ điều hành hoặc kiến trúc Agent chưa được hỗ trợ"
+    artifact = artifacts.get(server.os_family, {})
+    if not artifact.get("ready") or not artifact.get("signed"):
+        return "unsupported", "Gói nâng cấp đã xác thực chưa sẵn sàng"
+    if current is None or target is None or minimum is None:
+        return "manual_required", "Phiên bản Agent không hợp lệ; cần nâng cấp thủ công"
+    if current == target:
+        return "current", "Agent đang ở phiên bản mới nhất"
+    if current > target:
+        return "newer", "Agent đang mới hơn bản phát hành; không cho phép hạ phiên bản"
+    if current < minimum:
+        return "manual_required", f"Cần nâng cấp thủ công một lần lên tối thiểu {SELF_UPDATE_MIN_VERSION}"
+    return "eligible", "Có thể nâng cấp trực tiếp"
+
+
+def release_artifact_status() -> dict[str, dict[str, Any]]:
+    signing_ready = True
+    try:
+        agent_ca_signing_material()
+    except HTTPException:
+        signing_ready = False
+    result: dict[str, dict[str, Any]] = {}
+    for family in ("windows", "linux"):
+        try:
+            artifact = agent_release_artifact(family)
+            result[family] = {
+                "ready": signing_ready,
+                "signed": signing_ready,
+                "manifestSigned": signing_ready,
+                "authenticodeSigned": artifact["authenticode_signed"],
+                "sha256": artifact["sha256"],
+                "sizeBytes": artifact["size_bytes"],
+                "artifactKind": artifact["artifact_kind"],
+                "sourceCommit": artifact["source_commit"],
+            }
+        except (FileNotFoundError, ValueError):
+            result[family] = {"ready": False, "signed": False, "manifestSigned": False, "authenticodeSigned": False, "sha256": "", "sizeBytes": 0, "artifactKind": "windows_msi" if family == "windows" else "linux_elf", "sourceCommit": ""}
+    return result
+
+
 def client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
     return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "")
@@ -1408,7 +1673,15 @@ def auth_throttle_scopes(request: Request, identity: str) -> list[tuple[str, int
     ]
 
 
-def enforce_auth_throttle(db: Session, scopes: list[tuple[str, int]]) -> None:
+def agent_uninstall_throttle_scopes(request: Request, user_id: str) -> list[tuple[str, int]]:
+    source = client_ip(request) or "unknown"
+    return [
+        (auth_throttle_key("agent-uninstall-ip", source), settings.auth_ip_failures),
+        (auth_throttle_key("agent-uninstall-user-ip", f"{user_id}\0{source}"), settings.auth_account_failures),
+    ]
+
+
+def enforce_auth_throttle(db: Session, scopes: list[tuple[str, int]], detail: str = "Đăng nhập tạm thời bị giới hạn do quá nhiều lần thử thất bại") -> None:
     timestamp = now()
     blocked_until = max(
         (
@@ -1422,7 +1695,7 @@ def enforce_auth_throttle(db: Session, scopes: list[tuple[str, int]]) -> None:
         retry_after = max(1, int((blocked_until - timestamp).total_seconds()))
         raise HTTPException(
             status_code=429,
-            detail="Đăng nhập tạm thời bị giới hạn do quá nhiều lần thử thất bại",
+            detail=detail,
             headers={"Retry-After": str(retry_after)},
         )
 
@@ -1467,6 +1740,136 @@ def audit(db: Session, actor: str, action: str, target: str, request: Request | 
     previous_hash = previous.event_hash if previous else "0" * 64
     event_hash = hashlib.sha256((previous_hash + payload).encode()).hexdigest()
     db.add(AuditEvent(occurred_at=occurred, actor=actor, action=action, target=target, result=result, source_ip=client_ip(request) if request else "", detail=detail or {}, previous_hash=previous_hash, event_hash=event_hash))
+
+
+def load_agent_uninstall_policy(db: Session) -> dict[str, Any] | None:
+    setting = db.get(SystemSetting, AGENT_UNINSTALL_POLICY_KEY)
+    if setting is None:
+        return None
+    try:
+        policy = json.loads(setting.value)
+        required = {"version", "revision", "algorithm", "iterations", "salt", "verifier", "updated_at", "updated_by"}
+        if set(policy) != required or policy["version"] != 1 or policy["algorithm"] != "pbkdf2-sha256" or policy["iterations"] != AGENT_UNINSTALL_PBKDF2_ITERATIONS or not isinstance(policy["revision"], int) or policy["revision"] < 1:
+            raise ValueError
+        base64.b64decode(policy["salt"], validate=True)
+        base64.b64decode(policy["verifier"], validate=True)
+        return policy
+    except (TypeError, ValueError, binascii.Error, json.JSONDecodeError):
+        raise HTTPException(status_code=503, detail="Agent uninstall protection policy is invalid") from None
+
+
+def build_agent_uninstall_policy(password: str, revision: int, user: User) -> dict[str, Any]:
+    salt = secrets.token_bytes(16)
+    verifier = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, AGENT_UNINSTALL_PBKDF2_ITERATIONS)
+    return {
+        "version": 1,
+        "revision": revision,
+        "algorithm": "pbkdf2-sha256",
+        "iterations": AGENT_UNINSTALL_PBKDF2_ITERATIONS,
+        "salt": base64.b64encode(salt).decode(),
+        "verifier": base64.b64encode(verifier).decode(),
+        "updated_at": now().isoformat(),
+        "updated_by": user.id,
+    }
+
+
+def verify_agent_uninstall_password(policy: dict[str, Any], password: str) -> bool:
+    try:
+        salt = base64.b64decode(policy["salt"], validate=True)
+        expected = base64.b64decode(policy["verifier"], validate=True)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(policy["iterations"]))
+        return hmac.compare_digest(actual, expected)
+    except (TypeError, ValueError, binascii.Error):
+        return False
+
+
+def policy_secret(policy: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "revision": policy["revision"],
+            "enabled": True,
+            "algorithm": policy["algorithm"],
+            "iterations": policy["iterations"],
+            "salt": policy["salt"],
+            "verifier": policy["verifier"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def agent_uninstall_policy_failure(error: str) -> tuple[int, str]:
+    try:
+        payload = json.loads(error)
+        attempts = int(payload.get("attempts", 0))
+        message = str(payload.get("message", ""))
+        if not 0 <= attempts <= AGENT_UNINSTALL_POLICY_MAX_ATTEMPTS or len(message) > 2000:
+            raise ValueError
+        return attempts, message
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return (1, error[-2000:]) if error else (0, "")
+
+
+def terminal_agent_uninstall_policy_failure(state: AgentUninstallPolicyState | None, revision: int) -> bool:
+    if state is None or state.desired_revision != revision or state.status != "failed":
+        return False
+    attempts, _ = agent_uninstall_policy_failure(state.error)
+    return attempts >= AGENT_UNINSTALL_POLICY_MAX_ATTEMPTS
+
+
+def ensure_agent_uninstall_policy_job(db: Session, server: Server, policy: dict[str, Any], *, request: Request | None = None, actor: str = "system:agent-policy", reason: str | None = None) -> Job | None:
+    if semantic_agent_version(server.agent_version) is None or semantic_agent_version(server.agent_version) < semantic_agent_version(SELF_UPDATE_MIN_VERSION) or normalized_agent_architecture(server.architecture) != "x86_64":
+        return None
+    revision = int(policy["revision"])
+    state = db.get(AgentUninstallPolicyState, server.id)
+    if state and state.desired_revision == revision and state.applied_revision >= revision:
+        return None
+    if state and state.desired_revision == revision and state.status == "failed":
+        attempts, _ = agent_uninstall_policy_failure(state.error)
+        if attempts >= AGENT_UNINSTALL_POLICY_MAX_ATTEMPTS:
+            return None
+        retry_delay = AGENT_UNINSTALL_POLICY_RETRY_BASE * (2 ** max(0, attempts - 1))
+        if aware(state.updated_at) and now() - aware(state.updated_at) < retry_delay:
+            return None
+    active = db.execute(
+        select(Job).where(
+            Job.server_id == server.id,
+            Job.action == "agent.uninstall.policy",
+            Job.status.in_(["queued", "dispatched"]),
+        ).order_by(Job.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if active:
+        if state is None:
+            state = AgentUninstallPolicyState(server_id=server.id)
+            db.add(state)
+        state.desired_revision = revision
+        state.job_id = active.id
+        state.status = active.status
+        state.updated_at = now()
+        return None
+    job = Job(
+        server_id=server.id,
+        action="agent.uninstall.policy",
+        parameters=protect_parameters({"revision": revision, "secret": policy_secret(policy)}),
+        reason=reason or f"Đồng bộ chính sách bảo vệ gỡ Agent phiên bản {revision}",
+        status="queued",
+        risk="critical",
+        created_by=str(policy.get("updated_by") or "system")[:36],
+    )
+    db.add(job)
+    db.flush()
+    if state is None:
+        state = AgentUninstallPolicyState(server_id=server.id)
+        db.add(state)
+    preserve_failure = state.desired_revision == revision and state.status == "failed"
+    state.desired_revision = revision
+    state.job_id = job.id
+    state.status = "queued"
+    if not preserve_failure:
+        state.error = ""
+    state.updated_at = now()
+    audit(db, actor, "agent.uninstall.policy.queued", job.id, request, detail={"server_id": server.id, "revision": revision})
+    return job
 
 
 def prune_audit_events(db: Session) -> int:
@@ -3191,19 +3594,284 @@ def issue_agent_identity(
     }
 
 
+def timed_out_agent_upgrade(job: Job) -> bool:
+    try:
+        payload = json.loads(job.output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("timeout") == AGENT_UPGRADE_TIMEOUT_MARKER
+
+
+def expire_stale_agent_upgrades(db: Session, request: Request | None = None) -> int:
+    cutoff = now() - AGENT_UPGRADE_INSTALL_TIMEOUT
+    stale = db.execute(
+        select(Job).where(
+            Job.action == "agent.upgrade",
+            Job.status == "installing",
+            Job.started_at.is_not(None),
+            Job.started_at < cutoff,
+        )
+    ).scalars().all()
+    for job in stale:
+        target_version = agent_upgrade_target_version(job)
+        # Never retry an installer automatically after the service has already
+        # been stopped once. An operator may explicitly create a new upgrade
+        # job after checking the endpoint. A delayed success report or a
+        # check-in from the target version can still reconcile this job below.
+        job.status = "failed"
+        job.finished_at = now()
+        job.exit_code = 124
+        job.output = json.dumps(
+            {"timeout": AGENT_UPGRADE_TIMEOUT_MARKER, "targetVersion": target_version},
+            separators=(",", ":"),
+        )
+        audit(
+            db,
+            "system:agent-upgrade",
+            "agent.upgrade.timeout.failed",
+            job.id,
+            request,
+            result="warning",
+            detail={"server_id": job.server_id, "target_version": target_version},
+        )
+    return len(stale)
+
+
+def agent_upgrade_status_payload(db: Session, allowed_server_ids: set[str] | None = None) -> dict[str, Any]:
+    artifacts = release_artifact_status()
+    retired = retired_server_ids(db)
+    server_filter = Server.id.not_in(retired) if retired else True
+    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled").order_by(Server.name)).scalars().all()
+    if allowed_server_ids is not None:
+        servers = [server for server in servers if server.id in allowed_server_ids]
+    items: list[dict[str, Any]] = []
+    for server in servers:
+        eligibility, reason = agent_upgrade_eligibility(server, artifacts)
+        latest = db.execute(
+            select(Job).where(Job.server_id == server.id, Job.action == "agent.upgrade").order_by(Job.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        active_status = latest.status if latest and latest.status in {"queued", "dispatched", "installing", "failed"} else None
+        if eligibility in {"current", "newer", "unsupported"} and active_status == "failed":
+            active_status = None
+        active_id = latest.id if active_status else None
+        last_seen = aware(server.last_seen)
+        items.append({
+            "serverId": server.id,
+            "serverName": server.name,
+            "osFamily": server.os_family,
+            "architecture": server.architecture,
+            "currentVersion": server.agent_version,
+            "targetVersion": RELEASE_VERSION,
+            "eligibility": eligibility,
+            "reason": reason,
+            "online": bool(last_seen and now() - last_seen <= timedelta(seconds=180)),
+            "activeJobId": active_id,
+            "activeJobStatus": active_status,
+        })
+    return {
+        "targetVersion": RELEASE_VERSION,
+        "minimumSelfUpdateVersion": SELF_UPDATE_MIN_VERSION,
+        "artifacts": artifacts,
+        "items": items,
+    }
+
+
+@app.get("/api/v1/agent-upgrades/status")
+def agent_upgrade_status(user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    if expire_stale_agent_upgrades(db):
+        db.commit()
+    return agent_upgrade_status_payload(db, visible_server_ids(db, user))
+
+
+@app.post("/api/v1/agent-upgrades", status_code=201)
+def create_agent_upgrades(payload: AgentUpgradeRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    if expire_stale_agent_upgrades(db, request):
+        db.commit()
+    artifacts_status = release_artifact_status()
+    allowed = visible_server_ids(db, user)
+    locked_servers = db.execute(
+        select(Server).where(Server.id.in_(payload.server_ids)).order_by(Server.id).with_for_update()
+    ).scalars().all()
+    servers_by_id = {server.id: server for server in locked_servers}
+    missing = [server_id for server_id in payload.server_ids if server_id not in servers_by_id or server_id not in allowed]
+    if missing:
+        raise HTTPException(status_code=404, detail="One or more target Agents were not found")
+    queued: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    jobs: list[tuple[Server, Job]] = []
+    for server_id in payload.server_ids:
+        server = servers_by_id[server_id]
+        active = db.execute(
+            select(Job).where(Job.server_id == server.id, Job.action == "agent.upgrade", Job.status.in_(["queued", "dispatched", "installing"])).order_by(Job.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        if active:
+            skipped.append({"serverId": server.id, "reason": f"Agent đã có công việc cập nhật {active.status}"})
+            continue
+        eligibility, reason = agent_upgrade_eligibility(server, artifacts_status)
+        if eligibility != "eligible":
+            skipped.append({"serverId": server.id, "reason": reason})
+            continue
+        try:
+            artifact = agent_release_artifact(server.os_family)
+            job_id = str(uuid.uuid4())
+            manifest = build_agent_upgrade_manifest(job_id, server, artifact)
+            signature = sign_agent_upgrade_manifest(manifest)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Agent release artifact is unavailable") from exc
+        job = Job(
+            id=job_id,
+            server_id=server.id,
+            action="agent.upgrade",
+            parameters={"manifest": manifest, "signature": signature},
+            reason=payload.reason,
+            status="queued",
+            risk="critical",
+            created_by=user.id,
+        )
+        validate_job_parameters(job.action, job.parameters, server)
+        db.add(job)
+        jobs.append((server, job))
+    if not jobs:
+        raise HTTPException(status_code=409, detail={"message": "Không có Agent đủ điều kiện cập nhật", "skipped": skipped})
+    families = {server.os_family for server, _ in jobs}
+    task = BulkTask(
+        action="agent.upgrade",
+        os_family=next(iter(families)) if len(families) == 1 else "mixed",
+        target_count=len(jobs),
+        summary={"targetVersion": RELEASE_VERSION, "skippedCount": len(skipped)},
+        reason=payload.reason,
+        created_by=user.id,
+    )
+    db.add(task)
+    db.flush()
+    for server, job in jobs:
+        db.flush()
+        db.add(BulkTaskItem(bulk_task_id=task.id, server_id=server.id, job_id=job.id))
+        queued.append({"serverId": server.id, "jobId": job.id})
+        audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": job.action, "risk": job.risk, "execution": "agent-upgrade", "bulk_task_id": task.id, "target_version": RELEASE_VERSION})
+    audit(db, user.username, "agent.upgrade.batch.queued", task.id, request, detail={"target_version": RELEASE_VERSION, "queued_count": len(queued), "skipped_count": len(skipped)})
+    db.commit()
+    return {"bulkTaskId": task.id, "targetVersion": RELEASE_VERSION, "queued": queued, "skipped": skipped}
+
+
+def agent_uninstall_protection_payload(db: Session) -> dict[str, Any]:
+    policy = load_agent_uninstall_policy(db)
+    retired = retired_server_ids(db)
+    server_filter = Server.id.not_in(retired) if retired else True
+    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled")).scalars().all()
+    states = {state.server_id: state for state in db.execute(select(AgentUninstallPolicyState)).scalars().all()}
+    compatible = [server for server in servers if semantic_agent_version(server.agent_version) is not None and semantic_agent_version(server.agent_version) >= semantic_agent_version(SELF_UPDATE_MIN_VERSION) and normalized_agent_architecture(server.architecture) == "x86_64"]
+    revision = int(policy["revision"]) if policy else 0
+    applied = sum(1 for server in compatible if (state := states.get(server.id)) is not None and state.applied_revision >= revision and revision > 0)
+    failed = sum(1 for server in compatible if terminal_agent_uninstall_policy_failure(states.get(server.id), revision)) if policy else 0
+    pending = sum(
+        1
+        for server in compatible
+        if not ((state := states.get(server.id)) is not None and state.applied_revision >= revision and revision > 0)
+        and not terminal_agent_uninstall_policy_failure(state, revision)
+    ) if policy else 0
+    return {
+        "configured": policy is not None,
+        "revision": revision,
+        "updatedAt": policy.get("updated_at") if policy else None,
+        "totalAgents": len(servers),
+        "appliedAgents": applied,
+        "pendingAgents": pending,
+        "failedAgents": failed,
+        "manualRequiredAgents": len(servers) - len(compatible),
+        "items": [
+            {
+                "serverId": server.id,
+                "serverName": server.name,
+                "agentVersion": server.agent_version,
+                "desiredRevision": states[server.id].desired_revision if server.id in states else 0,
+                "appliedRevision": states[server.id].applied_revision if server.id in states else 0,
+                "status": (
+                    "failed"
+                    if server.id in states and terminal_agent_uninstall_policy_failure(states[server.id], revision)
+                    else "retrying"
+                    if server.id in states and states[server.id].desired_revision == revision and states[server.id].status == "failed"
+                    else states[server.id].status
+                    if server.id in states
+                    else "manual_required"
+                    if server not in compatible
+                    else "pending"
+                ),
+                "jobId": states[server.id].job_id if server.id in states else None,
+            }
+            for server in servers
+        ],
+    }
+
+
+@app.get("/api/v1/settings/agent-uninstall-protection")
+def get_agent_uninstall_protection(user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được quản lý mật khẩu gỡ Agent toàn hệ thống")
+    return agent_uninstall_protection_payload(db)
+
+
+def persist_agent_uninstall_protection(payload: AgentUninstallProtectionUpdateRequest, request: Request, user: User, db: Session) -> dict[str, Any]:
+    current = load_agent_uninstall_policy(db)
+    throttle_scopes = agent_uninstall_throttle_scopes(request, user.id)
+    enforce_auth_throttle(db, throttle_scopes, "Đổi mật khẩu gỡ Agent tạm thời bị giới hạn do quá nhiều lần nhập sai")
+    if current is not None and not verify_agent_uninstall_password(current, payload.current_password or ""):
+        record_auth_failure(db, throttle_scopes)
+        audit(db, user.username, "agent.uninstall.protection.update", "system", request, result="denied", detail={"reason": "current_password_invalid", "revision": current["revision"]})
+        db.commit()
+        raise HTTPException(status_code=401, detail="Mật khẩu gỡ Agent hiện tại không đúng")
+    clear_auth_throttle(db, throttle_scopes)
+    revision = int(current["revision"]) + 1 if current else 1
+    policy = build_agent_uninstall_policy(payload.new_password, revision, user)
+    db.merge(SystemSetting(key=AGENT_UNINSTALL_POLICY_KEY, value=json.dumps(policy, sort_keys=True, separators=(",", ":"))))
+    queued_jobs = db.execute(select(Job).where(Job.action == "agent.uninstall.policy", Job.status == "queued")).scalars().all()
+    for job in queued_jobs:
+        job.status = "cancelled"
+        job.finished_at = now()
+        job.output = "Chính sách gỡ Agent đã được thay bằng revision mới hơn."
+    retired = retired_server_ids(db)
+    server_filter = Server.id.not_in(retired) if retired else True
+    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled").order_by(Server.name)).scalars().all()
+    queued_count = 0
+    for server in servers:
+        if ensure_agent_uninstall_policy_job(db, server, policy, request=request, actor=user.username, reason=payload.reason):
+            queued_count += 1
+    audit(db, user.username, "agent.uninstall.protection.update", "system", request, detail={"revision": revision, "queued_count": queued_count, "reason": payload.reason})
+    db.commit()
+    return agent_uninstall_protection_payload(db)
+
+
+@app.put("/api/v1/settings/agent-uninstall-protection")
+def update_agent_uninstall_protection(payload: AgentUninstallProtectionUpdateRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được quản lý mật khẩu gỡ Agent toàn hệ thống")
+    if not hmac.compare_digest(payload.new_password, payload.confirm_password):
+        raise HTTPException(status_code=422, detail="Hai lần nhập mật khẩu gỡ Agent không khớp")
+    # The current deployment deliberately runs one API worker because the
+    # tunnel hub is process-local. This lock also serializes first-time policy
+    # creation, for which SELECT ... FOR UPDATE cannot lock a missing row.
+    with database_lock:
+        return persist_agent_uninstall_protection(payload, request, user, db)
+
+
 @app.get("/api/v1/agent-packages/status")
 def agent_package_status(_: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
     dashboard_url = canonical_dashboard_url(db)
     try:
-        validate_linux_agent(Path(settings.agent_assets_root) / LINUX_AGENT_PATH)
+        agent_release_artifact("linux")
         linux_available = True
     except (FileNotFoundError, ValueError):
         linux_available = False
+    try:
+        agent_release_artifact("windows")
+        windows_available = True
+    except (FileNotFoundError, ValueError):
+        windows_available = False
     return {
         "dashboardUrl": dashboard_url,
         "agentVersion": RELEASE_VERSION,
         "linuxAvailable": linux_available,
-        "windowsMsiAvailable": Path(settings.windows_agent_msi).is_file(),
+        "windowsMsiAvailable": windows_available,
         "agentTlsCaAvailable": agent_server_ca_available(),
         "claimTtlMinutes": 30,
         "webTlsTrust": settings.web_tls_trust,
@@ -3239,8 +3907,10 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
     expires_at = now() + timedelta(minutes=payload.expires_minutes)
     try:
         if payload.os_family == "linux":
+            artifact = agent_release_artifact("linux")
             content = linux_run_bundle(
                 Path(settings.agent_assets_root),
+                agent_content=artifact["content"],
                 dashboard_url=dashboard_url,
                 package_id=package_id,
                 package_secret=package_secret,
@@ -3250,7 +3920,8 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
             filename = f"TramAgent-Linux-{safe_label}.run"
             media_type = "application/octet-stream"
         else:
-            content = validate_windows_msi(Path(settings.windows_agent_msi))
+            artifact = agent_release_artifact("windows")
+            content = artifact["content"]
             filename = windows_msi_filename(dashboard_url, package_id, package_secret, bootstrap_tls_pin)
             media_type = "application/x-msi"
     except (FileNotFoundError, ValueError) as exc:
@@ -3350,6 +4021,77 @@ def enroll(payload: EnrollmentRequest, request: Request, db: Session = Depends(d
     record.uses += 1
     db.commit()
     return response
+
+
+def validated_agent_upgrade_artifact(job: Job, server: Server) -> dict[str, Any]:
+    parameters = job.parameters or {}
+    manifest = parameters.get("manifest")
+    signature = parameters.get("signature")
+    if not isinstance(manifest, dict) or not isinstance(signature, str):
+        raise HTTPException(status_code=409, detail="Agent upgrade manifest is missing")
+    verify_agent_upgrade_manifest(manifest, signature)
+    artifact = agent_release_artifact(server.os_family)
+    artifact_key = "windows-amd64" if server.os_family == "windows" else "linux-x86_64"
+    stored_artifacts = manifest.get("artifacts")
+    stored = stored_artifacts.get(artifact_key) if isinstance(stored_artifacts, dict) else None
+    expected_platform = "amd64" if server.os_family == "windows" else "x86_64"
+    try:
+        uuid.UUID(str(manifest.get("releaseId", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="Agent upgrade release identity is invalid") from exc
+    if (
+        manifest.get("schema") != 1
+        or manifest.get("jobId") != job.id
+        or manifest.get("agentId") != server.id
+        or manifest.get("version") != RELEASE_VERSION
+        or not isinstance(stored, dict)
+        or stored != {
+            "sha256": artifact["sha256"],
+            "size": artifact["size_bytes"],
+            "osFamily": server.os_family,
+            "architecture": expected_platform,
+        }
+    ):
+        raise HTTPException(status_code=409, detail="Agent upgrade manifest no longer matches the bundled release")
+    return artifact
+
+
+def agent_upgrade_target_version(job: Job) -> str:
+    manifest = (job.parameters or {}).get("manifest")
+    target = str(manifest.get("version", "")) if isinstance(manifest, dict) else ""
+    if semantic_agent_version(target) is None:
+        raise HTTPException(status_code=409, detail="Agent upgrade target version is invalid")
+    return target
+
+
+@app.get("/api/v1/agent/upgrades/{job_id}/artifact")
+def agent_upgrade_artifact(job_id: str, request: Request, agent_id: str = Query(min_length=36, max_length=36), db: Session = Depends(db_session)):
+    server = verify_agent(request, db, agent_id, b"")
+    job = db.get(Job, job_id)
+    if not job or job.action != "agent.upgrade" or job.server_id != server.id:
+        raise HTTPException(status_code=404, detail="Agent upgrade job not found")
+    if job.status not in {"dispatched", "installing"}:
+        raise HTTPException(status_code=409, detail="Agent upgrade artifact is not available in the current job state")
+    try:
+        artifact = validated_agent_upgrade_artifact(job, server)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Agent release artifact is unavailable") from exc
+    audit(db, f"agent:{server.id}", "agent.upgrade.download", job.id, request, detail={"target_version": RELEASE_VERSION, "sha256": artifact["sha256"], "size_bytes": artifact["size_bytes"]})
+    db.commit()
+    # Serve the exact bytes that were hashed and provenance-checked above.
+    # Re-opening the path through FileResponse would leave a small TOCTOU
+    # window if an artifact volume were replaced concurrently.
+    return Response(
+        content=artifact["content"],
+        media_type="application/x-msi" if server.os_family == "windows" else "application/octet-stream",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Content-Disposition": f'attachment; filename="{artifact["filename"]}"',
+            "X-Content-Type-Options": "nosniff",
+            "X-Tram-Agent-Version": RELEASE_VERSION,
+            "X-Tram-SHA256": artifact["sha256"],
+        },
+    )
 
 
 @app.get("/api/v1/agent-server-ca")
@@ -3495,6 +4237,29 @@ async def agent_download_file(transfer_id: str, agent_id: str, request: Request,
     )
 
 
+@app.post("/api/v1/agent/uninstall-event", status_code=202)
+async def agent_uninstall_event(payload: AgentUninstallEventRequest, request: Request, db: Session = Depends(db_session)):
+    server = verify_agent(request, db, payload.agent_id, await request.body())
+    result = "denied" if payload.event == "denied" else "failed" if payload.event == "failed" else "success"
+    audit(
+        db,
+        f"agent:{server.id}",
+        f"agent.uninstall.{payload.event}",
+        server.id,
+        request,
+        result=result,
+        detail={"server": server.name, "os_user": payload.os_user, "detail": payload.detail},
+    )
+    if payload.event == "completed":
+        # The completed event is signed with the last valid endpoint identity.
+        # Revoke it atomically with the audit record so credentials left on a
+        # damaged/unreachable filesystem cannot reconnect after uninstall.
+        server.cert_fingerprint = ""
+        server.status = "uninstalled"
+    db.commit()
+    return {"accepted": True}
+
+
 @app.post("/api/v1/agent/checkin")
 async def agent_checkin(payload: CheckinRequest, request: Request, db: Session = Depends(db_session)):
     server = verify_agent(request, db, payload.agent_id, await request.body())
@@ -3527,6 +4292,41 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
     if payload.metrics.services_running is not None:
         server.services_running = payload.metrics.services_running
     server.alerts = payload.metrics.alerts
+    expire_stale_agent_upgrades(db, request)
+    installing_upgrades = db.execute(
+        select(Job).where(Job.server_id == server.id, Job.action == "agent.upgrade", Job.status == "installing")
+    ).scalars().all()
+    for upgrade_job in installing_upgrades:
+        if hmac.compare_digest(agent_upgrade_target_version(upgrade_job), payload.agent_version):
+            upgrade_job.status = "succeeded"
+            upgrade_job.exit_code = 0
+            upgrade_job.finished_at = now()
+            if not upgrade_job.output:
+                upgrade_job.output = json.dumps({"updated": True, "version": payload.agent_version}, separators=(",", ":"))
+            audit(db, f"agent:{server.id}", "agent.upgrade.confirmed", upgrade_job.id, request, detail={"version": payload.agent_version})
+    queued_upgrades = db.execute(
+        select(Job).where(Job.server_id == server.id, Job.action == "agent.upgrade", Job.status == "queued")
+    ).scalars().all()
+    for upgrade_job in queued_upgrades:
+        if hmac.compare_digest(agent_upgrade_target_version(upgrade_job), payload.agent_version):
+            upgrade_job.status = "succeeded"
+            upgrade_job.exit_code = 0
+            upgrade_job.finished_at = now()
+            upgrade_job.output = json.dumps({"updated": True, "version": payload.agent_version, "confirmedBeforeRedispatch": True}, separators=(",", ":"))
+            audit(db, f"agent:{server.id}", "agent.upgrade.confirmed", upgrade_job.id, request, detail={"version": payload.agent_version, "before_redispatch": True})
+    timed_out_upgrades = db.execute(
+        select(Job).where(Job.server_id == server.id, Job.action == "agent.upgrade", Job.status == "failed")
+    ).scalars().all()
+    for upgrade_job in timed_out_upgrades:
+        if timed_out_agent_upgrade(upgrade_job) and hmac.compare_digest(agent_upgrade_target_version(upgrade_job), payload.agent_version):
+            upgrade_job.status = "succeeded"
+            upgrade_job.exit_code = 0
+            upgrade_job.finished_at = now()
+            upgrade_job.output = json.dumps({"updated": True, "version": payload.agent_version, "confirmedAfterTimeout": True}, separators=(",", ":"))
+            audit(db, f"agent:{server.id}", "agent.upgrade.confirmed", upgrade_job.id, request, detail={"version": payload.agent_version, "after_timeout": True})
+    uninstall_policy = load_agent_uninstall_policy(db)
+    if uninstall_policy is not None:
+        ensure_agent_uninstall_policy_job(db, server, uninstall_policy)
     supports_parallel_jobs = "active_job_ids" in payload.model_fields_set
     active_job_ids = payload.active_job_ids if supports_parallel_jobs else ([payload.active_job_id] if payload.active_job_id else [])
     if payload.active_job_id and active_job_ids and payload.active_job_id not in active_job_ids:
@@ -3546,14 +4346,33 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
             transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
             if transfer and transfer.server_id == server.id:
                 transfer.status = "queued"
+        if job.action == "agent.uninstall.policy":
+            state = db.get(AgentUninstallPolicyState, server.id)
+            if state is not None and state.job_id == job.id:
+                state.status = "queued"
+                state.updated_at = now()
         audit(db, f"agent:{server.id}", "job.interrupted.requeued", job.id, request, detail={"action": job.action})
 
     jobs: list[Job] = []
-    capacity = (MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1) - len(active_job_ids)
+    installing_upgrade_active = db.execute(
+        select(Job.id).where(Job.server_id == server.id, Job.action == "agent.upgrade", Job.status == "installing").limit(1)
+    ).scalar_one_or_none() is not None
+    capacity = 0 if installing_upgrade_active else (MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1) - len(active_job_ids)
     if capacity > 0:
         active_mutation = any(dispatched_by_id[job_id].action not in PARALLEL_AGENT_READ_ACTIONS for job_id in active_job_ids)
         queued = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "queued").order_by(Job.created_at).limit(100)).scalars().all()
         for queued_job in queued:
+            if queued_job.action == "agent.upgrade":
+                # Updating the service is an exclusive drain operation. Do not
+                # interrupt a read job, another mutation, or a job selected in
+                # this same response while the updater stops the service.
+                if active_job_ids or jobs:
+                    # Stop at the upgrade barrier instead of dispatching work
+                    # queued behind it. Otherwise a busy endpoint can keep
+                    # receiving read jobs forever and starve the upgrade.
+                    break
+                jobs.append(queued_job)
+                break
             is_read = queued_job.action in PARALLEL_AGENT_READ_ACTIONS
             if not is_read and active_mutation:
                 continue
@@ -3570,6 +4389,11 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
             transfer = db.get(FileTransfer, str(parameters.get("transfer_id", "")))
             if transfer and transfer.server_id == server.id:
                 transfer.status = "transferring"
+        if job.action == "agent.uninstall.policy":
+            state = db.get(AgentUninstallPolicyState, server.id)
+            if state is not None and state.job_id == job.id:
+                state.status = "dispatched"
+                state.updated_at = now()
     db.commit()
     return {"server_time": now().isoformat(), "checkin_interval_seconds": 5 if supports_parallel_jobs else 10, "inventory_interval_seconds": 1800, "max_concurrent_jobs": MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
 
@@ -3580,11 +4404,48 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     server = verify_agent(request, db, job.server_id, await request.body())
+    if job.action == "agent.upgrade" and job.status == "failed" and timed_out_agent_upgrade(job):
+        target_version = agent_upgrade_target_version(job)
+        if payload.status == "succeeded":
+            if not hmac.compare_digest(payload.agent_version, target_version):
+                raise HTTPException(status_code=409, detail="Updated Agent did not report the requested version")
+            server.agent_version = payload.agent_version
+            job.status = "succeeded"
+            job.exit_code = payload.exit_code
+            job.output = payload.output
+            job.finished_at = now()
+            audit(db, f"agent:{server.id}", "agent.upgrade.confirmed", job.id, request, detail={"version": payload.agent_version, "late_result_after_timeout": True})
+            db.commit()
+            return {"accepted": True, "status": job.status, "refresh_job_id": None, "refresh_job_ids": []}
+        return {"accepted": True, "duplicate": True, "refresh_job_id": None, "refresh_job_ids": []}
     if job.status in {"succeeded", "failed"}:
         return {"accepted": True, "duplicate": True, "refresh_job_id": None, "refresh_job_ids": []}
-    if job.status != "dispatched":
+    allowed_result_statuses = {"dispatched", "installing"} if job.action == "agent.upgrade" else {"dispatched"}
+    if job.status not in allowed_result_statuses:
         raise HTTPException(status_code=409, detail="Job is not dispatched")
     refresh_actions = AUTO_REFRESH_ACTIONS.get(job.action, ()) if job.status == "dispatched" else ()
+    if job.action == "agent.upgrade":
+        target_version = agent_upgrade_target_version(job)
+        if job.status == "dispatched" and payload.status == "succeeded" and not payload.agent_version:
+            job.status = "installing"
+            job.started_at = now()
+            job.exit_code = payload.exit_code
+            job.output = payload.output
+            job.finished_at = None
+            audit(db, f"agent:{server.id}", "job.installing", job.id, request, detail={"action": job.action, "target_version": target_version})
+            db.commit()
+            return {"accepted": True, "status": "installing", "refresh_job_id": None, "refresh_job_ids": []}
+        if payload.status == "succeeded" and not hmac.compare_digest(payload.agent_version, target_version):
+            raise HTTPException(status_code=409, detail="Updated Agent did not report the requested version")
+        if payload.agent_version:
+            server.agent_version = payload.agent_version
+        job.status = payload.status
+        job.exit_code = payload.exit_code
+        job.output = payload.output
+        job.finished_at = now()
+        audit(db, f"agent:{server.id}", f"job.{job.status}", job.id, request, job.status, {"action": job.action, "exit_code": payload.exit_code, "agent_version": payload.agent_version, "target_version": target_version})
+        db.commit()
+        return {"accepted": True, "status": job.status, "refresh_job_id": None, "refresh_job_ids": []}
     job.status = payload.status
     job.exit_code = payload.exit_code
     job.output = payload.output
@@ -3614,6 +4475,35 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
             transfer.status = "delivered" if payload.status == "succeeded" else "failed"
             transfer.delivered_at = now() if payload.status == "succeeded" else None
             clear_file_transfer_payload(db, transfer)
+    if job.action == "agent.uninstall.policy":
+        state = db.get(AgentUninstallPolicyState, server.id)
+        revision = int(reveal_parameters(job.parameters).get("revision", 0))
+        if state is None:
+            state = AgentUninstallPolicyState(server_id=server.id)
+            db.add(state)
+        state.desired_revision = max(state.desired_revision, revision)
+        state.job_id = job.id
+        state.updated_at = now()
+        if payload.status == "succeeded":
+            state.applied_revision = max(state.applied_revision, revision)
+        if revision < state.desired_revision:
+            # A password rotation may complete while the previous revision is
+            # already dispatched. Its result is valid, but must not block or
+            # mark the newer desired revision as failed.
+            state.status = "pending"
+            state.job_id = None
+            state.error = ""
+        elif payload.status == "succeeded":
+            state.status = "applied"
+            state.error = ""
+        else:
+            attempts, _ = agent_uninstall_policy_failure(state.error)
+            state.status = "failed"
+            state.error = json.dumps(
+                {"attempts": min(AGENT_UNINSTALL_POLICY_MAX_ATTEMPTS, attempts + 1), "message": payload.output[-2000:]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
     audit(db, f"agent:{server.id}", f"job.{payload.status}", job.id, request, payload.status, {"action": job.action, "exit_code": payload.exit_code})
     db.flush()
     refresh_jobs: list[Job] = []
@@ -3648,6 +4538,8 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
     policy = SAFE_ACTIONS.get(payload.action)
     if not policy:
         raise HTTPException(status_code=400, detail="Action is not allowlisted")
+    if payload.action in {"agent.upgrade", "agent.uninstall.policy"}:
+        raise HTTPException(status_code=400, detail="Agent lifecycle actions must use their dedicated management endpoints")
     required_permission = ACTION_PERMISSIONS.get(payload.action)
     if not required_permission or required_permission not in platform_role_permissions(db, user.role):
         raise HTTPException(status_code=403, detail="Role cannot execute this action")

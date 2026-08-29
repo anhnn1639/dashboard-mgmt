@@ -203,6 +203,18 @@ const operationLabels: Record<string, string> = {
   "agent.package.os_mismatch": "Từ chối bộ cài sai hệ điều hành",
   "agent.os_family.changed": "Cách ly Agent báo đổi hệ điều hành",
   "agent.certificate.rotate": "Đổi chứng thư Agent",
+  "agent.upgrade": "Cập nhật Agent",
+  "agent.upgrade.batch.queued": "Xếp hàng cập nhật Agent theo lô",
+  "agent.upgrade.download": "Agent tải gói cập nhật",
+  "agent.upgrade.confirmed": "Xác nhận Agent đã cập nhật",
+  "agent.upgrade.timeout.failed": "Cập nhật Agent quá thời gian chờ",
+  "agent.uninstall.policy": "Đồng bộ bảo vệ gỡ Agent",
+  "agent.uninstall.policy.queued": "Xếp hàng bảo vệ gỡ Agent",
+  "agent.uninstall.protection.update": "Đổi chính sách bảo vệ gỡ Agent",
+  "agent.uninstall.denied": "Từ chối gỡ Agent sai mật khẩu",
+  "agent.uninstall.authorized": "Cho phép gỡ Agent",
+  "agent.uninstall.completed": "Gỡ Agent hoàn tất",
+  "agent.uninstall.failed": "Gỡ Agent thất bại",
   "server.initial_scan.queued": "Xếp hàng quét máy chủ lần đầu",
   "server.share.update": "Cập nhật chia sẻ máy chủ",
   "server.delete": "Xóa máy chủ khỏi hệ thống",
@@ -1317,7 +1329,7 @@ export function OpsConsole() {
           ) : active === "remote-credentials" ? (
             <RemoteCredentialsView servers={servers} token={token} notify={notify} />
           ) : active === "agents" ? (
-            <AgentPackagesView token={token} />
+            <AgentPackagesView token={token} canManageUninstallProtection={currentUser.role === "admin"} />
           ) : (
             <section className="panel fleet-panel">
               <div className="panel-head fleet-head">
@@ -4103,7 +4115,76 @@ function AuditView({ token }: { token: string }) {
   );
 }
 
-function AgentPackagesView({ token }: { token: string }) {
+type AgentUpgradeItem = {
+  serverId: string;
+  serverName: string;
+  osFamily: OSFamily;
+  architecture: string;
+  currentVersion: string;
+  eligibility: string;
+  reason: string;
+  activeJobId?: string | null;
+  activeJobStatus?: string | null;
+  targetVersion: string;
+  online: boolean;
+};
+
+type AgentUpgradeStatus = {
+  targetVersion: string;
+  minimumSelfUpdateVersion: string;
+  artifacts: unknown;
+  items: AgentUpgradeItem[];
+};
+
+type AgentUninstallProtectionStatus = {
+  configured: boolean;
+  revision: number;
+  updatedAt?: string | null;
+  totalAgents: number;
+  appliedAgents: number;
+  pendingAgents: number;
+  failedAgents: number;
+  manualRequiredAgents: number;
+};
+
+const agentUpgradeStateLabels: Record<string, string> = {
+  eligible: "Có bản mới",
+  update_available: "Có bản mới",
+  manual_required: "Cần nâng thủ công 1 lần",
+  current: "Mới nhất",
+  newer: "Mới hơn bản phát hành",
+  offline: "Mất kết nối",
+  unsupported: "Không hỗ trợ",
+  queued: "Đang chờ Agent",
+  dispatched: "Đang tải gói",
+  installing: "Đang cài đặt",
+  succeeded: "Đã cập nhật",
+  failed: "Cập nhật thất bại",
+};
+
+function agentUpgradeState(item: AgentUpgradeItem) {
+  const activeStatus = String(item.activeJobStatus || "").toLowerCase();
+  if (["queued", "dispatched", "installing", "failed"].includes(activeStatus)) return activeStatus;
+  const eligibility = String(item.eligibility || "unsupported").toLowerCase();
+  return eligibility === "eligible" && item.online === false ? "offline" : eligibility;
+}
+
+function agentUpgradeIsActive(item: AgentUpgradeItem) {
+  return ["queued", "dispatched", "installing"].includes(agentUpgradeState(item));
+}
+
+function agentUpgradeCanSelect(item: AgentUpgradeItem) {
+  const eligibility = String(item.eligibility || "").toLowerCase();
+  return ["eligible", "update_available"].includes(eligibility) && !agentUpgradeIsActive(item);
+}
+
+function agentManagementError(data: Record<string, unknown>, fallback: string) {
+  if (typeof data.detail === "string") return data.detail;
+  if (data.detail && typeof data.detail === "object" && "message" in data.detail && typeof (data.detail as { message?: unknown }).message === "string") return (data.detail as { message: string }).message;
+  return fallback;
+}
+
+function AgentPackagesView({ token, canManageUninstallProtection }: { token: string; canManageUninstallProtection: boolean }) {
   const [status, setStatus] = useState<{
     dashboardUrl: string;
     agentVersion: string;
@@ -4116,6 +4197,79 @@ function AgentPackagesView({ token }: { token: string }) {
   const [busy, setBusy] = useState<OSFamily | null>(null);
   const [message, setMessage] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
+  const [upgradeStatus, setUpgradeStatus] = useState<AgentUpgradeStatus | null>(null);
+  const [upgradeLoading, setUpgradeLoading] = useState(true);
+  const [upgradeBusy, setUpgradeBusy] = useState(false);
+  const [upgradeMessage, setUpgradeMessage] = useState("");
+  const [upgradeMessageIsError, setUpgradeMessageIsError] = useState(false);
+  const [upgradeSearch, setUpgradeSearch] = useState("");
+  const [upgradeOsFilter, setUpgradeOsFilter] = useState<"all" | OSFamily>("all");
+  const [upgradeStateFilter, setUpgradeStateFilter] = useState("all");
+  const [selectedUpgradeServerIds, setSelectedUpgradeServerIds] = useState<string[]>([]);
+  const [upgradeModal, setUpgradeModal] = useState(false);
+  const [upgradeReason, setUpgradeReason] = useState("");
+  const [uninstallProtection, setUninstallProtection] = useState<AgentUninstallProtectionStatus | null>(null);
+  const [uninstallLoading, setUninstallLoading] = useState(true);
+  const [uninstallBusy, setUninstallBusy] = useState(false);
+  const [uninstallModal, setUninstallModal] = useState(false);
+  const [uninstallMessage, setUninstallMessage] = useState("");
+  const [uninstallMessageIsError, setUninstallMessageIsError] = useState(false);
+  const [uninstallLoadFailed, setUninstallLoadFailed] = useState(false);
+  const [uninstallLoadError, setUninstallLoadError] = useState("");
+
+  const loadUpgradeStatus = useCallback(async (quiet = false) => {
+    if (!quiet) setUpgradeLoading(true);
+    try {
+      const response = await fetch("/api/v1/agent-upgrades/status", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể đọc trạng thái cập nhật Agent"));
+      const next: AgentUpgradeStatus = {
+        targetVersion: String(data.targetVersion ?? ""),
+        minimumSelfUpdateVersion: String(data.minimumSelfUpdateVersion ?? ""),
+        artifacts: data.artifacts,
+        items: Array.isArray(data.items) ? data.items : [],
+      };
+      setUpgradeStatus(next);
+      setSelectedUpgradeServerIds((current) => current.filter((serverId) => next.items.some((item) => item.serverId === serverId && agentUpgradeCanSelect(item))));
+      setUpgradeMessageIsError(false);
+    } catch (reason) {
+      setUpgradeMessageIsError(true);
+      setUpgradeMessage(reason instanceof Error ? reason.message : "Không thể đọc trạng thái cập nhật Agent");
+    } finally {
+      if (!quiet) setUpgradeLoading(false);
+    }
+  }, [token]);
+
+  const loadUninstallProtection = useCallback(async (quiet = false) => {
+    if (!quiet) setUninstallLoading(true);
+    try {
+      const response = await fetch("/api/v1/settings/agent-uninstall-protection", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể đọc bảo vệ gỡ cài đặt Agent"));
+      setUninstallProtection({
+        configured: data.configured === true,
+        revision: Number(data.revision ?? 0),
+        updatedAt: data.updatedAt ? String(data.updatedAt) : null,
+        totalAgents: Number(data.totalAgents ?? 0),
+        appliedAgents: Number(data.appliedAgents ?? 0),
+        pendingAgents: Number(data.pendingAgents ?? 0),
+        failedAgents: Number(data.failedAgents ?? 0),
+        manualRequiredAgents: Number(data.manualRequiredAgents ?? 0),
+      });
+      setUninstallLoadFailed(false);
+      setUninstallLoadError("");
+      setUninstallMessageIsError(false);
+    } catch (reason) {
+      setUninstallLoadFailed(true);
+      setUninstallLoadError(reason instanceof Error ? reason.message : "Không thể đọc bảo vệ gỡ cài đặt Agent");
+    } finally {
+      if (!quiet) setUninstallLoading(false);
+    }
+  }, [token]);
 
   useEffect(() => {
     fetch("/api/v1/agent-packages/status", {
@@ -4132,6 +4286,133 @@ function AgentPackagesView({ token }: { token: string }) {
         setMessage(reason instanceof Error ? reason.message : "Không thể đọc cấu hình bộ cài");
       });
   }, [token]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadUpgradeStatus();
+      if (canManageUninstallProtection) void loadUninstallProtection();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [canManageUninstallProtection, loadUpgradeStatus, loadUninstallProtection]);
+
+  const upgradeHasActiveJobs = Boolean(upgradeStatus?.items.some(agentUpgradeIsActive));
+  useEffect(() => {
+    if (!upgradeHasActiveJobs) return;
+    const timer = window.setInterval(() => void loadUpgradeStatus(true), 3_000);
+    return () => window.clearInterval(timer);
+  }, [loadUpgradeStatus, upgradeHasActiveJobs]);
+
+  const uninstallRolloutPending = Boolean(!uninstallLoadFailed && uninstallProtection?.configured && uninstallProtection.pendingAgents > 0);
+  useEffect(() => {
+    if (!uninstallRolloutPending) return;
+    const timer = window.setInterval(() => void loadUninstallProtection(true), 5_000);
+    return () => window.clearInterval(timer);
+  }, [loadUninstallProtection, uninstallRolloutPending]);
+
+  const visibleUpgradeItems = useMemo(() => {
+    const query = normalizeSearchText(upgradeSearch);
+    return (upgradeStatus?.items ?? []).filter((item) => {
+      const state = agentUpgradeState(item);
+      return (upgradeOsFilter === "all" || item.osFamily === upgradeOsFilter) &&
+        (upgradeStateFilter === "all" || state === upgradeStateFilter) &&
+        (!query || normalizeSearchText(`${item.serverName} ${item.architecture} ${item.currentVersion} ${item.targetVersion} ${item.reason}`).includes(query));
+    });
+  }, [upgradeOsFilter, upgradeSearch, upgradeStateFilter, upgradeStatus]);
+  const visibleSelectableUpgradeItems = visibleUpgradeItems.filter(agentUpgradeCanSelect);
+  const selectedUpgradeItems = (upgradeStatus?.items ?? []).filter((item) => selectedUpgradeServerIds.includes(item.serverId) && agentUpgradeCanSelect(item));
+  const allVisibleUpgradeItemsSelected = visibleSelectableUpgradeItems.length > 0 && visibleSelectableUpgradeItems.every((item) => selectedUpgradeServerIds.includes(item.serverId));
+
+  function toggleVisibleUpgradeItems() {
+    const visibleIds = visibleSelectableUpgradeItems.map((item) => item.serverId);
+    setSelectedUpgradeServerIds((current) => allVisibleUpgradeItemsSelected
+      ? current.filter((serverId) => !visibleIds.includes(serverId))
+      : [...new Set([...current, ...visibleIds])].slice(0, 100));
+  }
+
+  async function submitAgentUpgrade(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const reason = upgradeReason.trim();
+    if (selectedUpgradeItems.length === 0 || selectedUpgradeItems.length > 100 || reason.length < 5) return;
+    setUpgradeBusy(true);
+    setUpgradeMessage("");
+    setUpgradeMessageIsError(false);
+    try {
+      const response = await fetch("/api/v1/agent-upgrades", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          server_ids: selectedUpgradeItems.map((item) => item.serverId),
+          reason,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể tạo tác vụ cập nhật Agent"));
+      const queued = Array.isArray(data.queued) ? data.queued as Array<{ serverId?: unknown }> : [];
+      const skipped = Array.isArray(data.skipped) ? data.skipped as Array<{ serverId?: unknown }> : [];
+      const queuedIds = new Set(queued.map((item) => String(item.serverId ?? "")).filter(Boolean));
+      const queuedCount = queued.length || selectedUpgradeItems.length;
+      const skippedCount = skipped.length;
+      setUpgradeMessage(skippedCount > 0
+        ? `Đã xếp hàng cập nhật ${queuedCount} Agent; ${skippedCount} Agent bị bỏ qua và vẫn được giữ chọn để bạn kiểm tra.`
+        : `Đã xếp hàng cập nhật ${queuedCount} Agent. Trạng thái sẽ tự làm mới tại đây.`);
+      setSelectedUpgradeServerIds((current) => current.filter((serverId) => !queuedIds.has(serverId)));
+      setUpgradeReason("");
+      setUpgradeModal(false);
+      await loadUpgradeStatus(true);
+    } catch (reasonValue) {
+      setUpgradeMessageIsError(true);
+      setUpgradeMessage(reasonValue instanceof Error ? reasonValue.message : "Không thể tạo tác vụ cập nhật Agent");
+    } finally {
+      setUpgradeBusy(false);
+    }
+  }
+
+  async function saveUninstallProtection(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const newPassword = String(form.get("new_password") ?? "");
+    const confirmPassword = String(form.get("confirm_password") ?? "");
+    if (newPassword !== confirmPassword) {
+      setUninstallMessageIsError(true);
+      setUninstallMessage("Hai lần nhập mật khẩu gỡ Agent không khớp.");
+      return;
+    }
+    setUninstallBusy(true);
+    setUninstallMessage("");
+    setUninstallMessageIsError(false);
+    try {
+      const response = await fetch("/api/v1/settings/agent-uninstall-protection", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          current_password: uninstallProtection?.configured ? String(form.get("current_password") ?? "") : "",
+          new_password: newPassword,
+          confirm_password: confirmPassword,
+          reason: form.get("reason"),
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể lưu mật khẩu bảo vệ gỡ Agent"));
+      formElement.reset();
+      setUninstallModal(false);
+      setUninstallMessage(uninstallProtection?.configured
+        ? "Đã đổi mật khẩu gỡ Agent. Các máy trực tuyến sẽ nhận revision mới ở lần đồng bộ kế tiếp."
+        : "Đã thiết lập mật khẩu gỡ Agent. Theo dõi trạng thái áp dụng ở bảng bên dưới.");
+      await loadUninstallProtection();
+    } catch (reasonValue) {
+      setUninstallMessageIsError(true);
+      setUninstallMessage(reasonValue instanceof Error ? reasonValue.message : "Không thể lưu mật khẩu bảo vệ gỡ Agent");
+    } finally {
+      setUninstallBusy(false);
+    }
+  }
 
   async function saveDashboardUrl(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -4313,6 +4594,133 @@ function AgentPackagesView({ token }: { token: string }) {
           Không đổi tên MSI Windows: tên file chứa locator và chế độ xác minh TLS. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
         </div>
       </form>
+
+      <article className="panel agent-fleet-panel">
+        <div className="agent-management-head">
+          <div>
+            <p className="eyebrow">FLEET UPDATE</p>
+            <h2>Cập nhật Agent trực tiếp</h2>
+            <p>
+              Bản phát hành hiện tại <b>v{upgradeStatus?.targetVersion || "…"}</b>
+              {upgradeStatus?.minimumSelfUpdateVersion ? ` · tự cập nhật từ v${upgradeStatus.minimumSelfUpdateVersion}` : ""}.
+              Máy quá cũ phải nâng thủ công một lần trước khi nhận cập nhật từ website.
+            </p>
+          </div>
+          <div className="agent-management-actions">
+            <button type="button" className="button ghost" disabled={upgradeLoading || upgradeBusy} onClick={() => void loadUpgradeStatus()}>
+              {upgradeLoading ? "Đang đọc…" : "↻ Làm mới"}
+            </button>
+            <button type="button" className="button primary" disabled={upgradeBusy || selectedUpgradeItems.length === 0} onClick={() => { setUpgradeReason(""); setUpgradeModal(true); }}>
+              Cập nhật đã chọn ({selectedUpgradeItems.length})
+            </button>
+          </div>
+        </div>
+        <div className="agent-upgrade-summary">
+          <span><b>{upgradeStatus?.items.length ?? 0}</b><small>Tổng Agent</small></span>
+          <span><b>{upgradeStatus?.items.filter((item) => ["eligible", "update_available"].includes(agentUpgradeState(item))).length ?? 0}</b><small>Có bản mới</small></span>
+          <span><b>{upgradeStatus?.items.filter(agentUpgradeIsActive).length ?? 0}</b><small>Đang cập nhật</small></span>
+          <span><b>{upgradeStatus?.items.filter((item) => agentUpgradeState(item) === "manual_required").length ?? 0}</b><small>Cần nâng thủ công</small></span>
+        </div>
+        <div className="agent-upgrade-filters" aria-label="Tìm kiếm và lọc Agent">
+          <input type="search" value={upgradeSearch} onChange={(event) => setUpgradeSearch(event.target.value)} placeholder="Tìm hostname, kiến trúc hoặc phiên bản…" aria-label="Tìm Agent cần cập nhật" />
+          <select value={upgradeOsFilter} onChange={(event) => setUpgradeOsFilter(event.target.value as "all" | OSFamily)} aria-label="Lọc Agent theo hệ điều hành">
+            <option value="all">Mọi hệ điều hành</option>
+            <option value="windows">Windows</option>
+            <option value="linux">Linux</option>
+          </select>
+          <select value={upgradeStateFilter} onChange={(event) => setUpgradeStateFilter(event.target.value)} aria-label="Lọc Agent theo trạng thái cập nhật">
+            <option value="all">Mọi trạng thái</option>
+            <option value="eligible">Có bản mới</option>
+            <option value="current">Mới nhất</option>
+            <option value="newer">Mới hơn bản phát hành</option>
+            <option value="manual_required">Cần nâng thủ công</option>
+            <option value="offline">Mất kết nối</option>
+            <option value="unsupported">Không hỗ trợ</option>
+            <option value="queued">Đang chờ Agent</option>
+            <option value="dispatched">Đang tải gói</option>
+            <option value="installing">Đang cài đặt</option>
+            <option value="failed">Cập nhật thất bại</option>
+          </select>
+        </div>
+        <div className="resource-table-scroll agent-upgrade-table-wrap">
+          <table className="resource-table agent-upgrade-table">
+            <thead><tr>
+              <th className="check-column"><input type="checkbox" aria-label="Chọn tất cả Agent có thể cập nhật đang hiển thị" checked={allVisibleUpgradeItemsSelected} disabled={!visibleSelectableUpgradeItems.length} onChange={toggleVisibleUpgradeItems} /></th>
+              <th>Máy chủ</th><th>Hệ điều hành</th><th>Phiên bản</th><th>Trạng thái</th><th>Chi tiết</th>
+            </tr></thead>
+            <tbody>
+              {visibleUpgradeItems.map((item) => {
+                const state = agentUpgradeState(item);
+                const canSelect = agentUpgradeCanSelect(item);
+                const targetVersion = item.targetVersion || upgradeStatus?.targetVersion || "—";
+                return <tr key={item.serverId}>
+                  <td><input type="checkbox" aria-label={`Chọn cập nhật Agent trên ${item.serverName}`} checked={selectedUpgradeServerIds.includes(item.serverId)} disabled={!canSelect || (!selectedUpgradeServerIds.includes(item.serverId) && selectedUpgradeServerIds.length >= 100)} onChange={() => setSelectedUpgradeServerIds((current) => current.includes(item.serverId) ? current.filter((serverId) => serverId !== item.serverId) : [...current, item.serverId].slice(0, 100))} /></td>
+                  <td><b>{item.serverName}</b><small>{item.architecture || "Không rõ kiến trúc"}</small></td>
+                  <td><span className={`os-family-badge ${item.osFamily}`}>{item.osFamily === "windows" ? "Windows" : "Linux"}</span></td>
+                  <td><b>v{item.currentVersion || "—"}</b><small>{["current", "newer"].includes(state) ? "Không hạ phiên bản" : `Mục tiêu v${targetVersion}`}</small></td>
+                  <td><span className={`state-pill agent-upgrade-state ${state}`}>{agentUpgradeStateLabels[state] ?? state}</span>{item.activeJobId ? <small>Job {item.activeJobId.slice(0, 8)}</small> : null}</td>
+                  <td><span className="agent-upgrade-reason">{item.reason || (canSelect ? "Sẵn sàng nhận gói đã xác minh" : "Backend chưa cho phép cập nhật")}</span></td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+          {!upgradeLoading && visibleUpgradeItems.length === 0 && <div className="empty-state">Không có Agent khớp điều kiện tìm kiếm và bộ lọc.</div>}
+          {upgradeLoading && <div className="empty-state">Đang đọc trạng thái phiên bản từ hệ thống…</div>}
+        </div>
+        <div className="package-security-note">Mỗi lượt chọn tối đa 100 Agent. Website chỉ gửi ID máy chủ và lý do. Backend tự chọn đúng artifact theo hệ điều hành/kiến trúc, khóa phiên bản đích và từ chối downgrade; trình duyệt không được chỉ định URL tải, hash hoặc version.</div>
+        {upgradeMessage && <p className={`settings-message${upgradeMessageIsError ? " error" : ""}`}>{upgradeMessage}</p>}
+      </article>
+
+      {canManageUninstallProtection && <article className="panel agent-uninstall-panel">
+        <div className="agent-management-head">
+          <div>
+            <p className="eyebrow">TAMPER PROTECTION</p>
+            <h2>Bảo vệ gỡ cài đặt Agent</h2>
+            <p>Một mật khẩu gỡ Agent dùng chung cho toàn fleet. Mật khẩu không được hiển thị lại, không trả về trình duyệt và không ghi vào nhật ký.</p>
+          </div>
+          <div className="agent-management-actions">
+            <span className={`state-pill ${uninstallLoadFailed ? "danger" : uninstallProtection?.configured ? "success" : "warning"}`}>{uninstallLoading ? "Đang đọc…" : uninstallLoadFailed ? "Không tải được chính sách" : uninstallProtection?.configured ? `Đã bật · revision ${uninstallProtection.revision}` : "Chưa thiết lập"}</span>
+            {uninstallLoadFailed
+              ? <button type="button" className="button ghost" disabled={uninstallLoading || uninstallBusy} onClick={() => void loadUninstallProtection()}>{uninstallLoading ? "Đang thử lại…" : "Thử lại"}</button>
+              : <button type="button" className="button primary" disabled={uninstallLoading || uninstallBusy} onClick={() => setUninstallModal(true)}>{uninstallProtection?.configured ? "Đổi mật khẩu" : "Thiết lập mật khẩu"}</button>}
+          </div>
+        </div>
+        <div className="agent-protection-rollout">
+          <span><b>{uninstallProtection?.appliedAgents ?? 0}</b><small>Đã áp dụng</small></span>
+          <span><b>{uninstallProtection?.pendingAgents ?? 0}</b><small>Chờ đồng bộ</small></span>
+          <span><b>{uninstallProtection?.failedAgents ?? 0}</b><small>Cần xử lý lỗi</small></span>
+          <span><b>{uninstallProtection?.manualRequiredAgents ?? 0}</b><small>Agent cũ cần nâng thủ công</small></span>
+          <span><b>{uninstallProtection?.totalAgents ?? 0}</b><small>Tổng Agent</small></span>
+        </div>
+        {(uninstallProtection?.failedAgents ?? 0) > 0 && <div className="resource-help warning">Một số Agent đã thử đồng bộ policy 3 lần nhưng vẫn lỗi. Hệ thống đã dừng retry tự động để tránh tạo job liên tục; kiểm tra dung lượng/quyền ACL của máy đích rồi lưu lại policy để tạo revision mới.</div>}
+        <div className="resource-help warning">
+          Bảo vệ này khóa quy trình uninstall được hỗ trợ và yêu cầu đúng mật khẩu tại máy đích. Người đã có quyền <b>root</b> trên Linux hoặc <b>Local Administrator</b> trên Windows vẫn có thể phá hoặc thay file dịch vụ bằng quyền hệ điều hành; hãy kết hợp RBAC, MFA và kiểm soát đặc quyền endpoint.
+        </div>
+        {uninstallProtection?.configured && uninstallProtection.updatedAt && <p className="agent-protection-updated">Cập nhật gần nhất {new Date(uninstallProtection.updatedAt).toLocaleString("vi-VN")} · revision {uninstallProtection.revision}. Agent cũ chỉ được bảo vệ sau khi nhận policy tương thích.</p>}
+        {uninstallLoadError && <p className="settings-message error">{uninstallLoadError}</p>}
+        {uninstallMessage && <p className={`settings-message${uninstallMessageIsError ? " error" : ""}`}>{uninstallMessage}</p>}
+      </article>}
+
+      {upgradeModal && <ModalShell title={`Cập nhật ${selectedUpgradeItems.length} Agent`} subtitle={`Backend khóa mục tiêu v${upgradeStatus?.targetVersion || "mới nhất"}; dịch vụ Agent sẽ khởi động lại trong thời gian ngắn`} close={() => { if (!upgradeBusy) setUpgradeModal(false); }}>
+        <form className="resource-form" onSubmit={submitAgentUpgrade}>
+          <div className="agent-upgrade-confirm-list">{selectedUpgradeItems.map((item) => <div key={item.serverId}><b>{item.serverName}</b><span>{item.osFamily === "windows" ? "Windows" : "Linux"} · v{item.currentVersion} → v{item.targetVersion || upgradeStatus?.targetVersion}</span></div>)}</div>
+          <label>Lý do / ticket<textarea value={upgradeReason} onChange={(event) => setUpgradeReason(event.target.value)} minLength={5} maxLength={500} rows={3} required placeholder="CHG-1234 · Nâng Agent để nhận bản vá và chính sách mới" /></label>
+          <div className="resource-help">Agent tải artifact do backend chọn qua kênh xác thực, kiểm tra hash/chữ ký rồi mới cài. Trạng thái chỉ hoàn tất sau khi Agent mới khởi động và báo đúng phiên bản.</div>
+          <div className="modal-actions"><button type="button" className="button ghost" disabled={upgradeBusy} onClick={() => setUpgradeModal(false)}>Hủy</button><button className="button primary" disabled={upgradeBusy || upgradeReason.trim().length < 5}>{upgradeBusy ? "Đang xếp hàng…" : "Bắt đầu cập nhật"}</button></div>
+        </form>
+      </ModalShell>}
+
+      {uninstallModal && !uninstallLoadFailed && <ModalShell title={uninstallProtection?.configured ? "Đổi mật khẩu gỡ Agent" : "Thiết lập mật khẩu gỡ Agent"} subtitle="Mật khẩu riêng của fleet, không phải mật khẩu đăng nhập website" close={() => { if (!uninstallBusy) setUninstallModal(false); }}>
+        <form className="resource-form" onSubmit={saveUninstallProtection}>
+          {uninstallProtection?.configured && <label>Mật khẩu gỡ Agent hiện tại<input name="current_password" type="password" autoComplete="off" minLength={1} maxLength={1024} required /></label>}
+          <label>Mật khẩu gỡ Agent mới<input name="new_password" type="password" autoComplete="off" minLength={14} maxLength={1024} required /></label>
+          <label>Nhập lại mật khẩu mới<input name="confirm_password" type="password" autoComplete="off" minLength={14} maxLength={1024} required /></label>
+          <label>Lý do / ticket<textarea name="reason" minLength={5} maxLength={500} rows={3} required placeholder="SEC-1234 · Bật hoặc luân phiên mật khẩu chống gỡ Agent" /></label>
+          <label className="check"><input name="acknowledge" type="checkbox" required /> Tôi hiểu mật khẩu không thể xem lại và Agent cũ chưa nhận policy vẫn chưa được bảo vệ.</label>
+          <div className="danger-panel">Hãy lưu mật khẩu trong kho bí mật của doanh nghiệp. Không gửi qua email/chat và không dùng chung với mật khẩu đăng nhập Local hoặc Domain.</div>
+          <div className="modal-actions"><button type="button" className="button ghost" disabled={uninstallBusy} onClick={() => setUninstallModal(false)}>Hủy</button><button className="button primary" disabled={uninstallBusy}>{uninstallBusy ? "Đang lưu…" : uninstallProtection?.configured ? "Đổi mật khẩu" : "Bật bảo vệ gỡ cài đặt"}</button></div>
+        </form>
+      </ModalShell>}
     </section>
   );
 }

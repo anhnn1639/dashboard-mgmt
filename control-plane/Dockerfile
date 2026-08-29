@@ -10,7 +10,11 @@ COPY control-plane/app ./app
 COPY control-plane/entrypoint.sh /entrypoint.sh
 COPY agent /opt/tram-agent-assets
 RUN useradd --system --uid 10001 --home /app ops \
-    && chown -R ops:ops /app /opt/tram-agent-assets \
+    && chown -R ops:ops /app \
+    && chown -R root:root /opt/tram-agent-assets \
+    && find /opt/tram-agent-assets -type d -exec chmod 0555 {} + \
+    && find /opt/tram-agent-assets -type f -exec chmod 0444 {} + \
+    && chmod 0555 /opt/tram-agent-assets/linux/x86_64/tram-agent \
     && chmod 0755 /entrypoint.sh
 EXPOSE 8000
 ENTRYPOINT ["/entrypoint.sh"]
