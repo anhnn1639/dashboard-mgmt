@@ -10,7 +10,7 @@ on:
       - agent/tram_agent.py
       - agent/VERSION
       - agent/requirements.txt
-      - agent/windows/**
+      - agent/windows/Product.wxs
       - .github/workflows/build-agent-msi.yml
 
 permissions:
