@@ -68,14 +68,16 @@ jobs:
       - name: Write release provenance
         shell: bash
         run: |
-          python3 -c 'import hashlib,json,pathlib; path=pathlib.Path("dist/tram-agent"); version=pathlib.Path("agent/VERSION").read_text(encoding="ascii").strip(); payload={"schema":1,"version":version,"artifactKind":"linux_elf","sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"sizeBytes":path.stat().st_size,"sourceCommit":"${{ github.sha }}","authenticodeSigned":False}; pathlib.Path("dist/tram-agent.provenance.json").write_text(json.dumps(payload,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
-          python3 -m json.tool dist/tram-agent.provenance.json
+          mkdir -p release
+          install -m 0755 dist/tram-agent release/tram-agent
+          python3 -c 'import hashlib,json,pathlib; path=pathlib.Path("release/tram-agent"); version=pathlib.Path("agent/VERSION").read_text(encoding="ascii").strip(); payload={"schema":1,"version":version,"artifactKind":"linux_elf","sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"sizeBytes":path.stat().st_size,"sourceCommit":"${{ github.sha }}","authenticodeSigned":False}; pathlib.Path("release/tram-agent.provenance.json").write_text(json.dumps(payload,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
+          python3 -m json.tool release/tram-agent.provenance.json
 
       - name: Upload standalone Linux agent
         uses: actions/upload-artifact@v4
         with:
           name: TramVanHanhAgent-linux-x86_64
           path: |
-            dist/tram-agent
-            dist/tram-agent.provenance.json
+            release/tram-agent
+            release/tram-agent.provenance.json
           if-no-files-found: error
