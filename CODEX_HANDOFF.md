@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Source Agent/API/dashboard và hai artifact đã đồng bộ `0.8.16` cho self-update và bảo vệ gỡ cài đặt. Source chức năng là `2c6aed3`; workflow Linux được sửa quyền staging tại `a2f055f`, và cả Linux/Windows artifact đều có provenance trỏ đúng full SHA `a2f055fe6790940b311094cd571cea34f657081d`.
+- Source Agent/API/dashboard và hai artifact đã đồng bộ `0.8.16` cho self-update và bảo vệ gỡ cài đặt. Source chức năng là `2c6aed3`; workflow Linux được sửa quyền staging tại `a2f055f`; artifact/provenance được bundle tại `e77571a`, và cả Linux/Windows provenance đều trỏ đúng full source SHA `a2f055fe6790940b311094cd571cea34f657081d`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -106,7 +106,7 @@
 - Kích thước: `14,516,224` bytes.
 - Phiên bản MSI: `0.8.16`.
 - SHA-256: `CB36769414C83ECA80E2FE92B73AF2CB72A09540D5C55B758546E1F9F0BDC8EB`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `a2f055fe6790940b311094cd571cea34f657081d` trên GitHub Actions run `33223828102`; runtime frozen, ProductVersion `0.8.16`, sidecar/source SHA, kích thước và SHA-256 ở trên đã được kiểm tra sau khi tải artifact bằng GitHub CLI.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `a2f055fe6790940b311094cd571cea34f657081d` trên GitHub Actions run `33223828102`; runtime frozen, ProductVersion `0.8.16`, sidecar/source SHA, kích thước và SHA-256 ở trên đã được kiểm tra sau khi tải artifact bằng GitHub CLI. Run hậu kiểm của commit bundle `33224083686` cũng pass.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -131,7 +131,7 @@
 - Workflow Linux chạy `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL UBI 7/8 rồi upload binary cùng provenance. Workflow Windows kiểm runtime frozen, MSI ProductVersion, ký Authenticode khi có secrets và upload MSI cùng provenance. Artifact 0.8.16 chỉ được bundle sau khi đối chiếu sidecar `sourceCommit` đúng source SHA, hash/size, ELF x86_64, MSI ProductVersion và chữ ký nếu metadata báo signed.
 - Trigger Windows chỉ theo source runtime/version/requirements/Product.wxs/workflow, không theo MSI/provenance đã bundle; commit artifact không còn tự tạo một build thừa rồi gây nhầm source SHA ở lần release sau.
 - Hardening còn lại: Agent CA hiện là online manifest signer và Authenticode chưa bắt buộc, nên môi trường high-assurance cần release key offline/độc lập, endpoint verify chữ ký release và enforce Authenticode; bổ sung per-Agent quota/rate limit cho artifact download để giảm DoS nếu một endpoint đã bị compromise.
-- Kiểm thử local trước source commit: Agent security `95/95`, control-plane `60/60`, render workspace `25/25`, ESLint, Vinext production build, `py_compile`, YAML và `git diff --check` đều pass. GitHub security audit run `33223677614` cũng pass dependency audit, Bandit high/high, Caddy adapt, Node production audit và toàn bộ Agent regression trên Linux. Lỗi validation `422` đã được redaction toàn cục nên không echo `input`/password; test bao phủ current/new/confirm password. Test chuyển nguồn Ubuntu có retry cleanup chỉ cho Windows `ERROR_DIR_NOT_EMPTY` transient đã tái hiện độc lập; không đổi mã production và không che lỗi cleanup khác.
+- Kiểm thử local trước source commit: Agent security `95/95`, control-plane `60/60`, render workspace `25/25`, ESLint, Vinext production build, `py_compile`, YAML và `git diff --check` đều pass. GitHub security audit cuối run `33224083775` cũng pass dependency audit, Bandit high/high, Caddy adapt, Node production audit và toàn bộ Agent regression trên Linux. Lỗi validation `422` đã được redaction toàn cục nên không echo trường `input` hoặc password; test bao phủ current/new/confirm password. Test chuyển nguồn Ubuntu có retry cleanup chỉ cho Windows `ERROR_DIR_NOT_EMPTY` transient đã tái hiện độc lập; không đổi mã production và không che lỗi cleanup khác.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
 
