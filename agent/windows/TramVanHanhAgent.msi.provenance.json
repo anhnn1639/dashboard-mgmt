@@ -1,1 +1,1 @@
-{"schema":1,"version":"0.8.16","artifactKind":"windows_msi","sha256":"cb36769414c83eca80e2fe92b73af2cb72a09540d5c55b758546e1f9f0bdc8eb","sizeBytes":14516224,"sourceCommit":"a2f055fe6790940b311094cd571cea34f657081d","authenticodeSigned":false}
+{"schema":1,"version":"0.8.17","artifactKind":"windows_msi","sha256":"f17439dea9faa37425fbf0ad719e8e62e073769e78134803bb13b4bbd8829caa","sizeBytes":14544896,"sourceCommit":"20622fd6a11b0766f8161d94bec6eed2562647a0","authenticodeSigned":false}
