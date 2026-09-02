@@ -54,6 +54,7 @@ AGENT_VERSION = load_agent_version()
 LOG = logging.getLogger("tram-agent")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@\\-]{1,128}$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9_.@ -]{1,128}$")
+LVM_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$")
 LINUX_ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
 WINDOWS_ACCOUNT_RE = re.compile(r"^[^\\/\[\]:;|=,+*?<>@\x00-\x1f]{1,20}$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,160}$")
@@ -75,6 +76,31 @@ UNINSTALL_PBKDF2_ITERATIONS = 600_000
 MAX_CONCURRENT_TUNNELS = 4
 MAX_CONCURRENT_JOBS = 4
 LINUX_BLOCK_SECTOR_BYTES = 512
+LINUX_STORAGE_ALIGNMENT_BYTES = 4 * 1024 * 1024
+LINUX_STORAGE_RESCAN_RESULT = Path("/run/tram-agent/storage-rescan.json")
+LINUX_STORAGE_RESCAN_UNIT_PATH = Path("/etc/systemd/system/tram-agent-storage-rescan.service")
+LINUX_FSTAB_PATH = Path("/etc/fstab")
+LINUX_MOUNT_ROOTS = ("/mnt", "/srv", "/data", "/opt", "/var/lib")
+LINUX_STORAGE_RESCAN_UNIT = """[Unit]
+Description=Tram Van Hanh storage bus rescan helper
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=240
+User=root
+Group=root
+ExecStart=/opt/tram-agent/tram-agent --config /etc/tram-agent/agent.json storage-rescan-helper
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/run/tram-agent
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+"""
 PROCESS_SNAPSHOT_CACHE_SECONDS = 1.0
 HOST_DISK_METRIC_INTERVAL_SECONDS = 30.0
 WINDOWS_UPDATE_SCAN_TIMEOUT_SECONDS = 900
@@ -99,7 +125,7 @@ ALLOWED_ACTIONS = {
 }
 READ_ONLY_ACTIONS = {
     "inventory.collect", "service.list", "user.list", "group.list", "patch.scan", "patch.source.read", "logs.sources", "logs.read",
-    "process.list", "firewall.list", "storage.list", "network.list",
+    "process.list", "firewall.list", "network.list",
 }
 
 
@@ -2252,13 +2278,136 @@ def lvm_report(command: str, columns: str) -> list[dict[str, Any]]:
     return []
 
 
+def _write_linux_rescan_control(path: Path, value: str) -> None:
+    """Write only to a caller-validated kernel rescan control file."""
+    with path.open("w", encoding="ascii") as handle:
+        handle.write(value)
+        handle.flush()
+
+
+def perform_linux_storage_rescan(sysfs_root: Path = Path("/sys")) -> dict[str, Any]:
+    """Discover new LUNs and refresh every physical block device.
+
+    This helper accepts no device supplied by the dashboard.  Every target is
+    enumerated from a fixed sysfs class and checked against a kernel-name
+    allowlist before it is opened.  It is normally executed by the dedicated
+    oneshot unit because the long-running Agent keeps ProtectKernelTunables.
+    """
+    if platform.system().lower() != "linux" or os.geteuid() != 0:
+        raise RuntimeError("Linux storage rescan requires root on Linux")
+    diagnostics: dict[str, Any] = {
+        "scsiHosts": [],
+        "nvmeControllers": [],
+        "blockDevices": [],
+        "errors": [],
+    }
+
+    def attempt(kind: str, name: str, path: Path, value: str) -> None:
+        try:
+            if not path.is_file():
+                return
+            _write_linux_rescan_control(path, value)
+            diagnostics[kind].append(name)
+        except OSError as exc:
+            diagnostics["errors"].append({"target": f"{kind}:{name}", "error": type(exc).__name__})
+
+    scsi_root = sysfs_root / "class/scsi_host"
+    if scsi_root.is_dir():
+        for host in sorted(scsi_root.iterdir(), key=lambda item: item.name):
+            if re.fullmatch(r"host[0-9]+", host.name):
+                attempt("scsiHosts", host.name, host / "scan", "- - -\n")
+
+    nvme_root = sysfs_root / "class/nvme"
+    if nvme_root.is_dir():
+        for controller in sorted(nvme_root.iterdir(), key=lambda item: item.name):
+            if re.fullmatch(r"nvme[0-9]+", controller.name):
+                attempt("nvmeControllers", controller.name, controller / "rescan_controller", "1\n")
+
+    udevadm = find_system_command("udevadm")
+    if udevadm:
+        code, output = run([udevadm, "settle", "--timeout=30"], timeout=45)
+        if code:
+            diagnostics["errors"].append({"target": "udevadm:settle-before-block", "error": output or f"exit {code}"})
+
+    block_root = sysfs_root / "class/block"
+    disk_name = re.compile(r"(?:sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+|dasd[a-z]+)")
+    if block_root.is_dir():
+        for block in sorted(block_root.iterdir(), key=lambda item: item.name):
+            if not disk_name.fullmatch(block.name) or (block / "partition").exists():
+                continue
+            attempt("blockDevices", block.name, block / "device/rescan", "1\n")
+
+    if udevadm:
+        code, output = run([udevadm, "settle", "--timeout=60"], timeout=75)
+        if code:
+            diagnostics["errors"].append({"target": "udevadm:settle-after-block", "error": output or f"exit {code}"})
+    diagnostics["completedAt"] = datetime.now(UTC).isoformat()
+    return diagnostics
+
+
+def storage_rescan_helper() -> int:
+    diagnostics = perform_linux_storage_rescan()
+    LINUX_STORAGE_RESCAN_RESULT.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(LINUX_STORAGE_RESCAN_RESULT, json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":")), 0o600)
+    return 0
+
+
+def ensure_linux_storage_rescan_unit() -> None:
+    if platform.system().lower() != "linux" or os.geteuid() != 0:
+        raise RuntimeError("Linux storage rescan helper requires root")
+    systemctl = find_system_command("systemctl")
+    if not systemctl:
+        raise RuntimeError("systemctl is required for Linux storage rescan")
+    current = ""
+    with contextlib.suppress(OSError):
+        current = LINUX_STORAGE_RESCAN_UNIT_PATH.read_text(encoding="utf-8")
+    if current == LINUX_STORAGE_RESCAN_UNIT:
+        return
+    atomic_write_text(LINUX_STORAGE_RESCAN_UNIT_PATH, LINUX_STORAGE_RESCAN_UNIT, 0o644)
+    code, output = run([systemctl, "daemon-reload"], timeout=60)
+    if code:
+        raise RuntimeError(output or "systemd daemon-reload failed for the storage rescan helper")
+
+
+def linux_storage_rescan() -> dict[str, Any]:
+    """Run the fixed rescan helper outside the Agent's hardened mount namespace."""
+    installed_agent = Path("/opt/tram-agent/tram-agent")
+    systemctl = find_system_command("systemctl")
+    if installed_agent.is_file() and systemctl and Path("/run/systemd/system").is_dir():
+        ensure_linux_storage_rescan_unit()
+        # Do not give this directory to RuntimeDirectory= on the oneshot unit:
+        # systemd removes it as soon as the helper exits, before we can read it.
+        result_directory = LINUX_STORAGE_RESCAN_RESULT.parent
+        if result_directory.is_symlink():
+            raise RuntimeError("Storage rescan result directory must not be a symbolic link")
+        result_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        result_directory.chmod(0o700)
+        with contextlib.suppress(OSError):
+            LINUX_STORAGE_RESCAN_RESULT.unlink()
+        code, output = run([systemctl, "start", "tram-agent-storage-rescan.service"], timeout=255)
+        if code:
+            raise RuntimeError(output or "Linux storage rescan helper failed")
+        try:
+            parsed = json.loads(LINUX_STORAGE_RESCAN_RESULT.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("Linux storage rescan helper returned no valid diagnostics") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Linux storage rescan diagnostics are invalid")
+        return parsed
+    # Source-tree diagnostics and unit tests do not run inside the protected
+    # production unit, so the same fixed implementation can run directly.
+    return perform_linux_storage_rescan()
+
+
 def parted_disk_layout(disk: str) -> dict[str, Any]:
     binary = find_system_command("parted")
-    if not binary or not DEVICE_RE.fullmatch(disk):
-        return {"partitionTable": "", "freeRegions": [], "partitions": {}}
+    if not DEVICE_RE.fullmatch(disk):
+        return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "invalid", "error": "Invalid disk path"}
+    if not binary:
+        return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "unavailable", "error": "parted is not installed"}
     code, output = run([binary, "--machine", "--script", disk, "unit", "B", "print", "free"], output_limit=1_000_000)
     if code != 0:
-        return {"partitionTable": "", "freeRegions": [], "partitions": {}}
+        return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "failed", "error": (output or f"parted exit {code}")[-2000:]}
     table = ""
     regions: list[dict[str, int]] = []
     partitions: dict[int, dict[str, int]] = {}
@@ -2285,7 +2434,7 @@ def parted_disk_layout(disk: str) -> dict[str, Any]:
             continue
         if number > 0:
             partitions[number] = {"startBytes": start, "endBytes": end, "sizeBytes": size}
-    return {"partitionTable": table, "freeRegions": regions, "partitions": partitions}
+    return {"partitionTable": table, "freeRegions": regions, "partitions": partitions, "status": "ok", "error": ""}
 
 
 def parted_free_regions(disk: str) -> list[dict[str, int]]:
@@ -2358,7 +2507,15 @@ def legacy_lsblk_devices(lsblk: str) -> tuple[int, list[dict[str, Any]] | str]:
     return 0, disks
 
 
-def linux_storage_scan() -> tuple[int, str]:
+def linux_storage_scan(rescan: bool = False) -> tuple[int, str]:
+    rescan_diagnostics: dict[str, Any] = {}
+    if rescan:
+        try:
+            rescan_diagnostics = linux_storage_rescan()
+        except RuntimeError as exc:
+            # A scan still returns the currently visible layout, but the UI is
+            # told explicitly that bus/device discovery was incomplete.
+            rescan_diagnostics = {"errors": [{"target": "storage-rescan", "error": str(exc)}]}
     lsblk = find_system_command("lsblk")
     if not lsblk:
         return 127, "lsblk is not installed"
@@ -2378,7 +2535,7 @@ def linux_storage_scan() -> tuple[int, str]:
             return legacy_code, str(legacy_result)
         devices = legacy_result
     pvs = lvm_report("pvs", "pv_name,vg_name,pv_size,pv_free")
-    vgs = lvm_report("vgs", "vg_name,vg_size,vg_free,pv_count,lv_count")
+    vgs = lvm_report("vgs", "vg_name,vg_size,vg_free,vg_extent_size,pv_count,lv_count")
     lvs = lvm_report("lvs", "lv_path,lv_name,vg_name,lv_size,data_percent,devices")
     pv_by_path = {str(item.get("pv_name", "")).strip(): item for item in pvs}
     vg_by_name: dict[str, dict[str, Any]] = {}
@@ -2390,6 +2547,7 @@ def linux_storage_scan() -> tuple[int, str]:
             "name": name,
             "sizeBytes": byte_value(item.get("vg_size")),
             "freeBytes": byte_value(item.get("vg_free")),
+            "extentSizeBytes": byte_value(item.get("vg_extent_size")) or LINUX_STORAGE_ALIGNMENT_BYTES,
             "physicalVolumes": [],
             "logicalVolumes": [],
         }
@@ -2421,13 +2579,45 @@ def linux_storage_scan() -> tuple[int, str]:
     logical_by_path = {item["path"]: item for item in logical_volumes}
     logical_by_mapper_name = {item["mapperName"]: item for item in logical_volumes}
     layout_by_disk: dict[str, dict[str, Any]] = {}
+    layout_diagnostics: list[dict[str, str]] = []
 
     def decorate(device: dict[str, Any], parent_disk: str = "") -> dict[str, Any]:
         path = str(device.get("path") or ("/dev/" + str(device.get("name", ""))))
         kind = str(device.get("type", ""))
         disk_path = path if kind == "disk" else parent_disk
         if kind == "disk":
-            layout_by_disk[path] = parted_disk_layout(path)
+            layout = parted_disk_layout(path)
+            disk_size = byte_value(device.get("size"))
+            logical_sector = byte_value(device.get("log-sec")) or LINUX_BLOCK_SECTOR_BYTES
+            raw_partitions = [child for child in device.get("children", []) if isinstance(child, dict) and str(child.get("type", "")) == "part"]
+            raw_ends = [byte_value(partition.get("endBytes")) for partition in layout.get("partitions", {}).values() if byte_value(partition.get("sizeBytes"))]
+            geometry_complete = True
+            for child in raw_partitions:
+                geometry = layout.get("partitions", {}).get(infer_partition_number(child), {})
+                if geometry:
+                    continue
+                if child.get("start") is None or str(child.get("start")).strip() == "" or not byte_value(child.get("size")):
+                    geometry_complete = False
+                    continue
+                # lsblk START follows the kernel's fixed 512-byte sector unit,
+                # not the device logical sector size (which may be 4096).
+                start = byte_value(child.get("start")) * LINUX_BLOCK_SECTOR_BYTES
+                raw_ends.append(start + byte_value(child.get("size")) - 1)
+            safe_start = (max(raw_ends) + 1) if raw_ends else 1024**2
+            safe_end = disk_size - max(1024**2, 34 * logical_sector) - 1
+            synthetic_size = safe_end - safe_start + 1
+            has_tail = any(0 <= byte_value(region.get("startBytes")) - safe_start <= 2 * 1024**2 for region in layout.get("freeRegions", []))
+            if geometry_complete and synthetic_size >= LINUX_STORAGE_ALIGNMENT_BYTES and not has_tail:
+                layout.setdefault("freeRegions", []).append({"startBytes": safe_start, "endBytes": safe_end, "sizeBytes": synthetic_size, "source": "kernel-tail"})
+                # A tail visible through the kernel but absent from parted is
+                # the normal signature of a GPT backup header left at the old
+                # end of a virtual disk.  Repair it before any resize even if
+                # parted returned exit code zero together with a warning.
+                layout["synthesizedTail"] = True
+            layout["freeRegions"] = sorted(layout.get("freeRegions", []), key=lambda region: byte_value(region.get("startBytes")))
+            layout_by_disk[path] = layout
+            if layout.get("status") != "ok":
+                layout_diagnostics.append({"disk": path, "status": str(layout.get("status", "failed")), "error": str(layout.get("error", "Unknown partition layout error"))})
         children = [decorate(child, disk_path) for child in device.get("children", []) if isinstance(child, dict)]
         children.sort(key=lambda child: (byte_value(child.get("offsetBytes")) or 2**63, byte_value(child.get("partitionNumber")) or 2**31, str(child.get("path", ""))))
         mountpoints = normalize_mountpoints(device.get("mountpoints"))
@@ -2436,7 +2626,7 @@ def linux_storage_scan() -> tuple[int, str]:
         partition_number = infer_partition_number(device) if kind == "part" else 0
         geometry = layout_by_disk.get(disk_path, {}).get("partitions", {}).get(partition_number, {}) if partition_number else {}
         logical_sector_bytes = byte_value(device.get("log-sec")) or 512
-        offset_bytes = byte_value(geometry.get("startBytes")) if geometry else byte_value(device.get("start")) * logical_sector_bytes
+        offset_bytes = byte_value(geometry.get("startBytes")) if geometry else byte_value(device.get("start")) * LINUX_BLOCK_SECTOR_BYTES
         end_offset_bytes = byte_value(geometry.get("endBytes")) if geometry else (offset_bytes + size - 1 if size else 0)
         if geometry:
             size = byte_value(geometry.get("sizeBytes")) or size
@@ -2476,7 +2666,10 @@ def linux_storage_scan() -> tuple[int, str]:
             regions = layout_by_disk[path]["freeRegions"]
             row["freeRegions"] = regions
             row["unallocatedBytes"] = sum(region["sizeBytes"] for region in regions)
-        if kind == "part" and disk_path:
+            row["layoutStatus"] = layout_by_disk[path].get("status", "unknown")
+            row["layoutError"] = layout_by_disk[path].get("error", "")
+            row["needsGptRepair"] = bool(layout_by_disk[path].get("synthesizedTail") and row["partitionTable"] == "gpt")
+        if kind == "part" and disk_path and not resize_protected:
             for region in layout_by_disk.get(disk_path, {}).get("freeRegions", []):
                 if 0 <= region["startBytes"] - row["endOffsetBytes"] <= 2 * 1024 * 1024:
                     if filesystem in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
@@ -2506,15 +2699,116 @@ def linux_storage_scan() -> tuple[int, str]:
 
     for row in decorated:
         collect_candidates(row)
+
+    # Oracle/RHEL 7 lsblk often emits device-mapper rows outside the disk
+    # tree.  Hydrate unmatched LVs from blkid/findmnt so XFS/ext4 growth and
+    # root protection remain available on those releases too.
+    blkid = find_system_command("blkid")
+    findmnt = find_system_command("findmnt")
+    for logical in logical_volumes:
+        if logical.get("filesystem"):
+            continue
+        path = str(logical.get("path", ""))
+        if not DEVICE_RE.fullmatch(path):
+            continue
+        if blkid:
+            code, filesystem = run([blkid, "-s", "TYPE", "-o", "value", path], timeout=30)
+            if code == 0:
+                logical["filesystem"] = filesystem.strip()
+            code, uuid_value = run([blkid, "-s", "UUID", "-o", "value", path], timeout=30)
+            if code == 0:
+                logical["uuid"] = uuid_value.strip()
+        if findmnt:
+            sources = [path]
+            mapper_name = str(logical.get("mapperName", ""))
+            if mapper_name:
+                sources.append(f"/dev/mapper/{mapper_name}")
+            for source in sources:
+                code, targets = run([findmnt, "--raw", "--noheadings", "--source", source, "--output", "TARGET"], timeout=30)
+                if code == 0 and targets.strip():
+                    logical["mountpoints"] = [line.strip() for line in targets.splitlines() if line.strip()]
+                    break
+        logical["protected"] = any(item in {"/", "/boot", "/boot/efi"} for item in logical.get("mountpoints", []))
+
+    for logical in logical_volumes:
+        filesystem = str(logical.get("filesystem", "")).lower()
+        mountpoints = [str(item) for item in logical.get("mountpoints", []) if item]
+        unsupported = filesystem not in {"ext2", "ext3", "ext4", "xfs"}
+        unmounted_xfs = filesystem == "xfs" and not mountpoints
+        logical["resizeProtected"] = bool(logical.get("resizeProtected") or unsupported or unmounted_xfs)
+        if unsupported:
+            logical["resizeReason"] = "Extend LV chỉ hỗ trợ filesystem ext2/ext3/ext4 hoặc XFS"
+        elif unmounted_xfs:
+            logical["resizeReason"] = "XFS phải đang được mount để xfs_growfs mở rộng an toàn"
+
+    node_by_path: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+    def index_nodes(row: dict[str, Any], disk: dict[str, Any]) -> None:
+        node_by_path[str(row.get("path", ""))] = (row, disk)
+        for child in row.get("children", []):
+            index_nodes(child, disk)
+
+    for disk in decorated:
+        index_nodes(disk, disk)
+    for vg in vg_by_name.values():
+        backing_growable = 0
+        plan: list[dict[str, Any]] = []
+        for pv_path in vg["physicalVolumes"]:
+            match = node_by_path.get(pv_path)
+            pv = pv_by_path.get(pv_path, {})
+            if not match:
+                continue
+            node, disk = match
+            if node.get("resizeProtected") or node.get("readOnly") or disk.get("readOnly") or disk.get("removable"):
+                continue
+            growable = byte_value(node.get("extendableBytes"))
+            if node.get("type") == "disk":
+                growable = max(0, byte_value(node.get("sizeBytes")) - byte_value(pv.get("pv_size")) - LINUX_STORAGE_ALIGNMENT_BYTES)
+            growable -= growable % max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(vg.get("extentSizeBytes")))
+            if growable <= 0:
+                continue
+            backing_growable += growable
+            plan.append({
+                "pv": pv_path,
+                "disk": str(disk.get("path", "")),
+                "partitionNumber": byte_value(node.get("partitionNumber")),
+                "growableBytes": growable,
+                "steps": (["resize-partition", "pvresize"] if node.get("type") == "part" else ["pvresize"]),
+            })
+        extent = max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(vg.get("extentSizeBytes")))
+        vg["backingGrowableBytes"] = backing_growable
+        vg["extendableBytes"] = (byte_value(vg.get("freeBytes")) + backing_growable) // extent * extent
+        vg["extensionPlan"] = plan
+        for logical_path in vg["logicalVolumes"]:
+            logical = logical_by_path.get(logical_path)
+            if logical:
+                logical["vgFreeBytes"] = byte_value(vg.get("freeBytes"))
+                logical["backingGrowableBytes"] = backing_growable
+                logical["extendableBytes"] = vg["extendableBytes"]
+                logical["extentSizeBytes"] = extent
+                logical["extensionPlan"] = plan
+
+    required_tools = {
+        "partitionResize": ("parted", "partprobe", "partx", "blockdev", "sgdisk", "udevadm"),
+        "lvm": ("pvs", "vgs", "lvs", "pvresize", "pvcreate", "vgcreate", "vgextend", "lvcreate", "lvextend"),
+        "ext4": ("mkfs.ext4", "resize2fs"),
+        "xfs": ("mkfs.xfs", "xfs_growfs"),
+        "mountPersist": ("mount", "umount", "blkid", "findmnt"),
+    }
+    missing_tools = sorted({command for commands in required_tools.values() for command in commands if not find_system_command(command)})
     result = {
         "platform": "linux",
         "disks": decorated,
         "volumeGroups": list(vg_by_name.values()),
         "logicalVolumes": logical_volumes,
         "lvmCandidates": candidates,
+        "rescanDiagnostics": rescan_diagnostics,
+        "layoutDiagnostics": layout_diagnostics,
+        "missingTools": missing_tools,
         "capabilities": {
-            "partitionCreate": bool(find_system_command("parted")),
-            "lvm": all(find_system_command(command) for command in ("pvs", "vgs", "lvs", "lvcreate", "vgcreate")),
+            **{name: all(find_system_command(command) for command in commands) for name, commands in required_tools.items()},
+            "partitionCreate": all(find_system_command(command) for command in ("parted", "partprobe", "partx", "blockdev", "sgdisk", "wipefs", "udevadm")),
+            "rescan": not bool(rescan_diagnostics.get("errors")),
         },
     }
     return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))
@@ -2543,12 +2837,12 @@ def windows_storage_scan() -> tuple[int, str]:
     return powershell(script, timeout=180, output_limit=10_000_000)
 
 
-def storage_scan(windows: bool) -> tuple[int, str]:
-    return windows_storage_scan() if windows else linux_storage_scan()
+def storage_scan(windows: bool, rescan: bool = False) -> tuple[int, str]:
+    return windows_storage_scan() if windows else linux_storage_scan(rescan=rescan)
 
 
-def parsed_storage_scan(windows: bool) -> dict[str, Any]:
-    code, output = storage_scan(windows)
+def parsed_storage_scan(windows: bool, rescan: bool = False) -> dict[str, Any]:
+    code, output = storage_scan(windows, rescan=rescan)
     if code != 0:
         raise RuntimeError(output or "Cannot scan storage")
     parsed = json.loads(output)
@@ -2640,12 +2934,62 @@ def run_windows_diskpart_resize(
 
 def linux_mount_path(value: Any) -> str:
     path = str(value or "").rstrip("/") or "/"
-    if not MOUNT_PATH_RE.fullmatch(path) or not any(path == root or path.startswith(root + "/") for root in ("/mnt", "/srv", "/data", "/opt", "/var/lib")):
+    components = path.split("/")[1:]
+    if (
+        not MOUNT_PATH_RE.fullmatch(path)
+        or any(component in {"", ".", ".."} for component in components)
+        or not any(path == root or path.startswith(root + "/") for root in LINUX_MOUNT_ROOTS)
+    ):
         raise ValueError("Mount point must be below /mnt, /srv, /data, /opt or /var/lib")
     return path
 
 
+def preflight_linux_filesystem(parameters: dict[str, Any], size_bytes: int | None = None) -> None:
+    """Reject predictable formatting/mount failures before changing storage."""
+    filesystem = str(parameters.get("filesystem", "ext4")).lower()
+    if filesystem not in {"ext4", "xfs"}:
+        raise ValueError("Only ext4 and xfs are supported for new Linux filesystems")
+    minimum = (300 if filesystem == "xfs" else 16) * 1024**2
+    if size_bytes is not None and size_bytes < minimum:
+        raise ValueError(f"{filesystem} requires at least {minimum // 1024**2} MiB after extent alignment")
+    label = str(parameters.get("label", "")).strip()
+    if label and (not re.fullmatch(r"[A-Za-z0-9_.-]+", label) or len(label) > (12 if filesystem == "xfs" else 16)):
+        raise ValueError("Filesystem label is invalid or exceeds the native filesystem limit")
+    required = [f"mkfs.{filesystem}"]
+    mount_point = linux_mount_path(parameters.get("mount_point")) if parameters.get("mount_point") else ""
+    if mount_point:
+        required += ["mount", "umount", "blkid", "findmnt"]
+    missing = [name for name in required if not find_system_command(name)]
+    if missing:
+        raise RuntimeError("Missing filesystem tools: " + ", ".join(missing))
+    if not mount_point:
+        return
+    mount_path = Path(mount_point)
+    current = Path(mount_path.anchor)
+    for component in mount_path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError("Mount point and its parents must not contain symbolic links")
+        if current.exists() and not current.is_dir():
+            raise ValueError("Mount point parents must be directories")
+    if mount_path.exists() and (not mount_path.is_dir() or any(mount_path.iterdir())):
+        raise ValueError("Mount point must be a new or empty directory")
+    code, mounted_target = run([find_system_command("findmnt"), "--noheadings", "--output", "TARGET", "--target", mount_point], timeout=30)
+    if code not in {0, 1}:
+        raise RuntimeError("Cannot verify whether the mount point is in use")
+    if code == 0 and any(line.strip() == mount_point for line in mounted_target.splitlines()):
+        raise ValueError("Mount point is already in use")
+    fstab = LINUX_FSTAB_PATH.read_text(encoding="utf-8", errors="replace") if LINUX_FSTAB_PATH.exists() else ""
+    for line in fstab.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == mount_point and not line.lstrip().startswith("#"):
+            raise ValueError("Mount point already exists in /etc/fstab")
+
+
 def format_and_mount_linux(device: str, parameters: dict[str, Any]) -> tuple[int, str]:
+    if not DEVICE_RE.fullmatch(device):
+        raise ValueError("Invalid Linux block-device path")
+    preflight_linux_filesystem(parameters)
     filesystem = str(parameters.get("filesystem", "ext4")).lower()
     if filesystem not in {"ext4", "xfs"}:
         raise ValueError("Only ext4 and xfs are supported for new Linux filesystems")
@@ -2655,36 +2999,110 @@ def format_and_mount_linux(device: str, parameters: dict[str, Any]) -> tuple[int
     formatter = find_system_command(f"mkfs.{filesystem}")
     if not formatter:
         return 127, f"mkfs.{filesystem} is not installed"
+    mount_point = linux_mount_path(parameters.get("mount_point")) if parameters.get("mount_point") else ""
+    mount = find_system_command("mount")
+    umount = find_system_command("umount")
+    blkid = find_system_command("blkid")
+    findmnt = find_system_command("findmnt")
+    if mount_point and (not mount or not umount or not blkid or not findmnt):
+        return 127, "mount/umount/blkid/findmnt is not installed"
+    mount_path = Path(mount_point) if mount_point else None
+    created_mount_point = False
+    fstab_existed = LINUX_FSTAB_PATH.exists()
+    existing_fstab = ""
+    fstab_mode = 0o644
+    if mount_path:
+        current = Path("/")
+        for component in mount_path.parts[1:]:
+            current /= component
+            if current.is_symlink():
+                raise ValueError("Mount point and its parents must not contain symbolic links")
+        if mount_path.exists():
+            if not mount_path.is_dir() or any(mount_path.iterdir()):
+                raise ValueError("Mount point must be a new or empty directory")
+        code, mounted_target = run([findmnt, "--noheadings", "--output", "TARGET", "--target", mount_point], timeout=30)
+        if code == 0 and any(line.strip() == mount_point for line in mounted_target.splitlines()):
+            raise ValueError("Mount point is already in use")
+        existing_fstab = LINUX_FSTAB_PATH.read_text(encoding="utf-8", errors="replace") if fstab_existed else ""
+        fstab_mode = LINUX_FSTAB_PATH.stat().st_mode & 0o777 if fstab_existed else 0o644
+        for line in existing_fstab.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] == mount_point and not line.lstrip().startswith("#"):
+                raise ValueError("Mount point already exists in /etc/fstab")
     command = [formatter, "-F"] if filesystem == "ext4" else [formatter, "-f"]
     if label:
         command += ["-L", label]
     command.append(device)
     code, output = run(command, timeout=1800)
-    if code != 0 or not parameters.get("mount_point"):
+    if code != 0 or not mount_point:
         return code, output
-    mount_point = linux_mount_path(parameters.get("mount_point"))
-    Path(mount_point).mkdir(parents=True, exist_ok=True)
-    mount = find_system_command("mount")
-    blkid = find_system_command("blkid")
-    if not mount or not blkid:
-        return 127, "mount/blkid is not installed"
+    assert mount_path is not None and mount and umount and blkid and findmnt
+    if not mount_path.exists():
+        mount_path.mkdir(parents=True, mode=0o755)
+        created_mount_point = True
     uuid_code, uuid_output = run([blkid, "-s", "UUID", "-o", "value", device])
     if uuid_code != 0 or not re.fullmatch(r"[A-Fa-f0-9-]{8,64}", uuid_output.strip()):
+        if created_mount_point:
+            with contextlib.suppress(OSError):
+                mount_path.rmdir()
         return 2, "Cannot read filesystem UUID"
-    code, mount_output = run([mount, device, mount_point])
-    if code != 0:
-        return code, mount_output
-    fstab = Path("/etc/fstab")
     line = f"UUID={uuid_output.strip()} {mount_point} {filesystem} defaults 0 {2 if filesystem == 'ext4' else 0}"
-    existing = fstab.read_text(errors="replace") if fstab.exists() else ""
-    if f"UUID={uuid_output.strip()} " not in existing:
-        with fstab.open("a", encoding="utf-8") as handle:
-            if existing and not existing.endswith("\n"):
-                handle.write("\n")
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-    return 0, json.dumps({"device": device, "filesystem": filesystem, "mountPoint": mount_point}, separators=(",", ":"))
+    fstab_changed = False
+    written_fstab = ""
+    mounted = False
+    try:
+        # Formatting may be slow. Refresh the snapshot immediately before the
+        # append so unrelated edits made during mkfs are not overwritten.
+        fstab_existed = LINUX_FSTAB_PATH.exists()
+        existing_fstab = LINUX_FSTAB_PATH.read_text(encoding="utf-8", errors="replace") if fstab_existed else ""
+        fstab_mode = LINUX_FSTAB_PATH.stat().st_mode & 0o777 if fstab_existed else 0o644
+        for existing_line in existing_fstab.splitlines():
+            fields = existing_line.split()
+            if len(fields) >= 2 and not existing_line.lstrip().startswith("#") and (fields[1] == mount_point or fields[0] == f"UUID={uuid_output.strip()}"):
+                raise ValueError("The filesystem or mount point was added to /etc/fstab by another operation")
+        written_fstab = existing_fstab + ("" if not existing_fstab or existing_fstab.endswith("\n") else "\n") + line + "\n"
+        fstab_changed = True
+        atomic_write_text(LINUX_FSTAB_PATH, written_fstab, fstab_mode)
+        code, mount_output = run([mount, mount_point], timeout=300)
+        mounted = code == 0
+        if code == 0:
+            verify_code, verify_output = run([findmnt, "--noheadings", "--output", "UUID,FSTYPE,TARGET", "--target", mount_point], timeout=30)
+            expected = [uuid_output.strip(), filesystem, mount_point]
+            if verify_code == 0 and any(row.split() == expected for row in verify_output.splitlines()):
+                restorecon = find_system_command("restorecon")
+                if restorecon:
+                    run([restorecon, "-RF", mount_point], timeout=120)
+                return 0, json.dumps({"device": device, "filesystem": filesystem, "mountPoint": mount_point, "uuid": uuid_output.strip(), "persistent": True}, separators=(",", ":"))
+            mount_output = verify_output or "findmnt did not confirm the new filesystem UUID and mount"
+            code = verify_code or 2
+    except (OSError, ValueError, RuntimeError) as exc:
+        code, mount_output = 2, str(exc)
+        state_code, targets = run([findmnt, "--noheadings", "--source", device, "--output", "TARGET"], timeout=30)
+        if state_code not in {0, 1}:
+            return code, f"Persistent mount failed with unknown mount state; LV and /etc/fstab must be inspected before retry: {mount_output}"
+        mounted = any(target.strip() == mount_point for target in targets.splitlines())
+    if mounted:
+        unmount_code, unmount_output = run([umount, mount_point], timeout=300)
+        if unmount_code:
+            return unmount_code, f"Filesystem was mounted but verification failed and automatic unmount also failed; /etc/fstab was kept to avoid an unmanaged active mount: {unmount_output or mount_output}"
+    if fstab_changed:
+        current_fstab = LINUX_FSTAB_PATH.read_text(encoding="utf-8", errors="replace") if LINUX_FSTAB_PATH.exists() else ""
+        if current_fstab == written_fstab:
+            if fstab_existed:
+                atomic_write_text(LINUX_FSTAB_PATH, existing_fstab, fstab_mode)
+            else:
+                LINUX_FSTAB_PATH.unlink(missing_ok=True)
+        else:
+            # Preserve concurrent edits and remove only our exact entry. If
+            # another writer changed that entry, leave it and the LV intact.
+            retained = [entry for entry in current_fstab.splitlines(keepends=True) if entry.rstrip("\r\n") != line]
+            updated = "".join(retained)
+            if updated != current_fstab:
+                atomic_write_text(LINUX_FSTAB_PATH, updated, LINUX_FSTAB_PATH.stat().st_mode & 0o777)
+    if created_mount_point:
+        with contextlib.suppress(OSError):
+            mount_path.rmdir()
+    return code, f"Filesystem was created but persistent mount failed and /etc/fstab was rolled back: {mount_output}"
 
 
 def find_linux_storage_node(scan: dict[str, Any], path: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -2701,6 +3119,312 @@ def find_linux_storage_node(scan: dict[str, Any], path: str) -> tuple[dict[str, 
         if found:
             return found, parent
     return None, None
+
+
+def linux_block_device_size(path: str) -> int:
+    if not DEVICE_RE.fullmatch(path):
+        raise ValueError("Invalid Linux block-device path")
+    blockdev = find_system_command("blockdev")
+    if not blockdev:
+        raise RuntimeError("blockdev is not installed")
+    code, output = run([blockdev, "--getsize64", path], timeout=60)
+    if code:
+        raise RuntimeError(output or f"Cannot read the live size of {path}")
+    try:
+        return int(output.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid block-device size returned for {path}") from exc
+
+
+def repair_linux_gpt_tail(disk: dict[str, Any]) -> None:
+    if not disk.get("needsGptRepair"):
+        return
+    disk_path = str(disk.get("path", ""))
+    if not DEVICE_RE.fullmatch(disk_path) or str(disk.get("partitionTable", "")).lower() != "gpt":
+        raise RuntimeError("Partition layout changed before GPT repair")
+    sgdisk = find_system_command("sgdisk")
+    if not sgdisk:
+        raise RuntimeError("gdisk/sgdisk is required to repair the GPT backup header after a disk expansion")
+    backup_root = Path("/var/lib/tram-agent/partition-backups")
+    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        backup_root.chmod(0o700)
+    safe_name = Path(disk_path).name
+    backup = backup_root / f"{safe_name}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.gpt"
+    code, output = run([sgdisk, f"--backup={backup}", disk_path], timeout=120)
+    if code:
+        raise RuntimeError(output or f"Cannot back up the GPT table of {disk_path}")
+    with contextlib.suppress(OSError):
+        backup.chmod(0o600)
+    code, output = run([sgdisk, "--move-second-header", disk_path], timeout=120)
+    if code:
+        raise RuntimeError(output or f"Cannot relocate the GPT backup header of {disk_path}")
+
+
+def reread_linux_partition(disk_path: str, partition_number: int, partition_path: str, minimum_size: int) -> int:
+    partprobe = find_system_command("partprobe")
+    partx = find_system_command("partx")
+    if not partprobe and not partx:
+        raise RuntimeError("partprobe or partx is required to refresh the kernel partition table")
+    reread_errors: list[str] = []
+    if partprobe:
+        code, output = run([partprobe, disk_path], timeout=120)
+        if code:
+            reread_errors.append(output or f"partprobe exit {code}")
+    if partx:
+        code, output = run([partx, "--update", "--nr", str(partition_number), disk_path], timeout=120)
+        if code:
+            reread_errors.append(output or f"partx exit {code}")
+    udevadm = find_system_command("udevadm")
+    if udevadm:
+        run([udevadm, "settle", "--timeout=60"], timeout=75)
+    deadline = time.monotonic() + 30
+    last_size = 0
+    while time.monotonic() < deadline:
+        try:
+            last_size = linux_block_device_size(partition_path)
+        except RuntimeError:
+            last_size = 0
+        if last_size >= minimum_size:
+            return last_size
+        time.sleep(1)
+    detail = "; ".join(item for item in reread_errors if item)
+    raise RuntimeError(f"Kernel did not expose the resized partition {partition_path} (expected at least {minimum_size} bytes, got {last_size}){': ' + detail if detail else ''}")
+
+
+def grow_linux_partition_node(scan: dict[str, Any], path: str, requested_bytes: int) -> dict[str, Any]:
+    node, disk = find_linux_storage_node(scan, path)
+    if not node or not disk or node.get("type") != "part" or node.get("resizeProtected"):
+        raise ValueError("Partition changed, is protected or cannot be extended safely")
+    filesystem = str(node.get("filesystem", ""))
+    if filesystem not in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
+        raise ValueError("Only ext2/ext3/ext4, XFS and LVM PV partitions can be extended")
+    number = byte_value(node.get("partitionNumber"))
+    disk_path = str(disk.get("path", ""))
+    if not number or not DEVICE_RE.fullmatch(path) or not DEVICE_RE.fullmatch(disk_path):
+        raise ValueError("Partition identity is unavailable")
+    logical_sector = byte_value(node.get("logicalSectorBytes")) or LINUX_BLOCK_SECTOR_BYTES
+    add_bytes = align_linux_storage_bytes(requested_bytes, logical_sector)
+    available = byte_value(node.get("extendableBytes"))
+    if add_bytes > available:
+        raise ValueError("Requested size exceeds the live contiguous free region")
+    parted = find_system_command("parted")
+    if not parted:
+        raise RuntimeError("parted is not installed")
+    repair_linux_gpt_tail(disk)
+    before_size = linux_block_device_size(path)
+    current_end = byte_value(node.get("endOffsetBytes"))
+    if not current_end:
+        current_end = byte_value(node.get("offsetBytes")) + before_size - 1
+    new_end = current_end + add_bytes
+    code, output = run([parted, "--script", disk_path, "unit", "B", "resizepart", str(number), f"{new_end}B"], timeout=600)
+    if code:
+        # Older EL7/EL8 parted releases refuse the busy-partition confirmation
+        # in script mode. Only answer that specific prompt after proving that
+        # the first attempt left the original partition geometry unchanged.
+        live_geometry = parted_disk_layout(disk_path).get("partitions", {}).get(number, {})
+        unchanged = bool(live_geometry) and byte_value(live_geometry.get("startBytes")) == byte_value(node.get("offsetBytes")) and byte_value(live_geometry.get("endBytes")) == current_end
+        if unchanged and ("is being used" in output or "Are you sure you want to continue" in output):
+            commands = f"unit B\nresizepart {number}\nYes\n{new_end}B\nquit\n"
+            code, output = run_with_input([parted, "---pretend-input-tty", disk_path], commands, timeout=600)
+        else:
+            already_written = bool(live_geometry) and byte_value(live_geometry.get("startBytes")) == byte_value(node.get("offsetBytes")) and byte_value(live_geometry.get("endBytes")) == new_end
+            if not already_written:
+                raise RuntimeError(output or f"parted could not resize {path}")
+    live_geometry = parted_disk_layout(disk_path).get("partitions", {}).get(number, {})
+    if not live_geometry or byte_value(live_geometry.get("startBytes")) != byte_value(node.get("offsetBytes")) or byte_value(live_geometry.get("endBytes")) != new_end:
+        raise RuntimeError(output or f"Partition {path} did not retain its start and reach the requested end")
+    after_size = reread_linux_partition(disk_path, number, path, before_size + add_bytes - logical_sector)
+    if after_size <= before_size:
+        raise RuntimeError(f"Partition {path} did not grow")
+    return {
+        "path": path,
+        "disk": disk_path,
+        "partitionNumber": number,
+        "beforeBytes": before_size,
+        "afterBytes": after_size,
+        "appliedBytes": after_size - before_size,
+        "filesystem": filesystem,
+    }
+
+
+def live_vg_free_bytes(vg_name: str) -> int:
+    for item in lvm_report("vgs", "vg_name,vg_free"):
+        if str(item.get("vg_name", "")).strip() == vg_name:
+            return byte_value(item.get("vg_free"))
+    return 0
+
+
+def ensure_linux_vg_capacity(scan: dict[str, Any], vg_name: str, required_bytes: int) -> tuple[int, list[dict[str, Any]]]:
+    vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
+    if not vg:
+        raise ValueError("Volume Group no longer exists")
+    current_free = byte_value(vg.get("freeBytes"))
+    if current_free >= required_bytes:
+        return current_free, []
+    if required_bytes > byte_value(vg.get("extendableBytes") or current_free):
+        raise ValueError("Volume Group and its backing PV partitions do not have enough contiguous capacity")
+    pvresize = find_system_command("pvresize")
+    if not pvresize:
+        raise RuntimeError("pvresize is not installed")
+    steps: list[dict[str, Any]] = []
+    for plan in vg.get("extensionPlan", []):
+        if current_free >= required_bytes:
+            break
+        pv_path = str(plan.get("pv", ""))
+        if not DEVICE_RE.fullmatch(pv_path):
+            continue
+        growable = byte_value(plan.get("growableBytes"))
+        if growable <= 0:
+            continue
+        if byte_value(plan.get("partitionNumber")):
+            extent = max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(vg.get("extentSizeBytes")))
+            missing_bytes = required_bytes - current_free
+            needed_growth = ((missing_bytes + extent - 1) // extent) * extent
+            step = grow_linux_partition_node(scan, pv_path, min(growable, needed_growth))
+        else:
+            step = {"path": pv_path, "disk": str(plan.get("disk", "")), "appliedBytes": growable, "filesystem": "LVM2_member"}
+        code, output = run([pvresize, pv_path], timeout=600)
+        if code:
+            raise RuntimeError(f"Backing partition grew but pvresize failed for {pv_path}: {output or 'unknown error'}")
+        step["pvresize"] = "completed"
+        steps.append(step)
+        current_free = live_vg_free_bytes(vg_name)
+    if current_free < required_bytes:
+        current_free = live_vg_free_bytes(vg_name)
+    if current_free < required_bytes:
+        raise RuntimeError(f"PV growth completed but Volume Group {vg_name} exposes only {current_free} free bytes; {required_bytes} are required")
+    return current_free, steps
+
+
+def grow_linux_filesystem(path: str, filesystem: str, mountpoints: list[str]) -> tuple[int, str]:
+    if filesystem in {"ext2", "ext3", "ext4"}:
+        resize2fs = find_system_command("resize2fs")
+        return run([resize2fs, path], timeout=1800) if resize2fs else (127, "resize2fs is not installed")
+    if filesystem == "xfs":
+        xfs_growfs = find_system_command("xfs_growfs")
+        return run([xfs_growfs, mountpoints[0]], timeout=1800) if xfs_growfs and mountpoints else (127 if not xfs_growfs else 2, "XFS must be mounted and xfs_growfs installed")
+    return 2, f"Filesystem {filesystem or 'unknown'} cannot be extended safely by the Agent"
+
+
+def linux_partition_path(disk_path: str, partition_number: int) -> str:
+    if not DEVICE_RE.fullmatch(disk_path) or partition_number < 1:
+        raise ValueError("Invalid disk or partition number")
+    separator = "p" if re.search(r"[0-9]$", disk_path) else ""
+    candidate = f"{disk_path}{separator}{partition_number}"
+    if not DEVICE_RE.fullmatch(candidate):
+        raise ValueError("Invalid generated partition path")
+    return candidate
+
+
+def create_linux_lvm_partition(scan: dict[str, Any], disk_path: str, start_bytes: int, source_size_bytes: int) -> str:
+    disk = next((item for item in scan.get("disks", []) if item.get("path") == disk_path and item.get("type") == "disk"), None)
+    if not disk or disk.get("readOnly") or disk.get("removable"):
+        raise ValueError("Selected disk changed, is read-only or removable")
+    region = next(
+        (
+            item for item in disk.get("freeRegions", [])
+            if start_bytes >= byte_value(item.get("startBytes"))
+            and start_bytes + source_size_bytes - 1 <= byte_value(item.get("endBytes"))
+        ),
+        None,
+    )
+    if not region:
+        raise ValueError("Selected unallocated region changed or is too small")
+    parted = find_system_command("parted")
+    partprobe = find_system_command("partprobe")
+    if not parted or not partprobe:
+        raise RuntimeError("parted/partprobe is required to create an LVM partition")
+    children = [item for item in disk.get("children", []) if item.get("type") == "part"]
+    if not str(disk.get("partitionTable", "")):
+        if children:
+            raise ValueError("Disk has partitions but no recognized partition table")
+        wipefs = find_system_command("wipefs")
+        if not wipefs:
+            raise RuntimeError("wipefs is required before initializing a new disk")
+        code, signatures = run([wipefs, "--no-act", "--parsable", disk_path], timeout=60)
+        if code:
+            raise RuntimeError(signatures or f"Cannot inspect signatures on {disk_path}")
+        if signatures.strip():
+            raise ValueError("New disk contains an existing signature; clear it through an approved maintenance procedure first")
+        code, output = run([parted, "--script", disk_path, "mklabel", "gpt"], timeout=120)
+        if code:
+            raise RuntimeError(output or f"Cannot initialize GPT on {disk_path}")
+        disk["partitionTable"] = "gpt"
+        disk["needsGptRepair"] = False
+    repair_linux_gpt_tail(disk)
+    end_bytes = start_bytes + source_size_bytes - 1
+    code, output = run(
+        [parted, "--script", "--align", "optimal", disk_path, "unit", "B", "mkpart", "primary", f"{start_bytes}B", f"{end_bytes}B"],
+        timeout=600,
+    )
+    if code:
+        raise RuntimeError(output or f"Cannot create an LVM partition on {disk_path}")
+    created_layout = parted_disk_layout(disk_path)
+    created_geometry = next(
+        (
+            (number, geometry) for number, geometry in created_layout.get("partitions", {}).items()
+            if abs(byte_value(geometry.get("startBytes")) - start_bytes) <= LINUX_STORAGE_ALIGNMENT_BYTES
+            and byte_value(geometry.get("endBytes")) >= end_bytes - LINUX_STORAGE_ALIGNMENT_BYTES
+        ),
+        None,
+    )
+    if not created_geometry:
+        raise RuntimeError("Partition was created but its live geometry could not be identified")
+    partition_number = int(created_geometry[0])
+    partition_path = linux_partition_path(disk_path, partition_number)
+    flag_code, flag_output = run([parted, "--script", disk_path, "set", str(partition_number), "lvm", "on"], timeout=120)
+    if flag_code:
+        raise RuntimeError(f"Partition was created but its LVM flag could not be set: {flag_output}")
+    reread_linux_partition(disk_path, partition_number, partition_path, source_size_bytes - LINUX_STORAGE_ALIGNMENT_BYTES)
+    return partition_path
+
+
+def prepare_linux_volume_group(parameters: dict[str, Any], scan: dict[str, Any], size_bytes: int) -> tuple[str, list[str]]:
+    source_kind = str(parameters.get("source_kind", "existing_vg"))
+    vg_name = str(parameters.get("vg_name", ""))
+    if not LVM_NAME_RE.fullmatch(vg_name):
+        raise ValueError("Invalid Volume Group name")
+    existing = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
+    if source_kind == "existing_vg":
+        if not existing:
+            raise ValueError("Selected Volume Group no longer exists")
+        _, steps = ensure_linux_vg_capacity(scan, vg_name, size_bytes)
+        return vg_name, [str(step.get("path", "")) for step in steps]
+    if source_kind not in {"empty_partition", "free_region"}:
+        raise ValueError("Invalid automatic Linux volume source")
+    pvcreate = find_system_command("pvcreate")
+    vgcreate = find_system_command("vgcreate")
+    vgextend = find_system_command("vgextend")
+    if not pvcreate or not vgcreate or not vgextend:
+        raise RuntimeError("pvcreate/vgcreate/vgextend is not installed")
+    if source_kind == "empty_partition":
+        device = str(parameters.get("device", ""))
+        candidate = next((item for item in scan.get("lvmCandidates", []) if item.get("path") == device), None)
+        if not candidate or byte_value(candidate.get("sizeBytes")) < size_bytes + LINUX_STORAGE_ALIGNMENT_BYTES:
+            raise ValueError("Selected empty partition changed or is too small")
+        wipefs = find_system_command("wipefs")
+        if not wipefs:
+            raise RuntimeError("wipefs is required to verify an empty partition")
+        code, signatures = run([wipefs, "--no-act", "--parsable", device], timeout=60)
+        if code or signatures.strip():
+            raise ValueError("Selected partition is not empty or its signatures cannot be verified")
+    else:
+        disk_path = str(parameters.get("disk", ""))
+        start_bytes = storage_int(parameters, "start_bytes", 1024**2)
+        source_size = storage_int(parameters, "source_size_bytes", size_bytes + LINUX_STORAGE_ALIGNMENT_BYTES)
+        device = create_linux_lvm_partition(scan, disk_path, start_bytes, source_size)
+    code, output = run([pvcreate, "--yes", device], timeout=600)
+    if code:
+        raise RuntimeError(output or f"pvcreate failed for {device}")
+    command = [vgextend, vg_name, device] if existing else [vgcreate, vg_name, device]
+    code, output = run(command, timeout=600)
+    if code:
+        raise RuntimeError(output or f"Cannot {'extend' if existing else 'create'} Volume Group {vg_name}")
+    free_bytes = live_vg_free_bytes(vg_name)
+    if free_bytes < size_bytes:
+        raise RuntimeError(f"Volume Group {vg_name} exposes only {free_bytes} bytes after adding {device}")
+    return vg_name, [device]
 
 
 def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
@@ -2728,19 +3452,41 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
             add_bytes,
             "extend",
         )
-    scan = parsed_storage_scan(False)
+    scan = parsed_storage_scan(False, rescan=True)
     if kind == "linux_lv":
         path = str(parameters.get("path", ""))
         logical = next((item for item in scan.get("logicalVolumes", []) if item.get("path") == path), None)
         if not logical or not DEVICE_RE.fullmatch(path):
             raise ValueError("Logical Volume changed or has insufficient free space")
-        aligned_add_bytes = align_linux_storage_bytes(add_bytes)
+        extent = max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(logical.get("extentSizeBytes")))
+        aligned_add_bytes = align_linux_storage_bytes(add_bytes, extent)
         if aligned_add_bytes > byte_value(logical.get("extendableBytes")):
             raise ValueError("Logical Volume changed or has insufficient free space")
+        filesystem = str(logical.get("filesystem", ""))
+        mountpoints = [str(item) for item in logical.get("mountpoints", []) if item]
+        if filesystem not in {"ext2", "ext3", "ext4", "xfs"}:
+            raise ValueError("Logical Volume filesystem must be ext2/ext3/ext4 or XFS")
+        if filesystem == "xfs" and not mountpoints:
+            raise ValueError("XFS must be mounted before it can be extended")
         binary = find_system_command("lvextend")
         if not binary:
             return 127, "lvextend is not installed"
-        return run([binary, "--resizefs", "--size", f"+{aligned_add_bytes}B", path], timeout=1800)
+        _, backing_steps = ensure_linux_vg_capacity(scan, str(logical.get("vgName", "")), aligned_add_bytes)
+        before_size = byte_value(logical.get("sizeBytes"))
+        code, output = run([binary, "--yes", "--size", f"+{aligned_add_bytes}B", path], timeout=1800)
+        if code:
+            return code, output
+        fs_code, fs_output = grow_linux_filesystem(path, filesystem, mountpoints)
+        if fs_code:
+            return fs_code, f"Logical Volume grew but filesystem growth failed: {fs_output}"
+        final_size = 0
+        for item in lvm_report("lvs", "lv_path,lv_size"):
+            if str(item.get("lv_path", "")).strip() == path:
+                final_size = byte_value(item.get("lv_size"))
+                break
+        if final_size and final_size < before_size + aligned_add_bytes - extent:
+            return 2, "LVM reported success but the Logical Volume did not reach the requested size"
+        return 0, json.dumps({"path": path, "filesystem": filesystem, "requestedBytes": add_bytes, "appliedBytes": aligned_add_bytes, "beforeBytes": before_size, "afterBytes": final_size, "backingSteps": backing_steps}, ensure_ascii=False, separators=(",", ":"))
     if kind != "linux_partition":
         raise ValueError("Invalid Linux storage target")
     path = str(parameters.get("path", ""))
@@ -2750,35 +3496,19 @@ def extend_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     number = byte_value(node.get("partitionNumber"))
     if not number:
         raise ValueError("Partition number is unavailable")
-    logical_sector_bytes = byte_value(node.get("logicalSectorBytes")) or LINUX_BLOCK_SECTOR_BYTES
-    aligned_add_bytes = align_linux_storage_bytes(add_bytes, logical_sector_bytes)
-    if aligned_add_bytes > byte_value(node.get("extendableBytes")):
-        raise ValueError("Partition changed, is protected or has insufficient contiguous space")
-    start = byte_value(node.get("startSector")) * logical_sector_bytes
-    new_end = start + byte_value(node.get("sizeBytes")) + aligned_add_bytes - 1
-    parted = find_system_command("parted")
-    if not parted:
-        return 127, "parted is not installed"
-    code, output = run([parted, "--script", str(disk["path"]), "unit", "B", "resizepart", str(number), f"{new_end}B"], timeout=600)
-    if code != 0:
-        return code, output
-    partprobe = find_system_command("partprobe")
-    if partprobe:
-        run([partprobe, str(disk["path"])], timeout=120)
     filesystem = str(node.get("filesystem", ""))
-    if filesystem not in {"ext2", "ext3", "ext4", "xfs", "LVM2_member"}:
-        raise ValueError("This filesystem cannot be extended safely by the Agent")
+    step = grow_linux_partition_node(scan, path, add_bytes)
     if filesystem == "LVM2_member":
         pvresize = find_system_command("pvresize")
-        return run([pvresize, path], timeout=600) if pvresize else (127, "pvresize is not installed")
-    if filesystem in {"ext2", "ext3", "ext4"}:
-        resize = find_system_command("resize2fs")
-        return run([resize, path], timeout=1800) if resize else (127, "resize2fs is not installed")
-    if filesystem == "xfs":
-        mountpoints = node.get("mountpoints", [])
-        grow = find_system_command("xfs_growfs")
-        return run([grow, str(mountpoints[0])], timeout=1800) if grow and mountpoints else (2, "XFS must be mounted and xfs_growfs installed")
-    return 2, f"Partition grew but filesystem {filesystem or 'unknown'} requires a manual grow operation"
+        if not pvresize:
+            return 127, "Partition grew but pvresize is not installed"
+        code, output = run([pvresize, path], timeout=600)
+    else:
+        code, output = grow_linux_filesystem(path, filesystem, [str(item) for item in node.get("mountpoints", []) if item])
+    if code:
+        return code, f"Partition grew but the dependent storage layer failed: {output}"
+    step["filesystemGrowth"] = filesystem
+    return 0, json.dumps(step, ensure_ascii=False, separators=(",", ":"))
 
 
 def shrink_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]:
@@ -2825,19 +3555,78 @@ def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
         assign = f"-DriveLetter {drive}" if drive else "-AssignDriveLetter"
         script = f"$d=Get-Disk -Number {disk_number} -ErrorAction Stop;if($d.IsReadOnly -or $d.IsOffline -or $d.LargestFreeExtent -lt {size_bytes}){{throw 'Disk changed or has insufficient unallocated space'}};$p=New-Partition -DiskNumber {disk_number} -Size {size_bytes} {assign} -ErrorAction Stop;$v=$p|Format-Volume -FileSystem {filesystem} -NewFileSystemLabel {ps_quote(label)} -Confirm:$false -Force -ErrorAction Stop;[pscustomobject]@{{diskNumber={disk_number};partitionNumber=$p.PartitionNumber;driveLetter=$p.DriveLetter;filesystem=$v.FileSystem;sizeBytes=[int64]$p.Size}}|ConvertTo-Json -Compress"
         return powershell(script, timeout=1800)
-    scan = parsed_storage_scan(False)
+    scan = parsed_storage_scan(False, rescan=True)
+    if kind == "linux_volume":
+        vg_name = str(parameters.get("vg_name", ""))
+        name = str(parameters.get("name", ""))
+        if not LVM_NAME_RE.fullmatch(vg_name) or not LVM_NAME_RE.fullmatch(name):
+            raise ValueError("Invalid Logical Volume name")
+        # The composite workflow always creates a persistent mount. Validating
+        # it before partition/PV changes makes bad requests fail closed.
+        linux_mount_path(parameters.get("mount_point"))
+        existing_vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
+        extent = max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(existing_vg.get("extentSizeBytes"))) if existing_vg else LINUX_STORAGE_ALIGNMENT_BYTES
+        aligned_size_bytes = align_linux_storage_bytes(size_bytes, extent)
+        preflight_linux_filesystem(parameters, aligned_size_bytes)
+        lv_path = f"/dev/{vg_name}/{name}"
+        if any(item.get("path") == lv_path or (item.get("vgName") == vg_name and item.get("name") == name) for item in scan.get("logicalVolumes", [])):
+            raise ValueError("Logical Volume already exists")
+        lvcreate = find_system_command("lvcreate")
+        lvremove = find_system_command("lvremove")
+        if not lvcreate or not lvremove:
+            return 127, "lvcreate/lvremove is not installed"
+        vg_name, backing_devices = prepare_linux_volume_group(parameters, scan, aligned_size_bytes)
+        code, output = run([lvcreate, "--yes", "--size", f"{aligned_size_bytes}B", "--name", name, vg_name], timeout=900)
+        if code:
+            return code, output
+        try:
+            format_code, format_output = format_and_mount_linux(lv_path, parameters)
+        except (OSError, ValueError, RuntimeError) as exc:
+            format_code, format_output = 2, str(exc)
+        if format_code:
+            blkid = find_system_command("blkid")
+            uuid_code, uuid_output = run([blkid, "-s", "UUID", "-o", "value", lv_path], timeout=30) if blkid else (127, "")
+            try:
+                fstab = LINUX_FSTAB_PATH.read_text(encoding="utf-8", errors="replace") if LINUX_FSTAB_PATH.exists() else ""
+            except OSError:
+                return format_code, f"Automatic volume creation failed; the new LV was preserved because /etc/fstab could not be verified: {format_output}"
+            identifiers = {lv_path, f"/dev/mapper/{vg_name.replace('-', '--')}-{name.replace('-', '--')}"}
+            if uuid_code == 0 and re.fullmatch(r"[A-Fa-f0-9-]{8,64}", uuid_output.strip()):
+                identifiers.add(f"UUID={uuid_output.strip()}")
+            elif uuid_code != 2:
+                return format_code, f"Automatic volume creation failed; the new LV was preserved because its filesystem identity is unknown: {format_output}"
+            referenced = any(entry.split() and not entry.lstrip().startswith("#") and entry.split()[0] in identifiers for entry in fstab.splitlines())
+            if referenced:
+                return format_code, f"Automatic volume creation failed; the new LV was preserved because /etc/fstab still references it: {format_output}"
+            findmnt = find_system_command("findmnt")
+            mount_code, mount_output = run([findmnt, "--noheadings", "--source", lv_path, "--output", "TARGET"], timeout=30) if findmnt else (127, "findmnt unavailable")
+            if mount_code not in {0, 1} or mount_output.strip():
+                return format_code, f"Automatic volume creation failed; the new LV was preserved because its mount state is active or unknown: {format_output}"
+            cleanup_code, cleanup_output = run([lvremove, "--yes", lv_path], timeout=600)
+            rollback = "the new LV was removed" if cleanup_code == 0 else f"the new LV could not be removed: {cleanup_output}"
+            return format_code, f"Automatic volume creation failed; {rollback}. Backing PV/VG capacity was retained for retry: {format_output}"
+        try:
+            mounted = json.loads(format_output)
+        except (TypeError, ValueError):
+            mounted = {"mountPoint": str(parameters.get("mount_point", ""))}
+        return 0, json.dumps({"kind": "linux_volume", "vgName": vg_name, "lvName": name, "path": lv_path, "sizeBytes": aligned_size_bytes, "backingDevices": backing_devices, **mounted}, ensure_ascii=False, separators=(",", ":"))
     if kind == "linux_lv":
         vg_name = str(parameters.get("vg_name", ""))
         name = str(parameters.get("name", ""))
-        if not GROUP_RE.fullmatch(vg_name) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", name):
+        if not LVM_NAME_RE.fullmatch(vg_name) or not LVM_NAME_RE.fullmatch(name):
             raise ValueError("Invalid Logical Volume name")
         vg = next((item for item in scan.get("volumeGroups", []) if item.get("name") == vg_name), None)
-        aligned_size_bytes = align_linux_storage_bytes(size_bytes)
-        if not vg or aligned_size_bytes > byte_value(vg.get("freeBytes")):
+        extent = max(LINUX_STORAGE_ALIGNMENT_BYTES, byte_value(vg.get("extentSizeBytes"))) if vg else LINUX_STORAGE_ALIGNMENT_BYTES
+        aligned_size_bytes = align_linux_storage_bytes(size_bytes, extent)
+        preflight_linux_filesystem(parameters, aligned_size_bytes)
+        if any(item.get("path") == f"/dev/{vg_name}/{name}" for item in scan.get("logicalVolumes", [])):
+            raise ValueError("Logical Volume already exists")
+        if not vg or aligned_size_bytes > byte_value(vg.get("extendableBytes") or vg.get("freeBytes")):
             raise ValueError("Volume Group changed or has insufficient free space")
         lvcreate = find_system_command("lvcreate")
         if not lvcreate:
             return 127, "lvcreate is not installed"
+        ensure_linux_vg_capacity(scan, vg_name, aligned_size_bytes)
         code, output = run([lvcreate, "--yes", "--size", f"{aligned_size_bytes}B", "--name", name, vg_name], timeout=900)
         if code != 0:
             return code, output
@@ -2845,7 +3634,7 @@ def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     if kind == "linux_vg":
         name = str(parameters.get("name", ""))
         device = str(parameters.get("device", ""))
-        if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", name):
+        if not LVM_NAME_RE.fullmatch(name):
             raise ValueError("Invalid Volume Group name")
         candidate = next((item for item in scan.get("lvmCandidates", []) if item.get("path") == device), None)
         if not candidate or byte_value(candidate.get("sizeBytes")) < size_bytes:
@@ -2857,6 +3646,7 @@ def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
         return run([vgcreate, name, device], timeout=600) if code == 0 else (code, output)
     if kind != "linux_partition":
         raise ValueError("Invalid Linux storage create type")
+    preflight_linux_filesystem(parameters, size_bytes)
     disk_path = str(parameters.get("disk", ""))
     start_bytes = storage_int(parameters, "start_bytes", 1024**2)
     disk = next((item for item in scan.get("disks", []) if item.get("path") == disk_path and item.get("type") == "disk"), None)
@@ -2868,6 +3658,7 @@ def create_storage(parameters: dict[str, Any], windows: bool) -> tuple[int, str]
     parted = find_system_command("parted")
     if not parted:
         return 127, "parted is not installed"
+    repair_linux_gpt_tail(disk)
     before = {str(child.get("path")) for child in disk.get("children", [])}
     fs_hint = "ext4" if str(parameters.get("filesystem", "ext4")) == "ext4" else "xfs"
     end_bytes = start_bytes + size_bytes - 1
@@ -3002,10 +3793,20 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tram-{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(content, encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         with contextlib.suppress(OSError):
             temporary.chmod(mode)
         os.replace(temporary, path)
+        if os.name != "nt":
+            with contextlib.suppress(OSError):
+                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
     finally:
         with contextlib.suppress(OSError):
             temporary.unlink()
@@ -4141,7 +4942,7 @@ def execute_job(action: str, parameters: dict[str, Any], inventory: dict[str, An
     if action == "firewall.rule.reorder":
         return reorder_firewall_rule(parameters, inventory)
     if action == "storage.list":
-        return storage_scan(windows)
+        return storage_scan(windows, rescan=not windows)
     if action == "storage.extend":
         return extend_storage(parameters, windows)
     if action == "storage.shrink":
@@ -4996,7 +5797,8 @@ def uninstall_agent(config: Config, password_stdin: bool) -> int:
         systemctl = find_system_command("systemctl")
         if systemctl:
             subprocess.run([systemctl, "disable", "--now", "tram-agent.service"], timeout=60, check=False)
-        for path in (Path("/etc/systemd/system/tram-agent.service"), Path("/opt/tram-agent/tram-agent"), Path("/opt/tram-agent/VERSION")):
+            subprocess.run([systemctl, "stop", "tram-agent-storage-rescan.service"], timeout=60, check=False)
+        for path in (Path("/etc/systemd/system/tram-agent.service"), LINUX_STORAGE_RESCAN_UNIT_PATH, Path("/opt/tram-agent/tram-agent"), Path("/opt/tram-agent/VERSION"), LINUX_STORAGE_RESCAN_RESULT):
             with contextlib.suppress(OSError):
                 path.unlink()
         runtime_state = Path("/var/lib/tram-agent")
@@ -5030,6 +5832,7 @@ def main() -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--once", action="store_true")
     sub.add_parser("service")
+    sub.add_parser("storage-rescan-helper", help=argparse.SUPPRESS)
     uninstall_parser = sub.add_parser("uninstall", help="Remove the Agent after verifying the dashboard-configured password")
     uninstall_parser.add_argument("--password-stdin", action="store_true", help="Read one password line from stdin without exposing it in process arguments")
     linux_update = sub.add_parser("apply-linux-update", help=argparse.SUPPRESS)
@@ -5076,6 +5879,8 @@ def main() -> int:
     if args.command == "service":
         run_windows_service(config, args.log_file)
         return 0
+    if args.command == "storage-rescan-helper":
+        return storage_rescan_helper()
     if args.command == "apply-linux-update":
         return apply_linux_update(args.job_id, Path(args.source), args.target_version)
     if args.command == "apply-windows-update":

@@ -1198,7 +1198,14 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         if action == "storage.shrink":
             allowed_kinds = {"windows_partition"} if server.os_family == "windows" else set()
         else:
-            allowed_kinds = {"windows_partition"} if server.os_family == "windows" else ({"linux_partition", "linux_lv"} if action == "storage.extend" else {"linux_partition", "linux_lv", "linux_vg"})
+            if server.os_family == "windows":
+                allowed_kinds = {"windows_partition"}
+            elif action == "storage.extend":
+                allowed_kinds = {"linux_partition", "linux_lv"}
+            elif action == "storage.create":
+                allowed_kinds = {"linux_partition", "linux_lv", "linux_vg", "linux_volume"}
+            else:
+                allowed_kinds = {"linux_partition", "linux_lv", "linux_vg"}
         if kind not in allowed_kinds:
             raise HTTPException(status_code=422, detail="Storage target does not match the server operating system")
         schemas: dict[tuple[str, str], tuple[set[str], set[str]]] = {
@@ -1210,6 +1217,7 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
             ("storage.create", "linux_partition"): ({"kind", "disk", "start_bytes", "size_bytes", "filesystem"}, {"label", "mount_point"}),
             ("storage.create", "linux_lv"): ({"kind", "vg_name", "name", "size_bytes"}, {"filesystem", "label", "mount_point"}),
             ("storage.create", "linux_vg"): ({"kind", "device", "name", "size_bytes"}, set()),
+            ("storage.create", "linux_volume"): ({"kind", "source_kind", "vg_name", "name", "size_bytes", "filesystem", "mount_point"}, {"label", "device", "disk", "start_bytes", "source_size_bytes"}),
             ("storage.delete", "windows_partition"): ({"kind", "disk_number", "partition_number"}, set()),
             ("storage.delete", "linux_partition"): ({"kind", "path"}, set()),
             ("storage.delete", "linux_lv"): ({"kind", "path"}, set()),
@@ -1218,12 +1226,37 @@ def validate_job_parameters(action: str, parameters: dict[str, Any], server: Ser
         required, optional = schemas[(action, kind)]
         if not required.issubset(parameters) or set(parameters) - required - optional:
             raise HTTPException(status_code=422, detail="Storage parameters are incomplete or unsupported")
-        numeric = [key for key in ("add_bytes", "shrink_bytes", "size_bytes") if key in parameters]
+        numeric = [key for key in ("add_bytes", "shrink_bytes", "size_bytes", "source_size_bytes") if key in parameters]
         numeric += [key for key in ("disk_number", "partition_number", "start_bytes") if key in parameters]
-        if any(isinstance(parameters[key], bool) or not isinstance(parameters[key], int) or parameters[key] < (1 if key in {"add_bytes", "shrink_bytes", "size_bytes", "partition_number"} else 0) for key in numeric):
+        if any(isinstance(parameters[key], bool) or not isinstance(parameters[key], int) or parameters[key] < (1 if key in {"add_bytes", "shrink_bytes", "size_bytes", "source_size_bytes", "partition_number"} else 0) for key in numeric):
             raise HTTPException(status_code=422, detail="Storage size must be a positive byte value")
         if any(not isinstance(value, str) or len(value) > 256 or any(ord(character) < 32 for character in value) for key, value in parameters.items() if key not in numeric and key != "kind"):
             raise HTTPException(status_code=422, detail="Storage text parameters are invalid")
+        if kind == "linux_volume":
+            source_kind = str(parameters.get("source_kind", ""))
+            source_fields = {
+                "existing_vg": set(),
+                "empty_partition": {"device"},
+                "free_region": {"disk", "start_bytes", "source_size_bytes"},
+            }
+            expected_source_fields = source_fields.get(source_kind)
+            if expected_source_fields is None or not expected_source_fields.issubset(parameters):
+                raise HTTPException(status_code=422, detail="Automatic Linux volume source is incomplete")
+            forbidden = ({"device", "disk", "start_bytes", "source_size_bytes"} - expected_source_fields) & set(parameters)
+            if forbidden:
+                raise HTTPException(status_code=422, detail="Automatic Linux volume source contains conflicting fields")
+            if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", str(parameters.get("vg_name", ""))) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", str(parameters.get("name", ""))):
+                raise HTTPException(status_code=422, detail="Linux Volume Group or Logical Volume name is invalid")
+            if str(parameters.get("filesystem", "")).lower() not in {"ext4", "xfs"}:
+                raise HTTPException(status_code=422, detail="Automatic Linux volumes support ext4 or XFS")
+            mount_point = str(parameters.get("mount_point", "")).rstrip("/") or "/"
+            components = mount_point.split("/")[1:]
+            if not re.fullmatch(r"/(?:[A-Za-z0-9_.-]+/?){1,12}", mount_point) or any(component in {"", ".", ".."} for component in components) or not any(mount_point == root or mount_point.startswith(root + "/") for root in ("/mnt", "/srv", "/data", "/opt", "/var/lib")):
+                raise HTTPException(status_code=422, detail="Linux mount point must be below /mnt, /srv, /data, /opt or /var/lib")
+        if action == "storage.create" and kind == "linux_lv" and (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", str(parameters.get("vg_name", ""))) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", str(parameters.get("name", "")))):
+            raise HTTPException(status_code=422, detail="Linux Volume Group or Logical Volume name is invalid")
+        if kind == "linux_vg" and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", str(parameters.get("name", ""))):
+            raise HTTPException(status_code=422, detail="Linux Volume Group name is invalid")
         return
     if action == "logs.read":
         sources = parameters.get("sources", [])

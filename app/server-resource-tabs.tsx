@@ -130,7 +130,12 @@ type StorageNode = {
   protected?: boolean;
   resizeProtected?: boolean;
   resizeReason?: string;
+  vgFreeBytes?: number;
+  backingGrowableBytes?: number;
+  extentSizeBytes?: number;
+  extensionPlan?: Array<{ pv?: string; disk?: string; partitionNumber?: number; growableBytes?: number; steps?: string[] }>;
   readOnly?: boolean;
+  removable?: boolean;
   freeRegions?: Array<{ startBytes: number; endBytes: number; sizeBytes: number }>;
 };
 
@@ -142,8 +147,12 @@ type VolumeGroup = {
   name: string;
   sizeBytes: number;
   freeBytes: number;
+  extendableBytes: number;
+  backingGrowableBytes: number;
+  extentSizeBytes: number;
   physicalVolumes: string[];
   logicalVolumes: string[];
+  extensionPlan: Array<{ pv?: string; disk?: string; partitionNumber?: number; growableBytes?: number; steps?: string[] }>;
 };
 
 type StorageScan = {
@@ -152,7 +161,10 @@ type StorageScan = {
   volumeGroups: VolumeGroup[];
   logicalVolumes: LogicalVolume[];
   lvmCandidates: Array<{ path: string; sizeBytes: number }>;
-  capabilities: { partitionCreate?: boolean; lvm?: boolean };
+  capabilities: { partitionCreate?: boolean; partitionResize?: boolean; lvm?: boolean; ext4?: boolean; xfs?: boolean; mountPersist?: boolean; rescan?: boolean };
+  missingTools: string[];
+  rescanDiagnostics?: { errors?: Array<{ target?: string; error?: string }> };
+  layoutDiagnostics?: Array<{ disk?: string; status?: string; error?: string }>;
 };
 
 function objectArray(value: unknown): Record<string, unknown>[] {
@@ -207,7 +219,15 @@ function normalizeStorageNode(value: Record<string, unknown>): StorageNode {
     protected: value.protected === true,
     resizeProtected: value.resizeProtected === true,
     resizeReason: storageText(value.resizeReason),
+    vgFreeBytes: bytes(value.vgFreeBytes),
+    backingGrowableBytes: bytes(value.backingGrowableBytes),
+    extentSizeBytes: bytes(value.extentSizeBytes),
+    extensionPlan: objectArray(value.extensionPlan).map((step) => ({
+      pv: storageText(step.pv), disk: storageText(step.disk), partitionNumber: Number(step.partitionNumber) || undefined,
+      growableBytes: bytes(step.growableBytes), steps: stringArray(step.steps),
+    })),
     readOnly: value.readOnly === true,
+    removable: value.removable === true,
     mountpoints: stringArray(value.mountpoints),
     children: objectArray(value.children).map(normalizeStorageNode),
     partitions: objectArray(value.partitions).map(normalizeStorageNode),
@@ -225,13 +245,25 @@ function parseStorage(output: string | undefined): StorageScan {
     platform: raw.platform === "windows" || raw.platform === "linux" ? raw.platform : "",
     disks: objectArray(raw.disks).map(normalizeStorageNode),
     volumeGroups: objectArray(raw.volumeGroups).map((group) => ({
-      ...group,
+      name: String(group.name ?? ""),
+      sizeBytes: bytes(group.sizeBytes),
+      freeBytes: bytes(group.freeBytes),
+      extendableBytes: bytes(group.extendableBytes ?? group.freeBytes),
+      backingGrowableBytes: bytes(group.backingGrowableBytes),
+      extentSizeBytes: bytes(group.extentSizeBytes),
       physicalVolumes: stringArray(group.physicalVolumes),
       logicalVolumes: stringArray(group.logicalVolumes),
+      extensionPlan: objectArray(group.extensionPlan).map((step) => ({
+        pv: storageText(step.pv), disk: storageText(step.disk), partitionNumber: Number(step.partitionNumber) || undefined,
+        growableBytes: bytes(step.growableBytes), steps: stringArray(step.steps),
+      })),
     })) as VolumeGroup[],
     logicalVolumes: objectArray(raw.logicalVolumes).map(normalizeStorageNode) as LogicalVolume[],
     lvmCandidates: objectArray(raw.lvmCandidates).map((item) => ({ path: String(item.path ?? ""), sizeBytes: bytes(item.sizeBytes) })).filter((item) => item.path),
     capabilities: raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities as StorageScan["capabilities"] : {},
+    missingTools: stringArray(raw.missingTools),
+    rescanDiagnostics: raw.rescanDiagnostics && typeof raw.rescanDiagnostics === "object" ? raw.rescanDiagnostics as StorageScan["rescanDiagnostics"] : undefined,
+    layoutDiagnostics: objectArray(raw.layoutDiagnostics) as StorageScan["layoutDiagnostics"],
   };
 }
 
@@ -243,7 +275,7 @@ function logicalVolumeMapperPath(logical: LogicalVolume) {
 
 type StorageTarget = {
   key: string;
-  kind: "windows_partition" | "linux_partition" | "linux_lv" | "linux_vg";
+  kind: "windows_partition" | "linux_partition" | "linux_lv" | "linux_vg" | "linux_volume";
   label: string;
   path?: string;
   diskNumber?: number;
@@ -260,6 +292,10 @@ type StorageTarget = {
   resizeReason?: string;
   mounted?: boolean;
   name?: string;
+  vgFreeBytes?: number;
+  backingGrowableBytes?: number;
+  extensionPlan?: StorageNode["extensionPlan"];
+  extentSizeBytes?: number;
 };
 
 export function StorageResourceTab({
@@ -283,8 +319,9 @@ export function StorageResourceTab({
   const [expanded, setExpanded] = useState<string[]>([]);
   const [selected, setSelected] = useState<StorageTarget | null>(null);
   const [modal, setModal] = useState<"create" | "extend" | "shrink" | "delete" | null>(null);
-  const [createKind, setCreateKind] = useState(osFamily === "windows" ? "windows_partition" : "linux_partition");
+  const [createKind, setCreateKind] = useState(osFamily === "windows" ? "windows_partition" : "linux_volume");
   const [createTarget, setCreateTarget] = useState("");
+  const [createFilesystem, setCreateFilesystem] = useState("ext4");
   const [confirmation, setConfirmation] = useState("");
   const disks = scan.disks;
   const windowsLayoutWarnings = osFamily === "windows" ? disks.flatMap((disk) => {
@@ -353,7 +390,12 @@ export function StorageResourceTab({
         kind: "linux_lv",
         label: String(logical.path),
         path: logical.path,
+        filesystem: logical.filesystem,
         extendableBytes: bytes(logical.extendableBytes),
+        vgFreeBytes: bytes(logical.vgFreeBytes),
+        backingGrowableBytes: bytes(logical.backingGrowableBytes),
+        extensionPlan: logical.extensionPlan,
+        extentSizeBytes: bytes(logical.extentSizeBytes),
         protected: Boolean(logical.protected),
         resizeProtected: Boolean(logical.resizeProtected),
         resizeReason: logical.resizeReason,
@@ -433,8 +475,10 @@ export function StorageResourceTab({
     const addBytes = Math.floor(Number(form.get("size_gb")) * 1024 ** 3 / 512) * 512;
     const parameters: Record<string, unknown> = { kind: selected.kind, add_bytes: addBytes };
     if (selected.path) parameters.path = selected.path;
-    if (selected.diskNumber !== undefined) parameters.disk_number = selected.diskNumber;
-    if (selected.partitionNumber !== undefined) parameters.partition_number = selected.partitionNumber;
+    if (selected.kind === "windows_partition") {
+      parameters.disk_number = selected.diskNumber;
+      parameters.partition_number = selected.partitionNumber;
+    }
     if (!await queue("storage.extend", parameters, `Extend ${selected.label} trên ${serverName}`)) return;
     setModal(null);
   }
@@ -471,6 +515,21 @@ export function StorageResourceTab({
       parameters.filesystem = form.get("filesystem");
       parameters.label = form.get("label");
       parameters.mount_point = form.get("mount_point");
+    } else if (createKind === "linux_volume") {
+      let source: { kind?: string; vg?: string; device?: string; disk?: string; start?: number; size?: number } = {};
+      try { source = JSON.parse(createTarget); } catch { return; }
+      parameters.source_kind = source.kind;
+      parameters.vg_name = source.kind === "existing_vg" ? source.vg : form.get("vg_name");
+      parameters.name = form.get("name");
+      parameters.filesystem = form.get("filesystem");
+      parameters.label = form.get("label");
+      parameters.mount_point = form.get("mount_point");
+      if (source.kind === "empty_partition") parameters.device = source.device;
+      if (source.kind === "free_region") {
+        parameters.disk = source.disk;
+        parameters.start_bytes = source.start;
+        parameters.source_size_bytes = source.size;
+      }
     } else if (createKind === "linux_lv") {
       parameters.vg_name = form.get("vg_name");
       parameters.name = form.get("name");
@@ -492,8 +551,10 @@ export function StorageResourceTab({
     const parameters: Record<string, unknown> = { kind: selected.kind };
     if (selected.path) parameters.path = selected.path;
     if (selected.name) parameters.name = selected.name;
-    if (selected.diskNumber !== undefined) parameters.disk_number = selected.diskNumber;
-    if (selected.partitionNumber !== undefined) parameters.partition_number = selected.partitionNumber;
+    if (selected.kind === "windows_partition") {
+      parameters.disk_number = selected.diskNumber;
+      parameters.partition_number = selected.partitionNumber;
+    }
     if (!await queue("storage.delete", parameters, `Xóa ${selected.label} trên ${serverName}`)) return;
     setSelected(null);
     setModal(null);
@@ -501,15 +562,49 @@ export function StorageResourceTab({
   }
 
   const freeRegions = disks.flatMap((disk) => (disk.freeRegions ?? []).map((region) => ({ disk, region })));
+  const minimumLinuxFilesystemBytes = (createFilesystem === "xfs" ? 300 : 16) * 1024 ** 2;
+  const minimumForExtent = (extent: number) => Math.ceil(minimumLinuxFilesystemBytes / extent) * extent;
+  const linuxVolumeSources = [
+    ...scan.volumeGroups.map((vg) => ({
+      key: JSON.stringify({ kind: "existing_vg", vg: vg.name }),
+      kind: "existing_vg",
+      label: `${vg.name} · ${formatBytes(vg.freeBytes)} sẵn có + ${formatBytes(vg.backingGrowableBytes)} có thể tự mở rộng`,
+      capacity: bytes(vg.extendableBytes),
+      extent: Math.max(4 * 1024 ** 2, bytes(vg.extentSizeBytes)),
+    })),
+    ...scan.lvmCandidates.map((item) => ({
+      key: JSON.stringify({ kind: "empty_partition", device: item.path }),
+      kind: "empty_partition",
+      label: `${item.path} · partition trống ${formatBytes(item.sizeBytes)}`,
+      capacity: Math.max(0, item.sizeBytes - 4 * 1024 ** 2),
+      extent: 4 * 1024 ** 2,
+    })),
+    ...freeRegions.filter(({ disk }) => !disk.readOnly && !disk.removable).map(({ disk, region }) => ({
+      key: JSON.stringify({ kind: "free_region", disk: disk.path, start: region.startBytes, size: region.sizeBytes }),
+      kind: "free_region",
+      label: `${disk.path} · vùng trống ${formatBytes(region.sizeBytes)} (Agent tự tạo partition/PV/VG)`,
+      capacity: Math.max(0, region.sizeBytes - 4 * 1024 ** 2),
+      extent: 4 * 1024 ** 2,
+    })),
+  ].filter((source) => source.capacity >= minimumForExtent(source.extent));
+  const selectedLinuxVolumeSource = linuxVolumeSources.find((source) => source.key === createTarget);
   const createCapacity = createKind === "windows_partition"
     ? bytes(disks.find((disk) => String(disk.number) === createTarget)?.largestFreeExtentBytes ?? disks.find((disk) => String(disk.number) === createTarget)?.unallocatedBytes)
     : createKind === "linux_partition"
       ? bytes(freeRegions.find(({ disk, region }) => `${disk.path}|${region.startBytes}` === createTarget)?.region.sizeBytes)
+      : createKind === "linux_volume"
+        ? bytes(selectedLinuxVolumeSource?.capacity)
       : createKind === "linux_lv"
-        ? bytes(scan.volumeGroups.find((vg) => vg.name === createTarget)?.freeBytes)
+        ? bytes(scan.volumeGroups.find((vg) => vg.name === createTarget)?.extendableBytes)
         : bytes(scan.lvmCandidates.find((item) => item.path === createTarget)?.sizeBytes);
-  const createMaxGiB = createCapacity > 0 ? Math.floor((createCapacity / 1024 ** 3) * 1000) / 1000 : 0;
+  const createExtent = createKind === "linux_volume" ? selectedLinuxVolumeSource?.extent ?? 4 * 1024 ** 2
+    : createKind === "linux_lv" ? Math.max(4 * 1024 ** 2, bytes(scan.volumeGroups.find((vg) => vg.name === createTarget)?.extentSizeBytes)) : 512;
+  const createMinGiB = minimumForExtent(createExtent) / 1024 ** 3;
+  const createMaxGiB = createCapacity > 0 ? Math.floor(createCapacity / createExtent) * createExtent / 1024 ** 3 : 0;
   const deleteBlocked = Boolean(selected?.protected || (selected?.kind === "linux_vg" && selected.mounted));
+  const selectedExtendMaxGiB = bytes(selected?.extendableBytes) / 1024 ** 3;
+  const selectedExtendMinGiB = (selected?.kind === "linux_lv" ? Math.max(4 * 1024 ** 2, bytes(selected.extentSizeBytes)) : 1024 ** 2) / 1024 ** 3;
+  const selectedSourceNeedsVgName = selectedLinuxVolumeSource && selectedLinuxVolumeSource.kind !== "existing_vg";
 
   return (
     <section className="resource-tab storage-resource-tab">
@@ -522,6 +617,8 @@ export function StorageResourceTab({
         </div>
       </div>
       <PendingState job={job} />
+      {osFamily === "linux" && (scan.rescanDiagnostics?.errors?.length ?? 0) > 0 && <div className="danger-panel"><b>Rescan kernel chưa hoàn tất</b><span>{scan.rescanDiagnostics?.errors?.map((item) => `${item.target}: ${item.error}`).join("; ")}. Agent vẫn hiển thị layout hiện tại nhưng sẽ kiểm tra lại trước khi ghi.</span></div>}
+      {osFamily === "linux" && scan.missingTools.length > 0 && <div className="storage-layout-warnings"><div><b>Thiếu công cụ storage trên client</b><span>{scan.missingTools.join(", ")}. Cài lại/nâng cấp Agent để bộ cài bổ sung dependency đúng bản hệ điều hành.</span></div></div>}
       <div className="storage-summary-grid">
         <div><b>{disks.length}</b><span>Disk</span></div>
         <div><b>{formatBytes(disks.reduce((sum, disk) => sum + bytes(disk.sizeBytes), 0))}</b><span>Tổng dung lượng</span></div>
@@ -562,21 +659,21 @@ export function StorageResourceTab({
       {osFamily === "linux" && scan.volumeGroups.length > 0 && <div className="vg-grid">
         {scan.volumeGroups.map((vg) => {
           const target: StorageTarget = { key: `vg:${vg.name}`, kind: "linux_vg", label: `Volume Group ${vg.name}`, name: vg.name, protected: false, mounted: vg.logicalVolumes.length > 0 };
-          return <div key={vg.name} className={`vg-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Volume Group</span><input aria-label={`Chọn Volume Group ${vg.name}`} type="checkbox" checked={selected?.key === target.key} disabled={target.mounted} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{vg.name}</b><small>{vg.physicalVolumes.join(", ")}</small></span></label><span>{formatBytes(vg.sizeBytes)}<small>{formatBytes(vg.freeBytes)} còn trống</small></span></div>;
+          return <div key={vg.name} className={`vg-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Volume Group</span><input aria-label={`Chọn Volume Group ${vg.name}`} type="checkbox" checked={selected?.key === target.key} disabled={target.mounted} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{vg.name}</b><small>{vg.physicalVolumes.join(", ")}</small></span></label><span>{formatBytes(vg.sizeBytes)}<small>{formatBytes(vg.freeBytes)} sẵn có · {formatBytes(vg.backingGrowableBytes)} từ disk</small></span></div>;
         })}
       </div>}
       {osFamily === "linux" && scan.logicalVolumes.length > 0 && <div className="vg-grid" aria-label="Logical Volumes">
         {scan.logicalVolumes.map((logical) => {
-          const target: StorageTarget = { key: `lv:${logical.path}`, kind: "linux_lv", label: String(logical.path), path: logical.path, extendableBytes: bytes(logical.extendableBytes), protected: Boolean(logical.protected), resizeProtected: Boolean(logical.resizeProtected), resizeReason: logical.resizeReason, mounted: Boolean(logical.mountpoints?.length) };
+          const target: StorageTarget = { key: `lv:${logical.path}`, kind: "linux_lv", label: String(logical.path), path: logical.path, filesystem: logical.filesystem, extendableBytes: bytes(logical.extendableBytes), vgFreeBytes: bytes(logical.vgFreeBytes), backingGrowableBytes: bytes(logical.backingGrowableBytes), extensionPlan: logical.extensionPlan, extentSizeBytes: bytes(logical.extentSizeBytes), protected: Boolean(logical.protected), resizeProtected: Boolean(logical.resizeProtected), resizeReason: logical.resizeReason, mounted: Boolean(logical.mountpoints?.length) };
           const canExtend = bytes(target.extendableBytes) >= 1024 ** 2 && !target.resizeProtected;
-          return <div key={logical.path} className={`vg-card logical-volume-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Logical Volume {logical.path}</span><input aria-label={`Chọn Logical Volume ${logical.path}`} type="checkbox" checked={selected?.key === target.key} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{logical.path}</b><small>{logical.filesystem || "LVM"} · {logical.mountpoints?.join(", ") || "chưa mount"}</small></span></label><span>{formatBytes(logical.sizeBytes)}<small>VG còn {formatBytes(logical.extendableBytes)}</small><button type="button" disabled={!canExtend} title={canExtend ? `Có thể Extend tối đa ${formatBytes(logical.extendableBytes)}` : "Volume Group không còn dung lượng trống"} onClick={() => { setSelected(target); setModal("extend"); }}>Extend LV</button></span></div>;
+          return <div key={logical.path} className={`vg-card logical-volume-card ${selected?.key === target.key ? "selected" : ""}`}><label><span className="sr-only">Chọn Logical Volume {logical.path}</span><input aria-label={`Chọn Logical Volume ${logical.path}`} type="checkbox" checked={selected?.key === target.key} onChange={() => setSelected(selected?.key === target.key ? null : target)} /><span><b>{logical.path}</b><small>{logical.filesystem || "LVM"} · {logical.mountpoints?.join(", ") || "chưa mount"}</small></span></label><span>{formatBytes(logical.sizeBytes)}<small>Có thể mở rộng {formatBytes(logical.extendableBytes)} ({formatBytes(logical.vgFreeBytes)} trong VG + {formatBytes(logical.backingGrowableBytes)} từ disk)</small><button type="button" disabled={!canExtend} title={canExtend ? `Agent tự chạy partition → PV/VG → LV → filesystem, tối đa ${formatBytes(logical.extendableBytes)}` : "Không còn vùng trống liền kề an toàn"} onClick={() => { setSelected(target); setModal("extend"); }}>Extend LV</button></span></div>;
         })}
       </div>}
 
       {modal === "extend" && selected && <ModalShell title={`Extend ${selected.label}`} subtitle={`Dung lượng có thể dùng: ${formatBytes(selected.extendableBytes)}`} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitExtend}>
-          <label>Dung lượng thêm (GiB)<input name="size_gb" type="number" min="0.001" step="0.001" max={(bytes(selected.extendableBytes) / 1024 ** 3).toFixed(3)} required /></label>
-          <div className="resource-help">{selected.kind === "linux_partition" && selected.filesystem === "LVM2_member" ? "Bước này tăng partition và chạy pvresize để đưa dung lượng vào Volume Group. Sau khi hệ thống tự quét lại, chọn đúng Logical Volume bên dưới và bấm Extend LV để tăng filesystem." : "Agent sẽ kiểm tra lại vùng trống liên tục/LVM free ngay trước khi mở rộng. Filesystem ext4/xfs và Windows volume được grow cùng partition."}</div>
+          <label>Dung lượng thêm (GiB)<input name="size_gb" type="number" min={selectedExtendMinGiB} step="any" max={selectedExtendMaxGiB || undefined} required /></label>
+          <div className="resource-help">{selected.kind === "linux_lv" ? <>Một lần bấm, Agent sẽ tự chạy: rescan disk → mở rộng partition PV liền kề → pvresize/VG → LV → {selected.filesystem || "filesystem"}. Dung lượng hiện có trong VG: {formatBytes(selected.vgFreeBytes)}; có thể lấy thêm từ disk: {formatBytes(selected.backingGrowableBytes)}.</> : "Agent rescan toàn bộ disk, kiểm tra lại vùng trống liền kề, cập nhật kernel partition table rồi grow filesystem ext4/xfs hoặc Windows volume."}</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Extend</button></div>
         </form>
       </ModalShell>}
@@ -590,9 +687,9 @@ export function StorageResourceTab({
         </form>
       </ModalShell>}
 
-      {modal === "create" && <ModalShell title="Tạo storage mới" subtitle={osFamily === "windows" ? "Tạo partition và format volume" : "Tạo partition, Volume Group hoặc Logical Volume"} close={() => setModal(null)}>
+      {modal === "create" && <ModalShell title="Tạo storage mới" subtitle={osFamily === "windows" ? "Tạo partition và format volume" : "Agent tự hoàn tất partition → PV/VG → LV → filesystem → mount/fstab"} close={() => setModal(null)}>
         <form className="resource-form" onSubmit={submitCreate}>
-          {osFamily === "linux" && <label>Loại cần tạo<select value={createKind} onChange={(event) => { setCreateKind(event.target.value); setCreateTarget(""); }}><option value="linux_partition">Partition + filesystem</option><option value="linux_vg">Volume Group từ partition trống</option><option value="linux_lv">Logical Volume trong VG</option></select></label>}
+          {osFamily === "linux" && <label>Loại cần tạo<select value={createKind} onChange={(event) => { setCreateKind(event.target.value); setCreateTarget(""); }}><option value="linux_volume">Volume Linux tự động (khuyến nghị)</option><option value="linux_partition">Partition + filesystem</option><option value="linux_vg">Volume Group thủ công</option><option value="linux_lv">Logical Volume thủ công</option></select></label>}
           {createKind === "windows_partition" && <>
             <label>Disk có unallocated space<select name="disk_number" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn Disk…</option>{disks.filter((disk) => bytes(disk.largestFreeExtentBytes ?? disk.unallocatedBytes) > 0 && !disk.readOnly).map((disk) => <option key={disk.number} value={disk.number}>Disk {disk.number} · vùng liên tục lớn nhất {formatBytes(disk.largestFreeExtentBytes ?? disk.unallocatedBytes)}</option>)}</select></label>
             <label>Dung lượng (GiB)<input name="size_gb" type="number" min="0.02" step="0.001" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
@@ -600,22 +697,31 @@ export function StorageResourceTab({
             <label>Nhãn volume<input name="label" defaultValue="New Volume" maxLength={32} required /></label>
           </>}
           {createKind === "linux_partition" && <>
-            <label>Vùng unallocated quét từ server<select name="region" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn vùng trống…</option>{freeRegions.map(({ disk, region }) => <option key={`${disk.path}-${region.startBytes}`} value={`${disk.path}|${region.startBytes}`}>{disk.path} · {formatBytes(region.sizeBytes)} từ offset {formatBytes(region.startBytes)}</option>)}</select></label>
-            <label>Dung lượng (GiB)<input name="size_gb" type="number" min="0.02" step="0.001" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
-            <div className="resource-form-grid"><label>Filesystem<select name="filesystem"><option value="ext4">ext4</option><option value="xfs">xfs</option></select></label><label>Nhãn filesystem<input name="label" maxLength={32} /></label></div>
-            <label>Mount point<input name="mount_point" pattern="/(mnt|srv|data|opt|var/lib)(/[A-Za-z0-9_.-]+)+" placeholder="/data/app" required /></label>
+            <label>Vùng unallocated quét từ server<select name="region" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn vùng trống…</option>{freeRegions.filter(({ disk, region }) => !disk.readOnly && !disk.removable && region.sizeBytes >= minimumLinuxFilesystemBytes).map(({ disk, region }) => <option key={`${disk.path}-${region.startBytes}`} value={`${disk.path}|${region.startBytes}`}>{disk.path} · {formatBytes(region.sizeBytes)} từ offset {formatBytes(region.startBytes)}</option>)}</select></label>
+            <label>Dung lượng (GiB)<input name="size_gb" type="number" min={createMinGiB} step="any" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
+            <div className="resource-form-grid"><label>Filesystem<select name="filesystem" value={createFilesystem} onChange={(event) => { setCreateFilesystem(event.target.value); setCreateTarget(""); }}><option value="ext4">ext4</option><option value="xfs">xfs</option></select></label><label>Nhãn filesystem<input name="label" maxLength={createFilesystem === "xfs" ? 12 : 16} /></label></div>
+            <label>Mount point<input name="mount_point" pattern="(?:/(?:mnt|srv|data|opt)(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*|/var/lib(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*)" placeholder="/data/app" required /></label>
+          </>}
+          {createKind === "linux_volume" && <>
+            <label>Nguồn dung lượng<select name="automatic_source" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn VG, partition trống hoặc vùng trống…</option>{linuxVolumeSources.map((source) => <option key={source.key} value={source.key}>{source.label}</option>)}</select></label>
+            {selectedSourceNeedsVgName && <label>Tên Volume Group mới/đích<input name="vg_name" pattern="[A-Za-z0-9_][A-Za-z0-9_.+-]*" placeholder="data-vg" required /></label>}
+            <label>Tên Logical Volume<input name="name" pattern="[A-Za-z0-9_][A-Za-z0-9_.+-]*" placeholder="app-lv" required /></label>
+            <label>Dung lượng LV (GiB)<input name="size_gb" type="number" min={createMinGiB} step="any" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
+            <div className="resource-form-grid"><label>Filesystem<select name="filesystem" value={createFilesystem} onChange={(event) => { setCreateFilesystem(event.target.value); setCreateTarget(""); }}><option value="ext4">ext4</option><option value="xfs">xfs</option></select></label><label>Nhãn filesystem<input name="label" maxLength={createFilesystem === "xfs" ? 12 : 16} /></label></div>
+            <label>Mount point<input name="mount_point" pattern="(?:/(?:mnt|srv|data|opt)(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*|/var/lib(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*)" placeholder="/data/app" required /></label>
+            <div className="resource-help">Không cần tạo thư mục trước. Agent tự tạo mount point, ghi UUID vào /etc/fstab theo kiểu atomic, mount và xác minh; nếu mount thất bại Agent rollback fstab.</div>
           </>}
           {createKind === "linux_vg" && <>
             <label>Partition trống<select name="device" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn partition…</option>{scan.lvmCandidates.map((item) => <option key={item.path} value={item.path}>{item.path} · {formatBytes(item.sizeBytes)}</option>)}</select></label>
-            <label>Tên Volume Group<input name="name" pattern="[A-Za-z0-9_.+-]+" required /></label>
+            <label>Tên Volume Group<input name="name" pattern="[A-Za-z0-9_][A-Za-z0-9_.+-]*" required /></label>
             <input name="size_gb" type="hidden" value="1" />
           </>}
           {createKind === "linux_lv" && <>
-            <label>Volume Group<select name="vg_name" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn VG…</option>{scan.volumeGroups.filter((vg) => bytes(vg.freeBytes) > 0).map((vg) => <option key={vg.name} value={vg.name}>{vg.name} · còn {formatBytes(vg.freeBytes)}</option>)}</select></label>
-            <label>Tên Logical Volume<input name="name" pattern="[A-Za-z0-9_.+-]+" required /></label>
-            <label>Dung lượng (GiB)<input name="size_gb" type="number" min="0.02" step="0.001" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
-            <div className="resource-form-grid"><label>Filesystem<select name="filesystem"><option value="ext4">ext4</option><option value="xfs">xfs</option></select></label><label>Nhãn filesystem<input name="label" maxLength={32} /></label></div>
-            <label>Mount point<input name="mount_point" pattern="/(mnt|srv|data|opt|var/lib)(/[A-Za-z0-9_.-]+)+" placeholder="/data/app" required /></label>
+            <label>Volume Group<select name="vg_name" value={createTarget} onChange={(event) => setCreateTarget(event.target.value)} required><option value="">Chọn VG…</option>{scan.volumeGroups.filter((vg) => bytes(vg.extendableBytes) >= minimumForExtent(Math.max(4 * 1024 ** 2, bytes(vg.extentSizeBytes)))).map((vg) => <option key={vg.name} value={vg.name}>{vg.name} · có thể dùng {formatBytes(vg.extendableBytes)}</option>)}</select></label>
+            <label>Tên Logical Volume<input name="name" pattern="[A-Za-z0-9_][A-Za-z0-9_.+-]*" required /></label>
+            <label>Dung lượng (GiB)<input name="size_gb" type="number" min={createMinGiB} step="any" max={createMaxGiB || undefined} disabled={!createTarget} required /></label>
+            <div className="resource-form-grid"><label>Filesystem<select name="filesystem" value={createFilesystem} onChange={(event) => { setCreateFilesystem(event.target.value); setCreateTarget(""); }}><option value="ext4">ext4</option><option value="xfs">xfs</option></select></label><label>Nhãn filesystem<input name="label" maxLength={createFilesystem === "xfs" ? 12 : 16} /></label></div>
+            <label>Mount point<input name="mount_point" pattern="(?:/(?:mnt|srv|data|opt)(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*|/var/lib(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*)" placeholder="/data/app" required /></label>
           </>}
           <div className="resource-help">{createTarget ? `Dung lượng khả dụng vừa quét: ${formatBytes(createCapacity)}. ` : "Hãy chọn target lấy từ máy chủ để xem dung lượng khả dụng. "}Nếu layout thay đổi trước lúc chạy, Agent sẽ dừng thay vì ghi nhầm Disk.</div>
           <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setModal(null)}>Hủy</button><button className="button primary" disabled={busy}>Tạo mới</button></div>

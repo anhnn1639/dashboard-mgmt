@@ -163,9 +163,9 @@ curl -fsS https://ops.example.com/api/v1/enrollment-tokens \
 
 Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token chỉ dùng được đúng loại máy.
 
-### 3. Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat 7/8 — cài Agent offline
+### 3. Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat 7/8 — cài Agent độc lập
 
-Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17. Python runtime cùng toàn bộ thư viện `requests`, `cryptography`, `psutil` và WebSocket đã nằm trong gói; installer không gọi `pip`, `apt`, `dnf`, `yum` hoặc repository Internet. OpenSSH Server và ClamAV là dịch vụ của hệ điều hành: nếu máy chưa có sẵn thì Agent vẫn quản trị được, nhưng SSH hoặc nhận file tương ứng sẽ báo thiếu và fail-closed thay vì tự tải package ngoài.
+Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17. Python runtime cùng toàn bộ thư viện `requests`, `cryptography`, `psutil` và WebSocket đã nằm trong gói, nên installer không gọi `pip`. Để các thao tác Disk/LVM chạy ngay trên mọi bản được hỗ trợ, installer kiểm tra rồi bổ sung các công cụ native đã ký từ repository hệ điều hành: `util-linux`, `parted`, `gdisk`, `lvm2`, `e2fsprogs`, `xfsprogs` và `udev/systemd`. Máy air-gapped cần cấu hình repository nội bộ/mirror tương ứng trước khi cài nếu thiếu các package này. OpenSSH Server và ClamAV vẫn là dịch vụ do hệ điều hành quản lý; nếu thiếu, SSH hoặc nhận file sẽ báo lỗi fail-closed.
 
 ```bash
 sudo sh agent/install-linux.sh
@@ -266,17 +266,21 @@ Mật khẩu Bind DN và TOTP secret được mã hóa bằng `JOB_SECRET_KEY` t
 | Xóa user/group | `userdel` / `groupdel` | `userdel` / `groupdel` | `Remove-LocalUser` / `Remove-LocalGroup` |
 | Tạo group | `groupadd` | `groupadd` | `New-LocalGroup` |
 | Firewall | UFW allow/deny/delete | chỉ đọc ở bản hiện tại | `New/Remove-NetFirewallRule` |
-| Mở rộng storage | `lvextend --resizefs` | `lvextend --resizefs` | DiskPart `extend` trên vùng Unallocated liền kề |
+| Mở rộng storage | rescan + partition/PV/VG/LV + ext4/XFS | rescan + partition/PV/VG/LV + ext4/XFS | DiskPart `extend` trên vùng Unallocated liền kề |
 
 Tác vụ đặc quyền được tạo ở trạng thái `queued` và Agent nhận ở lần check-in kế tiếp. API không còn endpoint approve; RBAC, MFA, validation tham số và audit vẫn bắt buộc.
 
-Nút **Extend** luôn hiển thị trên partition/LV. Nút chỉ bật khi Agent xác nhận có ít nhất 1 MiB dung lượng mở rộng an toàn: Windows cần vùng unallocated liền kề partition, còn Linux LVM cần dung lượng trống trong Volume Group. Windows Extend/Shrink dùng DiskPart native giống Disk Management, yêu cầu đúng dung lượng đã nhập và xác minh kích thước partition sau thao tác; Shrink chỉ áp dụng cho NTFS có drive letter. Root LV được phép extend nhưng vẫn bị khóa xóa; partition boot/root trực tiếp không được tự động extend. Ứng dụng không tự di chuyển partition Recovery của Windows.
+Nút **Quét lại** trên Linux yêu cầu helper systemd đặc quyền quét toàn bộ SCSI host, NVMe controller và mọi block device vật lý đã được kernel nhận diện, chờ udev ổn định rồi mới đọc lại `lsblk`/LVM. Vì vậy dung lượng virtual disk vừa tăng, LUN mới và disk mới được phát hiện mà không cần chạy thủ công `echo 1 > /sys/class/block/.../device/rescan`. Helper không nhận path từ website và chỉ ghi vào các control file sysfs được Agent tự liệt kê/allowlist.
+
+Nút **Extend** luôn hiển thị trên partition/LV và chỉ bật khi Agent xác nhận có vùng mở rộng liền kề an toàn. Với LV Linux, dung lượng khả dụng là tổng VG free hiện tại và phần đuôi có thể tăng của các PV; một lần bấm sẽ tự chạy GPT backup-header repair (kèm backup bảng GPT khi cần), mở rộng partition, `pvresize`, LV và filesystem ext2/3/4 hoặc XFS theo đúng thứ tự. Partition ext2/3/4/XFS không dùng LVM cũng được mở rộng trực tiếp và xác minh lại kích thước kernel. Root filesystem được phép extend nhưng vẫn bị khóa xóa; `/boot`, EFI và thiết bị read-only không được resize. Tạo **Volume Linux tự động** có thể dùng VG sẵn có, partition trống hoặc free region: Agent tạo partition/PV/VG/LV, format ext4/XFS, tự tạo mount point, ghi UUID vào `/etc/fstab` theo kiểu atomic, mount/xác minh và rollback fstab nếu thất bại.
+
+Windows Extend/Shrink dùng DiskPart native giống Disk Management, yêu cầu đúng dung lượng đã nhập và xác minh kích thước partition sau thao tác; Shrink chỉ áp dụng cho NTFS có drive letter. Vùng Unallocated phải nằm ngay bên phải volume cần Extend. Ứng dụng không tự di chuyển partition Recovery của Windows vì thao tác đó có thể làm mất WinRE hoặc dữ liệu; cần di chuyển/xử lý partition chắn trong maintenance window bằng công cụ chuyên dụng rồi quét lại.
 
 Mọi thao tác nghiệp vụ của người dùng (đăng nhập/MFA/logout, cấu hình, agent, job vận hành, file, phiên SSH/RDP và recording) được ghi vào `audit_events` trong PostgreSQL với actor, IP nguồn, kết quả, tham số an toàn và chuỗi hash. Mọi phản hồi `403` của người dùng đã xác thực cũng sinh sự kiện `security.authorization.denied`. Giao diện audit phân trang 500 bản ghi mỗi lần và có lọc theo từ khóa, kết quả, hành động. Bản ghi quá 30 ngày được dọn lúc API khởi động và mỗi giờ; hash cuối của phần đã xóa được giữ trong `system_settings.audit_retention_anchor` để duy trì dấu vết liên kết.
 
 ## API tác vụ allowlist
 
-`inventory.collect`, `service.*`, `user.create|disable|enable|delete|password.reset`, `group.create|delete`, `user.add_group`, `group.remove_user`, `patch.*`, `logs.read`, `process.list`, `firewall.list|rule.add|rule.remove`, `storage.list|extend`, `network.list`, `system.reboot`.
+`inventory.collect`, `service.*`, `user.create|disable|enable|delete|password.reset`, `group.create|delete`, `user.add_group`, `group.remove_user`, `patch.*`, `logs.read`, `process.list|kill`, `firewall.list|rule.add|rule.remove|rule.reorder`, `storage.list|extend|shrink|create|delete`, `network.list`, `system.reboot`, `file.deliver`, `agent.upgrade`.
 
 Không có `command.run`, `powershell.run` hoặc `shell.run`. Tham số user/group/service được validate bằng allowlist ký tự và mọi subprocess đều chạy không qua shell. Password/secret trong job được mã hóa bằng Fernet ở tầng ứng dụng và chỉ giải mã khi dispatch qua mTLS. Khi cần xử lý ngoài danh sách, dùng SSH/RDP có recording.
 

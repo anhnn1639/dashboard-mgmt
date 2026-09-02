@@ -1,4 +1,4 @@
-# Bàn giao Codex — 29/08/2026
+# Bàn giao Codex — 03/09/2026
 
 ## Repository và trạng thái
 
@@ -6,7 +6,7 @@
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
-- Source Agent/API/dashboard và hai artifact đã đồng bộ `0.8.16` cho self-update và bảo vệ gỡ cài đặt. Source chức năng là `2c6aed3`; workflow Linux được sửa quyền staging tại `a2f055f`; artifact/provenance được bundle tại `e77571a`, và cả Linux/Windows provenance đều trỏ đúng full source SHA `a2f055fe6790940b311094cd571cea34f657081d`.
+- Source Agent/API/dashboard đang phát hành `0.8.17` cho rescan/extend/create storage Linux. Hai artifact vẫn là `0.8.16` trong commit source; cần đợi workflow Linux/MSI của commit này, kiểm provenance rồi bundle đồng bộ trước khi triển khai. Bản artifact 0.8.16 trước đó ở `e77571a`, provenance source `a2f055fe6790940b311094cd571cea34f657081d`.
 - Log RDP ngày 17/08 xác nhận tunnel Agent, relay API và listener `127.0.0.1:3389` đều hoạt động; `guacd` dừng tại `Certificate validation failed`. Nguyên nhân là API gửi pin SHA-1 dạng compact trong khi FreeRDP 2.x của image `guacd` so sánh dạng colon-separated. API hiện chuẩn hóa pin thành `sha1:aa:bb:...`/`sha256:aa:bb:...`, tương thích cả FreeRDP 2.x và 3.x, vẫn giữ `ignore-cert=false`.
 - Bản sửa mới nhất tách đúng label/input của form **Bộ cài Agent**, hiển thị lỗi màu đỏ, công khai trạng thái `agentTlsCaAvailable` và thay luồng export CA một lần bằng sidecar đồng bộ liên tục.
 - Dashboard mở máy chủ bằng URL hash riêng và workspace toàn màn hình; breadcrumb quay lại đúng danh sách Linux/Windows. Các tab Tổng quan, Disk, Services, Tài khoản, Firewall, Tiến trình, Cập nhật, Truyền file và Nhật ký dùng trực tiếp action allowlist, dữ liệu quét từ đúng Agent đang quản trị và không có form command tùy ý.
@@ -85,6 +85,20 @@
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
+## Storage Linux 0.8.17 — thay đổi và bước triển khai
+
+- Nút **Quét lại** gọi rescan SCSI host, NVMe controller và toàn bộ block device vật lý được hỗ trợ trước khi đọc inventory. Helper systemd oneshot riêng chỉ ghi vào các sysfs target cố định; Agent chính vẫn giữ `ProtectKernelTunables=true`. Thư mục kết quả do caller tạo mode `0700`, không dùng `RuntimeDirectory` bị systemd xóa khi oneshot kết thúc; timeout helper 240 giây.
+- Scan tính riêng dung lượng filesystem còn trống, VG free, phần có thể mở rộng từ disk/PV và tổng LV extendable. Khi GPT backup header còn ở cuối disk cũ, dùng geometry kernel/parted có kiểm tra đầy đủ để nhận diện tail; thiếu START trên OL7 không được suy đoán offset 0 hoặc sinh vùng trống chồng partition.
+- **Extend LV** tự làm rescan → mở rộng partition PV liền kề khi cần → `pvresize`/VG → `lvextend` → `resize2fs` hoặc `xfs_growfs`. Chỉ mở rộng PV partition phần thiếu đã căn theo LVM extent, không lấy hết tail cho một yêu cầu nhỏ. Whole-disk PV nhận dung lượng mới qua `pvresize`. Không tự lấy một disk/PV không thuộc VG để tránh chọn nhầm thiết bị.
+- Partition thường ext2/3/4 hoặc XFS cũng extend được nếu có vùng trống liền kề; tuyệt đối không đổi start hoặc di chuyển partition. Sau lệnh native phải đối chiếu geometry và kích thước kernel trước grow filesystem. Có nhánh xác nhận busy-partition cho `parted` cũ trên EL7/EL8, chỉ retry sau khi chứng minh geometry chưa đổi. Windows Recovery/move/shrink không thay đổi bởi bản này.
+- **Volume Linux tự động** nhận nguồn VG có sẵn, partition trống hoặc vùng unallocated do Agent vừa quét; tự tạo partition/PV/VG/LV theo nguồn, format ext4/XFS, tạo mount point và ghi UUID vào fstab. Preflight kiểm đủ tool, tên, filesystem/label, kích thước thực sau extent alignment (XFS tối thiểu 300 MiB), mountpoint không có dữ liệu/symlink/entry fstab và LV chưa tồn tại trước mutation.
+- Fstab được đọc lại ngay trước append sau mkfs; rollback chỉ gỡ entry chính xác của thao tác và giữ edit đồng thời của quản trị viên khác. Không đổi mode của mount directory có sẵn. Nếu mount/rollback không xác minh được hoặc fstab vẫn tham chiếu UUID, LV được giữ lại và báo lỗi thay vì xóa mù; backing PV/VG đã cấp phát được giữ cho retry. Một lỗi phần cuối có thể để lại tài nguyên mới chưa hoàn tất và phải đọc output job trước khi thử lại.
+- API sửa validation `linux_lv` để Extend/Delete theo `path` không bị buộc có tên LV mới. UI không gửi `partition_number` của Linux sang schema Windows, dùng `step=any` tránh HTML chặn 1 GiB, căn min/max theo filesystem/extent và giải thích chuỗi tự động.
+- Bộ cài Linux `.run` kiểm tra/cài native toolchain từ repository OS đã cấu hình: `util-linux parted gdisk lvm2 e2fsprogs xfsprogs`, thêm `udev` Ubuntu, `systemd` EL7 hoặc `systemd-udev` EL8. Python/pip vẫn self-contained. Không bundle một bộ native binary dùng chung cho bốn distro; máy cách ly cần mirror/repository nội bộ truy cập được khi thiếu gói. Việc này chạy trước khi thay service/identity. Self-update chỉ thay executable: máy thiếu native tool phải chạy lại `.run` mới một lần; không xóa `/etc/tram-agent`.
+- Release target: `0.8.17`; minimum self-update bridge vẫn `0.8.16`. Sau artifact bundle: pull main, rebuild/recreate `dashboard api`, rồi cập nhật Agent Linux từ website (nếu tool đã đủ) hoặc cài đè `.run` mới để chuẩn bị toolchain. Windows MSI chỉ đồng bộ version chung; không có thay đổi partition Windows trong bản này.
+- Kiểm thử release: Agent `109/109`, control-plane `52/52`, rendered UI `25/25`, TypeScript, ESLint, production build, Python compile, shell syntax và diff whitespace. Các ca mới gồm OL7 không overlap, kernel tail/GPT, rescan lặp, busy-partition, LV extent/partial PV growth, preflight XFS/mount, exception rollback, giữ quyền thư mục và concurrent fstab edits. CI cần xác nhận lại các bộ này trên Linux cùng runtime binary trên Ubuntu 22.04/24.04 và Oracle/RHEL 7/8.
+- Chưa thao tác storage trên máy chủ thật của người dùng. Trước production phải có backup/snapshot và test trên VM staging: tăng virtual disk → Quét lại không chạy lệnh tay → extend LV/root hoặc partition thường → kiểm dữ liệu cũ, kích thước và mount sau reboot. Unit test/CI runtime không phải cam kết tuyệt đối không mất dữ liệu khi hạ tầng/đĩa có lỗi.
+
 ## Zero-touch Agent đã triển khai
 
 - Admin có trang **Bộ cài Agent** để xem/sửa origin HTTPS của control plane và tải Linux `.run` hoặc Windows `.msi`.
@@ -92,7 +106,7 @@
 - Khi đổi domain mà đã có agent, UI/API bắt buộc xác nhận vì agent cũ vẫn giữ endpoint và CA cũ.
 - Mỗi bộ cài có claim ngẫu nhiên 256-bit, hết hạn 5–60 phút, dùng một lần và khóa theo `windows|linux`. Replay, claim hết hạn hoặc nhầm OS đều fail-closed/audit.
 - Private key P-256 và CSR được sinh tại endpoint. Bộ cài chỉ mang locator, SHA-256 pin của CA và claim ngắn hạn; không chứa client private key/certificate dài hạn.
-- Linux `.run` tự giải nén executable self-contained và unit systemd, enroll, xóa bootstrap secret rồi start service; không cài dependency/Python/pip hoặc tự tải ClamAV từ Internet. Thiếu ClamAV chỉ cảnh báo và file delivery giữ fail-closed.
+- Linux `.run` tự giải nén executable self-contained và unit systemd, chuẩn bị native storage dependency từ repository OS nếu thiếu, enroll, xóa bootstrap secret rồi start service; không cài Python/pip hoặc tự tải ClamAV từ Internet. Thiếu ClamAV chỉ cảnh báo và file delivery giữ fail-closed.
 - Windows dùng MSI generic; API không sửa bytes MSI mà chỉ phát nó dưới tên chứa locator/claim/CA pin, nên có thể giữ chữ ký Authenticode. Không được đổi tên file trước khi cài.
 - MSI cài executable PyInstaller độc lập; Windows Server không cần Python. Service `TramVanHanhAgent` chạy `LocalSystem`, `Automatic`, phụ thuộc TCP/IP, start lúc cài và restart sau 30 giây nếu lỗi.
 - `agent/install-windows.ps1` thủ công cũng đã chuyển từ Scheduled Task sang Windows Service.
@@ -119,7 +133,7 @@
 - File: `agent/linux/x86_64/tram-agent`; sidecar `agent/linux/x86_64/tram-agent.provenance.json`; kích thước `16,705,216` bytes.
 - Phiên bản: `0.8.16`; SHA-256 `BF6E1676B3DC3F6867BBA47C03422F36693D959C8CCBA8BC4B45C103FEA31FBC`.
 - GitHub Actions run `33223814688` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. ELF64 little-endian x86_64, sidecar/source SHA, kích thước và hash được đối chiếu sau khi tải; artifact sinh từ source commit `a2f055fe6790940b311094cd571cea34f657081d`.
-- `.run` do website sinh chỉ chứa binary này, service, VERSION, bootstrap dùng một lần và CA pin; không còn chứa source/requirements hoặc gọi repository Internet.
+- `.run` do website sinh chứa binary này, installer, service, VERSION, bootstrap dùng một lần và CA pin; không chứa source/requirements/Python/pip. Từ 0.8.17 installer chỉ truy cập repository OS đã cấu hình nếu thiếu native storage toolchain.
 
 ## Self-update Agent và bảo vệ gỡ cài đặt 0.8.16
 

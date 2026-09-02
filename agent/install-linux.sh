@@ -43,8 +43,9 @@ for required_command in install systemctl; do
     exit 1
   fi
 done
+
 if [ ! -s "$artifact" ]; then
-  echo "Standalone Agent artifact is missing from the offline installer" >&2
+  echo "Standalone Agent artifact is missing from the installer" >&2
   exit 1
 fi
 
@@ -63,6 +64,51 @@ elif [ "$identity_file_count" -ne 0 ]; then
   echo "Do not delete /etc/tram-agent automatically. Restore its certificate/key backup or retire the old server in the dashboard before a deliberate clean enrollment." >&2
   exit 1
 fi
+
+# Storage operations intentionally use the distribution's signed native tools
+# instead of vendoring one set of dynamically linked binaries across four
+# incompatible releases.  Resolve the complete toolchain before changing the
+# Agent service so a fresh install is immediately ready for Disk/LVM work.
+storage_commands="lsblk blkid mount umount findmnt blockdev partx wipefs udevadm parted partprobe sgdisk pvs vgs lvs pvcreate pvresize vgcreate vgextend lvcreate lvextend lvremove mkfs.ext4 resize2fs mkfs.xfs xfs_growfs"
+missing_storage=""
+for storage_command in $storage_commands; do
+  if ! command -v "$storage_command" >/dev/null 2>&1; then
+    missing_storage="$missing_storage $storage_command"
+  fi
+done
+if [ -n "$missing_storage" ]; then
+  echo "Installing signed OS storage dependencies (missing:$missing_storage)"
+  case "$os_id" in
+    ubuntu)
+      if ! command -v apt-get >/dev/null 2>&1; then
+        echo "apt-get is required to install the Ubuntu storage toolchain" >&2
+        exit 1
+      fi
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev
+      ;;
+    ol|rhel)
+      udev_package=systemd
+      case "$os_version" in
+        8*) udev_package=systemd-udev ;;
+      esac
+      if command -v dnf >/dev/null 2>&1; then
+        dnf -y install util-linux parted gdisk lvm2 e2fsprogs xfsprogs "$udev_package"
+      elif command -v yum >/dev/null 2>&1; then
+        yum -y install util-linux parted gdisk lvm2 e2fsprogs xfsprogs "$udev_package"
+      else
+        echo "dnf/yum is required to install the Oracle/RHEL storage toolchain" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+for storage_command in $storage_commands; do
+  if ! command -v "$storage_command" >/dev/null 2>&1; then
+    echo "Storage dependency is still unavailable after package verification: $storage_command" >&2
+    exit 1
+  fi
+done
 
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 install -d -m 0700 /var/lib/tram-agent/inbox
@@ -108,5 +154,5 @@ elif [ -n "$bootstrap_source" ]; then
   echo "Agent enrolled and started without downloading Python or pip packages."
 else
   systemctl try-restart tram-agent.service
-  echo "Offline Agent installed. Enroll it, then enable tram-agent.service."
+  echo "Agent installed. Enroll it, then enable tram-agent.service."
 fi

@@ -904,13 +904,17 @@ class AgentSecurityTests(unittest.TestCase):
         address_families = next(line for line in service.splitlines() if line.startswith("RestrictAddressFamilies="))
         self.assertIn("AF_NETLINK", address_families.split("=", 1)[1].split())
 
-    def test_linux_installer_is_offline_and_uses_the_standalone_binary(self):
+    def test_linux_installer_uses_standalone_binary_and_prepares_native_storage_tools(self):
         installer = (MODULE_PATH.parent / "install-linux.sh").read_text(encoding="utf-8")
         service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
-        self.assertNotIn("apt-get", installer)
-        self.assertNotIn("dnf install", installer)
-        self.assertNotIn("yum install", installer)
         self.assertNotIn("pip install", installer)
+        self.assertIn("apt-get install", installer)
+        self.assertIn("dnf -y install", installer)
+        self.assertIn("yum -y install", installer)
+        for dependency in ("util-linux", "parted", "gdisk", "lvm2", "e2fsprogs", "xfsprogs"):
+            self.assertIn(dependency, installer)
+        self.assertIn("udev_package=systemd", installer)
+        self.assertIn("8*) udev_package=systemd-udev", installer)
         self.assertIn("ubuntu:22.04|ubuntu:24.04", installer)
         self.assertIn("ol:7*|ol:8*|rhel:7*|rhel:8*", installer)
         self.assertIn("linux/x86_64/tram-agent", installer)
@@ -1368,6 +1372,123 @@ trusted
         self.assertEqual(layout["partitionTable"], "gpt")
         self.assertEqual(layout["partitions"][1]["startBytes"], 1073741824)
 
+    def test_linux_storage_rescan_enumerates_only_fixed_physical_sysfs_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sysfs = Path(directory)
+            for path, content in (
+                ("class/scsi_host/host0/scan", ""),
+                ("class/scsi_host/not-a-host/scan", "unchanged"),
+                ("class/nvme/nvme0/rescan_controller", ""),
+                ("class/block/sda/device/rescan", ""),
+                ("class/block/sda1/device/rescan", "unchanged"),
+                ("class/block/sda1/partition", "1"),
+                ("class/block/loop0/device/rescan", "unchanged"),
+            ):
+                target = sysfs / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="ascii")
+            with patch.object(tram_agent.platform, "system", return_value="Linux"), patch.object(tram_agent.os, "geteuid", return_value=0, create=True), patch.object(tram_agent, "find_system_command", return_value=None):
+                result = tram_agent.perform_linux_storage_rescan(sysfs)
+            self.assertEqual((sysfs / "class/scsi_host/host0/scan").read_text(encoding="ascii"), "- - -\n")
+            self.assertEqual((sysfs / "class/nvme/nvme0/rescan_controller").read_text(encoding="ascii"), "1\n")
+            self.assertEqual((sysfs / "class/block/sda/device/rescan").read_text(encoding="ascii"), "1\n")
+            self.assertEqual((sysfs / "class/block/sda1/device/rescan").read_text(encoding="ascii"), "unchanged")
+            self.assertEqual(result["blockDevices"], ["sda"])
+            self.assertEqual(result["errors"], [])
+
+    def test_linux_storage_scan_exposes_vg_free_plus_adjacent_pv_tail_to_lv(self):
+        gib = 1024**3
+        disk_size = 120 * gib
+        pv_start = 2 * gib
+        pv_size = 98 * gib
+        tail_start = pv_start + pv_size
+        lsblk = json.dumps({"blockdevices": [{
+            "name": "sda", "kname": "sda", "path": "/dev/sda", "type": "disk", "size": disk_size, "pttype": "gpt", "ro": 0, "rm": 0,
+            "children": [{
+                "name": "sda3", "kname": "sda3", "path": "/dev/sda3", "pkname": "sda", "type": "part", "fstype": "LVM2_member", "size": pv_size, "start": pv_start // 512, "partn": 3, "log-sec": 512, "ro": 0, "rm": 0,
+                "children": [{"name": "ubuntu--vg-ubuntu--lv", "kname": "dm-0", "path": "/dev/mapper/ubuntu--vg-ubuntu--lv", "type": "lvm", "fstype": "ext4", "size": 97 * gib, "mountpoints": ["/"], "fsavail": 16 * gib, "ro": 0, "rm": 0}],
+            }],
+        }]})
+        # Some parted releases return zero but omit the new tail until the GPT
+        # backup header is relocated.  The kernel geometry must still expose
+        # that capacity and force a guarded GPT repair before mutation.
+        parted = f"BYT;\n/dev/sda:{disk_size}B:scsi:512:4096:gpt:Disk;\n3:{pv_start}B:{tail_start - 1}B:{pv_size}B:::lvm;"
+        reports = {
+            "pvs": [{"pv_name": "/dev/sda3", "vg_name": "ubuntu-vg", "pv_size": pv_size, "pv_free": 96 * 1024**2}],
+            "vgs": [{"vg_name": "ubuntu-vg", "vg_size": pv_size, "vg_free": 96 * 1024**2, "vg_extent_size": 4 * 1024**2}],
+            "lvs": [{"lv_path": "/dev/ubuntu-vg/ubuntu-lv", "lv_name": "ubuntu-lv", "vg_name": "ubuntu-vg", "lv_size": 97 * gib}],
+        }
+        def fake_run(command, **_kwargs):
+            if command[0].endswith("lsblk"):
+                return 0, lsblk
+            if command[0].endswith("parted"):
+                return 0, parted
+            return 0, ""
+        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "run", side_effect=fake_run), patch.object(tram_agent, "lvm_report", side_effect=lambda command, _columns: reports[command]):
+            code, output = tram_agent.linux_storage_scan()
+        self.assertEqual(code, 0)
+        parsed = json.loads(output)
+        logical = parsed["logicalVolumes"][0]
+        self.assertTrue(parsed["disks"][0]["needsGptRepair"])
+        self.assertEqual(parsed["disks"][0]["freeRegions"][0]["source"], "kernel-tail")
+        self.assertEqual(logical["vgFreeBytes"], 96 * 1024**2)
+        self.assertGreater(logical["backingGrowableBytes"], 19 * gib)
+        self.assertEqual(logical["extendableBytes"], logical["vgFreeBytes"] + logical["backingGrowableBytes"])
+        self.assertEqual(logical["extensionPlan"][0]["pv"], "/dev/sda3")
+
+    def test_rescan_oneshot_keeps_diagnostics_for_repeated_scans(self):
+        self.assertNotIn("RuntimeDirectory=", tram_agent.LINUX_STORAGE_RESCAN_UNIT)
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "run" / "storage-rescan.json"
+            runs = []
+            def fake_run(command, **_):
+                runs.append(command)
+                result.write_text(json.dumps({"scan": len(runs)}), encoding="utf-8")
+                return 0, ""
+            with patch.object(tram_agent, "LINUX_STORAGE_RESCAN_RESULT", result), patch.object(tram_agent.Path, "is_file", return_value=True), patch.object(tram_agent.Path, "is_dir", return_value=True), patch.object(tram_agent, "find_system_command", return_value="/bin/systemctl"), patch.object(tram_agent, "ensure_linux_storage_rescan_unit"), patch.object(tram_agent, "run", side_effect=fake_run):
+                self.assertEqual(tram_agent.linux_storage_rescan()["scan"], 1)
+                self.assertEqual(tram_agent.linux_storage_rescan()["scan"], 2)
+            self.assertTrue(result.is_file())
+
+    def test_linux_lv_extend_grows_backing_pv_before_lv_and_filesystem(self):
+        gib = 1024**3
+        scan = {
+            "volumeGroups": [{"name": "vg0", "freeBytes": 96 * 1024**2, "extendableBytes": 16 * gib, "extensionPlan": [{"pv": "/dev/sda3", "disk": "/dev/sda", "partitionNumber": 3, "growableBytes": 16 * gib}]}],
+            "logicalVolumes": [{"path": "/dev/vg0/root", "vgName": "vg0", "filesystem": "ext4", "mountpoints": ["/"], "extentSizeBytes": 4 * 1024**2, "sizeBytes": 80 * gib, "extendableBytes": 16 * gib}],
+        }
+        commands = []
+        def fake_report(command, _columns):
+            return [{"vg_name": "vg0", "vg_free": 16 * gib}] if command == "vgs" else [{"lv_path": "/dev/vg0/root", "lv_size": 81 * gib}]
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "grow_linux_partition_node", return_value={"path": "/dev/sda3", "appliedBytes": gib}) as grow_partition, patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "lvm_report", side_effect=fake_report), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+            code, output = tram_agent.extend_storage({"kind": "linux_lv", "path": "/dev/vg0/root", "add_bytes": gib}, False)
+        grow_partition.assert_called_once_with(scan, "/dev/sda3", gib - 96 * 1024**2)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(commands[0], ["/usr/sbin/pvresize", "/dev/sda3"])
+        self.assertEqual(commands[1], ["/usr/sbin/lvextend", "--yes", "--size", f"+{gib}B", "/dev/vg0/root"])
+        self.assertEqual(commands[2], ["/usr/sbin/resize2fs", "/dev/vg0/root"])
+
+    def test_linux_partition_extend_handles_legacy_busy_prompt_without_moving_start(self):
+        start, size, growth = 1024**2, 1024**3, 128 * 1024**2
+        end = start + size - 1
+        node = {"path": "/dev/sda1", "type": "part", "partitionNumber": 1, "filesystem": "ext4", "offsetBytes": start, "endOffsetBytes": end, "extendableBytes": growth, "logicalSectorBytes": 512}
+        scan = {"disks": [{"path": "/dev/sda", "type": "disk", "children": [node]}]}
+        before = {"partitions": {1: {"startBytes": start, "endBytes": end}}}
+        after = {"partitions": {1: {"startBytes": start, "endBytes": end + growth}}}
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/parted"), patch.object(tram_agent, "repair_linux_gpt_tail"), patch.object(tram_agent, "linux_block_device_size", return_value=size), patch.object(tram_agent, "parted_disk_layout", side_effect=[before, after]), patch.object(tram_agent, "run", return_value=(1, "Partition /dev/sda1 is being used. Are you sure you want to continue?")), patch.object(tram_agent, "run_with_input", return_value=(0, "done")) as interactive, patch.object(tram_agent, "reread_linux_partition", return_value=size + growth):
+            result = tram_agent.grow_linux_partition_node(scan, "/dev/sda1", growth)
+        self.assertEqual(result["appliedBytes"], growth)
+        interactive.assert_called_once_with(["/usr/sbin/parted", "---pretend-input-tty", "/dev/sda"], f"unit B\nresizepart 1\nYes\n{end + growth}B\nquit\n", timeout=600)
+
+    def test_storage_scan_never_invents_tail_when_partition_start_is_unknown(self):
+        lsblk = json.dumps({"blockdevices": [{"name": "sda", "path": "/dev/sda", "type": "disk", "size": 20 * 1024**3, "pttype": "gpt", "children": [{"name": "sda1", "path": "/dev/sda1", "type": "part", "size": 10 * 1024**3, "fstype": "ext4"}]}]})
+        def fake_run(command, **_):
+            return (0, lsblk) if command[0].endswith("lsblk") else (1, "layout unavailable")
+        with patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "lvm_report", return_value=[]), patch.object(tram_agent, "run", side_effect=fake_run):
+            _, output = tram_agent.linux_storage_scan()
+        disk = json.loads(output)["disks"][0]
+        self.assertEqual(disk["unallocatedBytes"], 0)
+        self.assertEqual(disk["children"][0]["extendableBytes"], 0)
+
     def test_oracle_linux_7_storage_falls_back_to_lsblk_pairs(self):
         pairs = '\n'.join([
             'NAME="sda" KNAME="sda" PKNAME="" TYPE="disk" FSTYPE="" LABEL="" UUID="" SIZE="107374182400" MOUNTPOINT="" MODEL="Virtual Disk" RO="0" RM="0" PTTYPE=""',
@@ -1397,6 +1518,11 @@ trusted
         self.assertEqual(parsed["disks"][0]["children"][1]["path"], "/dev/sda2")
         self.assertEqual(parsed["disks"][0]["children"][1]["partitionNumber"], 2)
         self.assertEqual(parsed["disks"][0]["children"][1]["extendableBytes"], 268435456)
+        self.assertEqual(parsed["disks"][0]["unallocatedBytes"], 268435456)
+        self.assertFalse(parsed["disks"][0]["needsGptRepair"])
+        for region in parsed["disks"][0]["freeRegions"]:
+            for partition in parsed["disks"][0]["children"]:
+                self.assertTrue(region["endBytes"] < partition["offsetBytes"] or region["startBytes"] > partition["endOffsetBytes"])
 
     def test_windows_storage_scan_reports_ordered_free_segments_and_resize_limits(self):
         scripts = []
@@ -1444,15 +1570,20 @@ trusted
         self.assertIn("select volume C", diskpart_inputs[0])
         self.assertIn("extend size=10240", diskpart_inputs[0])
 
-    def test_linux_lv_extend_aligns_decimal_gib_sizes_to_512_bytes(self):
+    def test_linux_lv_extend_aligns_decimal_gib_sizes_to_lvm_extents(self):
         scan = {
+            "volumeGroups": [
+                {"name": "ol", "freeBytes": 8_000_000, "extendableBytes": 8_000_000, "extensionPlan": []},
+                {"name": "ubuntu-vg", "freeBytes": 90_000_000, "extendableBytes": 90_000_000, "extensionPlan": []},
+            ],
             "logicalVolumes": [
-                {"path": "/dev/ol/u01", "extendableBytes": 7_516_160},
-                {"path": "/dev/ubuntu-vg/ubuntu-lv", "extendableBytes": 85_899_264},
+                {"path": "/dev/ol/u01", "vgName": "ol", "filesystem": "ext4", "mountpoints": ["/u01"], "extentSizeBytes": 512, "sizeBytes": 1024**3, "extendableBytes": 7_516_160},
+                {"path": "/dev/ubuntu-vg/ubuntu-lv", "vgName": "ubuntu-vg", "filesystem": "ext4", "mountpoints": ["/"], "extentSizeBytes": 512, "sizeBytes": 10 * 1024**3, "extendableBytes": 85_899_264},
             ]
         }
         commands = []
-        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/lvextend"), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+        lvs = [{"lv_path": "/dev/ol/u01", "lv_size": str(2 * 1024**3)}, {"lv_path": "/dev/ubuntu-vg/ubuntu-lv", "lv_size": str(11 * 1024**3)}]
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "lvm_report", return_value=lvs), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
             oracle_code, _ = tram_agent.extend_storage(
                 {"kind": "linux_lv", "path": "/dev/ol/u01", "add_bytes": 7_516_192},
                 False,
@@ -1463,8 +1594,114 @@ trusted
             )
         self.assertEqual(oracle_code, 0)
         self.assertEqual(ubuntu_code, 0)
-        self.assertEqual(commands[0], ["/usr/sbin/lvextend", "--resizefs", "--size", "+7516160B", "/dev/ol/u01"])
-        self.assertEqual(commands[1], ["/usr/sbin/lvextend", "--resizefs", "--size", "+85899264B", "/dev/ubuntu-vg/ubuntu-lv"])
+        self.assertEqual(commands[0], ["/usr/sbin/lvextend", "--yes", "--size", "+4194304B", "/dev/ol/u01"])
+        self.assertEqual(commands[1], ["/usr/sbin/resize2fs", "/dev/ol/u01"])
+        self.assertEqual(commands[2], ["/usr/sbin/lvextend", "--yes", "--size", "+83886080B", "/dev/ubuntu-vg/ubuntu-lv"])
+        self.assertEqual(commands[3], ["/usr/sbin/resize2fs", "/dev/ubuntu-vg/ubuntu-lv"])
+
+    def test_linux_mount_point_rejects_parent_traversal(self):
+        self.assertEqual(tram_agent.linux_mount_path("/data/app"), "/data/app")
+        with self.assertRaisesRegex(ValueError, "Mount point"):
+            tram_agent.linux_mount_path("/data/../etc")
+
+    def test_automatic_linux_volume_creates_lv_then_filesystem_and_mount(self):
+        gib = 1024**3
+        scan = {"volumeGroups": [{"name": "vg0", "freeBytes": 2 * gib, "extendableBytes": 2 * gib, "extentSizeBytes": 4 * 1024**2}], "logicalVolumes": []}
+        mounted = json.dumps({"device": "/dev/vg0/app", "filesystem": "xfs", "mountPoint": "/data/app", "uuid": "abcd-1234", "persistent": True})
+        commands = []
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "preflight_linux_filesystem"), patch.object(tram_agent, "prepare_linux_volume_group", return_value=("vg0", [])), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "format_and_mount_linux", return_value=(0, mounted)), patch.object(tram_agent, "run", side_effect=lambda command, **_: (commands.append(command) or (0, "ok"))):
+            code, output = tram_agent.create_storage({"kind": "linux_volume", "source_kind": "existing_vg", "vg_name": "vg0", "name": "app", "size_bytes": gib, "filesystem": "xfs", "mount_point": "/data/app"}, False)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(commands, [["/usr/sbin/lvcreate", "--yes", "--size", f"{gib}B", "--name", "app", "vg0"]])
+        self.assertEqual(json.loads(output)["mountPoint"], "/data/app")
+
+    def test_automatic_volume_preflights_xfs_aligned_size_before_backing_changes(self):
+        scan = {"volumeGroups": [{"name": "vg0", "extentSizeBytes": 64 * 1024**2}], "logicalVolumes": []}
+        parameters = {"kind": "linux_volume", "vg_name": "vg0", "name": "app", "size_bytes": 300 * 1024**2, "filesystem": "xfs", "mount_point": "/data/app"}
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "prepare_linux_volume_group") as prepare, patch.object(tram_agent, "run") as native:
+            with self.assertRaisesRegex(ValueError, "300 MiB after extent alignment"):
+                tram_agent.create_storage(parameters, False)
+        prepare.assert_not_called()
+        native.assert_not_called()
+
+    def test_filesystem_preflight_rejects_nonempty_mount_and_native_label_limit(self):
+        with self.assertRaisesRegex(ValueError, "label"):
+            tram_agent.preflight_linux_filesystem({"filesystem": "xfs", "label": "x" * 13}, 1024**3)
+        with tempfile.TemporaryDirectory() as directory:
+            mount = Path(directory) / "mount"
+            mount.mkdir()
+            (mount / "existing-data").write_text("keep", encoding="utf-8")
+            with patch.object(tram_agent, "linux_mount_path", return_value=str(mount)), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "run") as native:
+                with self.assertRaisesRegex(ValueError, "empty directory"):
+                    tram_agent.preflight_linux_filesystem({"filesystem": "ext4", "mount_point": "/data/app"}, 1024**3)
+            native.assert_not_called()
+
+    def test_automatic_volume_rolls_back_new_lv_after_format_exception(self):
+        scan = {"volumeGroups": [{"name": "vg0", "extentSizeBytes": 4 * 1024**2}], "logicalVolumes": []}
+        commands = []
+        def fake_run(command, **_):
+            commands.append(command)
+            return (2, "") if command[0].endswith("blkid") else (0, "")
+        with patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "preflight_linux_filesystem"), patch.object(tram_agent, "prepare_linux_volume_group", return_value=("vg0", [])), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "format_and_mount_linux", side_effect=ValueError("mount changed")), patch.object(tram_agent, "run", side_effect=fake_run):
+            code, output = tram_agent.create_storage({"kind": "linux_volume", "vg_name": "vg0", "name": "app", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, False)
+        self.assertEqual(code, 2)
+        self.assertIn("new LV was removed", output)
+        self.assertEqual(commands[-1], ["/usr/sbin/lvremove", "--yes", "/dev/vg0/app"])
+
+    def test_mount_uuid_failure_preserves_existing_directory_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mount = Path(directory) / "mount"
+            mount.mkdir(mode=0o700)
+            mode_before = mount.stat().st_mode
+            fstab = Path(directory) / "fstab"
+            fstab.write_text("", encoding="utf-8")
+            def fake_run(command, **_):
+                if command[0].endswith("mkfs.ext4"):
+                    return 0, "formatted"
+                return 1, ""
+            with patch.object(tram_agent, "LINUX_FSTAB_PATH", fstab), patch.object(tram_agent, "linux_mount_path", return_value=str(mount)), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "run", side_effect=fake_run):
+                code, _ = tram_agent.format_and_mount_linux("/dev/vg0/app", {"filesystem": "ext4", "mount_point": "/data/app"})
+            self.assertEqual(code, 2)
+            self.assertEqual(mount.stat().st_mode, mode_before)
+            self.assertEqual(fstab.read_text(encoding="utf-8"), "")
+
+    def test_mount_failure_preserves_concurrent_fstab_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mount = Path(directory) / "mount"
+            mount.mkdir()
+            fstab = Path(directory) / "fstab"
+            fstab.write_text("# original\n", encoding="utf-8")
+            def fake_run(command, **_):
+                if command[0].endswith("mkfs.ext4"):
+                    fstab.write_text(fstab.read_text(encoding="utf-8") + "# edited during mkfs\n", encoding="utf-8")
+                    return 0, "formatted"
+                if command[0].endswith("blkid"):
+                    return 0, "abcd-1234"
+                if command[0] == "/usr/sbin/mount":
+                    fstab.write_text(fstab.read_text(encoding="utf-8") + "# edited during mount\n", encoding="utf-8")
+                    return 1, "mount failed"
+                return 1, ""
+            with patch.object(tram_agent, "LINUX_FSTAB_PATH", fstab), patch.object(tram_agent, "linux_mount_path", return_value=str(mount)), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "run", side_effect=fake_run):
+                code, _ = tram_agent.format_and_mount_linux("/dev/vg0/app", {"filesystem": "ext4", "mount_point": "/data/app"})
+            self.assertEqual(code, 1)
+            self.assertEqual(fstab.read_text(encoding="utf-8"), "# original\n# edited during mkfs\n# edited during mount\n")
+
+    def test_automatic_volume_keeps_lv_when_failed_fstab_rollback_leaves_reference(self):
+        scan = {"volumeGroups": [{"name": "vg0", "extentSizeBytes": 4 * 1024**2}], "logicalVolumes": []}
+        with tempfile.TemporaryDirectory() as directory:
+            fstab = Path(directory) / "fstab"
+            commands = []
+            def failed_format(*_):
+                fstab.write_text("UUID=abcd-1234 /data/app ext4 defaults 0 2\n", encoding="utf-8")
+                raise OSError("rollback write failed")
+            def fake_run(command, **_):
+                commands.append(command)
+                return (0, "abcd-1234") if command[0].endswith("blkid") else (0, "")
+            with patch.object(tram_agent, "LINUX_FSTAB_PATH", fstab), patch.object(tram_agent, "parsed_storage_scan", return_value=scan), patch.object(tram_agent, "preflight_linux_filesystem"), patch.object(tram_agent, "prepare_linux_volume_group", return_value=("vg0", [])), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "format_and_mount_linux", side_effect=failed_format), patch.object(tram_agent, "run", side_effect=fake_run):
+                code, output = tram_agent.create_storage({"kind": "linux_volume", "vg_name": "vg0", "name": "app", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, False)
+            self.assertEqual(code, 2)
+            self.assertIn("/etc/fstab still references", output)
+            self.assertFalse(any(command[0].endswith("lvremove") for command in commands))
 
     def test_powershell_clixml_errors_are_readable(self):
         raw = '#< CLIXML\n<Objs><S S="Error">Exception from HRESULT: 0x80072EE2_x000D__x000A_At line:1 char:1</S></Objs>'

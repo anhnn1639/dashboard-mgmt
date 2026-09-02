@@ -137,6 +137,15 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   assert.equal((resources.match(/\/ 512\) \* 512/g) || []).length, 2);
   assert.match(resources, /Logical Volumes/);
   assert.match(resources, /Extend LV/);
+  assert.match(resources, /min=\{selectedExtendMinGiB\} step="any"/);
+  assert.match(resources, /if \(selected.kind === "windows_partition"\) \{\s*parameters.disk_number = selected.diskNumber;\s*parameters.partition_number = selected.partitionNumber;/);
+  assert.doesNotMatch(resources, /if \(selected.partitionNumber !== undefined\) parameters.partition_number/);
+  assert.match(resources, /minimumLinuxFilesystemBytes = \(createFilesystem === "xfs" \? 300 : 16\)/);
+  assert.match(resources, /Volume Linux tự động \(khuyến nghị\)/);
+  assert.match(resources, /rescan disk → mở rộng partition PV liền kề → pvresize\/VG → LV/);
+  assert.match(resources, /Agent tự tạo mount point, ghi UUID vào \/etc\/fstab theo kiểu atomic/);
+  assert.doesNotMatch(resources, /Sau khi hệ thống tự quét lại, chọn đúng Logical Volume/);
+  assert.doesNotMatch(resources, /max=\{\(bytes\(selected\.extendableBytes\) \/ 1024 \*\* 3\)\.toFixed\(3\)\}/);
   assert.match(resources, /resizeProtected: Boolean\(node\.resizeProtected\)/);
   assert.doesNotMatch(resources, /Windows Update API/);
   assert.doesNotMatch(resources, /Configuration Manager/);
@@ -417,11 +426,12 @@ test("viewer navigation is permission-aware and stale admin hashes are replaced"
   assert.match(source, /Đang tải quyền tài khoản/);
 });
 
-test("Linux package is advertised as a self-contained offline installer", async () => {
+test("Linux package is self-contained for Python and prepares native storage dependencies", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
-  assert.match(source, /offline self-contained/);
+  assert.match(source, /không cần cài Python\/pip/);
+  assert.match(source, /bộ công cụ storage native đã ký/);
   assert.match(source, /Ubuntu 22\.04\/24\.04 · Oracle Linux 7\/8 · RHEL 7\/8 · x86_64/);
-  assert.match(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
+  assert.doesNotMatch(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
 });
 
 test("Agent packages expose fleet self-update and uninstall password protection", async () => {

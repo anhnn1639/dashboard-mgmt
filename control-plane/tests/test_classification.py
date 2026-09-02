@@ -1759,6 +1759,11 @@ class ClassificationTests(unittest.TestCase):
         validate_job_parameters("storage.extend", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "add_bytes": 1024**3}, windows)
         validate_job_parameters("storage.shrink", {"kind": "windows_partition", "disk_number": 0, "partition_number": 2, "shrink_bytes": 1024**3}, windows)
         validate_job_parameters("storage.create", {"kind": "linux_lv", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3}, linux)
+        validate_job_parameters("storage.extend", {"kind": "linux_lv", "path": "/dev/vg0/data", "add_bytes": 1024**3}, linux)
+        validate_job_parameters("storage.delete", {"kind": "linux_lv", "path": "/dev/vg0/data"}, linux)
+        validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "existing_vg", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, linux)
+        validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "empty_partition", "vg_name": "data-vg", "name": "data", "device": "/dev/sdb1", "size_bytes": 1024**3, "filesystem": "xfs", "mount_point": "/srv/data"}, linux)
+        validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "free_region", "vg_name": "data-vg", "name": "data", "disk": "/dev/sdb", "start_bytes": 1024**2, "source_size_bytes": 2 * 1024**3, "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data"}, linux)
         with self.assertRaisesRegex(Exception, "operating system"):
             validate_job_parameters("storage.extend", {"kind": "linux_partition", "path": "/dev/sda1", "add_bytes": 1024**3}, windows)
         with self.assertRaisesRegex(Exception, "operating system"):
@@ -1767,6 +1772,16 @@ class ClassificationTests(unittest.TestCase):
             validate_job_parameters("storage.extend", {"kind": "linux_vg", "name": "vg0", "add_bytes": 1024**3}, linux)
         with self.assertRaisesRegex(Exception, "unsupported"):
             validate_job_parameters("storage.delete", {"kind": "linux_lv", "path": "/dev/vg0/data", "command": "rm -rf /"}, linux)
+        with self.assertRaisesRegex(Exception, "source"):
+            validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "free_region", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, linux)
+        with self.assertRaisesRegex(Exception, "mount point"):
+            validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "existing_vg", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/etc/data"}, linux)
+        with self.assertRaisesRegex(Exception, "mount point"):
+            validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "existing_vg", "vg_name": "vg0", "name": "data", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/../etc"}, linux)
+        with self.assertRaisesRegex(Exception, "positive byte"):
+            validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "free_region", "vg_name": "vg0", "name": "data", "disk": "/dev/sdb", "start_bytes": 1024**2, "source_size_bytes": 0, "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, linux)
+        with self.assertRaisesRegex(Exception, "name is invalid"):
+            validate_job_parameters("storage.create", {"kind": "linux_volume", "source_kind": "existing_vg", "vg_name": "--config", "name": "data", "size_bytes": 1024**3, "filesystem": "ext4", "mount_point": "/data/app"}, linux)
 
     def test_update_source_configuration_is_os_scoped_and_validated(self):
         windows = Server(id=str(uuid.uuid4()), name="win", os_family="windows", os_name="Windows Server 2022", os_version="10.0.20348")

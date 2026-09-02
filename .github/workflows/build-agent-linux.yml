@@ -46,6 +46,7 @@ jobs:
       - name: Validate the executable on every supported distribution family
         run: |
           set -euo pipefail
+          bash -n agent/install-linux.sh
           file dist/tram-agent
           readelf -h dist/tram-agent | grep -q 'Machine:.*Advanced Micro Devices X86-64'
           test "$(stat -c '%a' dist/tram-agent)" = "755"

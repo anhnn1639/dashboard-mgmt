@@ -4528,7 +4528,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
             kênh quản trị Agent sử dụng chứng thư riêng.
           </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
-          <li>Linux là gói offline self-contained: không cần Python, pip, apt, dnf, yum hoặc Internet để cài Agent.</li>
+          <li>Linux không cần cài Python/pip. Bộ cài tự kiểm tra và bổ sung bộ công cụ storage native đã ký từ repository hệ điều hành (util-linux, parted/gdisk, LVM, ext4/XFS) trên Ubuntu 22.04/24.04 và Oracle/RHEL 7/8.</li>
           <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
         </ul>
       </article>
@@ -4582,7 +4582,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
           <p className="package-warning">Bộ cài Windows chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
         )}
         {status && !status.linuxAvailable && (
-          <p className="package-warning">Bộ cài Linux offline chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
+          <p className="package-warning">Bộ cài Linux chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
         )}
         {status && !status.agentTlsCaAvailable && (
           <p className="package-warning">
