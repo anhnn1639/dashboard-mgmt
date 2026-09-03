@@ -95,8 +95,6 @@ jobs:
           - ubuntu-24.04
           - ol-7
           - ol-8
-          - rhel-7
-          - rhel-8
     steps:
       - uses: actions/checkout@v4
       - name: Build signed native dependency pack
@@ -105,31 +103,46 @@ jobs:
         run: |
           chmod +x agent/build-offline-dependencies.sh
           agent/build-offline-dependencies.sh "${{ matrix.profile }}" release/offline
-          python3 -m json.tool "release/offline/${{ matrix.profile }}-x86_64.tar.gz.provenance.json"
-      - name: Verify installation with all repositories and network disabled
+          python3 -m json.tool "release/offline/${{ matrix.profile }}-x86_64.tar.provenance.json"
+      - name: Verify installation with all HTTP repositories and network disabled
         env:
           PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          archive="$PWD/release/offline/$PROFILE-x86_64.tar.gz"
+          archive="$PWD/release/offline/$PROFILE-x86_64.tar"
           case "$PROFILE" in
             ubuntu-*) image="ubuntu:${PROFILE#ubuntu-}"; package_type=deb ;;
-            ol-*) image="oraclelinux:${PROFILE#ol-}-slim"; package_type=rpm ;;
-            rhel-7) image=registry.access.redhat.com/ubi7/ubi; package_type=rpm ;;
-            rhel-8) image=registry.access.redhat.com/ubi8/ubi; package_type=rpm ;;
+            ol-7) image=oraclelinux:7-slim; package_type=rpm ;;
+            ol-8) image=oraclelinux:8; package_type=rpm ;;
           esac
-          docker run --rm --network none -v "$archive:/tmp/offline.tar.gz:ro" -e PACKAGE_TYPE="$package_type" "$image" bash -lc '
+          docker run --rm --network none -v "$archive:/tmp/offline.tar:ro" -e PACKAGE_TYPE="$package_type" "$image" bash -lc '
             set -euo pipefail
-            mkdir -p /tmp/offline /tmp/empty-sources
-            tar -xzf /tmp/offline.tar.gz --no-same-owner -C /tmp/offline
+            mkdir -p /tmp/offline
+            tar -xf /tmp/offline.tar --no-same-owner -C /tmp/offline
             if [ "$PACKAGE_TYPE" = deb ]; then
+              mkdir -p /tmp/offline/empty-sources /tmp/offline/apt-lists/partial /tmp/offline/packages/partial
+              printf "deb [trusted=yes] file:/tmp/offline/packages ./\n" > /tmp/offline/offline.list
+              apt-get \
+                -o APT::Sandbox::User=root \
+                -o Dir::Etc::sourcelist=/tmp/offline/offline.list \
+                -o Dir::Etc::sourceparts=/tmp/offline/empty-sources \
+                -o Dir::State::lists=/tmp/offline/apt-lists \
+                -o Dir::Cache::archives=/tmp/offline/packages \
+                -o Acquire::Languages=none update
               DEBIAN_FRONTEND=noninteractive apt-get -y --no-download --no-install-recommends \
-                -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=/tmp/empty-sources \
-                -o Acquire::Languages=none install /tmp/offline/packages/*.deb
-            elif command -v dnf >/dev/null 2>&1; then
-              dnf -y --disablerepo="*" install /tmp/offline/packages/*.rpm
+                -o APT::Sandbox::User=root \
+                -o Dir::Etc::sourcelist=/tmp/offline/offline.list \
+                -o Dir::Etc::sourceparts=/tmp/offline/empty-sources \
+                -o Dir::State::lists=/tmp/offline/apt-lists \
+                -o Dir::Cache::archives=/tmp/offline/packages \
+                -o Acquire::Languages=none install util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev
             else
-              yum -y --disablerepo="*" localinstall /tmp/offline/packages/*.rpm
+              rpmkeys --checksig /tmp/offline/packages/*.rpm
+              if command -v dnf >/dev/null 2>&1; then
+                dnf -y --disablerepo="*" install /tmp/offline/packages/*.rpm
+              else
+                yum -y --disablerepo="*" localinstall /tmp/offline/packages/*.rpm
+              fi
             fi
             for command in lsblk blkid mount umount findmnt blockdev partx wipefs udevadm parted partprobe sgdisk pvs vgs lvs pvcreate pvresize vgcreate vgextend lvcreate lvextend lvremove mkfs.ext4 resize2fs mkfs.xfs xfs_growfs; do
               command -v "$command" >/dev/null
@@ -140,6 +153,6 @@ jobs:
         with:
           name: TramVanHanhAgent-linux-offline-${{ matrix.profile }}-x86_64
           path: |
-            release/offline/${{ matrix.profile }}-x86_64.tar.gz
-            release/offline/${{ matrix.profile }}-x86_64.tar.gz.provenance.json
+            release/offline/${{ matrix.profile }}-x86_64.tar
+            release/offline/${{ matrix.profile }}-x86_64.tar.provenance.json
           if-no-files-found: error

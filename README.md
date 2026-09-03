@@ -163,9 +163,9 @@ curl -fsS https://ops.example.com/api/v1/enrollment-tokens \
 
 Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token chỉ dùng được đúng loại máy.
 
-### 3. Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat 7/8 — cài Agent độc lập
+### 3. Ubuntu 22.04/24.04 và Oracle Linux 7/8 — cài Agent độc lập
 
-Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17, Python runtime và toàn bộ thư viện Agent. Quản trị viên phải chọn đúng Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7/8 hoặc profile Red Hat 7/8 tương ứng. Mỗi file mang riêng bộ package native đã ký cho đúng release (`util-linux`, `parted`, `gdisk`, `lvm2`, `e2fsprogs`, `xfsprogs`, `udev/systemd`), manifest SHA-256 và profile OS. Installer kiểm tra OS/profile/hash trước khi thay service, chỉ cài package cục bộ với mọi repository bị vô hiệu hóa, không chạy `apt-get update` và không có fallback Internet/mirror. OpenSSH Server và ClamAV vẫn là capability riêng do hệ điều hành quản lý; nếu thiếu, SSH hoặc nhận file sẽ báo lỗi fail-closed.
+Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17, Python runtime và toàn bộ thư viện Agent. Quản trị viên phải chọn đúng Ubuntu 22.04, Ubuntu 24.04 hoặc Oracle Linux 7/8 tương ứng. Mỗi file mang riêng bộ package native đã ký cho đúng release (`util-linux`, `parted`, `gdisk`, `lvm2`, `e2fsprogs`, `xfsprogs`, `udev/systemd`), manifest SHA-256 và profile OS. Installer kiểm tra OS/profile/hash trước khi thay service, chỉ cài package cục bộ chỉ từ nguồn file cục bộ, còn mọi repository HTTP/HTTPS đều bị vô hiệu hóa và không có fallback Internet/mirror. OpenSSH Server và ClamAV vẫn là capability riêng do hệ điều hành quản lý; nếu thiếu, SSH hoặc nhận file sẽ báo lỗi fail-closed.
 
 ```bash
 sudo sh agent/install-linux.sh

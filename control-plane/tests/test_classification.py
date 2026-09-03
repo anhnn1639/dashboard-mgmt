@@ -46,7 +46,7 @@ def write_artifact_provenance(path: Path, version: str, artifact_kind: str, *, a
     return provenance_path
 
 
-TEST_LINUX_OFFLINE_PROFILES = ("ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8", "rhel-7", "rhel-8")
+TEST_LINUX_OFFLINE_PROFILES = ("ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8")
 
 
 def write_offline_dependency_archive(root: Path, profile: str, version: str, source_commit: str = "1" * 40) -> Path:
@@ -62,11 +62,16 @@ def write_offline_dependency_archive(root: Path, profile: str, version: str, sou
         "packageType": package_type,
         "packages": [{"name": package_name, "sha256": hashlib.sha256(package_content).hexdigest(), "sizeBytes": len(package_content)}],
     }
-    archive_path = output_dir / f"{profile}-x86_64.tar.gz"
-    with tarfile.open(archive_path, mode="w:gz") as archive:
+    archive_path = output_dir / f"{profile}-x86_64.tar"
+    with tarfile.open(archive_path, mode="w") as archive:
         package_info = tarfile.TarInfo(f"packages/{package_name}")
         package_info.size = len(package_content)
         archive.addfile(package_info, io.BytesIO(package_content))
+        if package_type == "deb":
+            index_content = f"Package: test-storage-tools\nFilename: ./{package_name}\nSize: {len(package_content)}\nSHA256: {hashlib.sha256(package_content).hexdigest()}\n\n".encode()
+            index_info = tarfile.TarInfo("packages/Packages")
+            index_info.size = len(index_content)
+            archive.addfile(index_info, io.BytesIO(index_content))
         manifest_content = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         manifest_info = tarfile.TarInfo("manifest.json")
         manifest_info.size = len(manifest_content)
@@ -270,7 +275,7 @@ class ClassificationTests(unittest.TestCase):
             marker = b"__TRAM_AGENT_ARCHIVE__\n"
             self.assertIn(marker, bundle)
             archive_payload = bundle.split(marker, 1)[1]
-            with tarfile.open(fileobj=io.BytesIO(archive_payload), mode="r:gz") as archive:
+            with tarfile.open(fileobj=io.BytesIO(archive_payload), mode="r:") as archive:
                 member = archive.extractfile(str(LINUX_AGENT_PATH).replace("\\", "/"))
                 self.assertIsNotNone(member)
                 self.assertEqual(member.read(), bytes(validated))
@@ -2213,17 +2218,17 @@ class ClassificationTests(unittest.TestCase):
             self.assertIn("TramAgent-Linux-ubuntu-24.04-ubuntu-prod-01.run", linux_package.headers["content-disposition"])
             marker = b"__TRAM_AGENT_ARCHIVE__\n"
             archive_bytes = linux_package.content.split(marker, 1)[1]
-            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
                 self.assertEqual(archive.extractfile("VERSION").read().decode().strip(), app.version)
                 self.assertGreater(len(archive.extractfile("linux/x86_64/tram-agent").read()), 1024 * 512)
                 self.assertTrue(all(member.mtime >= 1_704_067_200 for member in archive.getmembers()))
                 self.assertNotIn("requirements.txt", archive.getnames())
                 self.assertNotIn("tram_agent.py", archive.getnames())
                 self.assertEqual(archive.extractfile("linux-profile").read().decode().strip(), "ubuntu-24.04")
-                offline_content = archive.extractfile("offline-dependencies.tar.gz").read()
+                offline_content = archive.extractfile("offline-dependencies.tar").read()
                 checksum = archive.extractfile("offline-dependencies.sha256").read().decode().split()[0]
                 self.assertEqual(hashlib.sha256(offline_content).hexdigest(), checksum)
-                with tarfile.open(fileobj=io.BytesIO(offline_content), mode="r:gz") as offline_archive:
+                with tarfile.open(fileobj=io.BytesIO(offline_content), mode="r:") as offline_archive:
                     self.assertIn("manifest.json", offline_archive.getnames())
                     self.assertTrue(any(name.endswith(".deb") for name in offline_archive.getnames()))
                 bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
@@ -2294,7 +2299,7 @@ class ClassificationTests(unittest.TestCase):
                 nginx_linux = client.post("/api/v1/agent-packages", headers=headers, json={"label": "nginx-linux", "os_family": "linux", "linux_profile": "ubuntu-24.04", "expires_minutes": 15})
                 self.assertEqual(nginx_linux.status_code, 200, nginx_linux.text)
                 nginx_archive = nginx_linux.content.split(marker, 1)[1]
-                with tarfile.open(fileobj=io.BytesIO(nginx_archive), mode="r:gz") as archive:
+                with tarfile.open(fileobj=io.BytesIO(nginx_archive), mode="r:") as archive:
                     nginx_bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
                     self.assertEqual(nginx_bootstrap["server_ca_sha256"], "system")
                     self.assertEqual(nginx_bootstrap["server_ca_certificate"], "")

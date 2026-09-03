@@ -7,15 +7,13 @@ import { UpdateSourceSettingsView } from "./update-source-settings";
 import { RemoteCredentialsView } from "./remote-credentials";
 
 type OSFamily = "linux" | "windows";
-type LinuxOfflineProfile = "ubuntu-22.04" | "ubuntu-24.04" | "ol-7" | "ol-8" | "rhel-7" | "rhel-8";
+type LinuxOfflineProfile = "ubuntu-22.04" | "ubuntu-24.04" | "ol-7" | "ol-8";
 
 const LINUX_OFFLINE_PROFILE_LABELS: Record<LinuxOfflineProfile, string> = {
   "ubuntu-22.04": "Ubuntu 22.04",
   "ubuntu-24.04": "Ubuntu 24.04",
   "ol-7": "Oracle Linux 7",
   "ol-8": "Oracle Linux 8",
-  "rhel-7": "Red Hat Enterprise Linux 7",
-  "rhel-8": "Red Hat Enterprise Linux 8",
 };
 
 type Health = "healthy" | "warning" | "critical" | "offline";
@@ -4542,7 +4540,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
             kênh quản trị Agent sử dụng chứng thư riêng.
           </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
-          <li>Linux không cần Internet hay repository khi cài. File .run mang sẵn bộ công cụ Disk/LVM đúng Ubuntu 22.04/24.04 hoặc Oracle/RHEL 7/8 đã chọn, kiểm tra hash trước khi cài cục bộ.</li>
+          <li>Linux không cần Internet hay repository khi cài. File .run mang sẵn bộ công cụ Disk/LVM đúng Ubuntu 22.04/24.04 hoặc Oracle Linux 7/8 đã chọn, kiểm tra hash trước khi cài cục bộ.</li>
           <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
         </ul>
       </article>

@@ -23,11 +23,9 @@ case "$os_id:$os_version" in
   ubuntu:24.04) linux_profile="ubuntu-24.04" ;;
   ol:7*) linux_profile="ol-7" ;;
   ol:8*) linux_profile="ol-8" ;;
-  rhel:7*) linux_profile="rhel-7" ;;
-  rhel:8*) linux_profile="rhel-8" ;;
   *)
     echo "Unsupported Linux release: ${PRETTY_NAME:-$os_id $os_version}" >&2
-    echo "Supported: Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat Enterprise Linux 7/8 (x86_64)." >&2
+    echo "Supported: Ubuntu 22.04/24.04 and Oracle Linux 7/8 (x86_64)." >&2
     exit 1
     ;;
 esac
@@ -92,7 +90,7 @@ if [ -n "$missing_storage" ]; then
     echo "This offline package does not match ${PRETTY_NAME:-$os_id $os_version}. Download the $linux_profile package from the dashboard." >&2
     exit 1
   fi
-  if [ ! -s "$script_dir/offline-dependencies.tar.gz" ] || [ ! -s "$script_dir/offline-dependencies.sha256" ]; then
+  if [ ! -s "$script_dir/offline-dependencies.tar" ] || [ ! -s "$script_dir/offline-dependencies.sha256" ]; then
     echo "The $linux_profile offline dependency pack is missing." >&2
     exit 1
   fi
@@ -100,32 +98,37 @@ if [ -n "$missing_storage" ]; then
   (cd "$script_dir" && sha256sum -c offline-dependencies.sha256)
   package_root="$script_dir/offline-dependencies"
   mkdir -m 0700 "$package_root"
-  tar -xzf "$script_dir/offline-dependencies.tar.gz" --no-same-owner -C "$package_root"
+  tar -xf "$script_dir/offline-dependencies.tar" --no-same-owner -C "$package_root"
   case "$os_id" in
     ubuntu)
       if ! command -v apt-get >/dev/null 2>&1; then
         echo "apt-get is required to install the bundled Ubuntu packages" >&2
         exit 1
       fi
-      set --
-      for package_file in "$package_root"/packages/*.deb; do
-        [ -f "$package_file" ] || { echo "The Ubuntu offline dependency pack is empty" >&2; exit 1; }
-        package_name=$(dpkg-deb -f "$package_file" Package)
-        package_version=$(dpkg-deb -f "$package_file" Version)
-        installed_version=$(dpkg-query -W -f='${Version}' "$package_name" 2>/dev/null || true)
-        if [ -z "$installed_version" ] || dpkg --compare-versions "$installed_version" lt "$package_version"; then
-          set -- "$@" "$package_file"
-        fi
-      done
-      if [ "$#" -gt 0 ]; then
-        mkdir -m 0700 "$package_root/empty-sources"
-        DEBIAN_FRONTEND=noninteractive apt-get -y --no-download --no-install-recommends \
-          -o Dir::Etc::sourcelist=/dev/null \
-          -o Dir::Etc::sourceparts="$package_root/empty-sources" \
-          -o Acquire::Languages=none install "$@"
+      if [ ! -s "$package_root/packages/Packages" ]; then
+        echo "The Ubuntu offline package index is missing" >&2
+        exit 1
       fi
+      mkdir -m 0700 "$package_root/empty-sources" "$package_root/apt-lists"
+      mkdir -m 0700 "$package_root/apt-lists/partial" "$package_root/packages/partial"
+      printf 'deb [trusted=yes] file:%s ./\n' "$package_root/packages" > "$package_root/offline.list"
+      echo "Refreshing the bundled local package index"
+      apt-get \
+        -o APT::Sandbox::User=root \
+        -o Dir::Etc::sourcelist="$package_root/offline.list" \
+        -o Dir::Etc::sourceparts="$package_root/empty-sources" \
+        -o Dir::State::lists="$package_root/apt-lists" \
+        -o Dir::Cache::archives="$package_root/packages" \
+        -o Acquire::Languages=none update
+      DEBIAN_FRONTEND=noninteractive apt-get -y --no-download --no-install-recommends \
+        -o APT::Sandbox::User=root \
+        -o Dir::Etc::sourcelist="$package_root/offline.list" \
+        -o Dir::Etc::sourceparts="$package_root/empty-sources" \
+        -o Dir::State::lists="$package_root/apt-lists" \
+        -o Dir::Cache::archives="$package_root/packages" \
+        -o Acquire::Languages=none install util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev
       ;;
-    ol|rhel)
+    ol)
       set -- "$package_root"/packages/*.rpm
       [ -f "$1" ] || { echo "The RPM offline dependency pack is empty" >&2; exit 1; }
       if command -v rpmkeys >/dev/null 2>&1; then
@@ -136,7 +139,7 @@ if [ -n "$missing_storage" ]; then
       elif command -v yum >/dev/null 2>&1; then
         yum -y --disablerepo='*' localinstall "$@"
       else
-        echo "dnf/yum is required to install the bundled Oracle/RHEL packages" >&2
+        echo "dnf/yum is required to install the bundled Oracle Linux packages" >&2
         exit 1
       fi
       ;;

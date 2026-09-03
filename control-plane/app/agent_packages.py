@@ -23,10 +23,8 @@ LINUX_OFFLINE_PROFILES = (
     "ubuntu-24.04",
     "ol-7",
     "ol-8",
-    "rhel-7",
-    "rhel-8",
 )
-LINUX_OFFLINE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+LINUX_OFFLINE_ARCHIVE_MAX_BYTES = 95 * 1024 * 1024
 LINUX_OFFLINE_EXPANDED_MAX_BYTES = 512 * 1024 * 1024
 # Keep bundles reproducible without using the Unix epoch. GNU tar versions on
 # Oracle Linux 7 warn that epoch-dated members are "implausibly old".
@@ -87,14 +85,14 @@ def validate_linux_agent(path: Path) -> bytes:
 def linux_offline_archive_path(assets_root: Path, profile: str) -> Path:
     if profile not in LINUX_OFFLINE_PROFILES:
         raise ValueError("Unsupported Linux offline dependency profile")
-    return assets_root / "linux" / "offline" / f"{profile}-x86_64.tar.gz"
+    return assets_root / "linux" / "offline" / f"{profile}-x86_64.tar"
 
 
 def _validate_linux_offline_archive(content: bytes, profile: str) -> None:
     if not content or len(content) > LINUX_OFFLINE_ARCHIVE_MAX_BYTES:
         raise ValueError
     expected_suffix = ".deb" if profile.startswith("ubuntu-") else ".rpm"
-    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:") as archive:
         members = archive.getmembers()
         names = [member.name for member in members]
         if not 2 <= len(members) <= 512 or len(names) != len(set(names)) or "manifest.json" not in names:
@@ -108,10 +106,18 @@ def _validate_linux_offline_archive(content: bytes, profile: str) -> None:
                 continue
             if not member.isfile() or path.is_absolute() or ".." in path.parts:
                 raise ValueError
-            if member.name != "manifest.json" and (path.parent.as_posix() != "packages" or path.suffix != expected_suffix):
+            is_ubuntu_index = profile.startswith("ubuntu-") and member.name == "packages/Packages"
+            if member.name != "manifest.json" and not is_ubuntu_index and (path.parent.as_posix() != "packages" or path.suffix != expected_suffix):
                 raise ValueError
             expanded_size += member.size
             if expanded_size > LINUX_OFFLINE_EXPANDED_MAX_BYTES:
+                raise ValueError
+        expected_names = {name for name in names if name.startswith("packages/") and name.endswith(expected_suffix)}
+        if profile.startswith("ubuntu-"):
+            index_member = archive.extractfile("packages/Packages") if "packages/Packages" in names else None
+            index_content = index_member.read().decode("utf-8") if index_member else ""
+            indexed_names = {f"packages/{name}" for name in re.findall(r"(?m)^Filename: \./([^\s/]+\.deb)$", index_content)}
+            if indexed_names != expected_names:
                 raise ValueError
         manifest_member = archive.extractfile("manifest.json")
         manifest = json.loads(manifest_member.read()) if manifest_member else None
@@ -127,7 +133,6 @@ def _validate_linux_offline_archive(content: bytes, profile: str) -> None:
             or not package_entries
         ):
             raise ValueError
-        expected_names = {name for name in names if name.startswith("packages/") and name.endswith(expected_suffix)}
         seen: set[str] = set()
         for entry in package_entries:
             if not isinstance(entry, dict) or set(entry) != {"name", "sha256", "sizeBytes"}:
@@ -256,7 +261,7 @@ def linux_run_bundle(
     ):
         raise ValueError("The standalone Linux x86_64 agent artifact is invalid")
     payload = io.BytesIO()
-    with tarfile.open(fileobj=payload, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+    with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for name, mode in required.items():
             if name == str(LINUX_AGENT_PATH).replace("\\", "/"):
                 # The caller may supply the exact bytes already validated
@@ -274,11 +279,11 @@ def linux_run_bundle(
             _tar_entry(archive, name, source.read_bytes(), mode)
         offline_digest = hashlib.sha256(offline_content).hexdigest()
         _tar_entry(archive, "linux-profile", f"{linux_profile}\n".encode("ascii"), 0o640)
-        _tar_entry(archive, "offline-dependencies.tar.gz", offline_content, 0o640)
+        _tar_entry(archive, "offline-dependencies.tar", offline_content, 0o640)
         _tar_entry(
             archive,
             "offline-dependencies.sha256",
-            f"{offline_digest}  offline-dependencies.tar.gz\n".encode("ascii"),
+            f"{offline_digest}  offline-dependencies.tar\n".encode("ascii"),
             0o640,
         )
         bootstrap = json.dumps(
@@ -305,7 +310,7 @@ if [ -z "$archive_line" ]; then
   echo "Invalid Tram Agent installer" >&2
   exit 2
 fi
-tail -n +"$archive_line" "$0" | tar -xzf - -C "$work_dir"
+tail -n +"$archive_line" "$0" | tar -xf - -C "$work_dir"
 sh "$work_dir/install-linux.sh" "$work_dir/bootstrap.json"
 exit 0
 __TRAM_AGENT_ARCHIVE__

@@ -14,9 +14,7 @@ case "$profile" in
   ubuntu-22.04) image=ubuntu:22.04; package_type=deb; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev" ;;
   ubuntu-24.04) image=ubuntu:24.04; package_type=deb; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev" ;;
   ol-7) image=oraclelinux:7-slim; package_type=rpm; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs systemd" ;;
-  ol-8) image=oraclelinux:8-slim; package_type=rpm; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs systemd-udev" ;;
-  rhel-7) image=registry.access.redhat.com/ubi7/ubi; package_type=rpm; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs systemd" ;;
-  rhel-8) image=registry.access.redhat.com/ubi8/ubi; package_type=rpm; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs systemd-udev" ;;
+  ol-8) image=oraclelinux:8; package_type=rpm; native_packages="util-linux parted gdisk lvm2 e2fsprogs xfsprogs systemd-udev" ;;
   *) echo "Unsupported Linux profile: $profile" >&2; exit 2 ;;
 esac
 
@@ -30,16 +28,19 @@ if [ "$package_type" = deb ]; then
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
+    apt-get -y install --no-install-recommends dpkg-dev
     mkdir -p /tmp/archives/partial
     : > /tmp/empty-dpkg-status
     apt-get -y --download-only --reinstall --no-install-recommends \
       -o Dir::State::status=/tmp/empty-dpkg-status \
       -o Dir::Cache::archives=/tmp/archives install $native_packages
     cp /tmp/archives/*.deb /out/
+    cd /out
+    dpkg-scanpackages . /dev/null > Packages
   "
 else
   case "$profile" in
-    *-7)
+    ol-7)
       docker run --rm -v "$work_dir/packages:/out" "$image" bash -lc "
         set -euo pipefail
         yum -y install yum-utils
@@ -47,7 +48,7 @@ else
         rpmkeys --checksig /out/*.rpm
       "
       ;;
-    *-8)
+    ol-8)
       docker run --rm -v "$work_dir/packages:/out" "$image" bash -lc "
         set -euo pipefail
         dnf -y install dnf-plugins-core
@@ -76,8 +77,13 @@ payload = {"schema": 1, "profile": profile, "architecture": "x86_64", "packageTy
 pathlib.Path(manifest_path).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
 
-archive="$output_dir/$profile-x86_64.tar.gz"
-tar --sort=name --mtime='@1704067200' --owner=0 --group=0 --numeric-owner -C "$work_dir" -cf - manifest.json packages | gzip -n > "$archive"
+archive="$output_dir/$profile-x86_64.tar"
+tar --sort=name --mtime='@1704067200' --owner=0 --group=0 --numeric-owner -C "$work_dir" -cf "$archive" manifest.json packages
+archive_size=$(stat -c %s "$archive")
+if [ "$archive_size" -gt 99614720 ]; then
+  echo "Offline dependency pack exceeds the 95 MiB repository limit: $archive" >&2
+  exit 1
+fi
 python3 - "$archive" "$version" "$profile" "$source_commit" <<'PY'
 import hashlib
 import json

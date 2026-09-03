@@ -218,7 +218,7 @@ Nhấn: Kiểm tra kết nối & hoàn tất
 1. Mở dashboard bằng chính URL HTTPS production, không dùng IP hoặc alias tạm.
 2. Vào **Bộ cài Agent** và xác nhận URL hiển thị khớp `OPS_DOMAIN`.
 3. Xác nhận các profile Linux cần dùng không có nhãn `chưa có pack`; thiếu pack thì chưa được phát hành `.run` cho profile đó.
-4. Chọn đúng Ubuntu/Oracle/RHEL và tải thử một Linux `.run`; tên file phải chứa profile OS. Tải thêm một Windows `.msi` và không đổi tên MSI.
+4. Chọn đúng Ubuntu/Oracle và tải thử một Linux `.run`; tên file phải chứa profile OS. Tải thêm một Windows `.msi` và không đổi tên MSI.
 5. Trên máy Linux cô lập, chạy `.run` trong lúc chặn Internet/repository. Installer phải xác minh đúng OS/profile/hash và hoàn tất bằng package cục bộ; không được có request tới repo. Máy vẫn phải tới được control plane qua `443` để claim và `9443` để vận hành.
 6. Claim chỉ sống 15–60 phút và dùng một lần. Xóa file tải về sau khi máy đã enroll.
 7. Windows MSI cài service `TramVanHanhAgent` kiểu `Automatic`; kiểm tra bằng:

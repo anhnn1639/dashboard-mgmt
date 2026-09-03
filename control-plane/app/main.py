@@ -567,7 +567,7 @@ class EnrollmentTokenRequest(BaseModel):
 class AgentPackageRequest(BaseModel):
     label: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@ -]+$")
     os_family: Literal["windows", "linux"]
-    linux_profile: Literal["ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8", "rhel-7", "rhel-8"] | None = None
+    linux_profile: Literal["ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8"] | None = None
     expires_minutes: int = Field(default=30, ge=5, le=60)
 
 
