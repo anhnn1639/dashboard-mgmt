@@ -7,6 +7,17 @@ import { UpdateSourceSettingsView } from "./update-source-settings";
 import { RemoteCredentialsView } from "./remote-credentials";
 
 type OSFamily = "linux" | "windows";
+type LinuxOfflineProfile = "ubuntu-22.04" | "ubuntu-24.04" | "ol-7" | "ol-8" | "rhel-7" | "rhel-8";
+
+const LINUX_OFFLINE_PROFILE_LABELS: Record<LinuxOfflineProfile, string> = {
+  "ubuntu-22.04": "Ubuntu 22.04",
+  "ubuntu-24.04": "Ubuntu 24.04",
+  "ol-7": "Oracle Linux 7",
+  "ol-8": "Oracle Linux 8",
+  "rhel-7": "Red Hat Enterprise Linux 7",
+  "rhel-8": "Red Hat Enterprise Linux 8",
+};
+
 type Health = "healthy" | "warning" | "critical" | "offline";
 type SystemTheme = "light" | "dark";
 
@@ -4189,12 +4200,14 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
     dashboardUrl: string;
     agentVersion: string;
     linuxAvailable: boolean;
+    linuxOfflineProfiles: Partial<Record<LinuxOfflineProfile, boolean>>;
     windowsMsiAvailable: boolean;
     agentTlsCaAvailable: boolean;
     claimTtlMinutes: number;
     webTlsTrust: "internal-ca" | "system";
   } | null>(null);
   const [busy, setBusy] = useState<OSFamily | null>(null);
+  const [linuxProfile, setLinuxProfile] = useState<LinuxOfflineProfile>("ubuntu-24.04");
   const [message, setMessage] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
   const [upgradeStatus, setUpgradeStatus] = useState<AgentUpgradeStatus | null>(null);
@@ -4464,6 +4477,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
         body: JSON.stringify({
           label: form.get("label"),
           os_family: osFamily,
+          linux_profile: osFamily === "linux" ? linuxProfile : null,
           expires_minutes: Number(form.get("expires_minutes")),
         }),
       });
@@ -4485,7 +4499,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
       setMessage(
         osFamily === "windows"
           ? "Đã tạo MSI dùng một lần. Giữ nguyên tên file, chép sang đúng Windows Server và chạy bằng Administrator."
-          : "Đã tạo gói Linux dùng một lần. Chạy: chmod +x <file>.run && sudo ./<file>.run",
+          : `Đã tạo gói offline ${LINUX_OFFLINE_PROFILE_LABELS[linuxProfile]} dùng một lần. Máy đích không cần kết nối Internet hoặc repository khi cài. Chạy: chmod +x <file>.run && sudo ./<file>.run`,
       );
       setMessageIsError(false);
     } catch (reason) {
@@ -4528,7 +4542,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
             kênh quản trị Agent sử dụng chứng thư riêng.
           </li>
           <li>Windows MSI cài service LocalSystem, tự khởi động cùng Windows và tự restart khi lỗi.</li>
-          <li>Linux không cần cài Python/pip. Bộ cài tự kiểm tra và bổ sung bộ công cụ storage native đã ký từ repository hệ điều hành (util-linux, parted/gdisk, LVM, ext4/XFS) trên Ubuntu 22.04/24.04 và Oracle/RHEL 7/8.</li>
+          <li>Linux không cần Internet hay repository khi cài. File .run mang sẵn bộ công cụ Disk/LVM đúng Ubuntu 22.04/24.04 hoặc Oracle/RHEL 7/8 đã chọn, kiểm tra hash trước khi cài cục bộ.</li>
           <li>Windows/Linux vẫn tự xuất hiện đúng mục theo inventory thực tế.</li>
         </ul>
       </article>
@@ -4555,16 +4569,27 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
             <option value="60">60 phút</option>
           </select>
         </label>
+        <label>
+          Hệ điều hành của máy Linux
+          <select value={linuxProfile} onChange={(event) => setLinuxProfile(event.target.value as LinuxOfflineProfile)}>
+            {(Object.entries(LINUX_OFFLINE_PROFILE_LABELS) as Array<[LinuxOfflineProfile, string]>).map(([profile, label]) => (
+              <option key={profile} value={profile} disabled={status?.linuxOfflineProfiles?.[profile] === false}>
+                {label}{status?.linuxOfflineProfiles?.[profile] === false ? " · chưa có pack" : ""}
+              </option>
+            ))}
+          </select>
+          <small>Phải chọn đúng OS/version của máy đích. Bộ cài sẽ từ chối trước khi thay Agent nếu không khớp.</small>
+        </label>
         <div className="agent-package-options">
           <button
             className="package-option linux"
             type="submit"
             data-os="linux"
-            disabled={busy !== null || status?.linuxAvailable === false || status?.agentTlsCaAvailable === false}
+            disabled={busy !== null || status?.linuxAvailable === false || status?.linuxOfflineProfiles?.[linuxProfile] === false || status?.agentTlsCaAvailable === false}
           >
             <span>L</span>
             <b>Tải Linux .run</b>
-            <small>Ubuntu 22.04/24.04 · Oracle Linux 7/8 · RHEL 7/8 · x86_64</small>
+            <small>{LINUX_OFFLINE_PROFILE_LABELS[linuxProfile]} · x86_64 · cài không cần repository</small>
           </button>
           <button
             className="package-option windows"
@@ -4578,6 +4603,9 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
           </button>
         </div>
         {busy && <p className="package-progress">Đang chuẩn bị gói cài {busy}…</p>}
+        {status && status.linuxAvailable && status.linuxOfflineProfiles?.[linuxProfile] === false && (
+          <p className="package-warning">Pack offline cho {LINUX_OFFLINE_PROFILE_LABELS[linuxProfile]} chưa sẵn sàng trên máy triển khai.</p>
+        )}
         {status && !status.windowsMsiAvailable && (
           <p className="package-warning">Bộ cài Windows chưa sẵn sàng. Hãy liên hệ quản trị viên triển khai.</p>
         )}

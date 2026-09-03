@@ -127,7 +127,7 @@ API kiểm tra kết nối, tạo schema, admin, cấu hình hệ thống và au
 
 Nhập tên máy/ticket, chọn thời hạn 15–60 phút rồi tải đúng định dạng:
 
-- Linux: `TramAgent-Linux-<label>.run`. Chép qua kênh quản trị tin cậy và chạy:
+- Linux: chọn đúng profile rồi tải `TramAgent-Linux-<profile>-<label>.run`. Chép qua kênh quản trị tin cậy và chạy:
 
   ```bash
   chmod +x TramAgent-Linux-*.run
@@ -165,7 +165,7 @@ Có thể thêm `"expected_os_family":"windows"` hoặc `"linux"` để token ch
 
 ### 3. Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat 7/8 — cài Agent độc lập
 
-Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17. Python runtime cùng toàn bộ thư viện `requests`, `cryptography`, `psutil` và WebSocket đã nằm trong gói, nên installer không gọi `pip`. Để các thao tác Disk/LVM chạy ngay trên mọi bản được hỗ trợ, installer kiểm tra rồi bổ sung các công cụ native đã ký từ repository hệ điều hành: `util-linux`, `parted`, `gdisk`, `lvm2`, `e2fsprogs`, `xfsprogs` và `udev/systemd`. Máy air-gapped cần cấu hình repository nội bộ/mirror tương ứng trước khi cài nếu thiếu các package này. OpenSSH Server và ClamAV vẫn là dịch vụ do hệ điều hành quản lý; nếu thiếu, SSH hoặc nhận file sẽ báo lỗi fail-closed.
+Gói `.run` tải từ dashboard chứa executable x86_64 self-contained được build trên baseline glibc 2.17, Python runtime và toàn bộ thư viện Agent. Quản trị viên phải chọn đúng Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7/8 hoặc profile Red Hat 7/8 tương ứng. Mỗi file mang riêng bộ package native đã ký cho đúng release (`util-linux`, `parted`, `gdisk`, `lvm2`, `e2fsprogs`, `xfsprogs`, `udev/systemd`), manifest SHA-256 và profile OS. Installer kiểm tra OS/profile/hash trước khi thay service, chỉ cài package cục bộ với mọi repository bị vô hiệu hóa, không chạy `apt-get update` và không có fallback Internet/mirror. OpenSSH Server và ClamAV vẫn là capability riêng do hệ điều hành quản lý; nếu thiếu, SSH hoặc nhận file sẽ báo lỗi fail-closed.
 
 ```bash
 sudo sh agent/install-linux.sh
@@ -177,6 +177,8 @@ sudo systemctl status tram-agent
 ```
 
 Thông thường không cần luồng thủ công trên: tải `.run` dùng một lần từ **Bộ cài Agent**, chép qua kênh nội bộ, `chmod +x` rồi chạy bằng `sudo`. Máy tự xuất hiện trong **Máy chủ Linux**. Installer chỉ chấp nhận đúng các release được hỗ trợ và `x86_64`.
+
+Các pack offline được tạo bởi workflow **Build Linux agent**, kiểm thử lại trong container đúng release với network và repository đều tắt, rồi đặt tại `agent/linux/offline/` kèm file provenance. API chỉ mở nút tải cho profile có pack hợp lệ, đúng version/hash/kích thước/source commit. Khi cập nhật danh sách package hoặc phiên bản Agent, phải build và bundle lại các pack trước khi deploy API.
 
 ### 4. Windows Server 2025 — cài thủ công
 

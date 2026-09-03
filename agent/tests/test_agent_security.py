@@ -904,22 +904,26 @@ class AgentSecurityTests(unittest.TestCase):
         address_families = next(line for line in service.splitlines() if line.startswith("RestrictAddressFamilies="))
         self.assertIn("AF_NETLINK", address_families.split("=", 1)[1].split())
 
-    def test_linux_installer_uses_standalone_binary_and_prepares_native_storage_tools(self):
+    def test_linux_installer_uses_standalone_binary_and_bundled_native_storage_tools(self):
         installer = (MODULE_PATH.parent / "install-linux.sh").read_text(encoding="utf-8")
+        builder = (MODULE_PATH.parent / "build-offline-dependencies.sh").read_text(encoding="utf-8")
         service = (MODULE_PATH.parent / "tram-agent.service").read_text(encoding="utf-8")
         self.assertNotIn("pip install", installer)
-        self.assertIn("apt-get install", installer)
-        self.assertIn("dnf -y install", installer)
-        self.assertIn("yum -y install", installer)
+        self.assertNotIn("apt-get update", installer)
+        self.assertIn("--no-download", installer)
+        self.assertIn("Dir::Etc::sourcelist=/dev/null", installer)
+        self.assertIn("--disablerepo='*'", installer)
+        self.assertIn("offline-dependencies.tar.gz", installer)
+        self.assertIn("offline-dependencies.sha256", installer)
+        self.assertIn("linux-profile", installer)
+        self.assertIn("sha256sum -c", installer)
         for dependency in ("util-linux", "parted", "gdisk", "lvm2", "e2fsprogs", "xfsprogs"):
-            self.assertIn(dependency, installer)
-        self.assertIn("udev_package=systemd", installer)
-        self.assertIn("8*) udev_package=systemd-udev", installer)
-        self.assertIn("ubuntu:22.04|ubuntu:24.04", installer)
-        self.assertIn("ol:7*|ol:8*|rhel:7*|rhel:8*", installer)
+            self.assertIn(dependency, builder)
+        for profile in ("ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8", "rhel-7", "rhel-8"):
+            self.assertIn(profile, installer)
+            self.assertIn(profile, builder)
         self.assertIn("linux/x86_64/tram-agent", installer)
         self.assertIn("ExecStart=/opt/tram-agent/tram-agent", service)
-
     def test_linux_installer_preserves_a_complete_existing_identity(self):
         installer = (MODULE_PATH.parent / "install-linux.sh").read_text(encoding="utf-8")
         for identity_file in ("agent.json", "agent.crt", "agent.key", "agent-ca.crt", "server-ca.crt"):

@@ -48,7 +48,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
-from .agent_packages import LINUX_AGENT_PATH, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_windows_msi, windows_msi_filename
+from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 
 
@@ -567,6 +567,7 @@ class EnrollmentTokenRequest(BaseModel):
 class AgentPackageRequest(BaseModel):
     label: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@ -]+$")
     os_family: Literal["windows", "linux"]
+    linux_profile: Literal["ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8", "rhel-7", "rhel-8"] | None = None
     expires_minutes: int = Field(default=30, ge=5, le=60)
 
 
@@ -3892,9 +3893,16 @@ def agent_package_status(_: User = Depends(require_permission("agents.manage")),
     dashboard_url = canonical_dashboard_url(db)
     try:
         agent_release_artifact("linux")
-        linux_available = True
+        linux_binary_available = True
     except (FileNotFoundError, ValueError):
-        linux_available = False
+        linux_binary_available = False
+    linux_offline_profiles: dict[str, bool] = {}
+    for profile in LINUX_OFFLINE_PROFILES:
+        try:
+            validate_linux_offline_archive(Path(settings.agent_assets_root), profile, RELEASE_VERSION, load_content=False)
+            linux_offline_profiles[profile] = True
+        except (FileNotFoundError, ValueError):
+            linux_offline_profiles[profile] = False
     try:
         agent_release_artifact("windows")
         windows_available = True
@@ -3903,13 +3911,13 @@ def agent_package_status(_: User = Depends(require_permission("agents.manage")),
     return {
         "dashboardUrl": dashboard_url,
         "agentVersion": RELEASE_VERSION,
-        "linuxAvailable": linux_available,
+        "linuxAvailable": linux_binary_available and any(linux_offline_profiles.values()),
+        "linuxOfflineProfiles": linux_offline_profiles,
         "windowsMsiAvailable": windows_available,
         "agentTlsCaAvailable": agent_server_ca_available(),
         "claimTtlMinutes": 30,
         "webTlsTrust": settings.web_tls_trust,
     }
-
 
 @app.put("/api/v1/settings/dashboard-url")
 def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
@@ -3930,6 +3938,10 @@ def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, u
 
 @app.post("/api/v1/agent-packages")
 def create_agent_package(payload: AgentPackageRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    if payload.os_family == "linux" and payload.linux_profile is None:
+        raise HTTPException(status_code=422, detail="Hãy chọn đúng phiên bản Linux để tạo bộ cài offline")
+    if payload.os_family == "windows" and payload.linux_profile is not None:
+        raise HTTPException(status_code=422, detail="Profile Linux không được dùng cho bộ cài Windows")
     dashboard_url = canonical_dashboard_url(db)
     ca_certificate, ca_fingerprint = read_agent_server_ca()
     bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
@@ -3949,8 +3961,9 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
                 package_secret=package_secret,
                 ca_certificate=bootstrap_ca_certificate,
                 ca_fingerprint=bootstrap_tls_pin,
+                linux_profile=payload.linux_profile,
             )
-            filename = f"TramAgent-Linux-{safe_label}.run"
+            filename = f"TramAgent-Linux-{payload.linux_profile}-{safe_label}.run"
             media_type = "application/octet-stream"
         else:
             artifact = agent_release_artifact("windows")
@@ -3968,7 +3981,7 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
         expires_at=expires_at,
     )
     db.add(record)
-    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url, "web_tls_trust": settings.web_tls_trust})
+    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "linux_profile": payload.linux_profile, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url, "web_tls_trust": settings.web_tls_trust})
     db.commit()
     return Response(
         content=content,

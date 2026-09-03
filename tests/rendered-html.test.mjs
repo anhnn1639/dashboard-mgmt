@@ -426,12 +426,13 @@ test("viewer navigation is permission-aware and stale admin hashes are replaced"
   assert.match(source, /Đang tải quyền tài khoản/);
 });
 
-test("Linux package is self-contained for Python and prepares native storage dependencies", async () => {
+test("Linux package carries the native offline pack for the selected OS version", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
-  assert.match(source, /không cần cài Python\/pip/);
-  assert.match(source, /bộ công cụ storage native đã ký/);
-  assert.match(source, /Ubuntu 22\.04\/24\.04 · Oracle Linux 7\/8 · RHEL 7\/8 · x86_64/);
-  assert.doesNotMatch(source, /không cần Python, pip, apt, dnf, yum hoặc Internet/);
+  assert.match(source, /không cần Internet hay repository khi cài/);
+  assert.match(source, /LINUX_OFFLINE_PROFILE_LABELS/);
+  assert.match(source, /linux_profile: osFamily === "linux" \? linuxProfile : null/);
+  assert.match(source, /Phải chọn đúng OS\/version của máy đích/);
+  assert.match(source, /cài không cần repository/);
 });
 
 test("Agent packages expose fleet self-update and uninstall password protection", async () => {

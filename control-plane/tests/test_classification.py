@@ -46,6 +46,45 @@ def write_artifact_provenance(path: Path, version: str, artifact_kind: str, *, a
     return provenance_path
 
 
+TEST_LINUX_OFFLINE_PROFILES = ("ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8", "rhel-7", "rhel-8")
+
+
+def write_offline_dependency_archive(root: Path, profile: str, version: str, source_commit: str = "1" * 40) -> Path:
+    output_dir = root / "linux/offline"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    package_type = "deb" if profile.startswith("ubuntu-") else "rpm"
+    package_name = f"test-storage-tools.{package_type}"
+    package_content = f"offline dependency fixture for {profile}".encode()
+    manifest = {
+        "schema": 1,
+        "profile": profile,
+        "architecture": "x86_64",
+        "packageType": package_type,
+        "packages": [{"name": package_name, "sha256": hashlib.sha256(package_content).hexdigest(), "sizeBytes": len(package_content)}],
+    }
+    archive_path = output_dir / f"{profile}-x86_64.tar.gz"
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        package_info = tarfile.TarInfo(f"packages/{package_name}")
+        package_info.size = len(package_content)
+        archive.addfile(package_info, io.BytesIO(package_content))
+        manifest_content = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        manifest_info = tarfile.TarInfo("manifest.json")
+        manifest_info.size = len(manifest_content)
+        archive.addfile(manifest_info, io.BytesIO(manifest_content))
+    content = archive_path.read_bytes()
+    provenance = {
+        "schema": 1,
+        "version": version,
+        "artifactKind": "linux_offline_dependencies",
+        "profile": profile,
+        "architecture": "x86_64",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "sizeBytes": len(content),
+        "sourceCommit": source_commit,
+    }
+    archive_path.with_name(archive_path.name + ".provenance.json").write_text(json.dumps(provenance, sort_keys=True), encoding="utf-8")
+    return archive_path
+
 tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = f"sqlite:///{Path(tmp.name) / 'test.db'}"
 os.environ["JWT_SECRET"] = "test-secret-that-is-not-used-in-production"
@@ -78,6 +117,12 @@ write_artifact_provenance(
     (test_agent_assets / "VERSION").read_text(encoding="ascii").strip(),
     "linux_elf",
 )
+for offline_profile in TEST_LINUX_OFFLINE_PROFILES:
+    write_offline_dependency_archive(
+        test_agent_assets,
+        offline_profile,
+        (test_agent_assets / "VERSION").read_text(encoding="ascii").strip(),
+    )
 os.environ["AGENT_ASSETS_ROOT"] = str(test_agent_assets)
 
 from app.main import AUTO_REFRESH_ACTIONS, INITIAL_SERVER_SCAN_ACTIONS, AgentBootstrapPackage, AgentUninstallPolicyState, AuditEvent, AuthThrottle, BulkTask, BulkTaskItem, FileTransfer, FileTransferChunk, Inventory, Job, MFACredential, PlatformRole, RecordingDeletionRequest, RemoteSession, RevokedSessionToken, Server, ServerUserShare, SessionLocal, SystemSetting, User, classify_os, current_user, guacamole_launch_url, guacamole_rdp_certificate_fingerprint, guacamole_ssh_host_key, issue_jwt, password_hasher, prune_audit_events, prune_recording_files, recording_file, recording_probe, retire_legacy_pending_jobs, settings, stream_file_transfer_chunks, synchronize_ldap_users_from_connection, validate_firewall_job_parameters, validate_job_parameters, validate_log_sources  # noqa: E402
@@ -220,6 +265,7 @@ class ClassificationTests(unittest.TestCase):
                 package_secret="test-only-package-secret",
                 ca_certificate="",
                 ca_fingerprint="system",
+                linux_profile="ubuntu-24.04",
             )
             marker = b"__TRAM_AGENT_ARCHIVE__\n"
             self.assertIn(marker, bundle)
@@ -2002,7 +2048,7 @@ class ClassificationTests(unittest.TestCase):
                 package = client.post(
                     "/api/v1/agent-packages",
                     headers=headers,
-                    json={"label": "missing-ca", "os_family": "linux", "expires_minutes": 15},
+                    json={"label": "missing-ca", "os_family": "linux", "linux_profile": "ubuntu-24.04", "expires_minutes": 15},
                 )
                 self.assertEqual(package.status_code, 503, package.text)
                 self.assertIn("Chứng thư bảo mật của kênh Agent", package.json()["detail"])
@@ -2148,15 +2194,23 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(status.json()["agentVersion"], (Path(settings.agent_assets_root) / "VERSION").read_text(encoding="ascii").strip())
             self.assertEqual(app.version, status.json()["agentVersion"])
             self.assertTrue(status.json()["windowsMsiAvailable"])
+            self.assertTrue(all(status.json()["linuxOfflineProfiles"].values()))
             self.assertTrue(status.json()["agentTlsCaAvailable"])
 
+            missing_profile = client.post(
+                "/api/v1/agent-packages",
+                headers=headers,
+                json={"label": "missing-profile", "os_family": "linux", "expires_minutes": 15},
+            )
+            self.assertEqual(missing_profile.status_code, 422, missing_profile.text)
+            self.assertIn("phiên bản Linux", missing_profile.json()["detail"])
             linux_package = client.post(
                 "/api/v1/agent-packages",
                 headers=headers,
-                json={"label": "ubuntu-prod-01", "os_family": "linux", "expires_minutes": 15},
+                json={"label": "ubuntu-prod-01", "os_family": "linux", "linux_profile": "ubuntu-24.04", "expires_minutes": 15},
             )
             self.assertEqual(linux_package.status_code, 200, linux_package.text)
-            self.assertIn("TramAgent-Linux-ubuntu-prod-01.run", linux_package.headers["content-disposition"])
+            self.assertIn("TramAgent-Linux-ubuntu-24.04-ubuntu-prod-01.run", linux_package.headers["content-disposition"])
             marker = b"__TRAM_AGENT_ARCHIVE__\n"
             archive_bytes = linux_package.content.split(marker, 1)[1]
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
@@ -2165,6 +2219,13 @@ class ClassificationTests(unittest.TestCase):
                 self.assertTrue(all(member.mtime >= 1_704_067_200 for member in archive.getmembers()))
                 self.assertNotIn("requirements.txt", archive.getnames())
                 self.assertNotIn("tram_agent.py", archive.getnames())
+                self.assertEqual(archive.extractfile("linux-profile").read().decode().strip(), "ubuntu-24.04")
+                offline_content = archive.extractfile("offline-dependencies.tar.gz").read()
+                checksum = archive.extractfile("offline-dependencies.sha256").read().decode().split()[0]
+                self.assertEqual(hashlib.sha256(offline_content).hexdigest(), checksum)
+                with tarfile.open(fileobj=io.BytesIO(offline_content), mode="r:gz") as offline_archive:
+                    self.assertIn("manifest.json", offline_archive.getnames())
+                    self.assertTrue(any(name.endswith(".deb") for name in offline_archive.getnames()))
                 bootstrap = json.loads(archive.extractfile("bootstrap.json").read())
                 self.assertEqual(bootstrap["server_url"], "https://ops.company.example")
                 self.assertIn("BEGIN CERTIFICATE", bootstrap["server_ca_certificate"])
@@ -2230,7 +2291,7 @@ class ClassificationTests(unittest.TestCase):
                 nginx_status = client.get("/api/v1/agent-packages/status", headers=headers)
                 self.assertEqual(nginx_status.status_code, 200, nginx_status.text)
                 self.assertEqual(nginx_status.json()["webTlsTrust"], "system")
-                nginx_linux = client.post("/api/v1/agent-packages", headers=headers, json={"label": "nginx-linux", "os_family": "linux", "expires_minutes": 15})
+                nginx_linux = client.post("/api/v1/agent-packages", headers=headers, json={"label": "nginx-linux", "os_family": "linux", "linux_profile": "ubuntu-24.04", "expires_minutes": 15})
                 self.assertEqual(nginx_linux.status_code, 200, nginx_linux.text)
                 nginx_archive = nginx_linux.content.split(marker, 1)[1]
                 with tarfile.open(fileobj=io.BytesIO(nginx_archive), mode="r:gz") as archive:

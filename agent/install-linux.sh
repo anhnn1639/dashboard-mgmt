@@ -19,8 +19,12 @@ fi
 os_id=$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')
 os_version=${VERSION_ID:-}
 case "$os_id:$os_version" in
-  ubuntu:22.04|ubuntu:24.04) ;;
-  ol:7*|ol:8*|rhel:7*|rhel:8*) ;;
+  ubuntu:22.04) linux_profile="ubuntu-22.04" ;;
+  ubuntu:24.04) linux_profile="ubuntu-24.04" ;;
+  ol:7*) linux_profile="ol-7" ;;
+  ol:8*) linux_profile="ol-8" ;;
+  rhel:7*) linux_profile="rhel-7" ;;
+  rhel:8*) linux_profile="rhel-8" ;;
   *)
     echo "Unsupported Linux release: ${PRETTY_NAME:-$os_id $os_version}" >&2
     echo "Supported: Ubuntu 22.04/24.04, Oracle Linux 7/8, Red Hat Enterprise Linux 7/8 (x86_64)." >&2
@@ -65,10 +69,11 @@ elif [ "$identity_file_count" -ne 0 ]; then
   exit 1
 fi
 
-# Storage operations intentionally use the distribution's signed native tools
-# instead of vendoring one set of dynamically linked binaries across four
-# incompatible releases.  Resolve the complete toolchain before changing the
-# Agent service so a fresh install is immediately ready for Disk/LVM work.
+# Native Disk/LVM tools are carried inside this one-time installer. The pack is
+# built from the signed repositories for exactly one supported release, hashed
+# by the build workflow and verified again before any package manager runs.
+# Repository configuration is disabled for the local install, so an air-gapped
+# endpoint never falls back to the Internet or an internal mirror.
 storage_commands="lsblk blkid mount umount findmnt blockdev partx wipefs udevadm parted partprobe sgdisk pvs vgs lvs pvcreate pvresize vgcreate vgextend lvcreate lvextend lvremove mkfs.ext4 resize2fs mkfs.xfs xfs_growfs"
 missing_storage=""
 for storage_command in $storage_commands; do
@@ -77,27 +82,61 @@ for storage_command in $storage_commands; do
   fi
 done
 if [ -n "$missing_storage" ]; then
-  echo "Installing signed OS storage dependencies (missing:$missing_storage)"
+  for required_command in sha256sum tar; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      echo "Missing required offline installer command: $required_command" >&2
+      exit 1
+    fi
+  done
+  if [ ! -s "$script_dir/linux-profile" ] || [ "$(tr -d '\r\n' < "$script_dir/linux-profile")" != "$linux_profile" ]; then
+    echo "This offline package does not match ${PRETTY_NAME:-$os_id $os_version}. Download the $linux_profile package from the dashboard." >&2
+    exit 1
+  fi
+  if [ ! -s "$script_dir/offline-dependencies.tar.gz" ] || [ ! -s "$script_dir/offline-dependencies.sha256" ]; then
+    echo "The $linux_profile offline dependency pack is missing." >&2
+    exit 1
+  fi
+  echo "Installing bundled offline OS storage dependencies (missing:$missing_storage)"
+  (cd "$script_dir" && sha256sum -c offline-dependencies.sha256)
+  package_root="$script_dir/offline-dependencies"
+  mkdir -m 0700 "$package_root"
+  tar -xzf "$script_dir/offline-dependencies.tar.gz" --no-same-owner -C "$package_root"
   case "$os_id" in
     ubuntu)
       if ! command -v apt-get >/dev/null 2>&1; then
-        echo "apt-get is required to install the Ubuntu storage toolchain" >&2
+        echo "apt-get is required to install the bundled Ubuntu packages" >&2
         exit 1
       fi
-      DEBIAN_FRONTEND=noninteractive apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends util-linux parted gdisk lvm2 e2fsprogs xfsprogs udev
+      set --
+      for package_file in "$package_root"/packages/*.deb; do
+        [ -f "$package_file" ] || { echo "The Ubuntu offline dependency pack is empty" >&2; exit 1; }
+        package_name=$(dpkg-deb -f "$package_file" Package)
+        package_version=$(dpkg-deb -f "$package_file" Version)
+        installed_version=$(dpkg-query -W -f='${Version}' "$package_name" 2>/dev/null || true)
+        if [ -z "$installed_version" ] || dpkg --compare-versions "$installed_version" lt "$package_version"; then
+          set -- "$@" "$package_file"
+        fi
+      done
+      if [ "$#" -gt 0 ]; then
+        mkdir -m 0700 "$package_root/empty-sources"
+        DEBIAN_FRONTEND=noninteractive apt-get -y --no-download --no-install-recommends \
+          -o Dir::Etc::sourcelist=/dev/null \
+          -o Dir::Etc::sourceparts="$package_root/empty-sources" \
+          -o Acquire::Languages=none install "$@"
+      fi
       ;;
     ol|rhel)
-      udev_package=systemd
-      case "$os_version" in
-        8*) udev_package=systemd-udev ;;
-      esac
+      set -- "$package_root"/packages/*.rpm
+      [ -f "$1" ] || { echo "The RPM offline dependency pack is empty" >&2; exit 1; }
+      if command -v rpmkeys >/dev/null 2>&1; then
+        rpmkeys --checksig "$@"
+      fi
       if command -v dnf >/dev/null 2>&1; then
-        dnf -y install util-linux parted gdisk lvm2 e2fsprogs xfsprogs "$udev_package"
+        dnf -y --disablerepo='*' install "$@"
       elif command -v yum >/dev/null 2>&1; then
-        yum -y install util-linux parted gdisk lvm2 e2fsprogs xfsprogs "$udev_package"
+        yum -y --disablerepo='*' localinstall "$@"
       else
-        echo "dnf/yum is required to install the Oracle/RHEL storage toolchain" >&2
+        echo "dnf/yum is required to install the bundled Oracle/RHEL packages" >&2
         exit 1
       fi
       ;;
@@ -105,11 +144,10 @@ if [ -n "$missing_storage" ]; then
 fi
 for storage_command in $storage_commands; do
   if ! command -v "$storage_command" >/dev/null 2>&1; then
-    echo "Storage dependency is still unavailable after package verification: $storage_command" >&2
+    echo "Storage dependency is still unavailable after offline package installation: $storage_command" >&2
     exit 1
   fi
 done
-
 install -d -m 0750 /opt/tram-agent /etc/tram-agent /var/log/tram-agent
 install -d -m 0700 /var/lib/tram-agent/inbox
 systemctl stop tram-agent.service >/dev/null 2>&1 || true

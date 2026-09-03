@@ -6,6 +6,7 @@ import io
 import json
 import re
 import tarfile
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +18,16 @@ PACKAGE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 WINDOWS_MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 LINUX_AGENT_PATH = Path("linux/x86_64/tram-agent")
 LINUX_ELF_MAGIC = b"\x7fELF"
+LINUX_OFFLINE_PROFILES = (
+    "ubuntu-22.04",
+    "ubuntu-24.04",
+    "ol-7",
+    "ol-8",
+    "rhel-7",
+    "rhel-8",
+)
+LINUX_OFFLINE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+LINUX_OFFLINE_EXPANDED_MAX_BYTES = 512 * 1024 * 1024
 # Keep bundles reproducible without using the Unix epoch. GNU tar versions on
 # Oracle Linux 7 warn that epoch-dated members are "implausibly old".
 REPRODUCIBLE_ARCHIVE_MTIME = 1_704_067_200
@@ -73,6 +84,135 @@ def validate_linux_agent(path: Path) -> bytes:
     return content
 
 
+def linux_offline_archive_path(assets_root: Path, profile: str) -> Path:
+    if profile not in LINUX_OFFLINE_PROFILES:
+        raise ValueError("Unsupported Linux offline dependency profile")
+    return assets_root / "linux" / "offline" / f"{profile}-x86_64.tar.gz"
+
+
+def _validate_linux_offline_archive(content: bytes, profile: str) -> None:
+    if not content or len(content) > LINUX_OFFLINE_ARCHIVE_MAX_BYTES:
+        raise ValueError
+    expected_suffix = ".deb" if profile.startswith("ubuntu-") else ".rpm"
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if not 2 <= len(members) <= 512 or len(names) != len(set(names)) or "manifest.json" not in names:
+            raise ValueError
+        expanded_size = 0
+        for member in members:
+            path = Path(member.name)
+            if member.isdir():
+                if member.name != "packages":
+                    raise ValueError
+                continue
+            if not member.isfile() or path.is_absolute() or ".." in path.parts:
+                raise ValueError
+            if member.name != "manifest.json" and (path.parent.as_posix() != "packages" or path.suffix != expected_suffix):
+                raise ValueError
+            expanded_size += member.size
+            if expanded_size > LINUX_OFFLINE_EXPANDED_MAX_BYTES:
+                raise ValueError
+        manifest_member = archive.extractfile("manifest.json")
+        manifest = json.loads(manifest_member.read()) if manifest_member else None
+        package_entries = manifest.get("packages") if isinstance(manifest, dict) else None
+        if (
+            not isinstance(manifest, dict)
+            or set(manifest) != {"schema", "profile", "architecture", "packageType", "packages"}
+            or manifest.get("schema") != 1
+            or manifest.get("profile") != profile
+            or manifest.get("architecture") != "x86_64"
+            or manifest.get("packageType") != expected_suffix[1:]
+            or not isinstance(package_entries, list)
+            or not package_entries
+        ):
+            raise ValueError
+        expected_names = {name for name in names if name.startswith("packages/") and name.endswith(expected_suffix)}
+        seen: set[str] = set()
+        for entry in package_entries:
+            if not isinstance(entry, dict) or set(entry) != {"name", "sha256", "sizeBytes"}:
+                raise ValueError
+            name = str(entry.get("name", ""))
+            member_name = f"packages/{name}"
+            if member_name not in expected_names or name in seen or Path(name).name != name:
+                raise ValueError
+            member = archive.extractfile(member_name)
+            package_content = member.read() if member else b""
+            if len(package_content) != entry.get("sizeBytes") or hashlib.sha256(package_content).hexdigest() != entry.get("sha256"):
+                raise ValueError
+            seen.add(name)
+        if {f"packages/{name}" for name in seen} != expected_names:
+            raise ValueError
+
+@lru_cache(maxsize=len(LINUX_OFFLINE_PROFILES))
+def _cached_linux_offline_archive(
+    path_text: str,
+    profile: str,
+    mtime_ns: int,
+    size_bytes: int,
+    provenance_mtime_ns: int,
+    provenance_size_bytes: int,
+    release_version: str,
+) -> tuple[int, str]:
+    path = Path(path_text)
+    content = path.read_bytes()
+    if len(content) != size_bytes:
+        raise ValueError
+    try:
+        _validate_linux_offline_archive(content, profile)
+        provenance = json.loads(path.with_name(path.name + ".provenance.json").read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise FileNotFoundError(f"Linux offline dependency archive is not available for {profile}") from exc
+    except (tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise ValueError(f"Linux offline dependency archive is invalid for {profile}") from exc
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) != {"schema", "version", "artifactKind", "profile", "architecture", "sha256", "sizeBytes", "sourceCommit"}
+        or provenance.get("schema") != 1
+        or provenance.get("version") != release_version
+        or provenance.get("artifactKind") != "linux_offline_dependencies"
+        or provenance.get("profile") != profile
+        or provenance.get("architecture") != "x86_64"
+        or provenance.get("sha256") != hashlib.sha256(content).hexdigest()
+        or provenance.get("sizeBytes") != len(content)
+        or not re.fullmatch(r"[0-9a-f]{40}", str(provenance.get("sourceCommit", "")))
+    ):
+        raise ValueError(f"Linux offline dependency provenance does not match release {release_version} for {profile}")
+    return len(content), hashlib.sha256(content).hexdigest()
+
+
+def validate_linux_offline_archive(
+    assets_root: Path,
+    profile: str,
+    release_version: str,
+    *,
+    load_content: bool = True,
+) -> bytes:
+    path = linux_offline_archive_path(assets_root, profile)
+    provenance_path = path.with_name(path.name + ".provenance.json")
+    try:
+        stat = path.stat()
+        provenance_stat = provenance_path.stat()
+    except OSError as exc:
+        raise FileNotFoundError(f"Linux offline dependency archive is not available for {profile}") from exc
+    expected_size, expected_sha256 = _cached_linux_offline_archive(
+        str(path.resolve()),
+        profile,
+        stat.st_mtime_ns,
+        stat.st_size,
+        provenance_stat.st_mtime_ns,
+        provenance_stat.st_size,
+        release_version,
+    )
+    if not load_content:
+        return b""
+    content = path.read_bytes()
+    if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_sha256:
+        _cached_linux_offline_archive.cache_clear()
+        raise ValueError(f"Linux offline dependency archive changed while being read for {profile}")
+    return content
+
+
 def _tar_entry(archive: tarfile.TarFile, name: str, content: bytes, mode: int) -> None:
     info = tarfile.TarInfo(name)
     info.size = len(content)
@@ -94,6 +234,7 @@ def linux_run_bundle(
     package_secret: str,
     ca_certificate: str,
     ca_fingerprint: str,
+    linux_profile: str,
 ) -> bytes:
     dashboard_netloc(dashboard_url)
     required = {
@@ -103,6 +244,8 @@ def linux_run_bundle(
         "install-linux.sh": 0o750,
     }
     root = assets_root.resolve()
+    release_version = (root / "VERSION").read_text(encoding="ascii").strip()
+    offline_content = validate_linux_offline_archive(root, linux_profile, release_version)
     if agent_content is None:
         agent_content = validate_linux_agent(root / LINUX_AGENT_PATH)
     elif (
@@ -129,6 +272,15 @@ def linux_run_bundle(
             if not source.is_file():
                 raise FileNotFoundError(f"Agent asset is missing: {name}")
             _tar_entry(archive, name, source.read_bytes(), mode)
+        offline_digest = hashlib.sha256(offline_content).hexdigest()
+        _tar_entry(archive, "linux-profile", f"{linux_profile}\n".encode("ascii"), 0o640)
+        _tar_entry(archive, "offline-dependencies.tar.gz", offline_content, 0o640)
+        _tar_entry(
+            archive,
+            "offline-dependencies.sha256",
+            f"{offline_digest}  offline-dependencies.tar.gz\n".encode("ascii"),
+            0o640,
+        )
         bootstrap = json.dumps(
             {
                 "version": 1,

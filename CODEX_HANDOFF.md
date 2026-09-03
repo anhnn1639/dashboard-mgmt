@@ -483,6 +483,14 @@ Production PostgreSQL bên ngoài dùng `compose.external.yaml` thay `compose.te
 - `.openai/hosting.json` đã gắn với private Sites project `appgprj_6a852d7a7310819194555fde1d13573f` để không tạo trùng project ở lần sau.
 - Project chưa được publish. Production vẫn là Docker/Nginx tại domain vận hành; việc đẩy toàn bộ source sang repository riêng của Sites cần quản trị viên xác nhận riêng trước khi thực hiện.
 
+### Bộ cài Linux air-gapped theo OS 0.8.17 (03/09/2026)
+
+- Đã xác nhận gói `.run` 0.8.17 trước thay đổi vẫn gọi `apt-get update/install` hoặc `yum/dnf install` khi máy thiếu `parted`, `gdisk`, LVM, ext4/XFS hay `udev`; vì vậy executable Agent tự chứa nhưng luồng cài chưa dùng được trên endpoint không tới repository.
+- Luồng mới yêu cầu chọn đúng Ubuntu 22.04, Ubuntu 24.04, Oracle Linux 7/8 hoặc Red Hat 7/8 khi tải. Mỗi `.run` mang một pack native riêng cho đúng release/architecture, manifest hash từng package, provenance ràng buộc version/profile/hash/kích thước/source commit và marker profile. API fail-closed nếu pack thiếu/sai; installer kiểm tra OS/profile/SHA-256 trước khi thay service.
+- Ubuntu chỉ cài các `.deb` còn thiếu hoặc mới hơn bằng `apt-get --no-download` với source list rỗng. Oracle/RHEL kiểm tra chữ ký RPM và chạy `dnf/yum --disablerepo='*'`. Installer không gọi `apt-get update` và không có fallback Internet/repository. OpenSSH/ClamAV tiếp tục là capability riêng của hệ điều hành, không được âm thầm tải kèm.
+- Dashboard hiển thị trạng thái từng pack, khóa lựa chọn chưa sẵn sàng, đưa profile vào request và tên file; workflow Linux tạo pack từ repository ký chính thức rồi thử cài trên container đúng release với `--network none` và toàn bộ repo tắt.
+- Kiểm thử nguồn hiện tại: Agent security `109/109`, control-plane `52/52`, render `25/25`, ESLint, Vinext production build, Python compile, YAML parse và Bash syntax đều pass. Các pack thật và smoke test container air-gapped sẽ được tạo/xác minh bởi GitHub Actions sau source commit này; chưa được coi là deploy-ready cho tới khi artifact đã bundle vào `agent/linux/offline/`.
+
 ## Ưu tiên sau smoke test
 
 ### Sửa claim Windows MSI 0.8.13 (28/08/2026)
