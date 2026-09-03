@@ -44,7 +44,7 @@ else
       docker run --rm -v "$work_dir/packages:/out" "$image" bash -lc "
         set -euo pipefail
         yum -y install yum-utils
-        repotrack -a x86_64 -p /out $native_packages
+        yumdownloader --resolve --destdir=/out $native_packages
         rpmkeys --checksig /out/*.rpm
       "
       ;;
@@ -52,7 +52,7 @@ else
       docker run --rm -v "$work_dir/packages:/out" "$image" bash -lc "
         set -euo pipefail
         dnf -y install dnf-plugins-core
-        dnf download --resolve --alldeps --arch=x86_64,noarch --destdir /out $native_packages
+        dnf download --resolve --arch=x86_64,noarch --destdir /out $native_packages
         rpmkeys --checksig /out/*.rpm
       "
       ;;
