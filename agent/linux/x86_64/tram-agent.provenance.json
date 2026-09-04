@@ -1,1 +1,1 @@
-{"artifactKind":"linux_elf","authenticodeSigned":false,"schema":1,"sha256":"cec259e9c55837a6659c3379b98c46ef3db48ece8441879eca805b22499309cd","sizeBytes":16733016,"sourceCommit":"20622fd6a11b0766f8161d94bec6eed2562647a0","version":"0.8.17"}
+{"artifactKind":"linux_elf","authenticodeSigned":false,"schema":1,"sha256":"dad5a83df054bdeccaa22a0260974a1eda06b0974050c92d95d549bb2a734b3f","sizeBytes":16734464,"sourceCommit":"c5372b1c16070a1d61bcbe777573e84e34312d2e","version":"0.8.18"}

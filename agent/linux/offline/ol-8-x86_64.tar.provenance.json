@@ -1,1 +1,1 @@
-{"architecture":"x86_64","artifactKind":"linux_offline_dependencies","profile":"ol-8","schema":1,"sha256":"f104c78429a3c0be708ec7d873043b507212a4d67afce49823d1b5d058f2823a","sizeBytes":11878400,"sourceCommit":"7f0634a2f4cfe80652517ed2cffdd688f70a7e7b","version":"0.8.17"}
+{"architecture":"x86_64","artifactKind":"linux_offline_dependencies","profile":"ol-8","schema":1,"sha256":"f104c78429a3c0be708ec7d873043b507212a4d67afce49823d1b5d058f2823a","sizeBytes":11878400,"sourceCommit":"c5372b1c16070a1d61bcbe777573e84e34312d2e","version":"0.8.18"}
