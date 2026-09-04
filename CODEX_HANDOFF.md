@@ -1,9 +1,10 @@
-# Bàn giao Codex — 03/09/2026
+# Bàn giao Codex — 04/09/2026
 
 ## Repository và trạng thái
 
 - Repository: `https://github.com/anhnn1639/dashboard-mgmt.git`
 - Nhánh triển khai: `main`; người dùng cho phép commit/push trực tiếp thay đổi hoàn chỉnh.
+- Agent `0.8.18` sửa lỗi Extend Linux sau khi hypervisor tăng virtual disk nhưng GPT backup header vẫn ở cuối kích thước cũ. Source commit `c5372b1c16070a1d61bcbe777573e84e34312d2e`; Linux ELF, Windows MSI và bốn provenance pack offline đã bundle tại `412e6be`. GitHub Actions source: Security audit `33824896295`, Windows MSI `33824896319`, Linux native/offline `33824896377`, đều pass; artifact tải về đã khớp version/source SHA/hash/size và bốn `.run` website sinh đã được mở kiểm tra đúng binary/profile/offline checksum.
 - Thay đổi Nginx/port 3000 và Agent 0.4.1: `73bbc4b Run dashboard behind Nginx on port 3000`; MSI đã bundle vào main tại `3df6d06`.
 - Đồng bộ `.env`/Nginx và version contract: `a38d722 Synchronize runtime config and release version`; MSI đồng bộ đã bundle tại `b7fada2`.
 - Source Agent/API/dashboard `0.8.17` cho rescan/extend/create storage Linux ở commit `20622fd6a11b0766f8161d94bec6eed2562647a0`; hai artifact/provenance đã được bundle vào `main` ở commit `445b25e10df6cb2754ccc839d17a7ed85a05ec00`. GitHub Actions Linux `33696211550`, Windows MSI `33696211522`, source Security audit `33696211523` và post-bundle Security audit `33696566980` đều pass; hai artifact đã được tải và đối chiếu đúng source SHA/version/hash/size trước khi bundle.
@@ -86,6 +87,15 @@
 - `agent/VERSION` là nguồn version chung cho runtime Agent, Linux bundle, API status và WiX MSI; workflow truyền giá trị này vào PyInstaller/WiX và test chống lệch version.
 - Luôn đọc `AGENTS.md`, xem status/diff trước khi sửa; không reset/xóa local change chưa xác định.
 
+## Sửa Extend GPT Linux 0.8.18 — 04/09/2026
+
+- Lỗi thực tế `Not all of the space available to /dev/sda appears to be used ... Unable to satisfy all constraints on the partition` xảy ra khi virtual disk đã được tăng nhưng GPT backup header còn ở cuối kích thước cũ. `parted --machine --script ... print free` có thể trả exit code 0 nhưng ghi cảnh báo này vào stderr; code cũ chỉ giữ stdout nên bỏ qua dấu hiệu cần sửa GPT và đi thẳng vào `resizepart`.
+- `run()` nay có chế độ giữ stderr của lệnh thành công; riêng scan `parted` bật chế độ này, nhận diện cảnh báo stale GPT và gắn `needsGptRepair` cho đúng disk. Trước resize, Agent backup GPT vào `/var/lib/tram-agent/partition-backups`, chạy `sgdisk --move-second-header`, đọc lại bảng partition và chỉ tiếp tục khi start/end hiện tại không đổi.
+- Có fail-safe cho trường hợp cảnh báo chỉ xuất hiện ở lần `resizepart`: Agent xác minh partition geometry chưa đổi và table vẫn là GPT, backup + dời backup header rồi retry đúng một lần. Không retry mù, không đổi partition start và không chạy repair trên MBR.
+- Source release: `c5372b1c16070a1d61bcbe777573e84e34312d2e`; artifact bundle: `412e6be`. Linux ELF SHA-256 `dad5a83df054bdeccaa22a0260974a1eda06b0974050c92d95d549bb2a734b3f` (16.734.464 byte); Windows MSI SHA-256 `e7c089c88e4c835a99cfa75dc7f1da31654fc2ae64010de0b86fefd7b9920aeb` (14.544.896 byte). Bốn pack offline giữ nguyên dependency bytes đã xác minh, provenance được nâng lên 0.8.18/source commit mới.
+- Kiểm thử release: Agent `111/111`, control-plane `52/52`, rendered UI `25/25`, production dashboard build, Python compile và `git diff --check` đều pass. GitHub Actions source Security audit `33824896295`, Windows MSI `33824896319`, Linux native/offline `33824896377` đều pass; bốn profile offline được cài trong container đúng OS với network bị khóa.
+- Sau deploy phải cập nhật Agent Linux trên máy đích lên `0.8.18`, bấm **Quét lại** storage rồi mới thử Extend lại. Trước thao tác production vẫn cần snapshot/backup; không cần và không nên chạy `parted -f` thủ công vì Agent tự backup, sửa GPT có guard và audit qua job.
+
 ## Storage Linux 0.8.17 — thay đổi và bước triển khai
 
 - Nút **Quét lại** gọi rescan SCSI host, NVMe controller và toàn bộ block device vật lý được hỗ trợ trước khi đọc inventory. Helper systemd oneshot riêng chỉ ghi vào các sysfs target cố định; Agent chính vẫn giữ `ProtectKernelTunables=true`. Thư mục kết quả do caller tạo mode `0700`, không dùng `RuntimeDirectory` bị systemd xóa khi oneshot kết thúc; timeout helper 240 giây.
@@ -107,7 +117,7 @@
 - Khi đổi domain mà đã có agent, UI/API bắt buộc xác nhận vì agent cũ vẫn giữ endpoint và CA cũ.
 - Mỗi bộ cài có claim ngẫu nhiên 256-bit, hết hạn 5–60 phút, dùng một lần và khóa theo `windows|linux`. Replay, claim hết hạn hoặc nhầm OS đều fail-closed/audit.
 - Private key P-256 và CSR được sinh tại endpoint. Bộ cài chỉ mang locator, SHA-256 pin của CA và claim ngắn hạn; không chứa client private key/certificate dài hạn.
-- Linux `.run` tự giải nén executable self-contained và unit systemd, chuẩn bị native storage dependency từ repository OS nếu thiếu, enroll, xóa bootstrap secret rồi start service; không cài Python/pip hoặc tự tải ClamAV từ Internet. Thiếu ClamAV chỉ cảnh báo và file delivery giữ fail-closed.
+- Linux `.run` tự giải nén executable self-contained, unit systemd và đúng pack native dependency offline theo OS; installer không cần Internet trên Ubuntu 22.04/24.04 hoặc Oracle Linux 7/8 được hỗ trợ, rồi enroll, xóa bootstrap secret và start service. Không cài Python/pip hoặc tự tải ClamAV từ Internet; thiếu ClamAV chỉ cảnh báo và file delivery giữ fail-closed.
 - Windows dùng MSI generic; API không sửa bytes MSI mà chỉ phát nó dưới tên chứa locator/claim/CA pin, nên có thể giữ chữ ký Authenticode. Không được đổi tên file trước khi cài.
 - MSI cài executable PyInstaller độc lập; Windows Server không cần Python. Service `TramVanHanhAgent` chạy `LocalSystem`, `Automatic`, phụ thuộc TCP/IP, start lúc cài và restart sau 30 giây nếu lỗi.
 - `agent/install-windows.ps1` thủ công cũng đã chuyển từ Scheduled Task sang Windows Service.
@@ -119,9 +129,9 @@
 - File: `agent/windows/TramVanHanhAgent.msi`
 - Sidecar: `agent/windows/TramVanHanhAgent.msi.provenance.json`.
 - Kích thước: `14,544,896` bytes.
-- Phiên bản MSI: `0.8.17`.
-- SHA-256: `F17439DEA9FAA37425FBF0AD719E8E62E073769E78134803BB13B4BBD8829CAA`.
-- Build PyInstaller + WiX và upload artifact thành công từ source commit `20622fd6a11b0766f8161d94bec6eed2562647a0` trên GitHub Actions run `33696211522`; runtime frozen, ProductVersion `0.8.17`, sidecar/source SHA, kích thước và SHA-256 ở trên đã được kiểm tra sau khi tải artifact bằng GitHub CLI.
+- Phiên bản MSI: `0.8.18`.
+- SHA-256: `E7C089C88E4C835A99CFA75DC7F1DA31654FC2AE64010DE0B86FEFD7B9920AEB`.
+- Build PyInstaller + WiX và upload artifact thành công từ source commit `c5372b1c16070a1d61bcbe777573e84e34312d2e` trên GitHub Actions run `33824896319`; runtime frozen, ProductVersion `0.8.18`, sidecar/source SHA, kích thước và SHA-256 ở trên đã được kiểm tra sau khi tải artifact.
 - Workflow: `.github/workflows/build-agent-msi.yml`.
 - Workflow hỗ trợ ký EXE và MSI nếu repository có secrets:
   - `WINDOWS_SIGNING_PFX_BASE64`
@@ -131,10 +141,10 @@
 
 ## Linux artifact
 
-- File: `agent/linux/x86_64/tram-agent`; sidecar `agent/linux/x86_64/tram-agent.provenance.json`; kích thước `16,733,016` bytes.
-- Phiên bản: `0.8.17`; SHA-256 `CEC259E9C55837A6659C3379B98C46EF3DB48ECE8441879ECA805B22499309CD`.
-- GitHub Actions run `33696211550` build bằng `python-build-standalone` CPython 3.11.15 release `20260623`, xác minh runtime SHA-256 rồi chạy `--help` và `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8. ELF64 little-endian x86_64, sidecar/source SHA, kích thước và hash được đối chiếu sau khi tải; artifact sinh từ source commit `20622fd6a11b0766f8161d94bec6eed2562647a0`.
-- `.run` do website sinh chứa binary này, installer, service, VERSION, bootstrap dùng một lần và CA pin; không chứa source/requirements/Python/pip. Từ 0.8.17 installer chỉ truy cập repository OS đã cấu hình nếu thiếu native storage toolchain.
+- File: `agent/linux/x86_64/tram-agent`; sidecar `agent/linux/x86_64/tram-agent.provenance.json`; kích thước `16,734,464` bytes.
+- Phiên bản: `0.8.18`; SHA-256 `DAD5A83DF054BDECCAA22A0260974A1EDA06B0974050C92D95D549BB2A734B3F`.
+- GitHub Actions run `33824896377` build bằng runtime đã pin checksum, xác minh runtime SHA-256 rồi cài/smoke-test đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và Red Hat UBI 7/8; bốn profile offline còn được cài với network bị khóa. ELF64 little-endian x86_64, sidecar/source SHA, kích thước và hash được đối chiếu sau khi tải; artifact sinh từ source commit `c5372b1c16070a1d61bcbe777573e84e34312d2e`.
+- `.run` do website sinh chứa binary này, installer, service, VERSION, bootstrap dùng một lần, CA pin và pack dependency offline đúng profile OS; không chứa source/requirements/Python/pip và không cần truy cập Internet để cài native storage toolchain trên bốn distro được hỗ trợ.
 
 ## Self-update Agent và bảo vệ gỡ cài đặt 0.8.16
 
@@ -143,10 +153,10 @@
 - Update là hàng rào độc quyền: chờ các job đang chạy xong, chặn dispatch job phía sau, báo `prepared` trước rồi mới chạy updater tách process/service. Linux giữ backup và rollback nếu service mới không lên. Windows dùng MSI; cả hai chỉ thành công khi runtime/check-in báo đúng version đích. Timeout 45 phút đánh dấu failed đúng một lần, không tự cài lại vô hạn; kết quả/check-in đúng version đến muộn vẫn được đối soát thành công.
 - Builtin Administrator đặt/luân phiên mật khẩu chống gỡ trong cùng trang. PostgreSQL chỉ lưu PBKDF2-SHA256 salt/verifier 600.000 vòng; đổi policy phải nhập mật khẩu hiện tại, có throttle namespace riêng với login, serialized bằng database lock, revision tăng đơn điệu và rollout retry tối đa ba lần với exponential backoff. Secret policy trong job được mã hóa; API/audit/browser không trả mật khẩu thô.
 - Windows MSI ẩn Remove/Modify và custom action từ chối uninstall thiếu permit HMAC dùng một lần, hết hạn ba phút; lệnh Agent hỏi mật khẩu qua TTY/stdin rồi mới gọi MSI. Linux bắt buộc root, Windows bắt buộc elevated Administrator. Agent cố gắng gửi denied/authorized/completed/failed bằng request ký số; completed thu hồi ngay fingerprint trong PostgreSQL rồi endpoint xóa identity/policy/permit/update staging. Nếu control plane mất kết nối sau khi OS đã gỡ binary, completed có thể không tới được và quản trị viên phải retire endpoint thủ công. Root/Local Administrator/SYSTEM vẫn có thể cưỡng ép xóa file nên production phải kết hợp EDR/WDAC/AppLocker/SELinux và quản lý đặc quyền.
-- Workflow Linux chạy `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL UBI 7/8 rồi upload binary cùng provenance. Workflow Windows kiểm runtime frozen, MSI ProductVersion, ký Authenticode khi có secrets và upload MSI cùng provenance. Artifact 0.8.17 chỉ được bundle sau khi đối chiếu sidecar `sourceCommit` đúng source SHA, hash/size, ELF x86_64, MSI ProductVersion và chữ ký nếu metadata báo signed.
+- Workflow Linux chạy `diagnose` đúng version trên Ubuntu 22.04/24.04, Oracle Linux 7/8 và RHEL UBI 7/8 rồi upload binary cùng provenance. Workflow Windows kiểm runtime frozen, MSI ProductVersion, ký Authenticode khi có secrets và upload MSI cùng provenance. Artifact 0.8.18 chỉ được bundle sau khi đối chiếu sidecar `sourceCommit` đúng source SHA, hash/size, ELF x86_64, MSI ProductVersion và chữ ký nếu metadata báo signed.
 - Trigger Windows chỉ theo source runtime/version/requirements/Product.wxs/workflow, không theo MSI/provenance đã bundle; commit artifact không còn tự tạo một build thừa rồi gây nhầm source SHA ở lần release sau.
 - Hardening còn lại: Agent CA hiện là online manifest signer và Authenticode chưa bắt buộc, nên môi trường high-assurance cần release key offline/độc lập, endpoint verify chữ ký release và enforce Authenticode; bổ sung per-Agent quota/rate limit cho artifact download để giảm DoS nếu một endpoint đã bị compromise.
-- Kiểm thử local trước source commit: Agent security `109/109`, control-plane `52/52`, render workspace `25/25`, TypeScript, ESLint, Vinext production build, `py_compile`, shell syntax và `git diff --check` đều pass. GitHub Security audit run `33696211523` của source và run `33696566980` sau khi bundle artifact đều pass dependency audit, Bandit high/high, Caddy adapt, Node production audit và toàn bộ Agent regression trên Linux.
+- Kiểm thử local trước source commit: Agent security `111/111`, control-plane `52/52`, render workspace `25/25`, TypeScript, ESLint, Vinext production build, `py_compile` và `git diff --check` đều pass. GitHub Security audit run `33824896295`, Windows MSI run `33824896319` và Linux native/offline run `33824896377` của source đều pass; workflow Linux còn cài bốn profile offline với network bị khóa.
 
 ## Reverse tunnel và truyền file vẫn giữ nguyên
 
