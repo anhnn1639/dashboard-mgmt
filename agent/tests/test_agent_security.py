@@ -1378,6 +1378,17 @@ trusted
         self.assertEqual(layout["partitionTable"], "gpt")
         self.assertEqual(layout["partitions"][1]["startBytes"], 1073741824)
 
+    def test_parted_layout_flags_successful_stale_gpt_warning_from_stderr(self):
+        stdout = "BYT;\n/dev/sda:128849018880B:scsi:512:4096:gpt:Disk;\n3:2147483648B:107374182399B:105226698752B:::lvm;\n:107374182400B:128847970303B:21473787904B:free;"
+        stderr = "Warning: Not all of the space available to /dev/sda appears to be used, you can fix the GPT to use all of the space (an extra 41943040 blocks) or continue with the current setting?"
+        completed = SimpleNamespace(returncode=0, stdout=stdout, stderr=stderr)
+        with patch.object(tram_agent, "find_system_command", return_value="/usr/sbin/parted"), patch.object(tram_agent.subprocess, "run", return_value=completed) as process:
+            layout = tram_agent.parted_disk_layout("/dev/sda")
+        self.assertTrue(layout["needsGptRepair"])
+        self.assertEqual(layout["partitionTable"], "gpt")
+        self.assertEqual(layout["partitions"][3]["endBytes"], 107374182399)
+        self.assertTrue(process.call_args.kwargs["capture_output"])
+
     def test_linux_storage_rescan_enumerates_only_fixed_physical_sysfs_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             sysfs = Path(directory)
@@ -1484,6 +1495,39 @@ trusted
             result = tram_agent.grow_linux_partition_node(scan, "/dev/sda1", growth)
         self.assertEqual(result["appliedBytes"], growth)
         interactive.assert_called_once_with(["/usr/sbin/parted", "---pretend-input-tty", "/dev/sda"], f"unit B\nresizepart 1\nYes\n{end + growth}B\nquit\n", timeout=600)
+
+    def test_linux_partition_extend_repairs_stale_gpt_after_failed_resize(self):
+        start, size, growth = 2 * 1024**3, 98 * 1024**3, 4 * 1024**3
+        end = start + size - 1
+        node = {"path": "/dev/sda3", "type": "part", "partitionNumber": 3, "filesystem": "LVM2_member", "offsetBytes": start, "endOffsetBytes": end, "extendableBytes": 20 * 1024**3, "logicalSectorBytes": 512}
+        scan = {"disks": [{"path": "/dev/sda", "type": "disk", "partitionTable": "gpt", "needsGptRepair": False, "children": [node]}]}
+        before = {"partitionTable": "gpt", "partitions": {3: {"startBytes": start, "endBytes": end}}}
+        after = {"partitionTable": "gpt", "partitions": {3: {"startBytes": start, "endBytes": end + growth}}}
+        warning = "Warning: Not all of the space available to /dev/sda appears to be used, you can fix the GPT to use all of the space (an extra 41943040 blocks) or continue with the current setting?\nError: Unable to satisfy all constraints on the partition."
+        commands = []
+        resize_attempts = 0
+
+        def fake_run(command, **_kwargs):
+            nonlocal resize_attempts
+            commands.append(command)
+            if command[0].endswith("parted") and "resizepart" in command:
+                resize_attempts += 1
+                return (1, warning) if resize_attempts == 1 else (0, "")
+            if command[0].endswith("sgdisk"):
+                return 0, ""
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(tram_agent, "LINUX_PARTITION_BACKUP_ROOT", Path(directory)), patch.object(tram_agent, "find_system_command", side_effect=lambda name: f"/usr/sbin/{name}"), patch.object(tram_agent, "linux_block_device_size", return_value=size), patch.object(tram_agent, "parted_disk_layout", side_effect=[before, after]), patch.object(tram_agent, "reread_linux_partition", return_value=size + growth), patch.object(tram_agent, "run", side_effect=fake_run):
+            result = tram_agent.grow_linux_partition_node(scan, "/dev/sda3", growth)
+
+        self.assertEqual(result["appliedBytes"], growth)
+        self.assertEqual(resize_attempts, 2)
+        resize_indexes = [index for index, command in enumerate(commands) if command[0].endswith("parted")]
+        backup_index = next(index for index, command in enumerate(commands) if command[0].endswith("sgdisk") and command[1].startswith("--backup="))
+        repair_index = next(index for index, command in enumerate(commands) if command[0].endswith("sgdisk") and command[1] == "--move-second-header")
+        self.assertLess(resize_indexes[0], backup_index)
+        self.assertLess(backup_index, repair_index)
+        self.assertLess(repair_index, resize_indexes[1])
 
     def test_storage_scan_never_invents_tail_when_partition_start_is_unknown(self):
         lsblk = json.dumps({"blockdevices": [{"name": "sda", "path": "/dev/sda", "type": "disk", "size": 20 * 1024**3, "pttype": "gpt", "children": [{"name": "sda1", "path": "/dev/sda1", "type": "part", "size": 10 * 1024**3, "fstype": "ext4"}]}]})

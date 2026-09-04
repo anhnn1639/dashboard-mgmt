@@ -79,6 +79,7 @@ LINUX_BLOCK_SECTOR_BYTES = 512
 LINUX_STORAGE_ALIGNMENT_BYTES = 4 * 1024 * 1024
 LINUX_STORAGE_RESCAN_RESULT = Path("/run/tram-agent/storage-rescan.json")
 LINUX_STORAGE_RESCAN_UNIT_PATH = Path("/etc/systemd/system/tram-agent-storage-rescan.service")
+LINUX_PARTITION_BACKUP_ROOT = Path("/var/lib/tram-agent/partition-backups")
 LINUX_FSTAB_PATH = Path("/etc/fstab")
 LINUX_MOUNT_ROOTS = ("/mnt", "/srv", "/data", "/opt", "/var/lib")
 LINUX_STORAGE_RESCAN_UNIT = """[Unit]
@@ -231,7 +232,14 @@ def signed_request(config: Config, method: str, url: str, payload: dict[str, Any
     return body, {"Content-Type": "application/json", **signed_headers(config, method, url, body)}
 
 
-def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: bool = False, output_limit: int = 100_000) -> tuple[int, str]:
+def run(
+    command: list[str],
+    timeout: int = 120,
+    check: bool = False,
+    sensitive: bool = False,
+    output_limit: int = 100_000,
+    include_stderr_on_success: bool = False,
+) -> tuple[int, str]:
     if not sensitive:
         LOG.info("exec action: %s", command[0])
     try:
@@ -244,7 +252,7 @@ def run(command: list[str], timeout: int = 120, check: bool = False, sensitive: 
         return 124, (f"{message}\n{detail}" if detail else message)[-output_limit:]
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
-    output = stdout if completed.returncode == 0 else "\n".join(part for part in (stdout, stderr) if part)
+    output = stdout if completed.returncode == 0 and not include_stderr_on_success else "\n".join(part for part in (stdout, stderr) if part)
     if check and completed.returncode:
         raise RuntimeError(output or f"Command failed: {completed.returncode}")
     return completed.returncode, output[-output_limit:]
@@ -2399,13 +2407,31 @@ def linux_storage_rescan() -> dict[str, Any]:
     return perform_linux_storage_rescan()
 
 
+def parted_reports_stale_gpt(output: str) -> bool:
+    normalized = output.casefold()
+    return (
+        ("not all of the space available" in normalized and "fix the gpt" in normalized)
+        or (
+            "backup gpt table" in normalized
+            and ("not on the end" in normalized or "not at the end" in normalized or "move the backup" in normalized)
+        )
+    )
+
+
 def parted_disk_layout(disk: str) -> dict[str, Any]:
     binary = find_system_command("parted")
     if not DEVICE_RE.fullmatch(disk):
         return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "invalid", "error": "Invalid disk path"}
     if not binary:
         return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "unavailable", "error": "parted is not installed"}
-    code, output = run([binary, "--machine", "--script", disk, "unit", "B", "print", "free"], output_limit=1_000_000)
+    # GNU parted writes stale-backup-GPT warnings to stderr while still
+    # returning success. Preserve stderr here so the mutation path can repair
+    # the backup header before attempting resizepart.
+    code, output = run(
+        [binary, "--machine", "--script", disk, "unit", "B", "print", "free"],
+        output_limit=1_000_000,
+        include_stderr_on_success=True,
+    )
     if code != 0:
         return {"partitionTable": "", "freeRegions": [], "partitions": {}, "status": "failed", "error": (output or f"parted exit {code}")[-2000:]}
     table = ""
@@ -2434,7 +2460,14 @@ def parted_disk_layout(disk: str) -> dict[str, Any]:
             continue
         if number > 0:
             partitions[number] = {"startBytes": start, "endBytes": end, "sizeBytes": size}
-    return {"partitionTable": table, "freeRegions": regions, "partitions": partitions, "status": "ok", "error": ""}
+    return {
+        "partitionTable": table,
+        "freeRegions": regions,
+        "partitions": partitions,
+        "status": "ok",
+        "error": "",
+        "needsGptRepair": table == "gpt" and parted_reports_stale_gpt(output),
+    }
 
 
 def parted_free_regions(disk: str) -> list[dict[str, int]]:
@@ -2668,7 +2701,10 @@ def linux_storage_scan(rescan: bool = False) -> tuple[int, str]:
             row["unallocatedBytes"] = sum(region["sizeBytes"] for region in regions)
             row["layoutStatus"] = layout_by_disk[path].get("status", "unknown")
             row["layoutError"] = layout_by_disk[path].get("error", "")
-            row["needsGptRepair"] = bool(layout_by_disk[path].get("synthesizedTail") and row["partitionTable"] == "gpt")
+            row["needsGptRepair"] = bool(
+                row["partitionTable"] == "gpt"
+                and (layout_by_disk[path].get("needsGptRepair") or layout_by_disk[path].get("synthesizedTail"))
+            )
         if kind == "part" and disk_path and not resize_protected:
             for region in layout_by_disk.get(disk_path, {}).get("freeRegions", []):
                 if 0 <= region["startBytes"] - row["endOffsetBytes"] <= 2 * 1024 * 1024:
@@ -3145,7 +3181,7 @@ def repair_linux_gpt_tail(disk: dict[str, Any]) -> None:
     sgdisk = find_system_command("sgdisk")
     if not sgdisk:
         raise RuntimeError("gdisk/sgdisk is required to repair the GPT backup header after a disk expansion")
-    backup_root = Path("/var/lib/tram-agent/partition-backups")
+    backup_root = LINUX_PARTITION_BACKUP_ROOT
     backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with contextlib.suppress(OSError):
         backup_root.chmod(0o700)
@@ -3159,6 +3195,7 @@ def repair_linux_gpt_tail(disk: dict[str, Any]) -> None:
     code, output = run([sgdisk, "--move-second-header", disk_path], timeout=120)
     if code:
         raise RuntimeError(output or f"Cannot relocate the GPT backup header of {disk_path}")
+    disk["needsGptRepair"] = False
 
 
 def reread_linux_partition(disk_path: str, partition_number: int, partition_path: str, minimum_size: int) -> int:
@@ -3218,6 +3255,22 @@ def grow_linux_partition_node(scan: dict[str, Any], path: str, requested_bytes: 
         current_end = byte_value(node.get("offsetBytes")) + before_size - 1
     new_end = current_end + add_bytes
     code, output = run([parted, "--script", disk_path, "unit", "B", "resizepart", str(number), f"{new_end}B"], timeout=600)
+    if code and parted_reports_stale_gpt(output):
+        # A prior scan can predate the hypervisor disk expansion or an older
+        # parted can expose the new tail while hiding its warning on stderr.
+        # Retry only after proving the failed command did not move either end
+        # of the target partition, then back up and repair GPT exactly once.
+        live_layout = parted_disk_layout(disk_path)
+        live_geometry = live_layout.get("partitions", {}).get(number, {})
+        unchanged = (
+            bool(live_geometry)
+            and byte_value(live_geometry.get("startBytes")) == byte_value(node.get("offsetBytes"))
+            and byte_value(live_geometry.get("endBytes")) == current_end
+        )
+        if not unchanged or str(live_layout.get("partitionTable", "")).lower() != "gpt":
+            raise RuntimeError(output or f"parted could not resize {path}")
+        repair_linux_gpt_tail({**disk, "partitionTable": "gpt", "needsGptRepair": True})
+        code, output = run([parted, "--script", disk_path, "unit", "B", "resizepart", str(number), f"{new_end}B"], timeout=600)
     if code:
         # Older EL7/EL8 parted releases refuse the busy-partition confirmation
         # in script mode. Only answer that specific prompt after proving that
