@@ -125,6 +125,10 @@ test("storage resize stays explicit and Updates shows only patches", async () =>
   const updateSettings = await readFile(new URL("../app/update-source-settings.tsx", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(resources, /<span>Thao tác<\/span>/);
+  assert.match(resources, /<span>Có thể Extend thêm<\/span>/);
+  assert.match(resources, /unallocated \? formatBytes\(node\.sizeBytes\) : formatBytes\(extendCapacity\)/);
+  assert.doesNotMatch(resources, /unallocated \? formatBytes\(node\.sizeBytes\) : formatBytes\(node\.freeBytes\)/);
+  assert.match(resources, /đây không phải dung lượng còn trống bên trong filesystem/);
   assert.match(resources, /disabled=\{!canExtend\}/);
   assert.match(resources, /partition Recovery hoặc partition khác đang nằm ở giữa/);
   assert.match(resources, /logicalVolumeMapperPath\(item\) === node\.path/);

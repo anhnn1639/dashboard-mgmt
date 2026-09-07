@@ -457,7 +457,7 @@ export function StorageResourceTab({
           <span>{node.filesystem || "—"}</span>
           <span>{formatBytes(node.sizeBytes)}</span>
           <span>{physicalPosition}</span>
-          <span>{unallocated ? formatBytes(node.sizeBytes) : formatBytes(node.freeBytes)}</span>
+          <span>{unallocated ? formatBytes(node.sizeBytes) : formatBytes(extendCapacity)}</span>
           <span className="storage-row-actions">
             {target && <button type="button" disabled={!canExtend} title={extendReason} onClick={() => { setSelected(target); setModal("extend"); }}>Extend</button>}
             {target?.kind === "windows_partition" && <button type="button" disabled={!canShrink} title={shrinkReason} onClick={() => { setSelected(target); setModal("shrink"); }}>Shrink</button>}
@@ -629,7 +629,7 @@ export function StorageResourceTab({
         {windowsLayoutWarnings.map((warning) => <div key={warning.key}><b>{warning.volume} chưa thể Extend</b><span>Disk {warning.disk} có {formatBytes(warning.freeBytes)} Unallocated ở phía sau, nhưng {warning.blockers} đang nằm giữa. Shrink không di chuyển phần đang chắn.</span></div>)}
       </div>}
       <div className="storage-tree">
-        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>{osFamily === "windows" ? "Vị trí vật lý" : "Mount"}</span><span>Còn trống</span><span>Thao tác</span></div>
+        <div className="storage-tree-row head"><span /><span>Disk / partition / volume</span><span>Filesystem</span><span>Dung lượng</span><span>{osFamily === "windows" ? "Vị trí vật lý" : "Mount"}</span><span>Có thể Extend thêm</span><span>Thao tác</span></div>
         {disks.map((disk, index) => {
           const key = String(disk.id ?? disk.path ?? disk.number ?? index);
           const children = osFamily === "windows" ? disk.partitions ?? [] : disk.children ?? [];
@@ -655,7 +655,7 @@ export function StorageResourceTab({
         })}
         {!disks.length && <div className="empty-state">Chưa có dữ liệu Disk; nhấn “Quét lại”.</div>}
       </div>
-      <p className="storage-extend-note">Các hàng và thanh sơ đồ được xếp theo offset thật từ trái sang phải. Extend chỉ bật khi Agent xác nhận có vùng Unallocated liền ngay bên phải. Unallocated không thể kéo thả; Shrink tạo vùng trống ở cuối chính volume đó và không di chuyển partition khác. Nếu Recovery nằm giữa C: và vùng trống, cần một quy trình bảo trì riêng có backup để di chuyển hoặc xóa/tạo lại Recovery.</p>
+      <p className="storage-extend-note">Cột “Có thể Extend thêm” là dung lượng Agent xác nhận có thể cấp thêm cho đúng partition hoặc Logical Volume; đây không phải dung lượng còn trống bên trong filesystem. Với partition thường, vùng Unallocated phải nằm liền ngay bên phải. Với Logical Volume, số này gồm dung lượng sẵn có trong Volume Group và phần Agent có thể mở rộng thêm từ disk. Unallocated không thể kéo thả; Shrink không di chuyển partition khác.</p>
       {osFamily === "linux" && scan.volumeGroups.length > 0 && <div className="vg-grid">
         {scan.volumeGroups.map((vg) => {
           const target: StorageTarget = { key: `vg:${vg.name}`, kind: "linux_vg", label: `Volume Group ${vg.name}`, name: vg.name, protected: false, mounted: vg.logicalVolumes.length > 0 };
