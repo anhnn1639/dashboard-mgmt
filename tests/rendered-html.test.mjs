@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { runInNewContext } from "node:vm";
 import test from "node:test";
+import { createRequire } from "node:module";
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -10,6 +11,40 @@ async function render() {
   const { default: worker } = await import(workerUrl.href);
   return worker.fetch(new Request("http://localhost/", { headers: { accept: "text/html" } }), { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } }, { waitUntil() {}, passThroughOnException() {} });
 }
+
+test("manual connection Add controls render only for Admin and Operator", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const exports = {};
+  runInNewContext(compiled, { exports, React, require: (name) => name === "./server-resource-tabs" ? { ModalShell: () => null } : require(name) });
+  for (const kind of ["network", "web"]) {
+    for (const role of ["admin", "operator", "viewer", "connector"]) {
+      const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
+      assert.equal(html.includes("＋ Thêm kết nối"), ["admin", "operator"].includes(role), `${kind}/${role}`);
+      if (role === "connector") assert.match(html, /Chưa có kết nối được chia sẻ/);
+      assert.doesNotMatch(html, /href="https?:/);
+    }
+  }
+});
+
+test("navigation policy enforces connector/auditor categories even with stale permissions", async () => {
+  const { default: ts } = await import("typescript");
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const nav = source.slice(source.indexOf("const navItems:"), source.indexOf("const healthLabel:"));
+  const compiled = ts.transpileModule(nav + "\nexports.allowed = (user) => navItems.filter(item => navigationAllowed(item, user)).map(item => item.id);", { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const exports = {};
+  runInNewContext(compiled, { exports });
+  const permissions = ["servers.view", "resources.view", "recordings.view", "audit.view", "logs.view", "users.manage", "roles.manage", "ldap.manage", "sessions.launch", "agents.manage", "updates.manage", "jobs.view", "deletions.request", "configuration.view"];
+  assert.deepEqual(Array.from(exports.allowed({ role: "connector", permissions })), ["linux", "windows", "network", "web"]);
+  assert.deepEqual(Array.from(exports.allowed({ role: "auditor", permissions })), ["logs", "audit"]);
+  const operator = exports.allowed({ role: "operator", permissions });
+  assert.ok(!operator.includes("remote-credentials"));
+  assert.ok(operator.includes("approvals"));
+});
 
 test("server-renders the secure operations console shell", async () => {
   const response = await render();
@@ -90,7 +125,8 @@ test("firewall add form uses server capabilities and a viewport-safe scroll regi
   assert.match(source, /Exit code/);
   assert.match(source, /autoRefreshForLatestMutation\.status !== "succeeded"/);
   assert.doesNotMatch(source, /\/api\/v1\/jobs\/\$\{jobId\}\/approve/);
-  assert.doesNotMatch(source, /Phê duyệt/);
+  const addForm = source.slice(source.indexOf("function FirewallAddModal"), source.indexOf("function SessionsView"));
+  assert.doesNotMatch(addForm, /deletion-approvals/);
   assert.doesNotMatch(source, /Table<input name="table"/);
   assert.doesNotMatch(source, /Chain<input name="chain"/);
   assert.match(styles, /\.add-firewall-modal\s*{[^}]*max-height:\s*calc\(100% - 32px\)/s);
@@ -490,7 +526,7 @@ test("remote credentials are admin-managed and clipboard is paste-only", async (
   const consoleSource = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   const credentialSource = await readFile(new URL("../app/remote-credentials.tsx", import.meta.url), "utf8");
   const apiSource = await readFile(new URL("../control-plane/app/main.py", import.meta.url), "utf8");
-  assert.match(consoleSource, /label: "Tài khoản Remote"[\s\S]*adminOnly: true/);
+  assert.match(consoleSource, /label: "Tài khoản xác thực"[\s\S]*adminOnly: true/);
   assert.match(consoleSource, /body: JSON\.stringify\(\{ server_id: server\.id, protocol, credential_id: credentialId, width, height \}\)/);
   assert.match(credentialSource, /Chỉ Administrator quản lý/);
   assert.match(credentialSource, /Mật khẩu được mã hóa ở máy chủ Trạm vận hành, không trả về trình duyệt và không ghi vào nhật ký/);

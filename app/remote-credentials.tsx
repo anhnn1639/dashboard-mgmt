@@ -126,7 +126,7 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
   return <>
     <section className="panel remote-credentials-panel">
       <div className="panel-head remote-credentials-head">
-        <div><h2>Tài khoản xác thực Remote</h2><p>Chỉ Administrator quản lý. Người được share chỉ có thể chọn nhãn tài khoản để mở phiên.</p></div>
+        <div><h2>Tài khoản xác thực</h2><p>Chỉ Administrator quản lý. Người được share chỉ có thể chọn nhãn tài khoản để mở phiên.</p></div>
         <div className="resource-toolbar-actions"><button type="button" className="button ghost" disabled={busy} onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "Không thể tải dữ liệu"))}>↻ Làm mới</button><button type="button" className="button primary compact" onClick={() => setEditing("new")}>＋ Thêm tài khoản</button></div>
       </div>
       {error && <div className="danger-panel">{error}</div>}

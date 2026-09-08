@@ -50,6 +50,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
 from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
+from .managed_targets import ManagedTargetRequest
 
 
 class Settings(BaseSettings):
@@ -430,6 +431,22 @@ class RecordingDeletionRequest(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
+
+
+class DeletionApproval(Base):
+    __tablename__ = "deletion_approvals"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
+    action: Mapped[str] = mapped_column(String(120))
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reason: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str] = mapped_column(String(36), index=True)
+    requested_by_username: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
 
 
 class FileTransfer(Base):
@@ -856,6 +873,11 @@ MAX_CONCURRENT_AGENT_JOBS = 4
 PARALLEL_AGENT_READ_ACTIONS = {action for action, policy in SAFE_ACTIONS.items() if policy["risk"] == "low"}
 
 PERMISSION_CATALOG: dict[str, dict[str, str]] = {
+    "jobs.view": {"group": "Vận hành", "label": "Xem công việc", "description": "Xem lịch sử tác vụ."},
+    "configuration.view": {"group": "Cấu hình", "label": "Xem cấu hình", "description": "Xem cấu hình và danh tính đã che thông tin bí mật, không thay đổi."},
+    "targets.manage": {"group": "Thiết bị", "label": "Cấu hình thiết bị và web console", "description": "Thêm và sửa đích kết nối được cho phép."},
+    "deletions.request": {"group": "Vận hành", "label": "Yêu cầu xóa", "description": "Gửi thao tác xóa để một Administrator phê duyệt."},
+    "deletions.approve": {"group": "Quản trị", "label": "Duyệt xóa", "description": "Một Administrator duyệt hoặc từ chối yêu cầu xóa."},
     "servers.view": {"group": "Máy chủ", "label": "Xem danh sách máy chủ", "description": "Xem inventory, tình trạng và trang chi tiết máy chủ."},
     "servers.manage": {"group": "Máy chủ", "label": "Xóa và chia sẻ máy chủ", "description": "Ẩn/ngừng Agent và gán quyền nhìn thấy máy chủ cho user/group."},
     "resources.view": {"group": "Máy chủ", "label": "Xem tài nguyên vận hành", "description": "Quét và xem Services, tài khoản, firewall, disk, process, update và network."},
@@ -926,9 +948,10 @@ ACTION_PERMISSIONS: dict[str, str] = {
 ALL_PLATFORM_PERMISSIONS = set(PERMISSION_CATALOG)
 BUILTIN_ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
     "admin": {"display_name": "Administrator", "description": "Toàn quyền quản trị website và máy chủ.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS)},
-    "operator": {"display_name": "Operator", "description": "Vận hành các máy chủ được chia sẻ, phiên truy cập và file; không quản trị danh tính website.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"audit.view", "users.manage", "ldap.manage", "roles.manage", "agents.manage", "recordings.delete", "servers.manage"})},
-    "viewer": {"display_name": "Viewer", "description": "Chỉ xem fleet và dữ liệu tài nguyên; không thực hiện thay đổi.", "permissions": ["logs.view", "resources.view", "servers.view"]},
-    "auditor": {"display_name": "Auditor", "description": "Xem fleet được chia sẻ, log, audit, file và recording; không thay đổi cấu hình hay máy chủ.", "permissions": ["audit.view", "files.view", "logs.view", "recordings.view", "servers.view"]},
+    "operator": {"display_name": "Operator", "description": "Xem và vận hành toàn bộ thiết bị; không quản lý danh tính/phân quyền. Mọi thao tác xóa trên website cần một Administrator duyệt.", "permissions": sorted(ALL_PLATFORM_PERMISSIONS - {"users.manage", "ldap.manage", "roles.manage", "accounts.manage", "recordings.delete", "deletions.approve"})},
+    "viewer": {"display_name": "Viewer", "description": "Xem toàn bộ thiết bị và cấu hình đã che bí mật; không mở phiên hay tạo tác vụ.", "permissions": ["logs.view", "resources.view", "servers.view", "jobs.view", "files.view", "recordings.view", "audit.view", "configuration.view"]},
+    "auditor": {"display_name": "Auditor", "description": "Chỉ xem nhật ký và log; không xem thiết bị, bản ghi phiên hoặc cấu hình.", "permissions": ["audit.view", "logs.view"]},
+    "connector": {"display_name": "Connector", "description": "Chỉ nhìn thấy và kết nối tài nguyên được chia sẻ trong bốn danh mục thiết bị.", "permissions": ["servers.view", "sessions.launch"]},
 }
 
 AUTO_REFRESH_ACTIONS: dict[str, tuple[str, ...]] = {
@@ -2281,6 +2304,9 @@ def ensure_builtin_roles(db: Session) -> None:
 
 
 def platform_role_permissions(db: Session, role_name: str) -> set[str]:
+    # Built-in policies cannot retain stale or manually elevated DB permissions.
+    if role_name in BUILTIN_ROLE_DEFINITIONS:
+        return set(BUILTIN_ROLE_DEFINITIONS[role_name]["permissions"])
     role = db.get(PlatformRole, role_name)
     if role is not None:
         return {str(permission) for permission in role.permissions or [] if permission in PERMISSION_CATALOG}
@@ -2318,6 +2344,8 @@ def require_permission(permission: str):
         raise RuntimeError(f"Unknown platform permission: {permission}")
 
     def dependency(user: User = Depends(current_user), db: Session = Depends(db_session)) -> User:
+        if permission in {"users.manage", "roles.manage", "ldap.manage", "deletions.approve"} and user.role != "admin":
+            raise HTTPException(status_code=403, detail="Chức năng này chỉ dành cho Administrator")
         if permission not in platform_role_permissions(db, user.role):
             raise HTTPException(status_code=403, detail="Role hiện tại không có quyền thực hiện chức năng này")
         return user
@@ -3200,7 +3228,7 @@ def retired_server_ids(db: Session) -> set[str]:
 
 def visible_server_ids(db: Session, user: User) -> set[str]:
     active_ids = set(db.execute(select(Server.id)).scalars().all()) - retired_server_ids(db)
-    if user.role == "admin":
+    if user.role in {"admin", "operator", "viewer"}:
         return active_ids
     direct = set(db.execute(select(ServerUserShare.server_id).where(ServerUserShare.user_id == user.id)).scalars().all())
     group_ids = set(db.execute(select(PlatformGroupMember.group_id).where(PlatformGroupMember.user_id == user.id)).scalars().all())
@@ -3228,7 +3256,7 @@ def server_shares_json(db: Session, server_id: str) -> dict[str, Any]:
 
 @app.get("/api/v1/servers")
 def list_servers(os_family: Literal["windows", "linux"] | None = None, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
-    query = select(Server).order_by(Server.os_family, Server.name)
+    query = select(Server).where(Server.os_family.in_(["linux", "windows"])).order_by(Server.os_family, Server.name)
     if os_family:
         query = query.where(Server.os_family == os_family)
     allowed = visible_server_ids(db, user)
@@ -3245,7 +3273,63 @@ def list_servers(os_family: Literal["windows", "linux"] | None = None, user: Use
 @app.get("/api/v1/servers/{server_id}")
 def get_server(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     server = visible_server(db, user, server_id)
+    if user.role == "connector":
+        return {key: value for key, value in server_json(server).items() if key in {"id", "name", "osFamily", "address", "os", "version", "tunnelOnline"}}
     return {**server_json(server), "inventory": server.inventory}
+
+
+@app.get("/api/v1/managed-targets")
+def list_managed_targets(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+    rows = db.execute(select(Server).where(Server.id.in_(visible_server_ids(db, user)), Server.os_family.in_(["network", "web"])).order_by(Server.name)).scalars().all()
+    show_config = user.role in {"admin", "operator", "viewer"}
+    return {"items": [{"id": row.id, "name": row.name, "kind": row.os_family, "address": row.address, "config": (row.inventory or {}).get("managedTarget") if show_config else None, "connectionReady": False} for row in rows]}
+
+
+def persist_managed_target(payload: ManagedTargetRequest, request: Request, user: User, db: Session, server: Server | None = None):
+    # Saving a target is metadata-only. No network probe or password forwarding.
+    if server and server.os_family != payload.kind:
+        raise HTTPException(status_code=422, detail="Không thể thay đổi loại thiết bị")
+    duplicate = db.execute(select(Server).where(Server.name == payload.name, Server.os_family == payload.kind, Server.id != (server.id if server else ""), Server.id.not_in(retired_server_ids(db)))).scalar_one_or_none()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Tên kết nối đã tồn tại")
+    if server is None:
+        server = Server(id=str(uuid.uuid4()), name=payload.name, os_family=payload.kind, os_name=payload.kind, address=payload.address, status="managed")
+        db.add(server)
+    server.name, server.address = payload.name, payload.address
+    server.ssh_host_key = payload.ssh_host_key
+    server.inventory = {"managedTarget": payload.model_dump()}
+    db.flush()
+    audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port})
+    db.commit()
+    return {"id": server.id, "saved": True}
+
+
+@app.post("/api/v1/managed-targets", status_code=201)
+def create_managed_target(payload: ManagedTargetRequest, request: Request, user: User = Depends(require_permission("targets.manage")), db: Session = Depends(db_session)):
+    return persist_managed_target(payload, request, user, db)
+
+
+@app.put("/api/v1/managed-targets/{server_id}")
+def update_managed_target(server_id: str, payload: ManagedTargetRequest, request: Request, user: User = Depends(require_permission("targets.manage")), db: Session = Depends(db_session)):
+    server = visible_server(db, user, server_id)
+    if server.os_family not in {"network", "web"}:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kết nối")
+    return persist_managed_target(payload, request, user, db, server)
+
+
+@app.get("/api/v1/configuration-snapshot")
+def configuration_snapshot(user: User = Depends(require_permission("configuration.view")), db: Session = Depends(db_session)):
+    users = db.execute(select(User).order_by(User.username)).scalars().all()
+    ldap = read_ldap_config(db)
+    return {
+        "Người dùng": [{"username": item.username, "displayName": item.display_name, "role": item.role, "enabled": item.enabled} for item in users],
+        "Vai trò": [{"name": item.name, "description": item.description, "permissions": sorted(platform_role_permissions(db, item.name))} for item in db.execute(select(PlatformRole)).scalars()],
+        "LDAP": {key: ldap.get(key) for key in ("enabled", "host", "port", "use_ssl", "base_dn", "default_role")},
+        "Nguồn cập nhật": [update_source_profile_setting_json(db, profile) for profile in UPDATE_SOURCE_PROFILE_DEFINITIONS],
+        "Tài khoản xác thực": [{"label": item.label, "serverId": item.server_id, "protocol": item.protocol} for item in db.execute(select(RemoteCredential)).scalars()],
+        "Lưu bản ghi": read_recording_retention(db),
+        "Agent": {"release": RELEASE_VERSION},
+    }
 
 
 @app.get("/api/v1/servers/{server_id}/shares")
@@ -3280,8 +3364,10 @@ def update_server_shares(server_id: str, payload: ServerSharesRequest, request: 
 
 @app.delete("/api/v1/servers/{server_id}")
 def delete_server(server_id: str, payload: ServerDeleteRequest, request: Request, user: User = Depends(require_permission("servers.manage")), db: Session = Depends(db_session)):
-    require_server_admin(user)
     server = visible_server(db, user, server_id)
+    if user.role == "operator":
+        return request_deletion(db, user, server, "server.delete", {}, payload.reason, request)
+    require_server_admin(user)
     active_session = db.execute(select(RemoteSession).where(RemoteSession.server_id == server.id, RemoteSession.status.in_(["waiting", "launched", "active"])).limit(1)).scalar_one_or_none()
     active_job = db.execute(select(Job).where(Job.server_id == server.id, Job.status == "dispatched").limit(1)).scalar_one_or_none()
     if active_session or active_job:
@@ -3410,7 +3496,7 @@ def can_view_job_output(user: User, action: str, db: Session) -> bool:
 
 
 @app.get("/api/v1/servers/{server_id}/jobs")
-def list_server_jobs(server_id: str, user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+def list_server_jobs(server_id: str, user: User = Depends(require_permission("resources.view")), db: Session = Depends(db_session)):
     server = visible_server(db, user, server_id)
     jobs = db.execute(select(Job).where(Job.server_id == server_id).order_by(Job.created_at.desc()).limit(100)).scalars().all()
     return {
@@ -3675,7 +3761,7 @@ def agent_upgrade_status_payload(db: Session, allowed_server_ids: set[str] | Non
     artifacts = release_artifact_status()
     retired = retired_server_ids(db)
     server_filter = Server.id.not_in(retired) if retired else True
-    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled").order_by(Server.name)).scalars().all()
+    servers = db.execute(select(Server).where(server_filter, Server.os_family.in_(["linux", "windows"]), Server.status != "uninstalled").order_by(Server.name)).scalars().all()
     if allowed_server_ids is not None:
         servers = [server for server in servers if server.id in allowed_server_ids]
     items: list[dict[str, Any]] = []
@@ -3724,7 +3810,7 @@ def create_agent_upgrades(payload: AgentUpgradeRequest, request: Request, user: 
     artifacts_status = release_artifact_status()
     allowed = visible_server_ids(db, user)
     locked_servers = db.execute(
-        select(Server).where(Server.id.in_(payload.server_ids)).order_by(Server.id).with_for_update()
+        select(Server).where(Server.id.in_(payload.server_ids), Server.os_family.in_(["linux", "windows"])).order_by(Server.id).with_for_update()
     ).scalars().all()
     servers_by_id = {server.id: server for server in locked_servers}
     missing = [server_id for server_id in payload.server_ids if server_id not in servers_by_id or server_id not in allowed]
@@ -3792,7 +3878,7 @@ def agent_uninstall_protection_payload(db: Session) -> dict[str, Any]:
     policy = load_agent_uninstall_policy(db)
     retired = retired_server_ids(db)
     server_filter = Server.id.not_in(retired) if retired else True
-    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled")).scalars().all()
+    servers = db.execute(select(Server).where(server_filter, Server.os_family.in_(["linux", "windows"]), Server.status != "uninstalled")).scalars().all()
     states = {state.server_id: state for state in db.execute(select(AgentUninstallPolicyState)).scalars().all()}
     compatible = [server for server in servers if semantic_agent_version(server.agent_version) is not None and semantic_agent_version(server.agent_version) >= semantic_agent_version(SELF_UPDATE_MIN_VERSION) and normalized_agent_architecture(server.architecture) == "x86_64"]
     revision = int(policy["revision"]) if policy else 0
@@ -3865,7 +3951,7 @@ def persist_agent_uninstall_protection(payload: AgentUninstallProtectionUpdateRe
         job.output = "Chính sách gỡ Agent đã được thay bằng revision mới hơn."
     retired = retired_server_ids(db)
     server_filter = Server.id.not_in(retired) if retired else True
-    servers = db.execute(select(Server).where(server_filter, Server.status != "uninstalled").order_by(Server.name)).scalars().all()
+    servers = db.execute(select(Server).where(server_filter, Server.os_family.in_(["linux", "windows"]), Server.status != "uninstalled").order_by(Server.name)).scalars().all()
     queued_count = 0
     for server in servers:
         if ensure_agent_uninstall_policy_job(db, server, policy, request=request, actor=user.username, reason=payload.reason):
@@ -3927,7 +4013,7 @@ def update_dashboard_url(payload: DashboardUrlUpdateRequest, request: Request, u
         raise HTTPException(status_code=400, detail="Open the dashboard through the requested HTTPS domain before saving it")
     current = db.get(SystemSetting, "dashboard_url")
     previous = current.value if current else ""
-    has_agents = db.execute(select(Server.id).limit(1)).scalar_one_or_none() is not None
+    has_agents = db.execute(select(Server.id).where(Server.os_family.in_(["linux", "windows"])).limit(1)).scalar_one_or_none() is not None
     if previous and previous != payload.dashboard_url and has_agents and not payload.confirm_existing_agents:
         raise HTTPException(status_code=409, detail="Existing agents keep their old endpoint; confirm the domain change after planning their migration")
     db.merge(SystemSetting(key="dashboard_url", value=payload.dashboard_url))
@@ -4581,6 +4667,8 @@ async def agent_job_result(job_id: str, payload: JobResultRequest, request: Requ
 
 @app.post("/api/v1/jobs", status_code=201)
 def create_job(payload: JobCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if user.role in {"viewer", "connector", "auditor"}:
+        raise HTTPException(status_code=403, detail="Vai trò này chỉ được xem dữ liệu, không tạo tác vụ")
     policy = SAFE_ACTIONS.get(payload.action)
     if not policy:
         raise HTTPException(status_code=400, detail="Action is not allowlisted")
@@ -4591,15 +4679,107 @@ def create_job(payload: JobCreateRequest, request: Request, user: User = Depends
         raise HTTPException(status_code=403, detail="Role cannot execute this action")
     server = visible_server(db, user, payload.server_id)
     parameters = dict(payload.parameters)
+    if server.os_family not in {"linux", "windows"}:
+        raise HTTPException(status_code=422, detail="Thiết bị khai báo thủ công không chạy tác vụ Agent")
     if payload.action == "logs.read":
         parameters = {"limit": 500, "sources": configured_log_sources(db, server)}
     validate_job_parameters(payload.action, parameters, server)
+    if user.role == "operator" and payload.action in OPERATOR_DELETE_ACTIONS:
+        return request_deletion(db, user, server, payload.action, parameters, payload.reason, request)
     job = Job(server_id=server.id, action=payload.action, parameters=protect_parameters(parameters), reason=payload.reason, status="queued", risk=policy["risk"], created_by=user.id)
     db.add(job)
     db.flush()
     audit(db, user.username, "job.create", job.id, request, detail={"server": server.name, "action": payload.action, "risk": job.risk, "execution": "direct"})
     db.commit()
     return {"id": job.id, "status": job.status, "risk": job.risk}
+
+
+# No free-form commands can be submitted to this approval queue.
+OPERATOR_DELETE_ACTIONS = frozenset({"storage.delete", "firewall.rule.remove", "user.delete", "group.delete", "group.remove_user"})
+
+
+def request_deletion(db: Session, user: User, server: Server, action: str, parameters: dict[str, Any], reason: str, request: Request) -> dict[str, Any]:
+    if user.role != "operator" or action not in OPERATOR_DELETE_ACTIONS | {"server.delete"}:
+        raise HTTPException(status_code=403, detail="Không được yêu cầu thao tác xóa này")
+    # PostgreSQL serializes concurrent submissions for one target.
+    db.execute(select(Server.id).where(Server.id == server.id).with_for_update()).scalar_one()
+    pending = db.execute(select(DeletionApproval).where(DeletionApproval.server_id == server.id, DeletionApproval.action == action, DeletionApproval.status == "pending", DeletionApproval.created_at > now() - timedelta(hours=24))).scalars().all()
+    if any(item.parameters == parameters for item in pending):
+        raise HTTPException(status_code=409, detail="Thao tác này đã có yêu cầu chờ duyệt")
+    item = DeletionApproval(server_id=server.id, action=action, parameters=protect_parameters(parameters), reason=reason, requested_by=user.id, requested_by_username=user.username)
+    db.add(item)
+    db.flush()
+    audit(db, user.username, "deletion.request", item.id, request, detail={"action": action, "server_id": server.id, "reason": reason})
+    db.commit()
+    return {"id": item.id, "approvalId": item.id, "status": "pending_approval", "risk": "critical", "message": "Đang chờ một Administrator duyệt; chưa thực hiện xóa."}
+
+
+class DeletionReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: Literal["approve", "reject"]
+
+
+@app.get("/api/v1/deletion-approvals")
+def list_deletion_approvals(user: User = Depends(require_any_permission("deletions.request", "deletions.approve")), db: Session = Depends(db_session)):
+    query = select(DeletionApproval, Server.name, DeletionApproval.requested_by_username).join(Server, Server.id == DeletionApproval.server_id)
+    if user.role != "admin":
+        query = query.where(DeletionApproval.requested_by == user.id)
+    rows = db.execute(query.order_by(DeletionApproval.created_at.desc()).limit(200)).all()
+    return {"items": [{"id": row.id, "serverName": name, "action": row.action, "parameters": row.parameters, "reason": row.reason, "status": row.status, "requestedBy": username, "reviewedBy": row.reviewed_by, "jobId": row.job_id, "createdAt": aware(row.created_at).isoformat()} for row, name, username in rows]}
+
+
+@app.post("/api/v1/deletion-approvals/{approval_id}/review")
+def review_deletion_approval(approval_id: str, payload: DeletionReviewRequest, request: Request, user: User = Depends(require_permission("deletions.approve")), db: Session = Depends(db_session)):
+    require_server_admin(user)
+    item = db.get(DeletionApproval, approval_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Không tìm thấy yêu cầu")
+    if item.requested_by == user.id:
+        raise HTTPException(status_code=403, detail="Người gửi yêu cầu không được tự duyệt")
+    if item.status != "pending":
+        raise HTTPException(status_code=409, detail="Yêu cầu đã được xử lý")
+    if aware(item.created_at) < now() - timedelta(hours=24):
+        raise HTTPException(status_code=409, detail="Yêu cầu quá 24 giờ; cần tạo lại để đối chiếu dữ liệu mới")
+    # Claim and execution stay in one transaction: rollback restores pending.
+    claimed = db.execute(update(DeletionApproval).where(DeletionApproval.id == item.id, DeletionApproval.status == "pending").values(status="rejected" if payload.decision == "reject" else "approved", reviewed_by=user.id, reviewed_at=now()))
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Một Administrator khác đã xử lý yêu cầu")
+    if payload.decision == "reject":
+        audit(db, user.username, "deletion.reject", item.id, request)
+        db.commit()
+        return {"id": item.id, "status": "rejected"}
+    requester = db.get(User, item.requested_by)
+    if not requester or not requester.enabled or requester.role not in {"operator", "admin"}:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Người yêu cầu không còn quyền vận hành")
+    server = visible_server(db, requester, item.server_id)
+    audit(db, user.username, "deletion.approve", item.id, request, detail={"requested_by": requester.username, "action": item.action, "server_id": server.id})
+    if item.action == "server.delete":
+        # delete_server commits the approval, retirement and audit together.
+        result = delete_server(server.id, ServerDeleteRequest(reason=item.reason, confirmation="DELETE"), request, user, db)
+        return {"id": item.id, "status": "approved", **result}
+    if item.action not in OPERATOR_DELETE_ACTIONS or ACTION_PERMISSIONS[item.action] not in platform_role_permissions(db, requester.role):
+        db.rollback()
+        raise HTTPException(status_code=403, detail="Người yêu cầu không còn quyền cho thao tác này")
+    parameters = reveal_parameters(item.parameters)
+    validate_job_parameters(item.action, parameters, server)
+    job = Job(server_id=server.id, action=item.action, parameters=item.parameters, reason=item.reason, status="queued", risk=SAFE_ACTIONS[item.action]["risk"], created_by=requester.id)
+    db.add(job)
+    db.flush()
+    item.job_id = job.id
+    audit(db, user.username, "job.create", job.id, request, detail={"approval_id": item.id, "action": item.action, "requested_by": requester.username})
+    db.commit()
+    return {"id": item.id, "status": "approved", "jobId": job.id}
+
+
+@app.get("/api/v1/logs")
+def list_readonly_logs(user: User = Depends(require_permission("logs.view")), db: Session = Depends(db_session)):
+    query = select(Job, Server.name).join(Server, Server.id == Job.server_id).where(Job.action == "logs.read", Job.status == "succeeded")
+    if user.role != "auditor":
+        query = query.where(Job.server_id.in_(visible_server_ids(db, user)))
+    rows = db.execute(query.order_by(Job.created_at.desc()).limit(30)).all()
+    return {"items": [{"id": job.id, "serverName": name, "createdAt": aware(job.created_at).isoformat(), "output": job.output[:100_000], "truncated": len(job.output) > 100_000} for job, name in rows]}
 
 
 def bulk_task_json(task: BulkTask, db: Session, allowed_server_ids: set[str] | None = None) -> dict[str, Any]:
@@ -4978,6 +5158,8 @@ def bulk_update_source_catalog(payload: BulkUpdateCatalogRequest, user: User = D
 
 @app.post("/api/v1/bulk-tasks", status_code=201)
 def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if user.role in {"viewer", "connector", "auditor"}:
+        raise HTTPException(status_code=403, detail="Vai trò này không được tạo tác vụ")
     policy = SAFE_ACTIONS.get(payload.action)
     permission = ACTION_PERMISSIONS.get(payload.action)
     if not policy or not permission or permission not in platform_role_permissions(db, user.role):
@@ -5135,7 +5317,7 @@ def create_bulk_task(payload: BulkTaskCreateRequest, request: Request, user: Use
 
 
 @app.get("/api/v1/bulk-tasks")
-def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: User = Depends(require_permission("jobs.view")), db: Session = Depends(db_session)):
     query = select(BulkTask).order_by(BulkTask.created_at.desc()).limit(100)
     if os_family:
         query = query.where(BulkTask.os_family == os_family)
@@ -5145,7 +5327,7 @@ def list_bulk_tasks(os_family: Literal["windows", "linux"] | None = None, _: Use
 
 
 @app.get("/api/v1/jobs")
-def list_jobs(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
+def list_jobs(user: User = Depends(require_permission("jobs.view")), db: Session = Depends(db_session)):
     rows = db.execute(
         select(Job, Server)
         .join(Server, Server.id == Job.server_id)
@@ -5329,19 +5511,26 @@ def update_recording_retention(payload: RecordingRetentionRequest, request: Requ
 
 
 @app.get("/api/v1/recording-deletion-requests")
-def list_recording_deletion_requests(_: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
-    rows = db.execute(select(RecordingDeletionRequest).order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
+def list_recording_deletion_requests(user: User = Depends(require_any_permission("recordings.delete", "deletions.request")), db: Session = Depends(db_session)):
+    query = select(RecordingDeletionRequest)
+    if user.role != "admin":
+        query = query.where(RecordingDeletionRequest.requested_by == user.id)
+    rows = db.execute(query.order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
     return {"items": [recording_deletion_json(item, db) for item in rows]}
 
 
 @app.post("/api/v1/recording-deletion-requests", status_code=201)
-def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, request: Request, user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
+def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, request: Request, user: User = Depends(require_any_permission("recordings.delete", "deletions.request")), db: Session = Depends(db_session)):
     session_ids = list(dict.fromkeys(payload.session_ids))
     if len(session_ids) != len(payload.session_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", item) for item in session_ids):
         raise HTTPException(status_code=400, detail="Danh sách recording không hợp lệ hoặc bị trùng")
     sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(session_ids))).scalars().all()
+    if any(item.server_id not in visible_server_ids(db, user) for item in sessions):
+        raise HTTPException(status_code=404, detail="Session not found")
     if len(sessions) != len(session_ids):
         raise HTTPException(status_code=404, detail="Có session không còn tồn tại")
+    if any(item.status not in {"closed", "failed"} for item in sessions):
+        raise HTTPException(status_code=409, detail="Chỉ được yêu cầu xóa recording của phiên đã kết thúc")
     unavailable = [item.id for item in sessions if recording_file(item.id) is None]
     if unavailable:
         raise HTTPException(status_code=409, detail="Có recording chưa sẵn sàng; hãy tải lại danh sách")
@@ -5358,11 +5547,15 @@ def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, r
 
 @app.post("/api/v1/recording-deletion-requests/{deletion_id}/approve")
 def approve_recording_deletion_request(deletion_id: str, request: Request, user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
+    require_server_admin(user)
     deletion = db.get(RecordingDeletionRequest, deletion_id)
     if not deletion:
         raise HTTPException(status_code=404, detail="Yêu cầu xóa recording không tồn tại")
     if deletion.requested_by == user.id:
         raise HTTPException(status_code=409, detail="Người tạo yêu cầu không được tự duyệt; cần quản trị viên thứ hai")
+    sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(deletion.session_ids))).scalars().all()
+    if any(item.status not in {"closed", "failed"} for item in sessions):
+        raise HTTPException(status_code=409, detail="Không được xóa recording của phiên chưa kết thúc")
     claimed_at = now()
     result = db.execute(update(RecordingDeletionRequest).where(RecordingDeletionRequest.id == deletion_id, RecordingDeletionRequest.status == "pending").values(status="deleting", approved_by=user.id, approved_by_username=user.username, approved_at=claimed_at))
     if result.rowcount != 1:
@@ -5416,6 +5609,8 @@ def remote_credential_json(db: Session, credential: RemoteCredential, server: Se
 
 
 def validate_remote_credential_target(server: Server, protocol: str) -> None:
+    if server.os_family not in {"linux", "windows"}:
+        raise HTTPException(status_code=409, detail="Chưa kích hoạt phiên có ghi hình cho kết nối khai báo thủ công")
     expected = "rdp" if server.os_family == "windows" else "ssh"
     if protocol != expected:
         raise HTTPException(status_code=422, detail=f"Máy chủ này chỉ hỗ trợ tài khoản {expected.upper()}")

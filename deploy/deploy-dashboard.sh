@@ -33,6 +33,10 @@ docker compose -f compose.yaml -f "$override" exec -T dashboard \
   grep -Fq 'Lưu cấu hình mẫu' /app/app/update-source-settings.tsx
 docker compose -f compose.yaml -f "$override" exec -T api \
   grep -Fq '/api/v1/settings/update-sources' /app/app/main.py
+docker compose -f compose.yaml -f "$override" exec -T api \
+  grep -Fq '/api/v1/deletion-approvals' /app/app/main.py
+docker compose -f compose.yaml -f "$override" exec -T dashboard \
+  grep -Fq '＋ Thêm kết nối' /app/app/managed-targets.tsx
 docker compose -f compose.yaml -f "$override" exec -T guacamole \
   test -r /etc/guacamole/extensions/tram-clipboard-sync.jar
 docker compose -f compose.yaml -f "$override" exec -T guacamole \

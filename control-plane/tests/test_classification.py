@@ -334,7 +334,7 @@ class ClassificationTests(unittest.TestCase):
                     db.add(operator)
                     db.commit()
                     operator_headers = {"Authorization": f"Bearer {issue_jwt(operator)}"}
-                self.assertEqual(client.get("/api/v1/agent-upgrades/status", headers=operator_headers).status_code, 403)
+                self.assertEqual(client.get("/api/v1/agent-upgrades/status", headers=operator_headers).status_code, 200)
 
                 status = client.get("/api/v1/agent-upgrades/status", headers=admin_headers)
                 self.assertEqual(status.status_code, 200, status.text)
@@ -1166,13 +1166,13 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(client.put(f"/api/v1/remote-credentials/{credential_id}", headers=viewer_headers, json={"label": "Changed", "username": "attacker", "password": "x", "user_ids": []}).status_code, 403)
             deleted = client.delete(f"/api/v1/remote-credentials/{credential_id}", headers=admin_headers)
             self.assertEqual(deleted.status_code, 200, deleted.text)
-    def test_server_visibility_comes_only_from_direct_or_group_share(self):
+    def test_connector_visibility_comes_only_from_direct_or_group_share(self):
         with TestClient(app) as client:
             admin_headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
             viewer_id = str(uuid.uuid4())
             server_id = str(uuid.uuid4())
             with SessionLocal() as db:
-                db.add(User(id=viewer_id, username=f"viewer-{viewer_id[:8]}", password_hash="!test", display_name="Scoped Viewer", role="viewer", enabled=True))
+                db.add(User(id=viewer_id, username=f"connector-{viewer_id[:8]}", password_hash="!test", display_name="Scoped Connector", role="connector", enabled=True))
                 db.add(Server(id=server_id, name=f"shared-{server_id[:8]}", os_family="linux", os_name="Oracle Linux", status="online"))
                 db.commit()
                 viewer = db.get(User, viewer_id)
@@ -1403,7 +1403,7 @@ class ClassificationTests(unittest.TestCase):
                 profile = client.get("/api/v1/me", headers=viewer_headers)
                 self.assertEqual(profile.status_code, 200, profile.text)
                 self.assertEqual(profile.json()["role"], "viewer")
-                self.assertEqual(set(profile.json()["permissions"]), {"logs.view", "resources.view", "servers.view"})
+                self.assertEqual(set(profile.json()["permissions"]), {"logs.view", "resources.view", "servers.view", "jobs.view", "files.view", "recordings.view", "audit.view", "configuration.view"})
                 self.assertEqual(client.get("/api/v1/servers", headers=viewer_headers).status_code, 200)
                 self.assertEqual(client.get("/api/v1/users", headers=viewer_headers).status_code, 403)
                 self.assertEqual(client.get("/api/v1/settings/ldap", headers=viewer_headers).status_code, 403)

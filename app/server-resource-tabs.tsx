@@ -612,8 +612,8 @@ export function StorageResourceTab({
         <div><h2>Disk & Volumes</h2><p>{osFamily === "windows" ? "Disk → partition → volume" : "Disk → partition → filesystem/LVM"}</p></div>
         <div className="resource-toolbar-actions">
           <button className="button ghost" type="button" onClick={refresh} disabled={busy}>↻ Quét lại</button>
-          <button className="resource-icon-button add" type="button" onClick={() => { setCreateTarget(""); setModal("create"); }} title="Tạo partition, VG hoặc LV">+</button>
-          <button className="resource-icon-button remove" type="button" disabled={!selected || deleteBlocked} onClick={() => setModal("delete")} title="Xóa mục đã chọn">−</button>
+          <button className="resource-icon-button add" type="button" disabled={busy} onClick={() => { setCreateTarget(""); setModal("create"); }} title="Tạo partition, VG hoặc LV">+</button>
+          <button className="resource-icon-button remove" type="button" disabled={busy || !selected || deleteBlocked} onClick={() => setModal("delete")} title="Xóa mục đã chọn">−</button>
         </div>
       </div>
       <PendingState job={job} />

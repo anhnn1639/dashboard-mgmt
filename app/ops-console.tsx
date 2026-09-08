@@ -5,6 +5,8 @@ import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEven
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 import { UpdateSourceSettingsView } from "./update-source-settings";
 import { RemoteCredentialsView } from "./remote-credentials";
+import { DeletionApprovalsView, ReadOnlyWorkspace } from "./role-workspaces";
+import { ManagedTargetsView } from "./managed-targets";
 
 type OSFamily = "linux" | "windows";
 type LinuxOfflineProfile = "ubuntu-22.04" | "ubuntu-24.04" | "ol-7" | "ol-8";
@@ -99,14 +101,27 @@ const navItems: Array<{ id: string; icon: string; label: string; group: string; 
   { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
   { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
   { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3, group: "infrastructure", permissions: ["servers.view"] },
+  { id: "network", icon: "◇", label: "Thiết bị mạng", group: "infrastructure", permissions: ["servers.view"] },
+  { id: "web", icon: "◎", label: "Web console", group: "infrastructure", permissions: ["servers.view"] },
   { id: "sessions", icon: "↗", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
-  { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["servers.view"] },
+  { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["jobs.view"] },
+  { id: "logs", icon: "≡", label: "Log máy chủ", group: "operations", permissions: ["logs.view"] },
+  { id: "approvals", icon: "✓", label: "Phê duyệt xóa", group: "operations", permissions: ["deletions.request", "deletions.approve"] },
+  { id: "configuration-view", icon: "⚙", label: "Xem cấu hình", group: "operations", permissions: ["configuration.view"] },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
   { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
   { id: "update-settings", icon: "↥", label: "Cấu hình cập nhật", group: "administration", permissions: ["updates.manage"] },
-  { id: "remote-credentials", icon: "⌁", label: "Tài khoản Remote", group: "administration", permissions: ["sessions.launch"], adminOnly: true },
+  { id: "remote-credentials", icon: "⌁", label: "Tài khoản xác thực", group: "administration", permissions: ["sessions.launch"], adminOnly: true },
   { id: "agents", icon: "↓", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
 ];
+
+function navigationAllowed(item: (typeof navItems)[number], user: CurrentUser | null) {
+  if (!user || (item.adminOnly && user.role !== "admin")) return false;
+  if (user.role === "connector" && !["linux", "windows", "network", "web"].includes(item.id)) return false;
+  if (user.role === "auditor" && !["audit", "logs"].includes(item.id)) return false;
+  if (item.id === "configuration-view" && user.role !== "viewer") return false;
+  return item.permissions.some((permission) => user.permissions.includes(permission));
+}
 
 const healthLabel: Record<Health, string> = {
   healthy: "Ổn định",
@@ -574,6 +589,7 @@ export function OpsConsole() {
   const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
   const [bulkTaskOpen, setBulkTaskOpen] = useState(false);
   const [serverManagement, setServerManagement] = useState<{ server: Server; mode: "share" | "delete" } | null>(null);
+  const [managedShare, setManagedShare] = useState<{ id: string; name: string } | null>(null);
   const [recentAudit, setRecentAudit] = useState<AuditEventRow[]>([]);
   const [recentAuditBusy, setRecentAuditBusy] = useState(false);
   const [recentAuditError, setRecentAuditError] = useState("");
@@ -755,7 +771,7 @@ export function OpsConsole() {
   }, [authReady, token]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!token || !currentUser?.permissions.includes("servers.view")) return;
     const initial = window.setTimeout(() => void loadServers(), 0);
     const timer = window.setInterval(() => {
       void loadServers();
@@ -764,7 +780,7 @@ export function OpsConsole() {
       window.clearTimeout(initial);
       window.clearInterval(timer);
     };
-  }, [loadServers, token]);
+  }, [loadServers, token, currentUser]);
 
   useEffect(() => {
     if (active !== "overview" || !currentUser) return;
@@ -774,7 +790,7 @@ export function OpsConsole() {
 
   useEffect(() => {
     if (token && !currentUser) return;
-    const allowedNavigation = navItems.filter((item) => item.permissions.some((permission) => currentUser?.permissions.includes(permission)));
+    const allowedNavigation = navItems.filter((item) => navigationAllowed(item, currentUser));
     const fallbackSection = allowedNavigation[0]?.id ?? "overview";
     const applyHashRoute = () => {
       const [section, encodedName] = window.location.hash.replace(/^#\/?/, "").split("/");
@@ -799,7 +815,7 @@ export function OpsConsole() {
       } else if (allowedNavigation.some((item) => item.id === section)) {
         setActive(section);
         setSelected(null);
-      } else if (section) {
+      } else {
         setActive(fallbackSection);
         setSelected(null);
         window.history.replaceState(null, "", sectionRoute(fallbackSection));
@@ -834,12 +850,12 @@ export function OpsConsole() {
 
   const scope = active === "linux" || active === "windows" ? active : null;
   const visibleNavItems = useMemo(
-    () => navItems.filter((item) => (!item.adminOnly || currentUser?.role === "admin") && item.permissions.some((permission) => currentUser?.permissions.includes(permission))),
+    () => navItems.filter((item) => navigationAllowed(item, currentUser)),
     [currentUser],
   );
   const infrastructureNavigation = visibleNavItems.filter((item) => item.group === "infrastructure");
-  const operationsNavigation = visibleNavItems.filter((item) => item.group === "operations");
-  const administrationNavigation = visibleNavItems.filter((item) => item.group === "administration");
+  const operationsNavigation = visibleNavItems.filter((item) => item.group === "operations" || (currentUser?.role !== "admin" && item.group === "administration"));
+  const administrationNavigation = currentUser?.role === "admin" ? visibleNavItems.filter((item) => item.group === "administration") : [];
   const visibleServers = useMemo(
     () =>
       servers.filter((server) => {
@@ -914,6 +930,7 @@ export function OpsConsole() {
   }
 
   function openServer(server: Server) {
+    if (currentUser?.role === "connector") setModal("session");
     setActive(server.osFamily);
     setSelected(server);
     setSelectedServerIds([]);
@@ -937,7 +954,7 @@ export function OpsConsole() {
     window.history.pushState(null, "", sectionRoute(section));
   }
 
-  const title =
+  const title = active === "network" ? "Thiết bị mạng" : active === "web" ? "Web console" : active === "approvals" ? "Phê duyệt xóa" : active === "logs" ? "Log máy chủ" : active === "configuration-view" ? "Xem cấu hình" :
     active === "linux"
       ? "Máy chủ Linux"
       : active === "windows"
@@ -953,7 +970,7 @@ export function OpsConsole() {
                 : active === "update-settings"
                   ? "Cấu hình cập nhật"
                   : active === "remote-credentials"
-                    ? "Tài khoản Remote"
+                    ? "Tài khoản xác thực"
                 : active === "agents"
                   ? "Tạo bộ cài Agent"
                 : "Trung tâm vận hành";
@@ -1316,7 +1333,7 @@ export function OpsConsole() {
             </>
           )}
 
-          {selected ? (
+          {active === "network" || active === "web" ? <ManagedTargetsView key={active} kind={active} token={token} role={currentUser.role} notify={notify} share={setManagedShare} /> : selected && currentUser.role === "connector" ? <section className="panel view-panel"><h2>{selected.name}</h2><button className="button primary" onClick={() => setModal("session")}>Kết nối</button></section> : selected ? (
             <ServerDrawer
               server={selected}
               close={closeServer}
@@ -1324,8 +1341,10 @@ export function OpsConsole() {
               notify={notify}
               token={token}
               canConfigureLogs={currentUser.permissions.includes("logs.configure")}
+              permissions={currentUser.permissions}
+              readOnly={currentUser.role === "viewer"}
             />
-          ) : active === "sessions" ? (
+          ) : active === "approvals" ? <DeletionApprovalsView token={token} isAdmin={currentUser.role === "admin"} /> : active === "logs" || active === "configuration-view" ? <ReadOnlyWorkspace key={active} token={token} kind={active === "logs" ? "logs" : "configuration"} /> : active === "sessions" ? (
             <SessionsView token={token} />
           ) : active === "jobs" ? (
             <JobsView token={token} servers={servers} />
@@ -1354,7 +1373,7 @@ export function OpsConsole() {
                   </p>
                 </div>
                 <div className="fleet-head-actions">
-                  {scope ? <button type="button" className="button primary compact" onClick={() => setBulkTaskOpen(true)}>＋ Tạo task chung</button> : null}
+                  {scope && currentUser.permissions.some((p) => ["updates.manage", "firewall.manage", "accounts.manage"].includes(p)) ? <button type="button" className="button primary compact" onClick={() => setBulkTaskOpen(true)}>＋ Tạo task chung</button> : null}
                   <div className="filters">
                     <button
                       className={filter === "all" ? "active" : ""}
@@ -1389,7 +1408,7 @@ export function OpsConsole() {
                 servers={visibleServers}
                 onSelect={openServer}
                 onShare={currentUser.role === "admin" && currentUser.permissions.includes("servers.manage") ? (server) => setServerManagement({ server, mode: "share" }) : undefined}
-                onDelete={scope && currentUser.role === "admin" && currentUser.permissions.includes("servers.manage") ? (server) => setServerManagement({ server, mode: "delete" }) : undefined}
+                onDelete={scope && ["admin", "operator"].includes(currentUser.role) && currentUser.permissions.includes("servers.manage") ? (server) => setServerManagement({ server, mode: "delete" }) : undefined}
                 selection={scope ? {
                   selectedIds: selectedServerIds,
                   toggle: (serverId) => setSelectedServerIds((current) => current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId]),
@@ -1439,7 +1458,8 @@ export function OpsConsole() {
         />
       )}
       {serverManagement?.mode === "share" && <ServerShareModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} saved={(shares) => { setServers((current) => current.map((server) => server.id === serverManagement.server.id ? { ...server, shares } : server)); setServerManagement(null); notify("Đã cập nhật phạm vi nhìn thấy máy chủ."); }} />}
-      {serverManagement?.mode === "delete" && <ServerDeleteModal server={serverManagement.server} token={token} close={() => setServerManagement(null)} deleted={() => { setServers((current) => current.filter((server) => server.id !== serverManagement.server.id)); setSelectedServerIds((current) => current.filter((id) => id !== serverManagement.server.id)); setServerManagement(null); notify("Đã xóa máy chủ khỏi danh sách và ngừng chấp nhận Agent cũ."); }} />}
+      {managedShare && <ServerShareModal server={managedShare} token={token} close={() => setManagedShare(null)} saved={() => { setManagedShare(null); notify("Đã cập nhật chia sẻ kết nối."); }} />}
+      {serverManagement?.mode === "delete" && <ServerDeleteModal server={serverManagement.server} token={token} approvalRequired={currentUser.role === "operator"} close={() => setServerManagement(null)} deleted={(pending) => { if (!pending) { setServers((current) => current.filter((server) => server.id !== serverManagement.server.id)); setSelectedServerIds((current) => current.filter((id) => id !== serverManagement.server.id)); } setServerManagement(null); notify(pending ? "Đã gửi yêu cầu xóa; máy chủ vẫn giữ nguyên cho đến khi một Administrator duyệt." : "Đã xóa máy chủ khỏi danh sách và ngừng chấp nhận Agent cũ."); }} />}
       {accountOpen && <AccountSettingsModal user={currentUser} token={token} close={() => setAccountOpen(false)} signOut={signOut} updated={(nextUser) => { setCurrentUser(nextUser); notify("Đã cập nhật thông tin tài khoản."); }} />}
       {toast && (
         <div className="toast">
@@ -1565,7 +1585,7 @@ function AccountSettingsModal({
   );
 }
 
-function ServerShareModal({ server, token, close, saved }: { server: Server; token: string; close: () => void; saved: (shares: { userIds: string[]; groupIds: string[]; count: number }) => void }) {
+function ServerShareModal({ server, token, close, saved }: { server: Pick<Server, "id" | "name"> & Partial<Pick<Server, "shares">>; token: string; close: () => void; saved: (shares: { userIds: string[]; groupIds: string[]; count: number }) => void }) {
   const [users, setUsers] = useState<Array<{ id: string; username: string; displayName: string; enabled: boolean }>>([]);
   const [groups, setGroups] = useState<PlatformGroupRow[]>([]);
   const [userIds, setUserIds] = useState<string[]>(server.shares?.userIds ?? []);
@@ -1590,10 +1610,10 @@ function ServerShareModal({ server, token, close, saved }: { server: Server; tok
     if (response.ok) saved({ userIds: data.userIds ?? [], groupIds: data.groupIds ?? [], count: Number(data.count ?? 0) });
     else { setError(data.detail ?? "Không thể cập nhật share"); setBusy(false); }
   }
-  return <ModalShell title={`Share ${server.name}`} subtitle="Administrator thấy toàn bộ; các tài khoản khác chỉ thấy máy chủ được gán trực tiếp hoặc qua group" close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<div className="share-picker"><fieldset><legend>Người dùng</legend>{users.filter((user) => user.enabled).map((user) => <label key={user.id} aria-label={`Share cho ${user.username}`}><input type="checkbox" checked={userIds.includes(user.id)} onChange={() => setUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /><span><b>{user.displayName || user.username}</b><small>{user.username}</small></span></label>)}</fieldset><fieldset><legend>Groups của trạm vận hành</legend>{groups.map((group) => <label key={group.id} aria-label={`Share cho group ${group.name}`}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => setGroupIds((current) => current.includes(group.id) ? current.filter((id) => id !== group.id) : [...current, group.id])} /><span><b>{group.name}</b><small>{group.memberCount} thành viên</small></span></label>)}</fieldset></div><div className="resource-help">Không chọn ai nghĩa là máy chủ chỉ hiển thị với Administrator.</div><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang xử lý…" : "Lưu share"}</button></div></form></ModalShell>;
+  return <ModalShell title={`Share ${server.name}`} subtitle="Admin, Operator và Viewer thấy toàn bộ. Connector chỉ thấy tài nguyên được chia sẻ trực tiếp hoặc qua group." close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<div className="share-picker"><fieldset><legend>Người dùng</legend>{users.filter((user) => user.enabled).map((user) => <label key={user.id} aria-label={`Share cho ${user.username}`}><input type="checkbox" checked={userIds.includes(user.id)} onChange={() => setUserIds((current) => current.includes(user.id) ? current.filter((id) => id !== user.id) : [...current, user.id])} /><span><b>{user.displayName || user.username}</b><small>{user.username}</small></span></label>)}</fieldset><fieldset><legend>Groups của trạm vận hành</legend>{groups.map((group) => <label key={group.id} aria-label={`Share cho group ${group.name}`}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => setGroupIds((current) => current.includes(group.id) ? current.filter((id) => id !== group.id) : [...current, group.id])} /><span><b>{group.name}</b><small>{group.memberCount} thành viên</small></span></label>)}</fieldset></div><div className="resource-help">Không chọn ai nghĩa là Connector không nhìn thấy tài nguyên này; Admin, Operator và Viewer vẫn thấy.</div><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang xử lý…" : "Lưu share"}</button></div></form></ModalShell>;
 }
 
-function ServerDeleteModal({ server, token, close, deleted }: { server: Server; token: string; close: () => void; deleted: () => void }) {
+function ServerDeleteModal({ server, token, close, deleted, approvalRequired }: { server: Server; token: string; close: () => void; deleted: (pending: boolean) => void; approvalRequired: boolean }) {
   const [confirmation, setConfirmation] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1602,9 +1622,9 @@ function ServerDeleteModal({ server, token, close, deleted }: { server: Server; 
     event.preventDefault(); setBusy(true); setError("");
     const response = await fetch(`/api/v1/servers/${server.id}`, { method: "DELETE", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ confirmation, reason }) });
     const data = await response.json().catch(() => ({}));
-    if (response.ok) deleted(); else { setError(data.detail ?? "Không thể xóa máy chủ"); setBusy(false); }
+    if (response.ok) deleted(data.status === "pending_approval"); else { setError(data.detail ?? "Không thể xóa máy chủ"); setBusy(false); }
   }
-  return <ModalShell title={`Xóa ${server.name}`} subtitle="Máy chủ biến mất khỏi fleet và certificate Agent hiện tại bị từ chối; lịch sử audit/job vẫn được giữ" close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<label>Lý do<input value={reason} onChange={(event) => setReason(event.target.value)} minLength={3} maxLength={500} required /></label><label>Gõ <b>DELETE</b><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button danger" disabled={busy || confirmation !== "DELETE" || reason.trim().length < 3}>Xóa máy chủ</button></div></form></ModalShell>;
+  return <ModalShell title={`Xóa ${server.name}`} subtitle="Máy chủ biến mất khỏi fleet và certificate Agent hiện tại bị từ chối; lịch sử audit/job vẫn được giữ" close={close}><form className="resource-form" onSubmit={submit}>{error && <div className="danger-panel">{error}</div>}<label>Lý do<input value={reason} onChange={(event) => setReason(event.target.value)} minLength={3} maxLength={500} required /></label><label>Gõ <b>DELETE</b><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label><div className="modal-actions"><button type="button" className="button ghost" onClick={close}>Hủy</button><button className="button danger" disabled={busy || confirmation !== "DELETE" || reason.trim().length < 3}>{approvalRequired ? "Gửi yêu cầu xóa" : "Xóa máy chủ"}</button></div></form></ModalShell>;
 }
 
 type BulkTaskResponse = {
@@ -2448,6 +2468,8 @@ function ServerDrawer({
   notify,
   token,
   canConfigureLogs,
+  permissions,
+  readOnly,
 }: {
   server: Server;
   close: () => void;
@@ -2455,6 +2477,8 @@ function ServerDrawer({
   notify: (message: string) => void;
   token: string;
   canConfigureLogs: boolean;
+  permissions: string[];
+  readOnly: boolean;
 }) {
   type Fact = {
     name?: string;
@@ -2634,6 +2658,8 @@ function ServerDrawer({
     reason: string,
     announce = true,
   ) {
+    if (readOnly) throw new Error("Vai trò Viewer chỉ được xem dữ liệu đã thu thập, không tạo tác vụ.");
+    if (/^(user\.|group\.)/.test(nextAction) && !["user.list", "group.list"].includes(nextAction) && !permissions.includes("accounts.manage")) throw new Error("Không có quyền cấu hình tài khoản.");
     const response = await fetch("/api/v1/jobs", {
       method: "POST",
       headers: {
@@ -2649,11 +2675,12 @@ function ServerDrawer({
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail ?? "Không thể tạo tác vụ");
-    if (announce) notify(`Đã gửi tác vụ ${nextAction} tới Agent · ${data.status}.`);
+    if (announce) notify(data.status === "pending_approval" ? "Đã gửi yêu cầu xóa; chờ một Administrator duyệt, chưa gửi tới Agent." : `Đã gửi tác vụ ${nextAction} tới Agent · ${data.status}.`);
     await loadJobs();
     return data as { id: string; status: string; risk: string };
   }
   async function refreshCurrentTab(parameters: Record<string, unknown> = {}) {
+    if (readOnly) { await loadJobs(); return; }
     if (!currentReadAction && activeTab !== "accounts") return;
     setBusy(true);
     try {
@@ -2674,6 +2701,7 @@ function ServerDrawer({
   }
   function selectTab(tab: ServerTab) {
     setActiveTab(tab);
+    if (readOnly) return;
     if (tab === "firewall" && (!latestFirewallJob || latestFirewallJob.status === "failed"))
       void queueJob("firewall.list", {}, `Quét firewall rules trên ${server.name}`).catch((reason) =>
         notify(reason instanceof Error ? reason.message : "Không thể quét firewall"),
@@ -2837,6 +2865,7 @@ function ServerDrawer({
   }
   async function uploadFile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!permissions.includes("files.manage")) return notify("Bạn không có quyền gửi file.");
     setFileBusy(true);
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
@@ -2888,7 +2917,7 @@ function ServerDrawer({
           </div>
         </div>
         <div className="drawer-actions">
-          <button className="connect" onClick={openSession} disabled={!server.tunnelOnline}>
+          <button className="connect" onClick={openSession} disabled={!permissions.includes("sessions.launch") || !server.tunnelOnline}>
             <span>↗</span>
             <b>{server.osFamily === "windows" ? "Remote Desktop" : "Mở SSH"}</b>
             <small>
@@ -2896,6 +2925,7 @@ function ServerDrawer({
             </small>
           </button>
           <button
+            disabled={readOnly}
             onClick={() =>
               queueJob(
                 "inventory.collect",
@@ -2921,6 +2951,7 @@ function ServerDrawer({
             </button>
           ))}
         </nav>
+        {readOnly && <p className="resource-help">Chế độ chỉ xem: dữ liệu đã thu thập. Không thể mở phiên, quét Agent hoặc thay đổi cấu hình.</p>}
         <div className="drawer-body">
           {activeTab === "overview" && (
             <>
@@ -2993,21 +3024,20 @@ function ServerDrawer({
                   <button className="button ghost" onClick={() => void refreshCurrentTab()} disabled={busy}>
                     {busy ? "Đang quét…" : "↻ Quét lại"}
                   </button>
-                  <button className="firewall-icon-button add" type="button" aria-label="Thêm firewall rule" title="Thêm firewall rule" onClick={() => setFirewallModal("add")}>+</button>
-                  <button className="firewall-icon-button remove" type="button" aria-label="Xóa firewall rule đã chọn" title="Xóa firewall rule đã chọn" disabled={selectedRules.length === 0} onClick={() => { setFirewallConfirmation(""); setFirewallModal("delete"); }}>−</button>
+                  {permissions.includes("firewall.manage") && <><button className="firewall-icon-button add" type="button" aria-label="Thêm firewall rule" title="Thêm firewall rule" onClick={() => setFirewallModal("add")}>+</button><button className="firewall-icon-button remove" type="button" aria-label="Xóa firewall rule đã chọn" title="Xóa firewall rule đã chọn" disabled={selectedRules.length === 0} onClick={() => { setFirewallConfirmation(""); setFirewallModal("delete"); }}>−</button></>}
                 </div>
               </div>}
 
               {activeTab === "storage" && (
-                <StorageResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <StorageResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy || readOnly} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "services" && (
-                <ServicesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <ServicesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy || readOnly} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "accounts" && (
-                <AccountsResourceTab userOutput={latestSuccessfulUserJob?.output} groupOutput={latestSuccessfulGroupJob?.output} job={latestUserJob?.status === "failed" ? latestUserJob : latestGroupJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <AccountsResourceTab userOutput={latestSuccessfulUserJob?.output} groupOutput={latestSuccessfulGroupJob?.output} job={latestUserJob?.status === "failed" ? latestUserJob : latestGroupJob} serverName={server.name} osFamily={server.osFamily} busy={busy || !permissions.includes("accounts.manage")} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "firewall" && (
@@ -3140,15 +3170,15 @@ function ServerDrawer({
               )}
 
               {activeTab === "updates" && (
-                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <UpdatesResourceTab key={successfulUpdateScanJobs[0]?.id ?? "updates-empty"} scans={successfulUpdateScanJobs} job={latestReadJob} serverName={server.name} osFamily={server.osFamily} busy={busy || readOnly} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "processes" && (
-                <ProcessesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
+                <ProcessesResourceTab output={latestSuccessfulReadJob?.output} job={latestReadJob} serverName={server.name} busy={busy || readOnly} refresh={() => void refreshCurrentTab()} queue={runResourceAction} />
               )}
 
               {activeTab === "logs" && (
-                <LogsResourceTab output={latestSuccessfulReadJob?.output} sourceOutput={latestSuccessfulLogSourcesJob?.output} configured={configuredLogSources} job={latestReadJob} serverName={server.name} busy={busy} refresh={() => void refreshCurrentTab()} saveSources={saveLogSources} canConfigure={canConfigureLogs} />
+                <LogsResourceTab output={latestSuccessfulReadJob?.output} sourceOutput={latestSuccessfulLogSourcesJob?.output} configured={configuredLogSources} job={latestReadJob} serverName={server.name} busy={busy || readOnly} refresh={() => void refreshCurrentTab()} saveSources={saveLogSources} canConfigure={canConfigureLogs} />
               )}
             </>
           )}
@@ -3172,7 +3202,7 @@ function ServerDrawer({
                 Hệ thống không tự chạy file và không ghi đè file đã có.
               </p>
             </div>
-            <button className="button primary" disabled={fileBusy || !server.tunnelOnline}>
+            <button className="button primary" disabled={fileBusy || !permissions.includes("files.manage") || !server.tunnelOnline}>
               {fileBusy ? "Đang quét…" : "Quét & gửi vào vùng cách ly"}
             </button>
           </form>
@@ -3199,7 +3229,7 @@ function ServerDrawer({
           key={`${server.id}:${latestFirewallJob?.id ?? "no-scan"}:${latestFirewallJob?.status ?? "pending"}`}
           server={server}
           scan={firewallScan}
-          busy={busy}
+          busy={busy || readOnly}
           close={closeFirewallModal}
           submit={submitFirewallRule}
         />
@@ -3885,7 +3915,7 @@ function AuditView({ token }: { token: string }) {
       ].join(" ")).includes(normalizedAuditSearch))
     : rows, [normalizedAuditSearch, rows]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
-  const selectableSessions = sessions.filter((session) => session.recordingAvailable && !pendingSessionIds.has(session.id));
+  const selectableSessions = sessions.filter((session) => ["closed", "failed"].includes(session.status) && session.recordingAvailable && !pendingSessionIds.has(session.id));
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
   function toggleRecording(sessionId: string) {
     setSelectedRecordingIds((current) => current.includes(sessionId) ? current.filter((item) => item !== sessionId) : [...current, sessionId]);
@@ -3969,12 +3999,12 @@ function AuditView({ token }: { token: string }) {
           >
             Sự kiện audit
           </button>
-          <button
+          {currentUser?.permissions.includes("recordings.view") && <button
             className={tab === "recordings" ? "active" : ""}
             onClick={() => setTab("recordings")}
           >
             Video ghi session
-          </button>
+          </button>}
         </div>
         {tab === "events" ? (
           <div className="audit-events-panel">
@@ -4027,19 +4057,18 @@ function AuditView({ token }: { token: string }) {
           </div>
         ) : (
           <div className="recording-management">
-            {currentUser?.permissions?.includes("recordings.delete") && (
+            {currentUser?.permissions?.some((permission) => ["recordings.delete", "deletions.request"].includes(permission)) && (
               <div className="recording-actions">
                 <label><input type="checkbox" checked={selectableSessions.length > 0 && selectableSessions.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableSessions.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableSessions.map((session) => session.id))} /> Chọn tất cả video khả dụng</label>
                 <span>{selectedRecordingIds.length} video đang chọn</span>
-                <span>{retention.enabled ? `Tự động xóa sau ${retention.days} ngày` : "Tự động xóa đang tắt"}</span>
-                <button className="resource-icon-button settings" type="button" title="Cấu hình thời gian lưu recording" onClick={() => setRetentionModal(true)}>⚙</button>
+                {currentUser.role === "admin" && <><span>{retention.enabled ? `Tự động xóa sau ${retention.days} ngày` : "Tự động xóa đang tắt"}</span><button className="resource-icon-button settings" type="button" title="Cấu hình thời gian lưu recording" onClick={() => setRetentionModal(true)}>⚙</button></>}
                 <button className="button danger" disabled={selectedRecordingIds.length === 0} onClick={() => { setDeleteValidation(""); setDeleteModal(true); }}>Xóa video đã chọn</button>
               </div>
             )}
             {recordingMessage && <div className="recording-message">{recordingMessage}</div>}
             {currentUser?.permissions?.includes("recordings.delete") && deletionRequests.some((item) => item.status === "pending") && (
               <div className="recording-approval-list">
-                <h3>Yêu cầu xóa đang chờ quản trị viên thứ hai</h3>
+                <h3>Yêu cầu xóa đang chờ Administrator duyệt</h3>
                 {deletionRequests.filter((item) => item.status === "pending").map((item) => (
                   <div key={item.id}>
                     <p><b>{item.requestedByUsername}</b><small>{item.sessions.map((session) => session.label).join("\n")}</small><em>{item.reason}</em></p>
@@ -4052,7 +4081,7 @@ function AuditView({ token }: { token: string }) {
             {sessions.length ? (
               sessions.map((session) => (
                 <div key={session.id}>
-                  {currentUser?.permissions?.includes("recordings.delete") ? <input type="checkbox" checked={selectedRecordingIds.includes(session.id)} disabled={!session.recordingAvailable || pendingSessionIds.has(session.id)} aria-label={`Chọn recording ${session.serverName}`} onChange={() => toggleRecording(session.id)} /> : <span />}
+                  {currentUser?.permissions?.some((permission) => ["recordings.delete", "deletions.request"].includes(permission)) ? <input type="checkbox" checked={selectedRecordingIds.includes(session.id)} disabled={!selectableSessions.some((item) => item.id === session.id)} aria-label={`Chọn recording ${session.serverName}`} onChange={() => toggleRecording(session.id)} /> : <span />}
                   <span className="play">▶</span>
                   <p>
                     <b>
