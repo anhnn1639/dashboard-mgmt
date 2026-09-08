@@ -225,10 +225,44 @@ test("navigation policy enforces connector/auditor categories even with stale pe
   runInNewContext(compiled, { exports });
   const permissions = ["servers.view", "resources.view", "recordings.view", "audit.view", "logs.view", "users.manage", "roles.manage", "ldap.manage", "sessions.launch", "agents.manage", "updates.manage", "jobs.view", "deletions.request", "configuration.view"];
   assert.deepEqual(Array.from(exports.allowed({ role: "connector", permissions })), ["linux", "windows", "network", "web"]);
-  assert.deepEqual(Array.from(exports.allowed({ role: "auditor", permissions })), ["logs", "audit"]);
+  assert.deepEqual(Array.from(exports.allowed({ role: "auditor", permissions })), ["audit"]);
+  for (const role of ["admin", "operator", "viewer", "auditor", "connector", "custom"]) {
+    assert.ok(!exports.allowed({ role, permissions }).includes("logs"), `${role}: no standalone server logs menu`);
+  }
+  assert.doesNotMatch(nav, /Log máy chủ/);
   const operator = exports.allowed({ role: "operator", permissions });
   assert.ok(!operator.includes("remote-credentials"));
   assert.ok(operator.includes("approvals"));
+});
+
+test("retired server logs hashes fall back safely while per-server logs remain", async () => {
+  const { default: ts } = await import("typescript");
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const nav = source.slice(source.indexOf("const navItems:"), source.indexOf("const healthLabel:"));
+  const routeStart = source.lastIndexOf("  useEffect(() => {", source.indexOf("const allowedNavigation ="));
+  const routeEnd = "  }, [servers, token, currentUser]);";
+  const route = source.slice(routeStart, source.indexOf(routeEnd, routeStart) + routeEnd.length);
+  const compiled = ts.transpileModule(nav + route, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const permissions = ["servers.view", "logs.view", "audit.view"];
+  for (const role of ["admin", "operator", "viewer", "auditor", "connector", "custom"]) {
+    for (const hash of ["#/logs", "#logs", "#/logs/"]) {
+      let active, selected, replaced;
+      runInNewContext(compiled, {
+        token: "test", currentUser: { role, permissions }, servers: [],
+        useEffect: (callback) => callback()(),
+        setActive: (value) => { active = value; },
+        setSelected: (value) => { selected = value; },
+        sectionRoute: (section) => `#/${section}`,
+        window: { location: { hash }, history: { replaceState: (_state, _title, url) => { replaced = url; } }, addEventListener() {}, removeEventListener() {} },
+      });
+      const expected = role === "auditor" ? "audit" : role === "connector" ? "linux" : "overview";
+      assert.equal(active, expected, `${role}/${hash}`);
+      assert.equal(replaced, `#/${expected}`);
+      assert.equal(selected, null);
+    }
+  }
+  assert.match(source, /\{ id: "logs", label: "Nhật ký", icon: "≡" \}/);
+  assert.match(source, /<LogsResourceTab\b/);
 });
 
 test("server-renders the secure operations console shell", async () => {

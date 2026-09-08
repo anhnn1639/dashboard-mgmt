@@ -105,7 +105,6 @@ const navItems: Array<{ id: string; icon: string; label: string; group: string; 
   { id: "web", icon: "◎", label: "Web console", group: "infrastructure", permissions: ["servers.view"] },
   { id: "sessions", icon: "↗", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
   { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["jobs.view"] },
-  { id: "logs", icon: "≡", label: "Log máy chủ", group: "operations", permissions: ["logs.view"] },
   { id: "approvals", icon: "✓", label: "Phê duyệt xóa", group: "operations", permissions: ["deletions.request", "deletions.approve"] },
   { id: "configuration-view", icon: "⚙", label: "Xem cấu hình", group: "operations", permissions: ["configuration.view"] },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
@@ -118,7 +117,7 @@ const navItems: Array<{ id: string; icon: string; label: string; group: string; 
 function navigationAllowed(item: (typeof navItems)[number], user: CurrentUser | null) {
   if (!user || (item.adminOnly && user.role !== "admin")) return false;
   if (user.role === "connector" && !["linux", "windows", "network", "web"].includes(item.id)) return false;
-  if (user.role === "auditor" && !["audit", "logs"].includes(item.id)) return false;
+  if (user.role === "auditor" && item.id !== "audit") return false;
   if (item.id === "configuration-view" && user.role !== "viewer") return false;
   return item.permissions.some((permission) => user.permissions.includes(permission));
 }

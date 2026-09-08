@@ -1,5 +1,12 @@
 # Bàn giao Codex — 08/09/2026
 
+## Bỏ menu Log máy chủ — 08/09/2026
+
+- Theo ảnh/yêu cầu mới, bỏ mục **Log máy chủ** khỏi menu chung cho mọi vai trò. Auditor chỉ còn **Nhật ký kiểm toán** trong sidebar; không thay quyền backend, API đọc log, việc thu thập/lưu log, recording hay dữ liệu PostgreSQL. Tab **Nhật ký** bên trong từng máy chủ giữ nguyên.
+- Giữ bố cục/sidebar hiện có theo Sites, không đổi theme hoặc triển khai sang Sites. Đường dẫn cũ `#/logs`, `#logs`, `#/logs/` tự chuyển về trang đầu tiên được phép theo cơ chế điều hướng hiện hữu, không render trang trắng.
+- TypeScript, ESLint, production build và **35/35** kiểm thử giao diện pass; regression bao phủ menu và đường dẫn cũ với Admin, Operator, Viewer, Auditor, Connector và role tùy chỉnh, đồng thời giữ tab Nhật ký theo máy chủ.
+- Chưa deploy production. Thay đổi này chỉ cần pull code rồi rebuild/recreate **dashboard** theo đúng Compose overlay đang dùng và tải lại giao diện; không cần nâng Agent hay thay dữ liệu/API.
+
 ## SSH tự thương lượng, bỏ tích chọn — 08/09/2026
 
 - Đã push source tại `25d9d73cea7b82b8023ee2cf6b611cbfae075cd4` và đối chiếu remote main. CI Security audit `34221979096` **success** cả 7 job (Python/API/Agent/security, Node build/render, edge và 4 profile SSH thật). Cisco legacy xác nhận `discovered automatically without opt-in`, password auth qua relay, recording không rỗng và pin sai bị chặn. Các profile SSH mới xác nhận không gọi legacy fallback.
