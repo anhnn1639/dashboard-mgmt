@@ -1,5 +1,7 @@
 import asyncio
+import importlib.util
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.direct_sessions import DirectSessionHub, discover_host_key
@@ -82,3 +84,14 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await discover_host_key("10.8.1.2", 2222), "ecdsa-sha2-nistp256 dGVzdA==")
             self.assertEqual(execute.call_args.args[-1], "10.8.1.2")
             self.assertNotIn("shell", execute.call_args.kwargs)
+
+    async def test_smoke_protocol_encoder_and_parser(self):
+        path = Path(__file__).resolve().parents[2] / "tests" / "ssh-smoke" / "verify.py"
+        spec = importlib.util.spec_from_file_location("ssh_smoke", path)
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        self.assertEqual(smoke.instruction("select", "ssh"), b"6.select,3.ssh;")
+        reader = asyncio.StreamReader()
+        reader.feed_data(smoke.instruction("args", "VERSION_1_5_0", "hostname", "port"))
+        reader.feed_eof()
+        self.assertEqual(await smoke.read_instruction(reader), ["args", "VERSION_1_5_0", "hostname", "port"])

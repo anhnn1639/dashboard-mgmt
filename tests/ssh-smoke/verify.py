@@ -63,10 +63,19 @@ async def main():
             for attempt in range(30):
                 try:
                     reader, writer = await asyncio.open_connection("127.0.0.1", 14822)
-                    writer.close()
-                    await writer.wait_closed()
+                    try:
+                        # Docker's TCP proxy may accept before guacd is ready.
+                        # Require a real protocol response, not just an open port.
+                        writer.write(instruction("select", "ssh"))
+                        await writer.drain()
+                        greeting = await asyncio.wait_for(read_instruction(reader), 5)
+                        if greeting[0] != "args":
+                            raise ConnectionError("guacd is not ready")
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
                     break
-                except OSError:
+                except (OSError, asyncio.IncompleteReadError, TimeoutError):
                     if attempt == 29:
                         raise
                     await asyncio.sleep(1)
@@ -128,4 +137,5 @@ async def main():
                 docker("rm", "-f", "tram-smoke-guacd")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
