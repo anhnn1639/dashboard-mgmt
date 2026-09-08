@@ -50,7 +50,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
 from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
-from .direct_sessions import DirectSessionHub, discover_host_key
+from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest
 
 
@@ -3322,7 +3322,7 @@ def persist_managed_target(payload: ManagedTargetRequest, request: Request, user
             # Usage of one's own newly supplied credential, not vault management.
             db.add(RemoteCredentialUserShare(credential_id=credential.id, user_id=user.id, granted_by=user.id))
         audit(db, user.username, "remote_credential.create", credential.id, request, detail={"server_id": server.id, "protocol": credential.protocol, "initial_target_credential": True})
-    audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port})
+    audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port, "ssh_legacy_compatibility": payload.ssh_legacy_compatibility})
     db.commit()
     return {"id": server.id, "saved": True}
 
@@ -5784,15 +5784,19 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
         if managed:
             config = ManagedTargetRequest.model_validate((server.inventory or {}).get("managedTarget", {}))
             if not server.ssh_host_key:
-                observed_key = await discover_host_key(config.address, config.port)
+                observed_key = await discover_host_key(config.address, config.port, legacy_compatibility=config.ssh_legacy_compatibility)
                 # Concurrent first connections must not overwrite an established pin.
                 db.execute(update(Server).where(Server.id == server.id, or_(Server.ssh_host_key.is_(None), Server.ssh_host_key == "")).values(ssh_host_key=observed_key))
                 db.refresh(server)
-                audit(db, user.username, "target.ssh.trust_first_use", server.id, request, detail={"host_key_sha256": hashlib.sha256(server.ssh_host_key.encode()).hexdigest()})
+                audit(db, user.username, "target.ssh.trust_first_use", server.id, request, detail={"host_key_sha256": hashlib.sha256(server.ssh_host_key.encode()).hexdigest(), "legacy_compatibility_allowed": config.ssh_legacy_compatibility})
                 db.commit()
             relay_port = await direct_hub.create_listener(session_id, server.id, config.address, config.port)
         else:
             relay_port = await tunnel_hub.create_listener(session_id, server.id, payload.protocol)
+    except SSHProbeError as exc:
+        audit(db, user.username, "target.ssh.preflight_failed", server.id, request, detail={"code": exc.code})
+        db.commit()
+        raise HTTPException(status_code=503 if exc.code == "probe_unavailable" else 409, detail=str(exc)) from exc
     except (ConnectionError, OSError, ValueError) as exc:
         if managed:
             raise HTTPException(status_code=409, detail="Không mở được SSH tới thiết bị. Kiểm tra IP, cổng, firewall và dịch vụ SSH.") from exc

@@ -12,7 +12,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from app.direct_sessions import DirectSessionHub, discover_host_key
+from app.direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 
 
 def docker(*args, **kwargs):
@@ -38,18 +38,31 @@ async def read_instruction(reader):
 
 
 async def main():
+    legacy = os.environ.get("SSH_SMOKE_PROFILE") == "cisco-legacy"
     secret = secrets.token_urlsafe(24)
     docker("exec", "-i", "tram-smoke-sshd", "chpasswd", input=f"smoke:{secret}\n")
     address = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", "tram-smoke-sshd")
     gateway = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", "tram-smoke-sshd")
     for attempt in range(30):
         try:
-            key = await discover_host_key(address, 22)
+            key = await discover_host_key(address, 22, legacy_compatibility=legacy)
             break
         except (OSError, ConnectionError):
             if attempt == 29:
                 raise
             await asyncio.sleep(1)
+
+    if legacy:
+        if not key.startswith("ssh-rsa "):
+            raise RuntimeError("Legacy fixture did not return an RSA host key")
+        try:
+            await discover_host_key(address, 22)
+        except SSHProbeError as error:
+            if error.code != "legacy_opt_in_required":
+                raise
+        else:
+            raise RuntimeError("Legacy fixture unexpectedly passed without target opt-in")
+        print("PASS: Group14/RSA SHA1 fixture needs explicit per-target compatibility")
 
     async def closed(_id, _reason):
         pass

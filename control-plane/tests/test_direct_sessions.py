@@ -2,9 +2,10 @@ import asyncio
 import importlib.util
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
-from app.direct_sessions import DirectSessionHub, discover_host_key
+from app.direct_sessions import DirectSessionHub, SSHProbeError, _run_probe, discover_host_key
 
 
 class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -78,12 +79,107 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
             await upstream.wait_closed()
 
     async def test_discovery_is_no_shell_and_prefers_ecdsa_compatible_key(self):
-        process = AsyncMock()
-        process.communicate.return_value = (b"10.8.1.2 ssh-rsa dGVzdA==\n10.8.1.2 ecdsa-sha2-nistp256 dGVzdA==\n", b"")
-        with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process) as execute:
+        result = (b"[10.8.1.2]:2222 ssh-rsa dGVzdA==\n[10.8.1.2]:2222 ecdsa-sha2-nistp256 dGVzdA==\n", b"debug1: kex: algorithm: (no match)")
+        with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=result) as execute, patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock) as legacy:
             self.assertEqual(await discover_host_key("10.8.1.2", 2222), "ecdsa-sha2-nistp256 dGVzdA==")
             self.assertEqual(execute.call_args.args[-1], "10.8.1.2")
             self.assertNotIn("shell", execute.call_args.kwargs)
+            self.assertEqual(execute.call_args.args[0], "ssh-keyscan")
+            legacy.assert_not_awaited()
+
+    async def test_legacy_requires_explicit_per_target_opt_in(self):
+        result = (b"", b"debug1: kex: algorithm: (no match)")
+        with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=result), patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock, return_value="ssh-rsa dGVzdA==") as legacy:
+            with self.assertRaises(SSHProbeError) as error:
+                await discover_host_key("10.8.1.2", 2222)
+            self.assertEqual(error.exception.code, "legacy_opt_in_required")
+            legacy.assert_not_awaited()
+            self.assertEqual(await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True), "ssh-rsa dGVzdA==")
+            legacy.assert_awaited_once_with("10.8.1.2", 2222)
+
+    async def test_legacy_is_not_attempted_on_network_or_unknown_failure(self):
+        for diagnostic, code in [(b"connect: Connection refused", "connection_refused"), (b"Connection timed out", "unreachable"), (b"untrusted remote banner", "handshake_failed")]:
+            with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", diagnostic)), patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock) as legacy:
+                with self.assertRaises(SSHProbeError) as error:
+                    await discover_host_key("10.8.1.2", 22, legacy_compatibility=True)
+                self.assertEqual(error.exception.code, code)
+                self.assertNotIn(diagnostic.decode(), str(error.exception))
+                legacy.assert_not_awaited()
+
+    async def test_legacy_probe_has_minimal_algorithms_no_credentials_or_commands(self):
+        async def run(*args):
+            if args[0] == "ssh-keyscan":
+                return b"", b"no matching key exchange method"
+            self.assertEqual(args[-1], "10.8.1.2")
+            self.assertIn("-N", args)
+            self.assertIn("-T", args)
+            self.assertIn("/dev/null", args)
+            self.assertIn("KexAlgorithms=+diffie-hellman-group14-sha1", args)
+            self.assertIn("PreferredAuthentications=none", args)
+            self.assertIn("PasswordAuthentication=no", args)
+            self.assertIn("IdentityAgent=none", args)
+            self.assertIn("StrictHostKeyChecking=accept-new", args)
+            self.assertIn("ClearAllForwardings=yes", args)
+            self.assertFalse(any("group1-sha1" in arg or "cbc" in arg or "3des" in arg or "ssh-dss" in arg for arg in args))
+            self.assertTrue(any(arg.startswith("UserKnownHostsFile=") and "tram-ssh-probe-" in arg for arg in args))
+            return b"", b"Permission denied (password)."
+
+        with patch("app.direct_sessions._run_probe", side_effect=run), patch.object(Path, "exists", return_value=True), patch.object(Path, "stat", return_value=SimpleNamespace(st_size=50)), patch.object(Path, "read_bytes", return_value=b"[10.8.1.2]:2222 ssh-rsa dGVzdA==\n"):
+            self.assertEqual(await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True), "ssh-rsa dGVzdA==")
+
+    async def test_legacy_does_not_accept_public_key_for_another_endpoint(self):
+        with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", b"no matching key exchange method")), patch.object(Path, "exists", return_value=True), patch.object(Path, "stat", return_value=SimpleNamespace(st_size=50)), patch.object(Path, "read_bytes", return_value=b"[10.8.1.9]:2222 ssh-rsa dGVzdA==\n"):
+            with self.assertRaises(SSHProbeError) as error:
+                await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True)
+            self.assertEqual(error.exception.code, "algorithms_unsupported")
+
+    async def test_probe_rejects_invalid_destinations_before_spawn(self):
+        with patch("app.direct_sessions._run_probe", new_callable=AsyncMock) as probe:
+            for address, port in [("127.0.0.1", 22), ("10.8.1.2", 0), ("10.8.1.2", 65536), ("10.8.1.2; id", 22)]:
+                with self.assertRaises(ValueError):
+                    await discover_host_key(address, port, legacy_compatibility=True)
+            probe.assert_not_awaited()
+
+    async def test_probe_bounds_output_and_cleans_up_process(self):
+        for output, expected in [(b"host key", None), (b"a" * 65537, "invalid_response")]:
+            stdout, stderr = asyncio.StreamReader(), asyncio.StreamReader()
+            stdout.feed_data(output)
+            stdout.feed_eof()
+            stderr.feed_eof()
+            process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, kill=Mock(), wait=AsyncMock(return_value=0))
+            with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process) as spawn:
+                if expected:
+                    with self.assertRaises(SSHProbeError) as error:
+                        await _run_probe("ssh-keyscan", "10.8.1.2")
+                    self.assertEqual(error.exception.code, expected)
+                else:
+                    self.assertEqual(await _run_probe("ssh-keyscan", "10.8.1.2"), (output, b""))
+                self.assertEqual(spawn.call_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+                self.assertNotIn("shell", spawn.call_args.kwargs)
+                process.kill.assert_called_once()
+                self.assertTrue(process.wait.await_count)
+
+    async def test_probe_timeout_and_cancellation_kill_child(self):
+        real_wait_for = asyncio.wait_for
+        async def short_wait(awaitable, timeout):
+            return await real_wait_for(awaitable, .001)
+        for cancel in (False, True):
+            process = SimpleNamespace(stdout=asyncio.StreamReader(), stderr=asyncio.StreamReader(), returncode=None, kill=Mock(), wait=AsyncMock(return_value=0))
+            with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process), patch("app.direct_sessions.asyncio.wait_for", side_effect=short_wait):
+                task = asyncio.create_task(_run_probe("ssh-keyscan", "10.8.1.2"))
+                if cancel:
+                    await asyncio.sleep(0)
+                    task.cancel()
+                with self.assertRaises(asyncio.CancelledError if cancel else SSHProbeError):
+                    await task
+                process.kill.assert_called_once()
+                process.wait.assert_awaited()
+
+    async def test_missing_ssh_tool_has_actionable_error(self):
+        with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, side_effect=FileNotFoundError):
+            with self.assertRaises(SSHProbeError) as error:
+                await _run_probe("ssh-keyscan", "10.8.1.2")
+            self.assertEqual(error.exception.code, "probe_unavailable")
 
     async def test_smoke_protocol_encoder_and_parser(self):
         path = Path(__file__).resolve().parents[2] / "tests" / "ssh-smoke" / "verify.py"

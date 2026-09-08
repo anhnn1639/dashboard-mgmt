@@ -5,7 +5,7 @@ import { ModalShell } from "./server-resource-tabs";
 import { readManagedTargetResponse } from "./managed-target-api";
 import { ManagedSessionModal } from "./managed-session-modal";
 
-type TargetConfig = { name: string; kind: "network" | "web"; address?: string; port?: number; url: string; credential?: { username: string; password: string } };
+type TargetConfig = { name: string; kind: "network" | "web"; address?: string; port?: number; url: string; ssh_legacy_compatibility?: boolean; credential?: { username: string; password: string } };
 type Target = { id: string; name: string; kind: "network" | "web"; address: string; config: TargetConfig | null; connectionReady: boolean };
 
 export function ManagedTargetsView({ kind, token, role, notify, share }: { kind: "network" | "web"; token: string; role: string; notify: (message: string) => void; share: (target: { id: string; name: string }) => void }) {
@@ -36,6 +36,7 @@ export function ManagedTargetsView({ kind, token, role, notify, share }: { kind:
     const form = new FormData(event.currentTarget);
     const body: TargetConfig = { kind, name: String(form.get("name")), url: kind === "web" ? String(form.get("url")) : "", ...(kind === "network" ? { address: String(form.get("address")), port: Number(form.get("port")) } : {}) };
     if (editing === "new") body.credential = { username: String(form.get("username")), password: String(form.get("password")) };
+    if (kind === "network") body.ssh_legacy_compatibility = form.get("ssh_legacy_compatibility") === "on";
     try {
       const response = await fetch(`/api/v1/managed-targets${editing && editing !== "new" ? "/" + editing.id : ""}`, { method: editing === "new" ? "POST" : "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
       await readManagedTargetResponse(response, editing === "new" ? "create" : "edit");
@@ -62,6 +63,7 @@ export function ManagedTargetsView({ kind, token, role, notify, share }: { kind:
         {error && <div className="danger-panel" role="alert">{error}</div>}
         <label>{kind === "web" ? "Tên web console" : "Tên kết nối"}<input name="name" defaultValue={selected?.name} minLength={2} maxLength={100} required /></label>
         {kind === "network" ? <div className="form-grid"><label>Địa chỉ IPv4 của thiết bị<input name="address" placeholder="10.64.70.20" defaultValue={selected?.address} required /></label><label>Cổng SSH<input name="port" type="number" min={1} max={65535} defaultValue={selected?.port ?? 22} required /></label></div> : <label>URL HTTPS<input name="url" type="url" placeholder="https://vcenter.example.local/ui/" defaultValue={selected?.url} required /></label>}
+        {kind === "network" && <fieldset><legend>Tương thích SSH</legend><label className="check"><input type="checkbox" name="ssh_legacy_compatibility" defaultChecked={selected?.ssh_legacy_compatibility ?? false} aria-describedby="ssh-legacy-help" />Tương thích SSH cũ (Group14/RSA-SHA1)</label><p id="ssh-legacy-help" className="resource-help">Chỉ bật cho thiết bị cũ cần SHA-1, có độ an toàn thấp hơn. Khi đọc khóa lần đầu, ưu tiên SSH mới và chỉ thử thêm Group14-SHA1, RSA/SHA1 cho đúng IP/cổng này nếu không khớp thuật toán. Không bật Group1, CBC/3DES. Khóa đã ghi nhận vẫn được kiểm tra; nên nâng firmware khi có thể.</p></fieldset>}
         {editing === "new" ? <fieldset><legend>Tài khoản xác thực ban đầu</legend><div className="form-grid"><label>Username<input name="username" required maxLength={128} autoComplete="off" /></label><label>Password<input name="password" type="password" required maxLength={1024} autoComplete="new-password" /></label></div><p className="resource-help">Lưu mã hóa vào Tài khoản xác thực. Sau khi lưu, chỉ Administrator được quản lý tài khoản; người kết nối chỉ chọn username được phép sử dụng.</p></fieldset> : <p className="resource-help">Tài khoản đã lưu không thay đổi tại đây. Administrator quản lý username/password trong mục Tài khoản xác thực.</p>}
         <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditing(null)}>Hủy</button><button disabled={busy} className="button primary">{busy ? "Đang lưu…" : "Lưu kết nối"}</button></div>
       </form>

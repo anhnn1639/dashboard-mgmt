@@ -29,6 +29,12 @@ jobs:
   managed-ssh-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [modern, ed25519, rsa-modern, cisco-legacy]
+    env:
+      SSH_SMOKE_PROFILE: ${{ matrix.profile }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,7 +44,15 @@ jobs:
         run: |
           docker network create tram-smoke-net
           docker build -t tram-smoke-sshd tests/ssh-smoke
-          docker run -d --name tram-smoke-sshd --network tram-smoke-net tram-smoke-sshd
+          options=()
+          case "$SSH_SMOKE_PROFILE" in
+            modern) ;;
+            ed25519) options=(-o HostKeyAlgorithms=ssh-ed25519) ;;
+            rsa-modern) options=(-o HostKeyAlgorithms=rsa-sha2-512,rsa-sha2-256) ;;
+            cisco-legacy) options=(-o KexAlgorithms=diffie-hellman-group14-sha1 -o HostKeyAlgorithms=ssh-rsa -o Ciphers=aes128-ctr -o MACs=hmac-sha1) ;;
+            *) exit 2 ;;
+          esac
+          docker run -d --name tram-smoke-sshd --network tram-smoke-net tram-smoke-sshd /usr/sbin/sshd -D -e -o PasswordAuthentication=yes -o PermitRootLogin=no "${options[@]}"
       - name: Verify real SSH, host key rejection and recording
         run: PYTHONPATH=control-plane python tests/ssh-smoke/verify.py
       - name: Remove disposable test services
