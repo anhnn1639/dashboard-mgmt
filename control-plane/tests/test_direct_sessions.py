@@ -88,21 +88,17 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(execute.call_args.args[0], "ssh-keyscan")
             legacy.assert_not_awaited()
 
-    async def test_legacy_requires_explicit_per_target_opt_in(self):
+    async def test_legacy_negotiation_automatically_falls_back_once_for_exact_target(self):
         result = (b"", b"debug1: kex: algorithm: (no match)")
         with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=result), patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock, return_value="ssh-rsa dGVzdA==") as legacy:
-            with self.assertRaises(SSHProbeError) as error:
-                await discover_host_key("10.8.1.2", 2222)
-            self.assertEqual(error.exception.code, "legacy_opt_in_required")
-            legacy.assert_not_awaited()
-            self.assertEqual(await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True), "ssh-rsa dGVzdA==")
+            self.assertEqual(await discover_host_key("10.8.1.2", 2222), "ssh-rsa dGVzdA==")
             legacy.assert_awaited_once_with("10.8.1.2", 2222)
 
     async def test_legacy_is_not_attempted_on_network_or_unknown_failure(self):
-        for diagnostic, code in [(b"connect: Connection refused", "connection_refused"), (b"Connection timed out", "unreachable"), (b"untrusted remote banner", "handshake_failed")]:
+        for diagnostic, code in [(b"connect: Connection refused", "connection_refused"), (b"Connection timed out", "unreachable"), (b"untrusted remote banner", "handshake_failed"), (b"Permission denied (password).", "handshake_failed"), (b"REMOTE HOST IDENTIFICATION HAS CHANGED", "handshake_failed")]:
             with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", diagnostic)), patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock) as legacy:
                 with self.assertRaises(SSHProbeError) as error:
-                    await discover_host_key("10.8.1.2", 22, legacy_compatibility=True)
+                    await discover_host_key("10.8.1.2", 22)
                 self.assertEqual(error.exception.code, code)
                 self.assertNotIn(diagnostic.decode(), str(error.exception))
                 legacy.assert_not_awaited()
@@ -126,19 +122,29 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
             return b"", b"Permission denied (password)."
 
         with patch("app.direct_sessions._run_probe", side_effect=run), patch.object(Path, "exists", return_value=True), patch.object(Path, "stat", return_value=SimpleNamespace(st_size=50)), patch.object(Path, "read_bytes", return_value=b"[10.8.1.2]:2222 ssh-rsa dGVzdA==\n"):
-            self.assertEqual(await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True), "ssh-rsa dGVzdA==")
+            self.assertEqual(await discover_host_key("10.8.1.2", 2222), "ssh-rsa dGVzdA==")
 
     async def test_legacy_does_not_accept_public_key_for_another_endpoint(self):
         with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", b"no matching key exchange method")), patch.object(Path, "exists", return_value=True), patch.object(Path, "stat", return_value=SimpleNamespace(st_size=50)), patch.object(Path, "read_bytes", return_value=b"[10.8.1.9]:2222 ssh-rsa dGVzdA==\n"):
             with self.assertRaises(SSHProbeError) as error:
-                await discover_host_key("10.8.1.2", 2222, legacy_compatibility=True)
+                await discover_host_key("10.8.1.2", 2222)
             self.assertEqual(error.exception.code, "algorithms_unsupported")
+
+    async def test_automatic_fallback_failure_is_not_retried_or_hidden(self):
+        for code in ("algorithms_unsupported", "timeout", "handshake_failed"):
+            failure = SSHProbeError(code, "SSH probe failed")
+            with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", b"no matching key exchange method")) as modern, patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock, side_effect=failure) as legacy:
+                with self.assertRaises(SSHProbeError) as error:
+                    await discover_host_key("10.8.1.2", 2222)
+                self.assertIs(error.exception, failure)
+                modern.assert_awaited_once()
+                legacy.assert_awaited_once_with("10.8.1.2", 2222)
 
     async def test_probe_rejects_invalid_destinations_before_spawn(self):
         with patch("app.direct_sessions._run_probe", new_callable=AsyncMock) as probe:
             for address, port in [("127.0.0.1", 22), ("10.8.1.2", 0), ("10.8.1.2", 65536), ("10.8.1.2; id", 22)]:
                 with self.assertRaises(ValueError):
-                    await discover_host_key(address, port, legacy_compatibility=True)
+                    await discover_host_key(address, port)
             probe.assert_not_awaited()
 
     async def test_probe_bounds_output_and_cleans_up_process(self):

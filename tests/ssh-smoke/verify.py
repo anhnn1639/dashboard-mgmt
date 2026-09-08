@@ -11,8 +11,10 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
-from app.direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
+from app import direct_sessions
+from app.direct_sessions import DirectSessionHub, discover_host_key
 
 
 def docker(*args, **kwargs):
@@ -45,7 +47,12 @@ async def main():
     gateway = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", "tram-smoke-sshd")
     for attempt in range(30):
         try:
-            key = await discover_host_key(address, 22, legacy_compatibility=legacy)
+            with patch.object(direct_sessions, "_discover_legacy_host_key", wraps=direct_sessions._discover_legacy_host_key) as fallback:
+                # Same public entry point for modern and Cisco legacy targets:
+                # no caller opt-in/config flag, and the real fallback still runs.
+                key = await discover_host_key(address, 22)
+                if fallback.await_count != (1 if legacy else 0):
+                    raise RuntimeError("SSH discovery did not honor modern-first automatic fallback")
             break
         except (OSError, ConnectionError):
             if attempt == 29:
@@ -55,14 +62,9 @@ async def main():
     if legacy:
         if not key.startswith("ssh-rsa "):
             raise RuntimeError("Legacy fixture did not return an RSA host key")
-        try:
-            await discover_host_key(address, 22)
-        except SSHProbeError as error:
-            if error.code != "legacy_opt_in_required":
-                raise
-        else:
-            raise RuntimeError("Legacy fixture unexpectedly passed without target opt-in")
-        print("PASS: Group14/RSA SHA1 fixture needs explicit per-target compatibility")
+        print("PASS: Group14/RSA SHA1 fixture discovered automatically without opt-in")
+    else:
+        print("PASS: modern SSH discovered without invoking legacy fallback")
 
     async def closed(_id, _reason):
         pass

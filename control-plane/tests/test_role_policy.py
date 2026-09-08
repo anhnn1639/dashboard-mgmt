@@ -219,7 +219,7 @@ class RolePolicyTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertTrue(response.json()["recording"])
                 self.assertNotIn("session-secret-fixture", response.text)
-            scan.assert_awaited_once_with("10.80.9.7", 2222, legacy_compatibility=False)
+            scan.assert_awaited_once_with("10.80.9.7", 2222)
             agent_relay.assert_not_awaited()
             self.assertEqual(relay.call_args.args[1:], (server_id, "10.80.9.7", 2222))
             parameters = next(iter(encrypt.call_args.args[0]["connections"].values()))["parameters"]
@@ -235,35 +235,45 @@ class RolePolicyTests(unittest.TestCase):
             events = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id)).scalars().all()
             self.assertNotIn("session-secret-fixture", str([event.detail for event in events]))
 
-    def test_ssh_compatibility_is_per_target_persisted_and_preserves_existing_pin(self):
-        server_id, credential_id = self.network_fixture()
-        with m.SessionLocal() as db:
-            config = dict(db.get(m.Server, server_id).inventory["managedTarget"])
-            self.assertIs(config["ssh_legacy_compatibility"], False)
-        config["ssh_legacy_compatibility"] = True
-        endpoint = f"/api/v1/managed-targets/{server_id}"
-        for role in ("viewer", "connector", "auditor"):
-            self.assertEqual(self.client.put(endpoint, headers=self.headers[role], json=config).status_code, 403)
-        self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 200)
-        host_key = "ssh-rsa " + base64.b64encode(b"fixture-rsa-host-key-material").decode()
-        with patch.object(m, "discover_host_key", new_callable=AsyncMock, return_value=host_key) as scan, patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock, return_value=49000), patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture"):
-            response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "ssh", "credential_id": credential_id})
-            self.assertEqual(response.status_code, 200, response.text)
-            scan.assert_awaited_once_with("10.80.9.7", 2222, legacy_compatibility=True)
-        config["ssh_legacy_compatibility"] = False
-        self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 200)
-        with m.SessionLocal() as db:
-            self.assertEqual(db.get(m.Server, server_id).ssh_host_key, host_key)
-            events = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id, m.AuditEvent.action == "target.configure")).scalars().all()
-            self.assertTrue(any(event.detail.get("ssh_legacy_compatibility") is True for event in events))
-        config["ssh_legacy_compatibility"] = "true"
-        self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 422)
-        config.update(kind="web", url="https://console.example.test/", ssh_legacy_compatibility=True)
-        self.assertEqual(self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=config).status_code, 422)
+    def test_automatic_ssh_works_without_resaving_missing_false_or_true_legacy_metadata(self):
+        for old_flag in (None, False, True):
+            server_id, credential_id = self.network_fixture()
+            with m.SessionLocal() as db:
+                server = db.get(m.Server, server_id)
+                config = dict(server.inventory["managedTarget"])
+                self.assertNotIn("ssh_legacy_compatibility", config)
+                # Reproduce rows saved by previous releases; do NOT PUT first.
+                if old_flag is not None:
+                    config["ssh_legacy_compatibility"] = old_flag
+                    server.inventory = {"managedTarget": dict(config)}
+                encrypted_password = db.get(m.RemoteCredential, credential_id).password_encrypted
+                db.commit()
+            host_key = "ssh-rsa " + base64.b64encode(b"fixture-rsa-host-key-material").decode()
+            with patch("app.direct_sessions._run_probe", new_callable=AsyncMock, return_value=(b"", b"no matching key exchange method")) as modern, patch("app.direct_sessions._discover_legacy_host_key", new_callable=AsyncMock, return_value=host_key) as legacy, patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock, return_value=49000), patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture"):
+                for _ in range(2):
+                    response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "ssh", "credential_id": credential_id})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertTrue(response.json()["recording"])
+                modern.assert_awaited_once()
+                legacy.assert_awaited_once_with("10.80.9.7", 2222)
+            endpoint = f"/api/v1/managed-targets/{server_id}"
+            config["ssh_legacy_compatibility"] = False  # stale form still accepted
+            for role in ("viewer", "connector", "auditor"):
+                self.assertEqual(self.client.put(endpoint, headers=self.headers[role], json=config).status_code, 403)
+            self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 200)
+            with m.SessionLocal() as db:
+                self.assertEqual(db.get(m.Server, server_id).ssh_host_key, host_key)
+                self.assertNotIn("ssh_legacy_compatibility", db.get(m.Server, server_id).inventory["managedTarget"])
+                self.assertEqual(db.get(m.RemoteCredential, credential_id).password_encrypted, encrypted_password)
+                events = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id, m.AuditEvent.action == "target.ssh.trust_first_use")).scalars().all()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].detail["ssh_compatibility"], "automatic-modern-first-group14-rsa-sha1")
+            config["ssh_legacy_compatibility"] = "true"
+            self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 422)
 
     def test_ssh_probe_failure_is_actionable_audited_and_does_not_open_relay(self):
         server_id, credential_id = self.network_fixture()
-        for code, status in [("legacy_opt_in_required", 409), ("probe_unavailable", 503)]:
+        for code, status in [("algorithms_unsupported", 409), ("probe_unavailable", 503)]:
             with patch.object(m, "discover_host_key", new_callable=AsyncMock, side_effect=m.SSHProbeError(code, "Thông báo SSH an toàn")), patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock) as relay:
                 response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "ssh", "credential_id": credential_id})
                 self.assertEqual(response.status_code, status, response.text)
@@ -272,7 +282,7 @@ class RolePolicyTests(unittest.TestCase):
         with m.SessionLocal() as db:
             self.assertFalse(db.get(m.Server, server_id).ssh_host_key)
             events = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id, m.AuditEvent.action == "target.ssh.preflight_failed")).scalars().all()
-            self.assertEqual({event.detail["code"] for event in events}, {"legacy_opt_in_required", "probe_unavailable"})
+            self.assertEqual({event.detail["code"] for event in events}, {"algorithms_unsupported", "probe_unavailable"})
 
     def test_ssh_requires_both_target_and_credential_share_and_readonly_roles_cannot_launch(self):
         server_id, credential_id = self.network_fixture()

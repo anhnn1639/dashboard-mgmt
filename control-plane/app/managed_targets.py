@@ -31,7 +31,9 @@ class ManagedTargetRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     url: str = Field(default="", max_length=2048)
     ssh_host_key: str = Field(default="", max_length=2048)
-    ssh_legacy_compatibility: bool = Field(default=False, strict=True)
+    # Accept old persisted metadata/stale forms, but never use or re-serialize
+    # the retired opt-in. All registered SSH targets now negotiate automatically.
+    ssh_legacy_compatibility: bool = Field(default=False, strict=True, exclude=True, repr=False)
     credential: InitialTargetCredential | None = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")
@@ -46,8 +48,6 @@ class ManagedTargetRequest(BaseModel):
             if self.url:
                 raise ValueError("SSH targets cannot contain browser settings")
         else:
-            if self.ssh_legacy_compatibility:
-                raise ValueError("SSH compatibility is only available for network devices")
             parsed = urlsplit(self.url)
             if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or any(ord(c) < 33 for c in self.url):
                 raise ValueError("Web consoles require HTTPS without embedded credentials or fragments")

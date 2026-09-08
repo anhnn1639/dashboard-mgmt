@@ -72,7 +72,7 @@ async def _run_probe(*args: str) -> tuple[bytes, bytes]:
 def _probe_failure(errors: bytes) -> SSHProbeError:
     diagnostic = errors.decode("ascii", errors="ignore").lower()
     if any(marker in diagnostic for marker in ("kex: algorithm: (no match)", "no matching key exchange method", "no matching host key type", "no matching cipher", "no matching mac")):
-        return SSHProbeError("algorithms_unsupported", "Thiết bị không có thuật toán SSH tương thích. Chế độ cũ chỉ hỗ trợ thêm Group14-SHA1 và RSA/SHA1; không hỗ trợ SSHv1, DSA, Group1 hoặc CBC/3DES. Cần nâng firmware nếu thiết bị chỉ có các thuật toán này.")
+        return SSHProbeError("algorithms_unsupported", "Không khớp thuật toán SSH sau khi tự thử SSH mới và Group14-SHA1/RSA-SHA1. Thiết bị chỉ hỗ trợ SSHv1, DSA, Group1 hoặc CBC/3DES cần nâng firmware hoặc đổi cấu hình SSH.")
     if "connection refused" in diagnostic:
         return SSHProbeError("connection_refused", "Thiết bị từ chối cổng SSH. Kiểm tra cổng và dịch vụ SSH trên thiết bị.")
     if any(marker in diagnostic for marker in ("timed out", "no route to host", "network is unreachable")):
@@ -81,7 +81,8 @@ def _probe_failure(errors: bytes) -> SSHProbeError:
 
 
 async def _discover_legacy_host_key(address: str, port: int) -> str:
-    # Only called for an individually opted-in DB target after modern KEX fails.
+    # Automatic minimal fallback for a registered DB target after modern KEX
+    # negotiation fails, as requested. Never retry network/authentication errors.
     # ssh-keyscan cannot accept KexAlgorithms. This isolated SSHv2 probe has no
     # vault credentials, authentication, remote command or forwarding enabled.
     # The temporary file contains PUBLIC keys; durable TOFU pins stay in PG.
@@ -122,7 +123,7 @@ async def _discover_legacy_host_key(address: str, port: int) -> str:
         return keys[0]
 
 
-async def discover_host_key(address: str, port: int, *, legacy_compatibility: bool = False) -> str:
+async def discover_host_key(address: str, port: int) -> str:
     ip = ipaddress.ip_address(address)
     if ip.version != 4 or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or not 1 <= port <= 65535:
         raise ValueError("Invalid SSH destination")
@@ -135,9 +136,7 @@ async def discover_host_key(address: str, port: int, *, legacy_compatibility: bo
         return keys[0]
     failure = _probe_failure(errors)
     if failure.code == "algorithms_unsupported":
-        if legacy_compatibility:
-            return await _discover_legacy_host_key(str(ip), port)
-        raise SSHProbeError("legacy_opt_in_required", "Đã tới dịch vụ SSH nhưng không khớp thuật toán. Với thiết bị cũ, vào Sửa kết nối và bật Tương thích SSH cũ (Group14/RSA-SHA1) riêng cho thiết bị này.")
+        return await _discover_legacy_host_key(str(ip), port)
     raise failure
 
 

@@ -133,20 +133,15 @@ test("Admin and Operator create forms accept initial credentials without exposin
         assert.equal(html.includes('name="address"'), kind === "network");
         assert.equal(html.includes('name="port"'), kind === "network");
         assert.equal(html.includes('name="url"'), kind === "web");
-        const legacyCheckbox = html.match(/<input[^>]*name="ssh_legacy_compatibility"[^>]*>/)?.[0];
-        assert.equal(Boolean(legacyCheckbox), kind === "network");
-        if (legacyCheckbox) {
-          assert.equal(legacyCheckbox.includes("checked"), !creating);
-          assert.match(html, /Chỉ bật cho thiết bị cũ cần SHA-1/);
-          assert.match(html, /Group14\/RSA-SHA1/);
-        }
+        assert.doesNotMatch(html, /name="ssh_legacy_compatibility"|Chỉ bật cho thiết bị cũ/);
+        assert.equal(html.includes("SSH tự thương lượng"), kind === "network");
         assert.doesNotMatch(html, /ssh_host_key|SSH public host key/);
       }
     }
   }
 });
 
-test("managed form submits per-target SSH opt-in and supports clearing it without changing vault credentials", async () => {
+test("managed form needs no SSH toggle and never submits obsolete flags from saved targets", async () => {
   const { default: ts } = await import("typescript");
   const require = createRequire(import.meta.url);
   const React = require("react");
@@ -163,8 +158,8 @@ test("managed form submits per-target SSH opt-in and supports clearing it withou
   }
   for (const kind of ["network", "web"]) {
     for (const creating of [true, false]) {
-      for (const enabled of [true, false]) {
-        const editing = creating ? "new" : { id: "existing", config: { kind, ssh_legacy_compatibility: true } };
+      for (const oldFlag of [undefined, true, false]) {
+        const editing = creating ? "new" : { id: "existing", config: { kind, ssh_legacy_compatibility: oldFlag } };
         const values = [[], editing, null, "", "", "", "ready", false, null];
         let index = 0;
         const submitted = [];
@@ -177,9 +172,9 @@ test("managed form submits per-target SSH opt-in and supports clearing it withou
           fetch: async (_url, options) => { if (options.body) submitted.push(JSON.parse(options.body)); return Response.json({ items: [], saved: true }); },
         });
         const tree = exports.ManagedTargetsView({ kind, role: "operator", token: "test", notify() {}, share() {} });
-        await findForm(tree).props.onSubmit({ preventDefault() {}, currentTarget: { name: "Switch", address: "10.80.2.7", port: "22", url: "https://console.example.test/", username: "fixture", password: "fixture", ssh_legacy_compatibility: enabled ? "on" : null } });
+        await findForm(tree).props.onSubmit({ preventDefault() {}, currentTarget: { name: "Switch", address: "10.80.2.7", port: "22", url: "https://console.example.test/", username: "fixture", password: "fixture" } });
         assert.equal(submitted.length, 1);
-        assert.equal(submitted[0].ssh_legacy_compatibility, kind === "network" ? enabled : undefined);
+        assert.equal("ssh_legacy_compatibility" in submitted[0], false);
         assert.equal(Boolean(submitted[0].credential), creating);
       }
     }
