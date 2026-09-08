@@ -27,6 +27,10 @@ docker compose -f compose.yaml -f "$override" build --pull --no-cache --build-ar
 docker compose -f compose.yaml -f "$override" build --pull --no-cache guacamole
 docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboard guacamole
 
+# Probe the running process, not just source files inside the image. A missing
+# route is HTTP 404; the correct protected route is HTTP 401 without credentials.
+docker compose -f compose.yaml -f "$override" exec -T api python - < deploy/verify-api-routes.py
+
 docker compose -f compose.yaml -f "$override" exec -T dashboard \
   node -e "const fs=require('fs'); const info=JSON.parse(fs.readFileSync('/app/public/build-info.json','utf8')); if(info.buildId !== process.argv[1]) { console.error('Dashboard build mismatch:', info.buildId, '!=', process.argv[1]); process.exit(1); } console.log('Dashboard build:', info.buildId);" "$revision"
 docker compose -f compose.yaml -f "$override" exec -T dashboard \

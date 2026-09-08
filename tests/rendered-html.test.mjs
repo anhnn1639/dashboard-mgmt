@@ -20,15 +20,70 @@ test("manual connection Add controls render only for Admin and Operator", async 
   const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
   const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const exports = {};
-  runInNewContext(compiled, { exports, React, require: (name) => name === "./server-resource-tabs" ? { ModalShell: () => null } : require(name) });
+  runInNewContext(compiled, { exports, React, require: (name) => name === "./server-resource-tabs" ? { ModalShell: () => null } : name === "./managed-target-api" ? {} : require(name) });
   for (const kind of ["network", "web"]) {
     for (const role of ["admin", "operator", "viewer", "connector"]) {
       const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
       assert.equal(html.includes("＋ Thêm kết nối"), ["admin", "operator"].includes(role), `${kind}/${role}`);
-      if (role === "connector") assert.match(html, /Chưa có kết nối được chia sẻ/);
+      assert.match(html, /Đang tải danh sách kết nối/);
+      assert.doesNotMatch(html, /Chưa có kết nối/);
       assert.doesNotMatch(html, /href="https?:/);
     }
   }
+});
+
+test("managed target API distinguishes missing deployment from empty data and form errors", async () => {
+  const { default: ts } = await import("typescript");
+  const source = await readFile(new URL("../app/managed-target-api.ts", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const exports = {};
+  runInNewContext(compiled, { exports });
+  for (const operation of ["list", "create"]) {
+    await assert.rejects(exports.readManagedTargetResponse(Response.json({ detail: "Not Found" }, { status: 404 }), operation), /cập nhật đồng bộ API/);
+    await assert.rejects(exports.readManagedTargetResponse(new Response("<h1>Not Found</h1>", { status: 404 }), operation), /HTTP 404/);
+  }
+  await assert.rejects(exports.readManagedTargetResponse(Response.json({}, { status: 404 }), "edit"), /Kết nối không còn tồn tại/);
+  await assert.rejects(exports.readManagedTargetResponse(new Response("<html>dashboard</html>"), "list"), /proxy/);
+  await assert.rejects(exports.readManagedTargetResponse(Response.json({}), "list"), /định dạng API/);
+  await assert.rejects(exports.readManagedTargetResponse(Response.json({}, { status: 401 }), "list"), /đăng nhập lại/);
+  await assert.rejects(exports.readManagedTargetResponse(Response.json({}, { status: 403 }), "create"), /không có quyền/);
+  const empty = await exports.readManagedTargetResponse(Response.json({ items: [] }), "list");
+  assert.equal(empty.items.length, 0);
+});
+
+test("managed catalog never shows empty-state text during loading or API failure", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const state of ["loading", "error", "ready"]) {
+    let index = 0;
+    // Inject hook state into a server-rendered fixture; no browser or production API.
+    const values = [[], null, null, "", "", state === "error" ? "API chưa có chức năng (HTTP 404)" : "", state, false];
+    const hooks = { ...React, useState: () => [values[index++], () => {}] };
+    const exports = {};
+    runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : name === "./server-resource-tabs" ? { ModalShell: () => null } : {} });
+    const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind: "network", role: "connector", token: "test", notify() {}, share() {} }));
+    assert.equal(html.includes("Chưa có kết nối được chia sẻ"), state === "ready");
+    assert.equal(html.includes("Thử lại"), state === "error");
+    assert.equal(html.includes("Đang tải danh sách"), state === "loading");
+  }
+});
+
+test("primary toolbar buttons retain contrasting action backgrounds in both themes", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(styles, /\.inline-actions button:not\(\.primary\):not\(\.danger\)/);
+  assert.match(styles, /html\[data-theme="light"\] \.button\.primary\s*\{[^}]*background: var\(--action-primary-bg\) !important/s);
+  assert.match(styles, /\.inline-actions \.button\s*\{[^}]*min-height: 36px/s);
+  const luminance = (hex) => {
+    const rgb = hex.match(/[a-f0-9]{2}/gi).map((value) => parseInt(value, 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+  };
+  const backgrounds = [...styles.matchAll(/--action-primary-(?:bg|hover): (#[a-f0-9]{6});/g)].map((match) => match[1]);
+  assert.equal(backgrounds.length, 4);
+  for (const background of backgrounds) assert.ok(1.05 / (luminance(background) + 0.05) >= 4.5, `White text on ${background}`);
 });
 
 test("navigation policy enforces connector/auditor categories even with stale permissions", async () => {
@@ -409,7 +464,7 @@ test("light theme recolors selectable cards, state badges, and compact controls"
   assert.match(styles, /html\[data-theme="light"\] \.bulk-target-list em\s*{[^}]*color:\s*#176a4e\s*!important;[^}]*background:\s*#e5f5ee\s*!important;/s);
   assert.match(
     styles,
-    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.storage-row-actions button,[\s\S]*?\)\s*{\s*background:\s*var\(--panel-2\)\s*!important;/s,
+    /html\[data-theme="light"\]\s+:where\([\s\S]*?\.storage-row-actions button:not\(\.primary\):not\(\.danger\),[\s\S]*?\)\s*{\s*background:\s*var\(--panel-2\)\s*!important;/s,
   );
   assert.match(
     styles,

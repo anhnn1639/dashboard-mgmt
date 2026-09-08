@@ -38,6 +38,11 @@ class RolePolicyTests(unittest.TestCase):
     def review(self, identifier, role="admin", decision="approve"):
         return self.client.post(f"/api/v1/deletion-approvals/{identifier}/review", headers=self.headers[role], json={"decision": decision})
 
+    def test_managed_target_routes_exist_and_remain_protected(self):
+        for path in ("/api/v1/managed-targets", "/api/v1/deletion-approvals", "/api/v1/configuration-snapshot"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 401, (path, response.text))
+
     def test_operator_and_viewer_see_unshared_servers_but_connector_does_not(self):
         for role in ("operator", "viewer"):
             response = self.client.get("/api/v1/servers", headers=self.headers[role])

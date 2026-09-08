@@ -15,6 +15,9 @@ on:
       - compose.yaml
       - deploy/Caddyfile
       - deploy/nginx-dashboard.conf.example
+      - deploy/deploy-dashboard.sh
+      - deploy/verify-api-routes.py
+      - tests/**
       - package.json
       - pnpm-lock.yaml
       - .github/workflows/security-audit.yml
@@ -27,6 +30,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Validate deployment script syntax
+        run: sh -n deploy/deploy-dashboard.sh
       - name: Validate Caddy configuration
         run: >-
           docker run --rm
