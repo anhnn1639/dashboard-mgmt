@@ -64,7 +64,9 @@ async def _run_probe(*args: str) -> tuple[bytes, bytes]:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await process.wait()
+        # Drain both pipes after killing the bounded probe. wait() alone can
+        # deadlock when an oversized banner has paused a StreamReader transport.
+        await process.communicate()
 
 
 def _probe_failure(errors: bytes) -> SSHProbeError:

@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,7 +147,7 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
             stdout.feed_data(output)
             stdout.feed_eof()
             stderr.feed_eof()
-            process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, kill=Mock(), wait=AsyncMock(return_value=0))
+            process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, kill=Mock(), wait=AsyncMock(return_value=0), communicate=AsyncMock(return_value=(b"", b"")))
             with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process) as spawn:
                 if expected:
                     with self.assertRaises(SSHProbeError) as error:
@@ -157,14 +158,14 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(spawn.call_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
                 self.assertNotIn("shell", spawn.call_args.kwargs)
                 process.kill.assert_called_once()
-                self.assertTrue(process.wait.await_count)
+                process.communicate.assert_awaited_once()
 
     async def test_probe_timeout_and_cancellation_kill_child(self):
         real_wait_for = asyncio.wait_for
         async def short_wait(awaitable, timeout):
             return await real_wait_for(awaitable, .001)
         for cancel in (False, True):
-            process = SimpleNamespace(stdout=asyncio.StreamReader(), stderr=asyncio.StreamReader(), returncode=None, kill=Mock(), wait=AsyncMock(return_value=0))
+            process = SimpleNamespace(stdout=asyncio.StreamReader(), stderr=asyncio.StreamReader(), returncode=None, kill=Mock(), wait=AsyncMock(return_value=0), communicate=AsyncMock(return_value=(b"", b"")))
             with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process), patch("app.direct_sessions.asyncio.wait_for", side_effect=short_wait):
                 task = asyncio.create_task(_run_probe("ssh-keyscan", "10.8.1.2"))
                 if cancel:
@@ -173,7 +174,12 @@ class DirectSessionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError if cancel else SSHProbeError):
                     await task
                 process.kill.assert_called_once()
-                process.wait.assert_awaited()
+                process.communicate.assert_awaited_once()
+
+    async def test_real_oversized_child_output_cannot_deadlock_cleanup(self):
+        with self.assertRaises(SSHProbeError) as error:
+            await asyncio.wait_for(_run_probe(sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1048576); sys.stdout.flush()"), 5)
+        self.assertEqual(error.exception.code, "invalid_response")
 
     async def test_missing_ssh_tool_has_actionable_error(self):
         with patch("app.direct_sessions.asyncio.create_subprocess_exec", new_callable=AsyncMock, side_effect=FileNotFoundError):
