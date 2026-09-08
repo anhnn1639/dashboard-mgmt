@@ -20,7 +20,7 @@ test("manual connection Add controls render only for Admin and Operator", async 
   const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
   const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const exports = {};
-  runInNewContext(compiled, { exports, React, require: (name) => name === "./server-resource-tabs" ? { ModalShell: () => null } : name === "./managed-target-api" ? {} : require(name) });
+  runInNewContext(compiled, { exports, React, require: (name) => name === "./server-resource-tabs" ? { ModalShell: () => null } : name.startsWith("./managed-") ? {} : require(name) });
   for (const kind of ["network", "web"]) {
     for (const role of ["admin", "operator", "viewer", "connector"]) {
       const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
@@ -29,6 +29,66 @@ test("manual connection Add controls render only for Admin and Operator", async 
       assert.doesNotMatch(html, /Chưa có kết nối/);
       assert.doesNotMatch(html, /href="https?:/);
     }
+  }
+});
+
+test("manual SSH connect affordance is role-aware and web remains explicitly unavailable", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const kind of ["network", "web"]) {
+    for (const role of ["admin", "operator", "viewer", "connector"]) {
+      const target = { id: "test", name: "Switch test", kind, address: "10.80.2.7", config: null, connectionReady: kind === "network" };
+      const values = [[target], null, null, "", "", "", "ready", false, null];
+      let index = 0;
+      const hooks = { ...React, useState: () => [values[index++], () => {}] };
+      const exports = {};
+      runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : {} });
+      const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
+      assert.equal(html.includes("↗ Kết nối"), kind === "network" && role !== "viewer", `${kind}/${role}`);
+      assert.doesNotMatch(html, /href="https?:/);
+      if (kind === "web") assert.match(html, /chưa được triển khai/);
+    }
+  }
+});
+
+test("managed session popup submits only selected credential ID and handles popup or API errors", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-session-modal.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const outcome of ["ok", "forbidden", "popup-blocked", "external-url"]) {
+    const values = [[{ id: "credential-id", username: "switch-user", label: "switch-user" }], "credential-id", false, false, ""];
+    let index = 0, requests = 0, closed = false, notified = false;
+    const errors = [];
+    const popup = { opener: {}, location: { href: "about:blank" }, close() { closed = true; } };
+    const hooks = { ...React, useEffect() {}, useState: () => { const slot = index++; return [values[slot], (value) => { if (slot === 4) errors.push(value); }]; } };
+    const exports = {};
+    runInNewContext(compiled, {
+      exports, React, URL,
+      require: (name) => name === "react" ? hooks : { ModalShell: (props) => React.createElement("div", null, Reflect.get(props, "children")) },
+      window: { open: () => outcome === "popup-blocked" ? null : popup, location: { origin: "https://ops.example.test" }, localStorage: { removeItem() {} } },
+      fetch: async (_url, options) => {
+        requests++;
+        assert.deepEqual(JSON.parse(options.body), { server_id: "target-id", protocol: "ssh", credential_id: "credential-id" });
+        return outcome === "forbidden" ? Response.json({ detail: "share revoked" }, { status: 403 }) : Response.json({ url: outcome === "external-url" ? "https://outside.example/" : "/guacamole/#/client/test" });
+      },
+    });
+    const tree = exports.ManagedSessionModal({ target: { id: "target-id", name: "Switch", kind: "network" }, token: "test", close() {}, notify() { notified = true; } });
+    const html = renderToStaticMarkup(tree);
+    assert.match(html, /switch-user/);
+    assert.doesNotMatch(html, /type="password"|name="password"|<input/);
+    await tree.props.children.props.onSubmit({ preventDefault() {} });
+    assert.equal(requests, outcome === "popup-blocked" ? 0 : 1);
+    assert.equal(notified, outcome === "ok");
+    if (outcome === "ok") assert.equal(popup.location.href, "https://ops.example.test/guacamole/#/client/test");
+    else assert.ok(errors.at(-1));
+    if (["forbidden", "external-url"].includes(outcome)) assert.equal(closed, true);
   }
 });
 
@@ -49,6 +109,34 @@ test("managed target API distinguishes missing deployment from empty data and fo
   await assert.rejects(exports.readManagedTargetResponse(Response.json({}, { status: 403 }), "create"), /không có quyền/);
   const empty = await exports.readManagedTargetResponse(Response.json({ items: [] }), "list");
   assert.equal(empty.items.length, 0);
+});
+
+test("Admin and Operator create forms accept initial credentials without exposing saved passwords on edit", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const kind of ["network", "web"]) {
+    for (const role of ["admin", "operator"]) {
+      for (const creating of [true, false]) {
+        let index = 0;
+        const editing = creating ? "new" : { id: "existing", config: { name: "existing", kind, url: "https://vcenter.example.test/ui/", address: "10.80.2.7", port: 22 } };
+        const values = [[], editing, null, "", "", "", "ready", false];
+        const hooks = { ...React, useState: () => [values[index++], () => {}] };
+        const exports = {};
+        runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : name === "./server-resource-tabs" ? { ModalShell: (props) => React.createElement("div", null, Reflect.get(props, "children")) } : {} });
+        const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
+        assert.equal(html.includes('name="username"'), creating, `${kind}/${role}/${creating}`);
+        assert.equal(html.includes('type="password"'), creating);
+        assert.equal(html.includes('name="address"'), kind === "network");
+        assert.equal(html.includes('name="port"'), kind === "network");
+        assert.equal(html.includes('name="url"'), kind === "web");
+        assert.doesNotMatch(html, /ssh_host_key|SSH public host key/);
+      }
+    }
+  }
 });
 
 test("managed catalog never shows empty-state text during loading or API failure", async () => {

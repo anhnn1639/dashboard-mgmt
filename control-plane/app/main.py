@@ -50,6 +50,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
 from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
+from .direct_sessions import DirectSessionHub, discover_host_key
 from .managed_targets import ManagedTargetRequest
 
 
@@ -762,7 +763,7 @@ class LogSourcesUpdateRequest(BaseModel):
 class SessionLaunchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     server_id: str
-    protocol: Literal["ssh", "rdp"]
+    protocol: Literal["ssh", "rdp", "web"]
     credential_id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
     width: int = Field(default=1440, ge=800, le=7680)
     height: int = Field(default=900, ge=600, le=4320)
@@ -771,7 +772,7 @@ class SessionLaunchRequest(BaseModel):
 class RemoteCredentialCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     server_id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
-    protocol: Literal["ssh", "rdp"]
+    protocol: Literal["ssh", "rdp", "web"]
     label: str = Field(min_length=2, max_length=100)
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
@@ -1310,6 +1311,7 @@ tunnel_hub = TunnelHub(
     max_sessions_per_agent=settings.tunnel_max_sessions_per_agent,
     closed_callback=mark_tunnel_closed,
 )
+direct_hub = DirectSessionHub(settings.tunnel_bind_host, mark_tunnel_closed)
 
 SESSION_COOKIE_NAME = "tram_ops_session"
 SESSION_COOKIE_MARKER = "cookie-session"
@@ -2665,6 +2667,8 @@ async def start_audit_retention() -> None:
 @app.on_event("shutdown")
 async def stop_audit_retention() -> None:
     global audit_retention_task, recording_retention_task
+    for session_id in list(direct_hub.relays):
+        await direct_hub.cancel(session_id, "service-stopped")
     for task in (audit_retention_task, recording_retention_task):
         if task is None:
             continue
@@ -3282,13 +3286,22 @@ def get_server(server_id: str, user: User = Depends(require_permission("servers.
 def list_managed_targets(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     rows = db.execute(select(Server).where(Server.id.in_(visible_server_ids(db, user)), Server.os_family.in_(["network", "web"])).order_by(Server.name)).scalars().all()
     show_config = user.role in {"admin", "operator", "viewer"}
-    return {"items": [{"id": row.id, "name": row.name, "kind": row.os_family, "address": row.address, "config": (row.inventory or {}).get("managedTarget") if show_config else None, "connectionReady": False} for row in rows]}
+    return {"items": [{"id": row.id, "name": row.name, "kind": row.os_family, "address": row.address, "config": (row.inventory or {}).get("managedTarget") if show_config else None, "connectionReady": row.os_family == "network"} for row in rows]}
 
 
 def persist_managed_target(payload: ManagedTargetRequest, request: Request, user: User, db: Session, server: Server | None = None):
-    # Saving a target is metadata-only. No network probe or password forwarding.
+    # Operator may supply authentication only while creating a NEW target.
+    # Existing vault entries remain Administrator-only, including through PUT.
+    creating = server is None
+    if payload.credential and (not creating or user.role not in {"admin", "operator"}):
+        raise HTTPException(status_code=403, detail="Chỉ nhập tài khoản ban đầu khi thêm kết nối. Tài khoản đã lưu do Administrator quản lý.")
     if server and server.os_family != payload.kind:
         raise HTTPException(status_code=422, detail="Không thể thay đổi loại thiết bị")
+    if server:
+        current = (server.inventory or {}).get("managedTarget", {})
+        endpoint_changed = any(current.get(key) != getattr(payload, key) for key in ("address", "port", "url"))
+        if endpoint_changed and user.role != "admin" and db.execute(select(RemoteCredential.id).where(RemoteCredential.server_id == server.id).limit(1)).scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="Kết nối đã gắn tài khoản xác thực; chỉ Administrator được đổi đích truy cập để tránh gửi mật khẩu sang máy khác.")
     duplicate = db.execute(select(Server).where(Server.name == payload.name, Server.os_family == payload.kind, Server.id != (server.id if server else ""), Server.id.not_in(retired_server_ids(db)))).scalar_one_or_none()
     if duplicate:
         raise HTTPException(status_code=409, detail="Tên kết nối đã tồn tại")
@@ -3296,9 +3309,19 @@ def persist_managed_target(payload: ManagedTargetRequest, request: Request, user
         server = Server(id=str(uuid.uuid4()), name=payload.name, os_family=payload.kind, os_name=payload.kind, address=payload.address, status="managed")
         db.add(server)
     server.name, server.address = payload.name, payload.address
-    server.ssh_host_key = payload.ssh_host_key
+    if creating or (server.inventory or {}).get("managedTarget", {}).get("address") != payload.address or (server.inventory or {}).get("managedTarget", {}).get("port") != payload.port:
+        server.ssh_host_key = payload.ssh_host_key or None
     server.inventory = {"managedTarget": payload.model_dump()}
     db.flush()
+    if payload.credential:
+        initial = payload.credential
+        credential = RemoteCredential(server_id=server.id, protocol="web" if payload.kind == "web" else "ssh", label=initial.username[:100], username=initial.username, password_encrypted=job_fernet().encrypt(initial.password.get_secret_value().encode()).decode(), created_by=user.id)
+        db.add(credential)
+        db.flush()
+        if user.role == "operator":
+            # Usage of one's own newly supplied credential, not vault management.
+            db.add(RemoteCredentialUserShare(credential_id=credential.id, user_id=user.id, granted_by=user.id))
+        audit(db, user.username, "remote_credential.create", credential.id, request, detail={"server_id": server.id, "protocol": credential.protocol, "initial_target_credential": True})
     audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port})
     db.commit()
     return {"id": server.id, "saved": True}
@@ -5609,11 +5632,9 @@ def remote_credential_json(db: Session, credential: RemoteCredential, server: Se
 
 
 def validate_remote_credential_target(server: Server, protocol: str) -> None:
-    if server.os_family not in {"linux", "windows"}:
-        raise HTTPException(status_code=409, detail="Chưa kích hoạt phiên có ghi hình cho kết nối khai báo thủ công")
-    expected = "rdp" if server.os_family == "windows" else "ssh"
-    if protocol != expected:
-        raise HTTPException(status_code=422, detail=f"Máy chủ này chỉ hỗ trợ tài khoản {expected.upper()}")
+    expected = {"windows": "rdp", "linux": "ssh", "network": "ssh", "web": "web"}.get(server.os_family)
+    if not expected or protocol != expected:
+        raise HTTPException(status_code=422, detail="Loại tài khoản không phù hợp với thiết bị này")
 
 
 def validate_remote_credential_users(db: Session, server: Server, user_ids: list[str]) -> list[str]:
@@ -5706,7 +5727,7 @@ def delete_remote_credential(credential_id: str, request: Request, actor: User =
 
 
 @app.get("/api/v1/servers/{server_id}/remote-credentials")
-def list_available_remote_credentials(server_id: str, protocol: Literal["ssh", "rdp"], user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
+def list_available_remote_credentials(server_id: str, protocol: Literal["ssh", "rdp", "web"], user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
     server = visible_server(db, user, server_id)
     validate_remote_credential_target(server, protocol)
     query = select(RemoteCredential).where(RemoteCredential.server_id == server.id, RemoteCredential.protocol == protocol).order_by(RemoteCredential.label)
@@ -5714,7 +5735,7 @@ def list_available_remote_credentials(server_id: str, protocol: Literal["ssh", "
         shared_ids = select(RemoteCredentialUserShare.credential_id).where(RemoteCredentialUserShare.user_id == user.id)
         query = query.where(RemoteCredential.id.in_(shared_ids))
     credentials = db.execute(query).scalars().all()
-    return {"items": [{"id": credential.id, "label": credential.label, "protocol": credential.protocol} for credential in credentials]}
+    return {"items": [{"id": credential.id, "label": credential.label, "protocol": credential.protocol, **({"username": credential.username} if server.os_family in {"network", "web"} else {})} for credential in credentials]}
 
 
 @app.get("/api/v1/sessions/{session_id}/recording")
@@ -5735,8 +5756,10 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     server = visible_server(db, user, payload.server_id)
     if payload.protocol == "rdp" and server.os_family != "windows":
         raise HTTPException(status_code=400, detail="RDP is reserved for Windows servers")
-    if payload.protocol == "ssh" and server.os_family != "linux":
-        raise HTTPException(status_code=400, detail="SSH is reserved for Linux servers")
+    if payload.protocol == "ssh" and server.os_family not in {"linux", "network"}:
+        raise HTTPException(status_code=400, detail="SSH requires a Linux server or network device")
+    if payload.protocol == "web" and server.os_family != "web":
+        raise HTTPException(status_code=400, detail="Web sessions require a web console")
     credential = db.get(RemoteCredential, payload.credential_id)
     if not credential or credential.server_id != server.id or credential.protocol != payload.protocol:
         raise HTTPException(status_code=404, detail="Tài khoản remote không tồn tại trên máy chủ này")
@@ -5749,13 +5772,30 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
         ).scalar_one_or_none()
         if not shared:
             raise HTTPException(status_code=403, detail="Tài khoản remote này chưa được chia sẻ cho bạn")
+    if payload.protocol == "web":
+        raise HTTPException(status_code=503, detail="Dịch vụ phiên web có ghi hình chưa được triển khai; tài khoản đã lưu không được gửi ra ngoài.")
     remote_password = decrypt_remote_credential_password(credential)
-    if not tunnel_hub.is_online(server.id):
+    managed = server.os_family == "network"
+    hub = direct_hub if managed else tunnel_hub
+    if not managed and not tunnel_hub.is_online(server.id):
         raise HTTPException(status_code=409, detail="Kênh tunnel mTLS của agent đang offline; hệ thống không fallback sang 22/3389 trực tiếp")
     session_id = str(uuid.uuid4())
     try:
-        relay_port = await tunnel_hub.create_listener(session_id, server.id, payload.protocol)
-    except (ConnectionError, OSError) as exc:
+        if managed:
+            config = ManagedTargetRequest.model_validate((server.inventory or {}).get("managedTarget", {}))
+            if not server.ssh_host_key:
+                observed_key = await discover_host_key(config.address, config.port)
+                # Concurrent first connections must not overwrite an established pin.
+                db.execute(update(Server).where(Server.id == server.id, or_(Server.ssh_host_key.is_(None), Server.ssh_host_key == "")).values(ssh_host_key=observed_key))
+                db.refresh(server)
+                audit(db, user.username, "target.ssh.trust_first_use", server.id, request, detail={"host_key_sha256": hashlib.sha256(server.ssh_host_key.encode()).hexdigest()})
+                db.commit()
+            relay_port = await direct_hub.create_listener(session_id, server.id, config.address, config.port)
+        else:
+            relay_port = await tunnel_hub.create_listener(session_id, server.id, payload.protocol)
+    except (ConnectionError, OSError, ValueError) as exc:
+        if managed:
+            raise HTTPException(status_code=409, detail="Không mở được SSH tới thiết bị. Kiểm tra IP, cổng, firewall và dịch vụ SSH.") from exc
         target = "127.0.0.1:22 (sshd)" if payload.protocol == "ssh" else "127.0.0.1:3389 (Remote Desktop)"
         raise HTTPException(
             status_code=409,
@@ -5764,7 +5804,13 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
     common = {"hostname": settings.tunnel_relay_host, "port": str(relay_port), "username": credential.username, "password": remote_password, "recording-path": settings.recording_root, "create-recording-path": "true", "recording-name": f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}", "recording-exclude-output": "false", "recording-exclude-mouse": "false", "recording-exclude-touch": "false", "disable-copy": "true", "disable-paste": "false"}
     if payload.protocol == "ssh":
         common.update({"typescript-path": settings.recording_root, "create-typescript-path": "true", "typescript-name": f"{session_id}.typescript", "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true"})
-        known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, relay_port, server.ssh_host_key)
+        try:
+            known_host = guacamole_ssh_host_key(settings.tunnel_relay_host, relay_port, server.ssh_host_key)
+            if managed and not known_host:
+                raise HTTPException(status_code=409, detail="Thiết bị mạng chưa có khóa máy chủ SSH hợp lệ.")
+        except HTTPException:
+            await hub.cancel(session_id, "ssh-host-key-invalid")
+            raise
         if known_host:
             common["host-key"] = known_host
     else:
@@ -5772,17 +5818,17 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
             (server.inventory or {}).get("extra", {}).get("rdp_certificate_fingerprint")
         )
         if not fingerprint:
-            await tunnel_hub.cancel(session_id, "rdp-certificate-missing")
+            await hub.cancel(session_id, "rdp-certificate-missing")
             raise HTTPException(status_code=409, detail="Agent chưa cung cấp fingerprint certificate RDP; cấu hình certificate RDP rồi đồng bộ inventory")
         common.update({"security": "nla", "ignore-cert": "false", "cert-fingerprints": fingerprint, "enable-drive": "false", "disable-upload": "true", "disable-download": "true", "enable-printing": "false", "width": str(payload.width), "height": str(payload.height), "resize-method": "display-update"})
     try:
         guac_payload = {"username": user.username, "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000), "connections": {server.name: {"protocol": payload.protocol, "parameters": common}}}
         encrypted = encrypt_guacamole_json(guac_payload)
         db.add(RemoteSession(id=session_id, server_id=server.id, protocol=payload.protocol, remote_username=credential.username, created_by=user.username, status="waiting", recording_name=f"{session_id}-${{GUAC_USERNAME}}-${{GUAC_DATE}}-${{GUAC_TIME}}"))
-        audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "credential_id": credential.id, "credential_label": credential.label, "transport": "agent-mtls-tunnel", "target_port": 22 if payload.protocol == "ssh" else 3389, "recording": True, "clipboard": "paste-only", "native_file_transfer": "disabled"})
+        audit(db, user.username, f"session.{payload.protocol}.launch", server.id, request, detail={"session_id": session_id, "credential_id": credential.id, "credential_label": credential.label, "transport": "managed-ssh-relay" if managed else "agent-mtls-tunnel", "target_port": config.port if managed else (22 if payload.protocol == "ssh" else 3389), "recording": True, "clipboard": "paste-only", "native_file_transfer": "disabled"})
         db.commit()
     except Exception:
-        await tunnel_hub.cancel(session_id, "launch-failed")
+        await hub.cancel(session_id, "launch-failed")
         raise
     return {
         "sessionId": session_id,

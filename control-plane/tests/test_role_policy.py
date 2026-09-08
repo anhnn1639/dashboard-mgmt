@@ -1,10 +1,11 @@
 """API-level role/approval regressions. Reuse the existing disposable test DB."""
+import base64
 import json
 import unittest
 import uuid
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import test_classification  # initializes the existing temporary fixture, never production data
 from app import main as m
@@ -139,6 +140,129 @@ class RolePolicyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         for forbidden in ("password_hash", "password_encrypted", "bind_password", "private_key"):
             self.assertNotIn(forbidden, response.text)
+
+    def test_operator_can_create_target_with_initial_credential_but_cannot_manage_vault(self):
+        secret = "  initial-only-test-password  "
+        for kind in ("network", "web"):
+            payload = {"name": "initial-" + uuid.uuid4().hex[:8], "kind": kind, "credential": {"username": "ops-initial", "password": secret}}
+            payload.update({"address": "10.80.9.7", "port": 22} if kind == "network" else {"url": "https://vcenter.example.test:8443/ui/"})
+            response = self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=payload)
+            self.assertEqual(response.status_code, 201, response.text)
+            server_id = response.json()["id"]
+            with m.SessionLocal() as db:
+                server = db.get(m.Server, server_id)
+                stored = db.execute(select(m.RemoteCredential).where(m.RemoteCredential.server_id == server_id)).scalar_one()
+                credential_id = stored.id
+                self.assertEqual(m.decrypt_remote_credential_password(stored), secret)
+                self.assertNotIn("credential", server.inventory["managedTarget"])
+                self.assertNotIn(secret, json.dumps(server.inventory))
+                self.assertNotEqual(stored.password_encrypted, secret)
+                self.assertEqual(stored.protocol, "web" if kind == "web" else "ssh")
+                if kind == "web":
+                    self.assertEqual((server.address, server.inventory["managedTarget"]["port"]), ("vcenter.example.test", 8443))
+            choices = self.client.get(f"/api/v1/servers/{server_id}/remote-credentials?protocol={'web' if kind == 'web' else 'ssh'}", headers=self.headers["operator"])
+            self.assertEqual(choices.status_code, 200, choices.text)
+            self.assertEqual(choices.json()["items"][0]["username"], "ops-initial")
+            for text in (response.text, choices.text, self.client.get("/api/v1/managed-targets", headers=self.headers["operator"]).text, self.client.get("/api/v1/audit", headers=self.headers["admin"]).text):
+                self.assertNotIn(secret, text)
+                self.assertNotIn("password_encrypted", text)
+            for method, endpoint, body in (
+                ("GET", "/api/v1/remote-credentials", None),
+                ("POST", "/api/v1/remote-credentials", {"server_id": server_id, "protocol": "web" if kind == "web" else "ssh", "label": "other", "username": "other", "password": "other"}),
+                ("PUT", f"/api/v1/remote-credentials/{credential_id}", {"label": "changed", "username": "changed", "password": "changed"}),
+                ("DELETE", f"/api/v1/remote-credentials/{credential_id}", None),
+            ):
+                self.assertEqual(self.client.request(method, endpoint, headers=self.headers["operator"], json=body).status_code, 403)
+            self.assertEqual(self.client.put(f"/api/v1/managed-targets/{server_id}", headers=self.headers["operator"], json=payload).status_code, 403)
+            rename = {key: value for key, value in payload.items() if key != "credential"}
+            rename["name"] += "-renamed"
+            self.assertEqual(self.client.put(f"/api/v1/managed-targets/{server_id}", headers=self.headers["operator"], json=rename).status_code, 200)
+            redirected = dict(rename, **({"address": "10.80.9.8"} if kind == "network" else {"url": "https://other.example.test/"}))
+            self.assertEqual(self.client.put(f"/api/v1/managed-targets/{server_id}", headers=self.headers["operator"], json=redirected).status_code, 403)
+            vault = self.client.get("/api/v1/remote-credentials", headers=self.headers["admin"])
+            self.assertIn(credential_id, {item["id"] for item in vault.json()["items"]})
+
+    def test_initial_credentials_are_transactional_and_never_echoed_on_validation_errors(self):
+        payload = {"name": "duplicate-" + uuid.uuid4().hex[:8], "kind": "web", "url": "https://vcenter.example.test/ui/", "credential": {"username": "initial", "password": "private-fixture-only"}}
+        first = self.client.post("/api/v1/managed-targets", headers=self.headers["admin"], json=payload)
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=payload).status_code, 409)
+        with m.SessionLocal() as db:
+            self.assertEqual(len(db.execute(select(m.RemoteCredential).where(m.RemoteCredential.server_id == first.json()["id"])).scalars().all()), 1)
+        payload["credential"]["username"] = ""
+        error = self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=payload)
+        self.assertEqual(error.status_code, 422)
+        self.assertNotIn("private-fixture-only", error.text)
+
+    def network_fixture(self, kind="network"):
+        payload = {"name": "session-" + uuid.uuid4().hex[:8], "kind": kind, "credential": {"username": "switch-user", "password": "session-secret-fixture"}}
+        payload.update({"address": "10.80.9.7", "port": 2222} if kind == "network" else {"url": "https://console.example.test/"})
+        response = self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=payload)
+        self.assertEqual(response.status_code, 201, response.text)
+        server_id = response.json()["id"]
+        with m.SessionLocal() as db:
+            credential = db.execute(select(m.RemoteCredential).where(m.RemoteCredential.server_id == server_id)).scalar_one()
+            credential_id = credential.id
+        return server_id, credential_id
+
+    def test_managed_ssh_uses_saved_credentials_pins_first_key_and_records(self):
+        server_id, credential_id = self.network_fixture()
+        data = {"server_id": server_id, "protocol": "ssh", "credential_id": credential_id}
+        host_key = "ssh-ed25519 " + base64.b64encode(b"test-ed25519-host-key-material").decode()
+        with patch.object(m, "discover_host_key", new_callable=AsyncMock, return_value=host_key) as scan, patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock, return_value=49000) as relay, patch.object(m.tunnel_hub, "create_listener", new_callable=AsyncMock) as agent_relay, patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture") as encrypt:
+            # Legacy metadata used empty string rather than NULL.
+            with m.SessionLocal() as db:
+                db.get(m.Server, server_id).ssh_host_key = ""
+                db.commit()
+            for _ in range(2):
+                response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json=data)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["recording"])
+                self.assertNotIn("session-secret-fixture", response.text)
+            scan.assert_awaited_once_with("10.80.9.7", 2222)
+            agent_relay.assert_not_awaited()
+            self.assertEqual(relay.call_args.args[1:], (server_id, "10.80.9.7", 2222))
+            parameters = next(iter(encrypt.call_args.args[0]["connections"].values()))["parameters"]
+            self.assertEqual(parameters["password"], "session-secret-fixture")
+            self.assertEqual(parameters["username"], "switch-user")
+            self.assertIn(host_key, parameters["host-key"])
+            self.assertEqual(parameters["recording-exclude-output"], "false")
+            self.assertEqual(parameters["disable-paste"], "false")
+            self.assertEqual(parameters["disable-copy"], "true")
+            self.assertEqual(parameters["enable-sftp"], "false")
+        with m.SessionLocal() as db:
+            self.assertEqual(db.get(m.Server, server_id).ssh_host_key, host_key)
+            events = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id)).scalars().all()
+            self.assertNotIn("session-secret-fixture", str([event.detail for event in events]))
+
+    def test_ssh_requires_both_target_and_credential_share_and_readonly_roles_cannot_launch(self):
+        server_id, credential_id = self.network_fixture()
+        data = {"server_id": server_id, "protocol": "ssh", "credential_id": credential_id}
+        with patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock) as relay, patch.object(m, "discover_host_key", new_callable=AsyncMock):
+            for role in ("viewer", "auditor", "connector"):
+                self.assertIn(self.client.post("/api/v1/sessions/launch", headers=self.headers[role], json=data).status_code, (403, 404))
+            with m.SessionLocal() as db:
+                db.add(m.ServerUserShare(server_id=server_id, user_id=self.ids["connector"], granted_by=self.ids["admin"]))
+                db.commit()
+            self.assertEqual(self.client.post("/api/v1/sessions/launch", headers=self.headers["connector"], json=data).status_code, 403)
+            self.assertEqual(self.client.get(f"/api/v1/servers/{server_id}/remote-credentials?protocol=ssh", headers=self.headers["connector"]).json()["items"], [])
+            relay.assert_not_awaited()
+        with m.SessionLocal() as db:
+            db.add(m.RemoteCredentialUserShare(credential_id=credential_id, user_id=self.ids["connector"], granted_by=self.ids["admin"]))
+            db.get(m.Server, server_id).ssh_host_key = "ssh-ed25519 " + base64.b64encode(b"test-ed25519-host-key-material").decode()
+            db.commit()
+        with patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock, return_value=49000), patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture"):
+            self.assertEqual(self.client.post("/api/v1/sessions/launch", headers=self.headers["connector"], json=data).status_code, 200)
+            wrong_server = dict(data, server_id=self.server_id)
+            self.assertEqual(self.client.post("/api/v1/sessions/launch", headers=self.headers["admin"], json=wrong_server).status_code, 404)
+
+    def test_web_launch_fails_closed_without_decrypting_or_sending_credentials(self):
+        server_id, credential_id = self.network_fixture("web")
+        with patch.object(m, "decrypt_remote_credential_password") as decrypt, patch.object(m.direct_hub, "create_listener", new_callable=AsyncMock) as relay:
+            response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
+            self.assertEqual(response.status_code, 503)
+            decrypt.assert_not_called()
+            relay.assert_not_awaited()
 
     def test_operator_recording_deletion_needs_one_admin_and_rejects_active_session(self):
         root = Path(test_classification.tmp.name) / ("role-recordings-" + uuid.uuid4().hex)

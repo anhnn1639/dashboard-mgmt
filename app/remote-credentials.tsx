@@ -7,7 +7,7 @@ type ServerOption = {
   id: string;
   name: string;
   address: string;
-  osFamily: "linux" | "windows";
+  osFamily: "linux" | "windows" | "network" | "web";
   os: string;
 };
 
@@ -25,7 +25,7 @@ type RemoteCredentialRow = {
   serverId: string;
   serverName: string;
   serverAddress: string;
-  protocol: "ssh" | "rdp";
+  protocol: "ssh" | "rdp" | "web";
   label: string;
   username: string;
   userIds: string[];
@@ -40,18 +40,24 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
   const [editing, setEditing] = useState<RemoteCredentialRow | "new" | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [manualTargets, setManualTargets] = useState<ServerOption[]>([]);
+  const availableTargets = useMemo(() => [...servers, ...manualTargets], [servers, manualTargets]);
 
   const load = useCallback(async () => {
     setError("");
     const headers = { Authorization: `Bearer ${token}` };
-    const [credentialResponse, userResponse] = await Promise.all([
+    const [credentialResponse, userResponse, targetResponse] = await Promise.all([
       fetch("/api/v1/remote-credentials", { headers, cache: "no-store" }),
       fetch("/api/v1/users", { headers, cache: "no-store" }),
+      fetch("/api/v1/managed-targets", { headers, cache: "no-store" }),
     ]);
     const credentialPayload = await credentialResponse.json();
     const userPayload = await userResponse.json();
-    if (!credentialResponse.ok) throw new Error(credentialPayload.detail ?? "Không thể đọc tài khoản Remote");
+    const targetPayload = await targetResponse.json();
+    if (!credentialResponse.ok) throw new Error(credentialPayload.detail ?? "Không thể đọc tài khoản xác thực");
     if (!userResponse.ok) throw new Error(userPayload.detail ?? "Không thể đọc người dùng");
+    if (!targetResponse.ok) throw new Error("Không thể đọc Thiết bị mạng/Web console; kiểm tra phiên bản API.");
+    setManualTargets((targetPayload.items ?? []).map((item: { id: string; name: string; address: string; kind: "network" | "web" }) => ({ id: item.id, name: item.name, address: item.address, osFamily: item.kind, os: item.kind })));
     setCredentials(credentialPayload.items ?? []);
     setUsers(userPayload.items ?? []);
   }, [token]);
@@ -72,7 +78,7 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
     setError("");
     const form = new FormData(event.currentTarget);
     const serverId = selected?.serverId ?? String(form.get("server_id") ?? "");
-    const server = servers.find((item) => item.id === serverId);
+    const server = availableTargets.find((item) => item.id === serverId);
     if (!server) {
       setBusy(false);
       setError("Hãy chọn máy chủ");
@@ -86,7 +92,7 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
     };
     if (!selected) {
       body.server_id = server.id;
-      body.protocol = server.osFamily === "windows" ? "rdp" : "ssh";
+      body.protocol = server.osFamily === "web" ? "web" : server.osFamily === "windows" ? "rdp" : "ssh";
     }
     try {
       const response = await fetch(selected ? `/api/v1/remote-credentials/${selected.id}` : "/api/v1/remote-credentials", {
@@ -95,12 +101,12 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
         body: JSON.stringify(body),
       });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "Không thể lưu tài khoản Remote");
+      if (!response.ok) throw new Error(payload.detail ?? "Không thể lưu tài khoản xác thực");
       setEditing(null);
       await load();
-      notify(selected ? "Đã cập nhật tài khoản Remote." : "Đã tạo tài khoản Remote.");
+      notify(selected ? "Đã cập nhật tài khoản xác thực." : "Đã tạo tài khoản xác thực.");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Không thể lưu tài khoản Remote");
+      setError(reason instanceof Error ? reason.message : "Không thể lưu tài khoản xác thực");
     } finally {
       setBusy(false);
     }
@@ -113,11 +119,11 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
     try {
       const response = await fetch(`/api/v1/remote-credentials/${item.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "Không thể xóa tài khoản Remote");
+      if (!response.ok) throw new Error(payload.detail ?? "Không thể xóa tài khoản xác thực");
       await load();
-      notify("Đã xóa tài khoản Remote.");
+      notify("Đã xóa tài khoản xác thực.");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Không thể xóa tài khoản Remote");
+      setError(reason instanceof Error ? reason.message : "Không thể xóa tài khoản xác thực");
     } finally {
       setBusy(false);
     }
@@ -130,9 +136,9 @@ export function RemoteCredentialsView({ servers, token, notify }: { servers: Ser
         <div className="resource-toolbar-actions"><button type="button" className="button ghost" disabled={busy} onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "Không thể tải dữ liệu"))}>↻ Làm mới</button><button type="button" className="button primary compact" onClick={() => setEditing("new")}>＋ Thêm tài khoản</button></div>
       </div>
       {error && <div className="danger-panel">{error}</div>}
-      <div className="resource-help">Mật khẩu được mã hóa ở máy chủ Trạm vận hành, không trả về trình duyệt và không ghi vào nhật ký. Share máy chủ cho người dùng trước, sau đó mới share tài khoản Remote.</div>
-      <div className="resource-table-scroll"><table className="resource-table"><thead><tr><th>Máy chủ</th><th>Giao thức</th><th>Nhãn tài khoản</th><th>Username</th><th>Được share</th><th /></tr></thead><tbody>{credentials.map((item) => <tr key={item.id}><td><b>{item.serverName}</b><small>{item.serverAddress}</small></td><td><span className="state-pill">{item.protocol.toUpperCase()}</span></td><td><b>{item.label}</b><small>{item.passwordConfigured ? "Đã lưu mật khẩu mã hóa" : "Chưa có mật khẩu"}</small></td><td>{item.username}</td><td>{item.userIds.length} người dùng</td><td><div className="row-actions"><button type="button" className="row-more" onClick={() => setEditing(item)}>Sửa</button><button type="button" className="button danger compact" disabled={busy} onClick={() => void remove(item)}>Xóa</button></div></td></tr>)}</tbody></table>{!credentials.length && <div className="empty-state">Chưa có tài khoản Remote. Hãy tạo tài khoản cho từng máy chủ cần truy cập.</div>}</div>
+      <div className="resource-help">Mật khẩu được mã hóa ở máy chủ Trạm vận hành, không trả về trình duyệt và không ghi vào nhật ký. Share máy chủ cho người dùng trước, sau đó mới share tài khoản xác thực.</div>
+      <div className="resource-table-scroll"><table className="resource-table"><thead><tr><th>Máy chủ</th><th>Giao thức</th><th>Nhãn tài khoản</th><th>Username</th><th>Được share</th><th /></tr></thead><tbody>{credentials.map((item) => <tr key={item.id}><td><b>{item.serverName}</b><small>{item.serverAddress}</small></td><td><span className="state-pill">{item.protocol.toUpperCase()}</span></td><td><b>{item.label}</b><small>{item.passwordConfigured ? "Đã lưu mật khẩu mã hóa" : "Chưa có mật khẩu"}</small></td><td>{item.username}</td><td>{item.userIds.length} người dùng</td><td><div className="row-actions"><button type="button" className="row-more" onClick={() => setEditing(item)}>Sửa</button><button type="button" className="button danger compact" disabled={busy} onClick={() => void remove(item)}>Xóa</button></div></td></tr>)}</tbody></table>{!credentials.length && <div className="empty-state">Chưa có tài khoản xác thực. Hãy tạo tài khoản cho từng máy chủ cần truy cập.</div>}</div>
     </section>
-    {editing && <ModalShell title={selected ? `Sửa ${selected.label}` : "Thêm tài khoản Remote"} subtitle="Mật khẩu chỉ được dùng phía máy chủ khi khởi tạo SSH/RDP" close={() => setEditing(null)}><form key={selected?.id ?? "new"} className="resource-form" onSubmit={save}>{error && <div className="danger-panel">{error}</div>}{!selected && <label>Máy chủ<select name="server_id" required defaultValue=""><option value="" disabled>Chọn máy chủ…</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.name} [{server.address}] · {server.osFamily === "windows" ? "RDP" : "SSH"}</option>)}</select></label>}<div className="form-grid"><label>Nhãn hiển thị<input name="label" required minLength={2} maxLength={100} defaultValue={selected?.label ?? ""} placeholder="Ví dụ: Administrator vận hành" /></label><label>Username<input name="username" required maxLength={128} defaultValue={selected?.username ?? ""} autoComplete="off" /></label></div><label>{selected ? "Mật khẩu mới (để trống nếu giữ nguyên)" : "Mật khẩu"}<input name="password" type="password" required={!selected} maxLength={1024} autoComplete="new-password" /></label><fieldset><legend>Người dùng được phép chọn tài khoản này</legend><div className="choice-grid remote-share-grid">{shareableUsers.map((user) => <label key={user.id} aria-label={`Cho phép ${user.displayName || user.username} sử dụng tài khoản này`}><input type="checkbox" name="user_ids" value={user.id} defaultChecked={selected?.userIds.includes(user.id) ?? false} /><span><b>{user.displayName || user.username}</b><small>{user.username} · {user.source === "ldap" ? "AD" : "Local"}</small></span></label>)}</div>{!shareableUsers.length && <div className="empty-state compact">Chưa có người dùng không phải Administrator để share.</div>}</fieldset><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditing(null)}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang lưu…" : "Lưu tài khoản"}</button></div></form></ModalShell>}
+    {editing && <ModalShell title={selected ? `Sửa ${selected.label}` : "Thêm tài khoản xác thực"} subtitle="Mật khẩu chỉ được dùng phía máy chủ khi khởi tạo phiên kết nối" close={() => setEditing(null)}><form key={selected?.id ?? "new"} className="resource-form" onSubmit={save}>{error && <div className="danger-panel">{error}</div>}{!selected && <label>Máy chủ<select name="server_id" required defaultValue=""><option value="" disabled>Chọn máy chủ…</option>{availableTargets.map((server) => <option key={server.id} value={server.id}>{server.name} [{server.address}] · {server.osFamily === "web" ? "WEB" : server.osFamily === "windows" ? "RDP" : "SSH"}</option>)}</select></label>}<div className="form-grid"><label>Nhãn hiển thị<input name="label" required minLength={2} maxLength={100} defaultValue={selected?.label ?? ""} placeholder="Ví dụ: Administrator vận hành" /></label><label>Username<input name="username" required maxLength={128} defaultValue={selected?.username ?? ""} autoComplete="off" /></label></div><label>{selected ? "Mật khẩu mới (để trống nếu giữ nguyên)" : "Mật khẩu"}<input name="password" type="password" required={!selected} maxLength={1024} autoComplete="new-password" /></label><fieldset><legend>Người dùng được phép chọn tài khoản này</legend><div className="choice-grid remote-share-grid">{shareableUsers.map((user) => <label key={user.id} aria-label={`Cho phép ${user.displayName || user.username} sử dụng tài khoản này`}><input type="checkbox" name="user_ids" value={user.id} defaultChecked={selected?.userIds.includes(user.id) ?? false} /><span><b>{user.displayName || user.username}</b><small>{user.username} · {user.source === "ldap" ? "AD" : "Local"}</small></span></label>)}</div>{!shareableUsers.length && <div className="empty-state compact">Chưa có người dùng không phải Administrator để share.</div>}</fieldset><div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditing(null)}>Hủy</button><button className="button primary" disabled={busy}>{busy ? "Đang lưu…" : "Lưu tài khoản"}</button></div></form></ModalShell>}
   </>;
 }

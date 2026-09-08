@@ -26,6 +26,27 @@ permissions:
   contents: read
 
 jobs:
+  managed-ssh-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start disposable SSH target
+        run: |
+          docker network create tram-smoke-net
+          docker build -t tram-smoke-sshd tests/ssh-smoke
+          docker run -d --name tram-smoke-sshd --network tram-smoke-net tram-smoke-sshd
+      - name: Verify real SSH, host key rejection and recording
+        run: PYTHONPATH=control-plane python tests/ssh-smoke/verify.py
+      - name: Remove disposable test services
+        if: ${{ always() }}
+        run: |
+          docker rm -f tram-smoke-sshd tram-smoke-guacd || true
+          docker network rm tram-smoke-net || true
+
   edge-config:
     runs-on: ubuntu-24.04
     steps:
