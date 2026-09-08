@@ -120,6 +120,10 @@ async def main():
         finally:
             for identifier in list(hub.relays):
                 await hub.cancel(identifier)
+            # Fixture-only diagnostics; never print its generated password.
+            for container in ("tram-smoke-guacd", "tram-smoke-sshd"):
+                result = subprocess.run(["docker", "logs", container], capture_output=True, text=True)
+                print(f"{container} diagnostics:\n" + (result.stdout + result.stderr).replace(secret, "[redacted]"))
             with contextlib.suppress(Exception):
                 docker("rm", "-f", "tram-smoke-guacd")
 
