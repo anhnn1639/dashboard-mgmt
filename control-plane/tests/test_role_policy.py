@@ -313,6 +313,57 @@ class RolePolicyTests(unittest.TestCase):
             decrypt.assert_not_called()
             relay.assert_not_awaited()
 
+    def test_web_launch_uses_internal_recorded_browser_without_vault_decryption(self):
+        server_id, credential_id = self.network_fixture("web")
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}) as prepare, patch.object(m.web_hub, "watch") as watch, patch.object(m, "decrypt_remote_credential_password") as decrypt, patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture") as encrypt:
+            response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["recording"])
+            self.assertTrue(response.json()["url"].startswith("/guacamole/"))
+            self.assertNotIn("console.example.test", response.text)
+            decrypt.assert_not_called()
+            prepare.assert_awaited_once()
+            self.assertEqual(prepare.call_args.args[1], "https://console.example.test/")
+            connection = next(iter(encrypt.call_args.args[0]["connections"].values()))
+            self.assertEqual(connection["protocol"], "vnc")
+            self.assertEqual(connection["parameters"]["hostname"], "web-console")
+            self.assertEqual(connection["parameters"]["password"], "vnc12345")
+            self.assertEqual(connection["parameters"]["recording-include-keys"], "false")
+            self.assertEqual(connection["parameters"]["disable-copy"], "true")
+            self.assertEqual(connection["parameters"]["disable-paste"], "false")
+            identifier, _probe, authorize, activate, finish = watch.call_args.args
+            self.assertTrue(authorize())
+            with patch.object(m.web_hub, "call", new_callable=AsyncMock, return_value={"status": "active"}) as call:
+                self.client.portal.call(activate)
+                call.assert_awaited_once_with("POST", f"/sessions/{identifier}/activate", {})
+            with m.SessionLocal() as db:
+                self.assertEqual(db.get(m.RemoteSession, identifier).status, "active")
+                db.get(m.User, self.ids["operator"]).enabled = False
+                db.commit()
+            self.assertFalse(authorize())
+            self.client.portal.call(finish, identifier, "web-access-revoked")
+            with m.SessionLocal() as db:
+                self.assertEqual(db.get(m.RemoteSession, identifier).status, "failed")
+                self.assertIsNotNone(db.get(m.RemoteSession, identifier).finished_at)
+
+    def test_web_launch_requires_both_target_and_credential_share_and_cleans_failure(self):
+        server_id, credential_id = self.network_fixture("web")
+        data = {"server_id": server_id, "protocol": "web", "credential_id": credential_id}
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, side_effect=m.WebSessionError("unavailable")) as prepare, patch.object(m.web_hub, "stop_remote", new_callable=AsyncMock) as stop, patch.object(m, "decrypt_remote_credential_password") as decrypt:
+            for role in ("viewer", "auditor", "connector"):
+                self.assertIn(self.client.post("/api/v1/sessions/launch", headers=self.headers[role], json=data).status_code, (403, 404))
+            prepare.assert_not_awaited()
+            with m.SessionLocal() as db:
+                db.add(m.ServerUserShare(server_id=server_id, user_id=self.ids["connector"], granted_by=self.ids["admin"]))
+                db.commit()
+            self.assertEqual(self.client.post("/api/v1/sessions/launch", headers=self.headers["connector"], json=data).status_code, 403)
+            prepare.assert_not_awaited()
+            self.assertEqual(self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json=data).status_code, 503)
+            stop.assert_awaited_once()
+            decrypt.assert_not_called()
+            with m.SessionLocal() as db:
+                self.assertEqual(db.execute(select(m.RemoteSession).where(m.RemoteSession.server_id == server_id)).scalars().all(), [])
+
     def test_operator_recording_deletion_needs_one_admin_and_rejects_active_session(self):
         root = Path(test_classification.tmp.name) / ("role-recordings-" + uuid.uuid4().hex)
         root.mkdir()

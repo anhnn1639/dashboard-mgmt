@@ -32,7 +32,7 @@ test("manual connection Add controls render only for Admin and Operator", async 
   }
 });
 
-test("manual SSH connect affordance is role-aware and web remains explicitly unavailable", async () => {
+test("manual SSH and web connect controls remain visible to authorized roles", async () => {
   const { default: ts } = await import("typescript");
   const require = createRequire(import.meta.url);
   const React = require("react");
@@ -48,9 +48,9 @@ test("manual SSH connect affordance is role-aware and web remains explicitly una
       const exports = {};
       runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : {} });
       const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
-      assert.equal(html.includes("↗ Kết nối"), kind === "network" && role !== "viewer", `${kind}/${role}`);
+      assert.equal(html.includes("↗ Kết nối"), role !== "viewer", `${kind}/${role}`);
       assert.doesNotMatch(html, /href="https?:/);
-      if (kind === "web") assert.match(html, /chưa được triển khai/);
+      if (kind === "web") { assert.match(html, /Cần kiểm tra dịch vụ phiên/); assert.match(html, /Máy người dùng chỉ cần truy cập Trạm/); }
     }
   }
 });

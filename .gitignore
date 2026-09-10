@@ -47,3 +47,5 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+
+/deploy/web-console-ca/*.crt

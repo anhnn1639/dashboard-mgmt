@@ -53,6 +53,7 @@ from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest
 from .schema_migrations import detach_recording_history_users
+from .web_sessions import WebSessionHub, WebSessionError
 
 
 class Settings(BaseSettings):
@@ -69,6 +70,8 @@ class Settings(BaseSettings):
     caddy_root_ca: str = "/caddy-data/caddy/pki/authorities/local/root.crt"
     guacamole_url: str = "/guacamole"
     guacamole_json_secret: str = ""
+    web_console_url: str = ""
+    web_console_host: str = "web-console"
     job_secret_key: str = ""
     allowed_origins: str = ""
     allowed_hosts: str = ""
@@ -886,7 +889,7 @@ PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     "servers.manage": {"group": "Máy chủ", "label": "Xóa và chia sẻ máy chủ", "description": "Ẩn/ngừng Agent và gán quyền nhìn thấy máy chủ cho user/group."},
     "resources.view": {"group": "Máy chủ", "label": "Xem tài nguyên vận hành", "description": "Quét và xem Services, tài khoản, firewall, disk, process, update và network."},
     "sessions.launch": {"group": "Phiên truy cập", "label": "Mở SSH / Remote Desktop", "description": "Khởi tạo phiên quản trị qua tunnel mTLS của Agent."},
-    "recordings.view": {"group": "Phiên truy cập", "label": "Xem recording", "description": "Xem danh sách và phát lại recording SSH/RDP."},
+    "recordings.view": {"group": "Phiên truy cập", "label": "Xem recording", "description": "Xem danh sách và phát lại recording SSH/RDP/Web console."},
     "recordings.delete": {"group": "Phiên truy cập", "label": "Xóa recording", "description": "Xóa recording theo luồng kiểm soát và audit hiện hành."},
     "services.manage": {"group": "Vận hành", "label": "Điều khiển Services", "description": "Start, Stop và Restart service."},
     "accounts.manage": {"group": "Vận hành", "label": "Quản lý tài khoản máy chủ", "description": "Tạo, sửa, khóa, xóa user/group trên máy chủ được quản trị."},
@@ -1315,6 +1318,7 @@ tunnel_hub = TunnelHub(
     closed_callback=mark_tunnel_closed,
 )
 direct_hub = DirectSessionHub(settings.tunnel_bind_host, mark_tunnel_closed)
+web_hub = WebSessionHub(settings.web_console_url, lambda: settings.guacamole_json_secret)
 
 SESSION_COOKIE_NAME = "tram_ops_session"
 SESSION_COOKIE_MARKER = "cookie-session"
@@ -2605,6 +2609,12 @@ def startup() -> None:
         with factory() as db:
             ensure_builtin_roles(db)
             retire_legacy_pending_jobs(db)
+            # Browser transports are ephemeral. An API restart loses the lease;
+            # preserve audit rows but finalize orphaned web-session history.
+            for web_session in db.execute(select(RemoteSession).where(RemoteSession.protocol == "web", RemoteSession.status.not_in(["closed", "failed"]))).scalars():
+                web_session.status = "failed"
+                web_session.finished_at = now()
+                audit(db, "system:web-console", "session.web.closed", web_session.id, result="failed", detail={"reason": "api-restarted"})
             expire_file_payloads(db)
             prune_revoked_session_tokens(db)
             prune_audit_events(db)
@@ -2671,6 +2681,7 @@ async def start_audit_retention() -> None:
 @app.on_event("shutdown")
 async def stop_audit_retention() -> None:
     global audit_retention_task, recording_retention_task
+    await web_hub.shutdown()
     for session_id in list(direct_hub.relays):
         await direct_hub.cancel(session_id, "service-stopped")
     for task in (audit_retention_task, recording_retention_task):
@@ -3296,7 +3307,7 @@ def get_server(server_id: str, user: User = Depends(require_permission("servers.
 def list_managed_targets(user: User = Depends(require_permission("servers.view")), db: Session = Depends(db_session)):
     rows = db.execute(select(Server).where(Server.id.in_(visible_server_ids(db, user)), Server.os_family.in_(["network", "web"])).order_by(Server.name)).scalars().all()
     show_config = user.role in {"admin", "operator", "viewer"}
-    return {"items": [{"id": row.id, "name": row.name, "kind": row.os_family, "address": row.address, "config": (row.inventory or {}).get("managedTarget") if show_config else None, "connectionReady": row.os_family == "network"} for row in rows]}
+    return {"items": [{"id": row.id, "name": row.name, "kind": row.os_family, "address": row.address, "config": (row.inventory or {}).get("managedTarget") if show_config else None, "connectionReady": row.os_family == "network" or web_hub.configured} for row in rows]}
 
 
 def persist_managed_target(payload: ManagedTargetRequest, request: Request, user: User, db: Session, server: Server | None = None):
@@ -5761,6 +5772,90 @@ def read_recording(session_id: str, request: Request, user: User = Depends(requi
     return FileResponse(path, media_type="application/octet-stream", filename=f"{session.id}.guac", content_disposition_type="inline", headers={"Cache-Control": "private, no-store"})
 
 
+async def launch_web_session(payload: SessionLaunchRequest, request: Request, user: User,
+                             server: Server, credential: RemoteCredential, db: Session):
+    if not web_hub.configured:
+        raise HTTPException(status_code=503, detail="Dịch vụ Web console chưa sẵn sàng. Cần triển khai đồng bộ API và dịch vụ trình duyệt có ghi hình.")
+    config = ManagedTargetRequest.model_validate((server.inventory or {}).get("managedTarget", {}))
+    session_id = str(uuid.uuid4())
+    server_id, user_id, credential_id = server.id, user.id, credential.id
+    target_url = config.url
+    claims = dict(request.state.authenticated_claims)
+
+    def authorized() -> bool:
+        with SessionLocal() as check:
+            actor = check.get(User, user_id)
+            target = check.get(Server, server_id)
+            account = check.get(RemoteCredential, credential_id)
+            if (not actor or not actor.enabled or not target or not account
+                    or "sessions.launch" not in platform_role_permissions(check, actor.role)
+                    or server_id not in visible_server_ids(check, actor)
+                    or check.get(RevokedSessionToken, claims.get("jti")) is not None
+                    or now().timestamp() >= claims.get("exp", 0)
+                    or (target.inventory or {}).get("managedTarget", {}).get("url") != target_url
+                    or account.server_id != server_id or account.protocol != "web"):
+                return False
+            return actor.role == "admin" or check.execute(select(RemoteCredentialUserShare).where(
+                RemoteCredentialUserShare.credential_id == credential_id,
+                RemoteCredentialUserShare.user_id == user_id)).scalar_one_or_none() is not None
+
+    async def activate() -> None:
+        if not authorized():
+            raise WebSessionError("access-revoked")
+        # Manual sign-in in the recorded remote browser. The vault is NOT read
+        # or decrypted, and no saved credentials are sent to this worker.
+        await web_hub.call("POST", f"/sessions/{session_id}/activate", {})
+        with SessionLocal() as active_db:
+            row = active_db.get(RemoteSession, session_id)
+            row.status = "active"
+            audit(active_db, "system:web-console", "session.web.recording.started", session_id,
+                  detail={"recording": True})
+            active_db.commit()
+
+    async def finished(identifier: str, reason: str) -> None:
+        with SessionLocal() as final_db:
+            row = final_db.get(RemoteSession, identifier)
+            if row and row.status not in {"closed", "failed"}:
+                row.status = "closed" if reason == "closed" else "failed"
+                row.finished_at = now()
+                audit(final_db, "system:web-console", "session.web.closed", identifier,
+                      result=row.status, detail={"reason": reason})
+                final_db.commit()
+
+    try:
+        worker = await web_hub.prepare(session_id, target_url, min(payload.width, 1920), min(payload.height, 1080))
+        parameters = {
+            "hostname": settings.web_console_host, "port": str(worker["port"]),
+            "password": worker["password"], "color-depth": "24",
+            "recording-path": settings.recording_root, "create-recording-path": "true",
+            "recording-name": session_id + ".guac", "recording-exclude-output": "false",
+            "recording-exclude-mouse": "false", "recording-exclude-touch": "false",
+            "recording-include-keys": "false", "disable-copy": "true", "disable-paste": "false",
+            "enable-sftp": "false", "sftp-disable-upload": "true", "sftp-disable-download": "true",
+        }
+        encrypted = encrypt_guacamole_json({"username": user.username,
+            "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000),
+            "connections": {server.name: {"protocol": "vnc", "parameters": parameters}}})
+        db.add(RemoteSession(id=session_id, server_id=server_id, protocol="web",
+            remote_username=credential.username, created_by=user.username, status="waiting",
+            recording_name=session_id + ".guac"))
+        audit(db, user.username, "session.web.launch", server_id, request,
+              detail={"session_id": session_id, "credential_id": credential_id,
+                      "transport": "recorded-server-browser", "recording": True,
+                      "authentication": "manual-in-recorded-browser",
+                      "clipboard": "paste-only", "native_file_transfer": "disabled"})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        await web_hub.stop_remote(session_id)
+        if isinstance(exc, WebSessionError):
+            raise HTTPException(status_code=503, detail="Không khởi tạo được phiên Web console có ghi hình. Kiểm tra dịch vụ trình duyệt trên Trạm Vận Hành.") from exc
+        raise
+    web_hub.watch(session_id, lambda: recording_file(session_id), authorized, activate, finished)
+    return {"sessionId": session_id, "url": guacamole_launch_url(settings.guacamole_url, server.name, encrypted),
+            "expiresIn": 120, "recording": True}
+
+
 @app.post("/api/v1/sessions/launch")
 async def launch_session(payload: SessionLaunchRequest, request: Request, user: User = Depends(require_permission("sessions.launch")), db: Session = Depends(db_session)):
     server = visible_server(db, user, payload.server_id)
@@ -5783,7 +5878,7 @@ async def launch_session(payload: SessionLaunchRequest, request: Request, user: 
         if not shared:
             raise HTTPException(status_code=403, detail="Tài khoản remote này chưa được chia sẻ cho bạn")
     if payload.protocol == "web":
-        raise HTTPException(status_code=503, detail="Dịch vụ phiên web có ghi hình chưa được triển khai; tài khoản đã lưu không được gửi ra ngoài.")
+        return await launch_web_session(payload, request, user, server, credential, db)
     remote_password = decrypt_remote_credential_password(credential)
     managed = server.os_family == "network"
     hub = direct_hub if managed else tunnel_hub

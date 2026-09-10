@@ -54,6 +54,8 @@ services:
       CADDY_ROOT_CA: /run/server-ca/server-ca.crt
       WEB_TLS_TRUST: ${WEB_TLS_TRUST:-system}
       GUACAMOLE_URL: /guacamole
+      WEB_CONSOLE_URL: http://web-console:8081
+      WEB_CONSOLE_HOST: web-console
       GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
       JOB_SECRET_KEY: ${JOB_SECRET_KEY:-}
       ALLOWED_HOSTS: ${OPS_DOMAIN},localhost,127.0.0.1,api
@@ -147,6 +149,37 @@ services:
       # overwrite agent-ca.key and other private material in deploy/pki.
       - ./deploy/pki/public:/host-export
 
+  web-console:
+    build:
+      context: ./web-console-worker
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10002:10002"
+    environment:
+      GUACAMOLE_JSON_SECRET: ${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}
+    expose: ["8081"]
+    # No public port, Docker socket, API data, vault or recordings mount.
+    volumes:
+      - ${WEB_CONSOLE_CA_DIR:-./deploy/web-console-ca}:/run/web-ca:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002
+      - /home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002
+    shm_size: 512m
+    mem_limit: 4g
+    cpus: 4
+    pids_limit: 512
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./web-console-worker/seccomp_profile.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    networks: [session, web_console_egress]
+
   recording-init:
     image: alpine:3.22
     user: "0:0"
@@ -214,6 +247,7 @@ networks:
   session:
     internal: true
   identity_egress:
+  web_console_egress:
   malware_scan:
     internal: true
   signature_egress:

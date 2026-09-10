@@ -1,0 +1,1 @@
+Place only administrator-verified public issuing CA certificates (*.crt) here for internal HTTPS consoles. Never put private keys here. The browser imports them into its ephemeral trust database at startup; hostname validation remains enabled. Restart web-console after changing certificates.

@@ -24,8 +24,8 @@ revision=$(git rev-parse HEAD)
 # carries the exact revision, while Guacamole carries the clipboard-sync extension.
 docker compose -f compose.yaml -f "$override" build --pull --no-cache api
 docker compose -f compose.yaml -f "$override" build --pull --no-cache --build-arg SOURCE_REVISION="$revision" dashboard
-docker compose -f compose.yaml -f "$override" build --pull --no-cache guacamole
-docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboard guacamole
+docker compose -f compose.yaml -f "$override" build --pull --no-cache guacamole web-console
+docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboard guacamole web-console
 
 # Probe the running process, not just source files inside the image. A missing
 # route is HTTP 404; the correct protected route is HTTP 401 without credentials.
@@ -48,6 +48,8 @@ docker compose -f compose.yaml -f "$override" exec -T guacamole \
 docker compose -f compose.yaml -f "$override" exec -T guacamole \
   sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v3.js"
 
-docker compose -f compose.yaml -f "$override" ps api dashboard guacamole
+docker compose -f compose.yaml -f "$override" ps api dashboard guacamole web-console
+docker compose -f compose.yaml -f "$override" exec -T web-console \
+  python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5)"
 echo "Deployment verified at commit $revision"
 echo "Open a new tab or use the in-app reload prompt if an older tab is still open."
