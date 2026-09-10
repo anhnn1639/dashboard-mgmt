@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from restricted_proxy import PinnedProxy
 
 
 def origin(url: str) -> tuple[str, str, int]:
@@ -66,7 +67,7 @@ async def pinned_address(url: str) -> str:
     ips = {item[4][0] for item in answers}
     if not ips or not all(safe_ip(ip) for ip in ips):
         raise ValueError("unsafe target")
-    # The actual browser DNS is pinned for the entire session, including WSS.
+    # The CONNECT transport uses this IP for the entire session, including WSS.
     return sorted(ips, key=lambda ip: (":" in ip, ip))[0]
 
 
@@ -121,7 +122,7 @@ class Desktop:
         self.created = time.monotonic()
         self.deadline = self.created + 120
         self.listener = self.writer = self.browser = self.context = self.page = None
-        self.client_task = self.navigation_task = None
+        self.client_task = self.navigation_task = self.proxy = None
         self.frame_requested = asyncio.Event()
         self.pixel_format = (32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
         self.buttons = 0
@@ -130,15 +131,21 @@ class Desktop:
         self.input_lock = asyncio.Lock()
         self.notice = "Đang chuẩn bị ghi hình kiểm toán. Vui lòng chờ…"
 
+    def input_enabled(self):
+        now = time.monotonic()
+        return self.status == "active" and now < self.deadline and now - self.created < 3600
+
     async def start(self, playwright):
         ip = await pinned_address(self.url)
-        host = origin(self.url)[1]
-        mapped = f"[{ip}]" if ":" in ip else ip
-        self.browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True,
-            args=[f"--host-resolver-rules=MAP {host} {mapped}, MAP * ~NOTFOUND",
-                  "--no-proxy-server", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
-            env={k: v for k, v in os.environ.items() if k not in {
-                "GUACAMOLE_JSON_SECRET", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}})
+        _, host, port = origin(self.url)
+        self.proxy = PinnedProxy(host, port, ip, self.input_enabled)
+        proxy = await self.proxy.start()
+        self.browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, timeout=20000,
+            proxy=proxy,
+            args=["--proxy-bypass-list=<-loopback>", "--disable-quic",
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
+            env={k: v for k, v in os.environ.items() if k in {
+                "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "TEMP", "TMP"}})
         self.context = await self.browser.new_context(viewport={"width": self.width, "height": self.height - 28},
             accept_downloads=False, ignore_https_errors=False, service_workers="block")
         self.context.set_default_timeout(3000)
@@ -161,20 +168,20 @@ class Desktop:
             await page.close()
 
     async def route(self, route):
-        if self.status == "active" and allowed_url(route.request.url, self.url):
+        if self.input_enabled() and allowed_url(route.request.url, self.url):
             await route.continue_()
         else:
             self.notice = "Đã chặn địa chỉ ngoài console. Liên hệ quản trị viên nếu cần đăng nhập SSO."
             await route.abort("blockedbyclient")
 
     async def route_socket(self, websocket):
-        if self.status == "active" and allowed_url(websocket.url, self.url):
+        if self.input_enabled() and allowed_url(websocket.url, self.url):
             websocket.connect_to_server()
         else:
             await websocket.close()
 
     async def activate(self):
-        if self.status != "connected":
+        if self.status != "connected" or time.monotonic() >= self.deadline or time.monotonic() - self.created >= 3600:
             raise HTTPException(409, "Recording transport is not connected")
         self.status = "active"
         self.deadline = time.monotonic() + 15
@@ -194,6 +201,8 @@ class Desktop:
             return
         self.status = "closed" if reason == "closed" else "failed"
         self.reason = reason
+        if self.proxy:
+            await self.proxy.stop()
         if self.listener:
             self.listener.close()
         if self.writer:
@@ -209,7 +218,7 @@ class Desktop:
         self.deadline = time.monotonic() + 60
 
     async def accept(self, reader, writer):
-        if self.status != "waiting" or self.writer:
+        if self.status != "waiting" or self.writer or time.monotonic() >= self.deadline:
             writer.close()
             return
         self.writer = writer
@@ -261,12 +270,12 @@ class Desktop:
                     self.frame_requested.set()
                 elif kind == 4:
                     down, keysym = struct.unpack(">B2xI", await reader.readexactly(7))
-                    if self.status == "active":
+                    if self.input_enabled():
                         async with self.input_lock:
                             await self.key(keysym, bool(down))
                 elif kind == 5:
                     mask, x, y = struct.unpack(">BHH", await reader.readexactly(5))
-                    if self.status == "active":
+                    if self.input_enabled():
                         async with self.input_lock:
                             await self.mouse(mask, x, y)
                 elif kind == 6:
@@ -274,7 +283,7 @@ class Desktop:
                     if length > 65536:
                         raise ValueError("clipboard limit")
                     value = await reader.readexactly(length)
-                    if self.status == "active":
+                    if self.input_enabled():
                         self.clipboard = value.decode("utf-8", errors="replace")
                 else:
                     raise ValueError("unsupported RFB message")
@@ -291,6 +300,8 @@ class Desktop:
                 await writer.wait_closed()
 
     async def key(self, keysym, down):
+        if not self.input_enabled():
+            return
         key = KEYS.get(keysym)
         if key is None:
             point = keysym & 0xffffff if keysym & 0xff000000 == 0x01000000 else keysym
@@ -309,7 +320,7 @@ class Desktop:
             await self.page.keyboard.up(key)
 
     async def mouse(self, mask, x, y):
-        if y < 28:
+        if not self.input_enabled() or y < 28:
             return
         await self.page.mouse.move(min(x, self.width - 1), min(y - 28, self.height - 29))
         for bit, name in ((1, "left"), (2, "middle"), (4, "right")):
@@ -368,12 +379,14 @@ creation_lock = asyncio.Lock()
 
 async def sweep():
     while True:
+        expired = []
         for identifier, desktop in list(desktops.items()):
-            if time.monotonic() > desktop.deadline:
+            if time.monotonic() >= desktop.deadline:
                 if desktop.status in {"closed", "failed"}:
                     desktops.pop(identifier, None)
                 else:
-                    await desktop.stop("lease-expired")
+                    expired.append(desktop.stop("lease-expired"))
+        await asyncio.gather(*expired, return_exceptions=True)
         await asyncio.sleep(1)
 
 
@@ -447,9 +460,9 @@ async def activate(identifier: UUID):
 @app.post("/sessions/{identifier}/lease", dependencies=[Depends(authenticate)])
 def lease(identifier: UUID):
     item = get_desktop(identifier)
-    if item.status != "active" or time.monotonic() > item.deadline or time.monotonic() - item.created > 3600:
+    if not item.input_enabled():
         raise HTTPException(409, "Session lease expired")
-    item.deadline = time.monotonic() + 15
+    item.deadline = min(time.monotonic() + 15, item.created + 3600)
     return {"status": item.status}
 
 

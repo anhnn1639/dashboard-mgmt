@@ -35,18 +35,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build isolated browser with Chromium sandbox
-        run: docker build -t tram-web-smoke-worker web-console-worker
-      - name: Verify internal HTTPS access, recording gate and lease shutdown
-        run: python tests/web-smoke/verify.py
       - name: Worker protocol and security regression tests
         run: |
           python -m pip install -r web-console-worker/requirements.txt httpx2==2.12.0
           python -m unittest discover -s web-console-worker -p "test*.py" -v
+      - name: Build isolated browser with Chromium sandbox
+        run: docker build -t tram-web-smoke-worker web-console-worker
+      - name: Verify internal HTTPS access, recording gate and lease shutdown
+        run: python tests/web-smoke/verify.py
       - name: Remove disposable web test services
         if: ${{ always() }}
         run: |
-          docker rm -f tram-web-worker tram-web-guacd tram-web-fixture || true
+          docker rm -f tram-web-worker tram-web-guacd tram-web-fixture tram-web-forbidden || true
           docker network rm tram-web-smoke || true
 
   managed-ssh-smoke:
@@ -126,7 +126,7 @@ jobs:
           python -m pip_audit -r agent/requirements.txt
       - name: Scan Python code for high-severity security defects
         if: ${{ always() }}
-        run: bandit -r control-plane/app agent/tram_agent.py web-console-worker/browser_worker.py web-console-worker/entrypoint.py --severity-level high --confidence-level high
+        run: bandit -r control-plane/app agent/tram_agent.py web-console-worker/browser_worker.py web-console-worker/restricted_proxy.py web-console-worker/entrypoint.py --severity-level high --confidence-level high
       - name: Run Agent regression tests on Linux
         if: ${{ always() }}
         run: |

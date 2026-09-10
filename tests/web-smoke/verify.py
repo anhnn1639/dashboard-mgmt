@@ -61,6 +61,7 @@ async def main():
         (fixture / 'fixture.py').write_bytes((repository / 'tests/web-smoke/fixture.py').read_bytes())
         docker('network', 'create', 'tram-web-smoke')
         try:
+            docker('run', '-d', '--name', 'tram-web-forbidden', '--network', 'tram-web-smoke', '--network-alias', 'forbidden.test', '-v', str(fixture) + ':/fixture:ro', 'python:3.12-bookworm', 'python', '/fixture/fixture.py', 'sink')
             docker('run', '-d', '--name', 'tram-web-fixture', '--network', 'tram-web-smoke', '--network-alias', 'console.test', '-v', str(fixture) + ':/fixture:ro', 'python:3.12-bookworm', 'python', '/fixture/fixture.py')
             # Secret travels only via a private stdin env file, never argv/logs.
             envfile = root / 'worker.env'
@@ -86,6 +87,12 @@ async def main():
                         raise
                     await asyncio.sleep(1)
 
+            # Prove both forbidden sinks are actually listening, without
+            # connecting to them or creating a false positive hit marker.
+            for container, port in (('tram-web-forbidden', 443), ('tram-web-fixture', 8443)):
+                check = "from pathlib import Path; assert any(line.split()[1].endswith(':%04X') and line.split()[3] == '0A' for line in Path('/proc/net/tcp').read_text().splitlines()[1:])" % port
+                docker('exec', container, 'python', '-c', check)
+
             # Disposable-fixture diagnostics only; no production URL/account.
             preflight = """import asyncio, uuid
 from playwright.async_api import async_playwright
@@ -100,7 +107,7 @@ async def check():
             await d.stop()
 asyncio.run(check())
 """
-            result = subprocess.run(['docker', 'exec', '-i', 'tram-web-worker', 'python', '-'], input=preflight, capture_output=True, text=True)
+            result = subprocess.run(['docker', 'exec', '-i', 'tram-web-worker', 'python', '-'], input=preflight, capture_output=True, text=True, timeout=45)
             print((result.stdout + result.stderr).replace(secret, '[redacted]')[-7000:])
             if result.returncode:
                 raise RuntimeError('Isolated browser startup failed in disposable fixture')
@@ -150,6 +157,19 @@ asyncio.run(check())
             assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited']).returncode != 0
             await asyncio.to_thread(http, 'POST', '/sessions/' + identifier + '/activate', {})
             first_size = recording.stat().st_size
+            # Wait for both same-origin redirect requests to fail and prove that
+            # no TCP connection reached either forbidden destination.
+            for attempt in range(20):
+                await asyncio.to_thread(http, 'POST', '/sessions/' + identifier + '/lease', {})
+                if subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/redirect-checks-done']).returncode == 0:
+                    break
+                await asyncio.sleep(1)
+            else:
+                raise RuntimeError('Redirect rejection fixture did not complete')
+            for path in ('/tmp/redirect-ip-attempted', '/tmp/redirect-port-attempted'):
+                assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', path]).returncode == 0
+            for container in ('tram-web-fixture', 'tram-web-forbidden'):
+                assert subprocess.run(['docker', 'exec', container, 'test', '-f', '/tmp/forbidden-hit']).returncode != 0, 'Forbidden redirect reached a TCP destination'
             submitted = False
             for attempt in range(12):
                 await asyncio.to_thread(http, 'POST', '/sessions/' + identifier + '/lease', {})
@@ -168,11 +188,11 @@ asyncio.run(check())
             state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
             assert state['status'] == 'failed' and state['reason'] == 'lease-expired', state
             consumer.cancel(); await asyncio.gather(consumer, return_exceptions=True)
-            print('PASS: real sandboxed Chromium HTTPS + Guacamole VNC input + growing recording; no target request before recording; API lease loss closes browser')
+            print('PASS: real sandboxed Chromium HTTPS + Guacamole VNC input + growing recording; no target request before recording; literal-IP/wrong-port redirects blocked before TCP; API lease loss closes browser')
         finally:
             for writer in clients:
                 writer.close()
-            for container in ('tram-web-worker', 'tram-web-guacd', 'tram-web-fixture'):
+            for container in ('tram-web-worker', 'tram-web-guacd', 'tram-web-fixture', 'tram-web-forbidden'):
                 with contextlib.suppress(Exception):
                     result = subprocess.run(['docker', 'logs', container], capture_output=True, text=True)
                     print(container + ': ' + (result.stdout + result.stderr).replace(secret, '[redacted]')[-4000:])

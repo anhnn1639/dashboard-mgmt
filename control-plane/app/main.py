@@ -5836,11 +5836,14 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
         encrypted = encrypt_guacamole_json({"username": user.username,
             "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000),
             "connections": {server.name: {"protocol": "vnc", "parameters": parameters}}})
+        # The selected credential authorizes access; manual website sign-in
+        # does not establish which account the operator actually uses.
         db.add(RemoteSession(id=session_id, server_id=server_id, protocol="web",
-            remote_username=credential.username, created_by=user.username, status="waiting",
+            remote_username="Đăng nhập thủ công (chưa xác minh tài khoản)", created_by=user.username, status="waiting",
             recording_name=session_id + ".guac"))
         audit(db, user.username, "session.web.launch", server_id, request,
               detail={"session_id": session_id, "credential_id": credential_id,
+                      "credential_use": "access-authorization-only", "remote_identity_verified": False,
                       "transport": "recorded-server-browser", "recording": True,
                       "authentication": "manual-in-recorded-browser",
                       "clipboard": "paste-only", "native_file_transfer": "disabled"})

@@ -332,12 +332,27 @@ class RolePolicyTests(unittest.TestCase):
             self.assertEqual(connection["parameters"]["disable-copy"], "true")
             self.assertEqual(connection["parameters"]["disable-paste"], "false")
             identifier, _probe, authorize, activate, finish = watch.call_args.args
+            manual_identity = "Đăng nhập thủ công (chưa xác minh tài khoản)"
+            with m.SessionLocal() as db:
+                session = db.get(m.RemoteSession, identifier)
+                self.assertEqual(session.remote_username, manual_identity)
+                self.assertNotEqual(session.remote_username, db.get(m.RemoteCredential, credential_id).username)
+                launched = db.execute(select(m.AuditEvent).where(
+                    m.AuditEvent.action == "session.web.launch", m.AuditEvent.target == server_id)).scalar_one()
+                self.assertEqual(launched.detail["credential_id"], credential_id)
+                self.assertEqual(launched.detail["credential_use"], "access-authorization-only")
+                self.assertIs(launched.detail["remote_identity_verified"], False)
+                self.assertEqual(launched.detail["authentication"], "manual-in-recorded-browser")
+            listed = self.client.get("/api/v1/sessions", headers=self.headers["admin"])
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertEqual(next(item for item in listed.json()["items"] if item["id"] == identifier)["username"], manual_identity)
             self.assertTrue(authorize())
             with patch.object(m.web_hub, "call", new_callable=AsyncMock, return_value={"status": "active"}) as call:
                 self.client.portal.call(activate)
                 call.assert_awaited_once_with("POST", f"/sessions/{identifier}/activate", {})
             with m.SessionLocal() as db:
                 self.assertEqual(db.get(m.RemoteSession, identifier).status, "active")
+                self.assertEqual(db.get(m.RemoteSession, identifier).remote_username, manual_identity)
                 db.get(m.User, self.ids["operator"]).enabled = False
                 db.commit()
             self.assertFalse(authorize())

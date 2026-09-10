@@ -1,0 +1,99 @@
+import asyncio
+import unittest
+
+from restricted_proxy import PinnedProxy
+
+
+class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.enabled = False
+        self.hits = 0
+        self.upstream_tasks = set()
+        self.upstream_writers = set()
+
+        async def echo(reader, writer):
+            task = asyncio.current_task()
+            self.upstream_tasks.add(task)
+            self.upstream_writers.add(writer)
+            self.hits += 1
+            try:
+                while data := await reader.read(65536):
+                    writer.write(data)
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                self.upstream_writers.discard(writer)
+                self.upstream_tasks.discard(task)
+
+        self.server = await asyncio.start_server(echo, '127.0.0.1', 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        # Test-only loopback fixture. Production pins validated unicast addresses.
+        self.proxy = PinnedProxy('console.invalid', self.port, '127.0.0.1', lambda: self.enabled)
+        await self.proxy.start()
+        self.proxy_port = self.proxy.listener.sockets[0].getsockname()[1]
+        self.clients = []
+
+    async def asyncTearDown(self):
+        await asyncio.wait_for(self.proxy.stop(), 4)
+        for writer in self.clients:
+            writer.close()
+            await writer.wait_closed()
+        for writer in list(self.upstream_writers):
+            writer.close()
+        await asyncio.gather(*list(self.upstream_tasks), return_exceptions=True)
+        self.server.close()
+        await asyncio.wait_for(self.server.wait_closed(), 2)
+
+    async def connect(self, authority=None, auth=True, method='CONNECT'):
+        reader, writer = await asyncio.open_connection('127.0.0.1', self.proxy_port)
+        self.clients.append(writer)
+        authority = authority or f'console.invalid:{self.port}'
+        authorization = b'Proxy-Authorization: ' + self.proxy.authorization + b'\r\n' if auth else b''
+        writer.write(f'{method} {authority} HTTP/1.1\r\n'.encode() + authorization + b'\r\n')
+        await writer.drain()
+        response = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 2)
+        return response, reader, writer
+
+    async def test_requires_authentication_and_recording_activation(self):
+        response, _, _ = await self.connect(auth=False)
+        self.assertIn(b'407', response)
+        response, _, _ = await self.connect()
+        self.assertIn(b'403', response)
+        self.assertEqual(self.hits, 0)
+
+    async def test_redirect_destinations_and_plain_http_never_reach_upstream(self):
+        self.enabled = True
+        for authority in (f'127.0.0.1:{self.port}', f'other.invalid:{self.port}',
+                          'console.invalid:1', '169.254.169.254:443',
+                          f'user@console.invalid:{self.port}', f'console.invalid:{self.port}/path'):
+            response, _, _ = await self.connect(authority)
+            self.assertIn(b'403', response, authority)
+        response, _, _ = await self.connect(f'http://console.invalid:{self.port}/', method='GET')
+        self.assertIn(b'403', response)
+        self.assertEqual(self.hits, 0)
+
+    async def test_transport_uses_pinned_ip_and_closes_when_lease_expires(self):
+        self.enabled = True
+        response, reader, writer = await self.connect()
+        self.assertIn(b'200', response)
+        # The deliberately unresolvable CONNECT hostname must not be looked up.
+        writer.write(b'tls-bytes-stay-opaque')
+        await writer.drain()
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(21), 2), b'tls-bytes-stay-opaque')
+        self.assertEqual(self.hits, 1)
+        self.enabled = False
+        self.assertEqual(await asyncio.wait_for(reader.read(), 2), b'')
+
+    async def test_stop_with_live_tunnel_and_pending_handshake_does_not_deadlock(self):
+        self.enabled = True
+        _, reader, _ = await self.connect()
+        pending_reader, pending_writer = await asyncio.open_connection('127.0.0.1', self.proxy_port)
+        self.clients.append(pending_writer)
+        await asyncio.wait_for(self.proxy.stop(), 3)
+        self.assertEqual(await asyncio.wait_for(reader.read(), 2), b'')
+        self.assertEqual(await asyncio.wait_for(pending_reader.read(), 2), b'')
+        self.assertFalse(self.proxy.tasks)
+        self.assertFalse(self.proxy.writers)
+        with self.assertRaises(OSError):
+            await asyncio.open_connection('127.0.0.1', self.proxy_port)

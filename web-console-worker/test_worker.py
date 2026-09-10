@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import struct
+import time
 import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -89,3 +91,52 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         route.request.url = "https://sso-other.test/"
         await desktop.route(route)
         self.assertEqual(route.continue_.await_count, 1)
+
+
+    async def test_expired_lease_blocks_input_routes_and_activation_immediately(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
+        desktop.status = "active"
+        desktop.deadline = time.monotonic() - 1
+        desktop.page = type("Page", (), {"keyboard": type("Keyboard", (), {"down": AsyncMock()})(),
+            "mouse": type("Mouse", (), {"move": AsyncMock()})(), "goto": AsyncMock()})()
+        route = type("Route", (), {"request": type("Request", (), {"url": desktop.url})(),
+            "continue_": AsyncMock(), "abort": AsyncMock()})()
+        websocket = type("Socket", (), {"url": "wss://console.test/socket", "close": AsyncMock()})()
+        await desktop.key(ord("a"), True)
+        await desktop.mouse(1, 80, 80)
+        await desktop.route(route)
+        await desktop.route_socket(websocket)
+        desktop.page.keyboard.down.assert_not_awaited()
+        desktop.page.mouse.move.assert_not_awaited()
+        route.continue_.assert_not_awaited()
+        route.abort.assert_awaited_once()
+        websocket.close.assert_awaited_once()
+        desktop.status = "connected"
+        with self.assertRaises(HTTPException):
+            await desktop.activate()
+        desktop.page.goto.assert_not_awaited()
+        desktop.status = "active"
+        desktop.created = time.monotonic() - 3601
+        desktop.deadline = time.monotonic() + 10
+        self.assertFalse(desktop.input_enabled())
+
+    async def test_sweep_starts_all_expired_cleanup_concurrently(self):
+        started = [asyncio.Event(), asyncio.Event()]
+        release = asyncio.Event()
+        items = []
+        for index in range(2):
+            desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
+            desktop.deadline = time.monotonic() - 1
+            async def stop(_reason, index=index):
+                started[index].set()
+                await release.wait()
+            desktop.stop = stop
+            items.append(desktop)
+        with patch.dict(w.desktops, {item.id: item for item in items}, clear=True):
+            task = asyncio.create_task(w.sweep())
+            try:
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 1)
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)

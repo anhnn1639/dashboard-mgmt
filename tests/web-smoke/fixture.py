@@ -1,7 +1,25 @@
-"""Disposable HTTPS form. No production account or system is involved."""
+"""Disposable HTTPS form and forbidden TCP sinks. No production systems."""
+import socket
+import socketserver
 import ssl
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+class ForbiddenConnection(socketserver.BaseRequestHandler):
+    def handle(self):
+        # Mark TCP arrival, including TLS that would fail certificate validation.
+        Path('/tmp/forbidden-hit').touch()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == 'sink':
+    socketserver.ThreadingTCPServer(('0.0.0.0', 443), ForbiddenConnection).serve_forever()
+    raise SystemExit
+
+wrong_port = socketserver.ThreadingTCPServer(('0.0.0.0', 8443), ForbiddenConnection)
+threading.Thread(target=wrong_port.serve_forever, daemon=True).start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -10,13 +28,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         Path('/tmp/visited').touch()
+        if self.path in ('/redirect-ip', '/redirect-port'):
+            Path('/tmp/' + self.path[1:] + '-attempted').touch()
+            destination = ('https://' + socket.gethostbyname('forbidden.test') + '/blocked'
+                           if self.path == '/redirect-ip' else 'https://console.test:8443/blocked')
+            self.send_response(302)
+            self.send_header('Location', destination)
+            self.end_headers()
+            return
+        if self.path == '/checks-finished':
+            Path('/tmp/redirect-checks-done').touch()
+            self.send_response(204)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-        self.wfile.write(b'''<!doctype html><html><body style="background:#def;color:#123;font:24px sans-serif">
+        self.wfile.write(b"""<!doctype html><html><body style="background:#def;color:#123;font:24px sans-serif">
         <h1>Recorded internal console fixture</h1>
-        <form method="post"><input name="value" autofocus><button>Submit fixture</button></form>
-        <script>fetch('https://outside.test/blocked').catch(()=>{});</script></body></html>''')
+        <form method="post"><input name="value" disabled><button>Submit fixture</button></form>
+        <script>
+        Promise.allSettled(['/redirect-ip','/redirect-port'].map(url=>fetch(url))).then(async results=>{
+          if(!results.every(item=>item.status==='rejected')) return;
+          await fetch('/checks-finished');
+          const input=document.querySelector('input'); input.disabled=false; input.focus();
+        });
+        </script></body></html>""")
 
     def do_POST(self):
         length = int(self.headers.get('Content-Length', '0'))
@@ -31,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'<h1 style="color:green">Interaction received through recorded browser</h1>')
 
 
-server = HTTPServer(('0.0.0.0', 443), Handler)
+server = ThreadingHTTPServer(('0.0.0.0', 443), Handler)
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain('/fixture/server.crt', '/fixture/server.key')
 server.socket = tls.wrap_socket(server.socket, server_side=True)
