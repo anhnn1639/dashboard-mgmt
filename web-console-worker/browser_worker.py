@@ -27,24 +27,25 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as BrowserTimeoutError, async_playwright
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from restricted_proxy import PinnedProxy
 
 
 def origin(url: str) -> tuple[str, str, int]:
     parsed = urlsplit(url)
-    if (parsed.scheme not in {"https", "wss"} or not parsed.hostname
+    if (parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.hostname
             or parsed.username is not None or parsed.password is not None
             or "\\" in url or any(ord(c) < 33 for c in url)):
         raise ValueError("invalid target")
     host = parsed.hostname.lower()
     if not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:]+", host):
         raise ValueError("invalid hostname")
-    port = parsed.port if parsed.port is not None else 443
+    scheme = "https" if parsed.scheme in {"https", "wss"} else "http"
+    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
     if not 1 <= port <= 65535:
         raise ValueError("invalid port")
-    return ("https", host, port)
+    return (scheme, host, port)
 
 
 def allowed_url(url: str, target: str) -> bool:
@@ -75,6 +76,8 @@ class CreateSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_id: UUID
     target_url: str = Field(max_length=2048)
+    allowed_origins: list[str] = Field(default_factory=list, max_length=16)
+    ignore_https_errors: bool = Field(default=False, strict=True)
     width: int = Field(default=1440, ge=800, le=1920)
     height: int = Field(default=900, ge=600, le=1080)
 
@@ -82,9 +85,19 @@ class CreateSession(BaseModel):
     @classmethod
     def validate_url(cls, value):
         origin(value)
-        if not value.startswith("https://") or urlsplit(value).fragment:
-            raise ValueError("HTTPS target required")
+        if not value.startswith(("http://", "https://")) or urlsplit(value).fragment:
+            raise ValueError("HTTP or HTTPS target required")
         return value
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def validate_origins(cls, values):
+        for value in values:
+            origin(value)
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or len(value) > 256:
+                raise ValueError("Only explicit HTTP/HTTPS origins are accepted")
+        return values
 
 
 def authenticate(authorization: str = Header(default="")):
@@ -116,6 +129,11 @@ class Desktop:
     def __init__(self, payload: CreateSession):
         self.id = str(payload.session_id)
         self.url = payload.target_url
+        self.ignore_https_errors = payload.ignore_https_errors
+        self.navigation_error = ""
+        self.allowed_origins = frozenset([origin(self.url), *(origin(value) for value in payload.allowed_origins)])
+        self.destinations = {}
+        self.destination_lock = asyncio.Lock()
         self.width, self.height = payload.width, payload.height
         self.password = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(8))
         self.status, self.reason = "waiting", ""
@@ -137,8 +155,9 @@ class Desktop:
 
     async def start(self, playwright):
         ip = await pinned_address(self.url)
-        _, host, port = origin(self.url)
-        self.proxy = PinnedProxy(host, port, ip, self.input_enabled)
+        scheme, host, port = origin(self.url)
+        self.destinations[(scheme, host, port)] = ip
+        self.proxy = PinnedProxy(host, port, ip, self.input_enabled, scheme=scheme, resolve=self.resolve_destination)
         proxy = await self.proxy.start()
         self.browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, timeout=20000,
             proxy=proxy,
@@ -147,7 +166,7 @@ class Desktop:
             env={k: v for k, v in os.environ.items() if k in {
                 "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "TEMP", "TMP"}})
         self.context = await self.browser.new_context(viewport={"width": self.width, "height": self.height - 28},
-            accept_downloads=False, ignore_https_errors=False, service_workers="block")
+            accept_downloads=False, ignore_https_errors=self.ignore_https_errors, service_workers="block")
         self.context.set_default_timeout(3000)
         self.context.set_default_navigation_timeout(15000)
         await self.context.route("**/*", self.route)
@@ -167,15 +186,36 @@ class Desktop:
         if page != self.page:
             await page.close()
 
+    async def resolve_destination(self, scheme, host, port):
+        key = (scheme, host, port)
+        # The set comes only from Administrator-approved PostgreSQL metadata.
+        # Neither redirects nor page scripts can add an origin during a session.
+        if key not in self.allowed_origins or not self.input_enabled():
+            return None
+        async with self.destination_lock:
+            if key not in self.destinations:
+                host_text = "[" + host + "]" if ":" in host else host
+                try:
+                    self.destinations[key] = await asyncio.wait_for(pinned_address(f"{scheme}://{host_text}:{port}"), 3)
+                except (ValueError, OSError, TimeoutError):
+                    return None
+            return self.destinations[key] if self.input_enabled() else None
+
+    def permitted(self, url):
+        try:
+            return origin(url) in self.allowed_origins
+        except ValueError:
+            return False
+
     async def route(self, route):
-        if self.input_enabled() and allowed_url(route.request.url, self.url):
+        if self.input_enabled() and self.permitted(route.request.url):
             await route.continue_()
         else:
-            self.notice = "Đã chặn địa chỉ ngoài console. Liên hệ quản trị viên nếu cần đăng nhập SSO."
+            self.notice = "Địa chỉ ngoài cấu hình kết nối. Administrator có thể khai báo địa chỉ chuyển hướng / SSO trong Sửa kết nối."
             await route.abort("blockedbyclient")
 
     async def route_socket(self, websocket):
-        if self.input_enabled() and allowed_url(websocket.url, self.url):
+        if self.input_enabled() and self.permitted(websocket.url):
             websocket.connect_to_server()
         else:
             await websocket.close()
@@ -191,10 +231,33 @@ class Desktop:
         self.navigation_task = asyncio.create_task(self.navigate())
 
     async def navigate(self):
+        self.navigation_error = ""
+        if self.proxy:
+            self.proxy.blocked_destination = False
         try:
-            await self.page.goto(self.url, wait_until="domcontentloaded")
-        except Exception:
-            self.notice = "Không mở được website. Kiểm tra kết nối mạng, chứng thư HTTPS hoặc địa chỉ SSO."
+            response = await self.page.goto(self.url, wait_until="domcontentloaded")
+            if response is not None and response.status >= 400:
+                self.navigation_error = "http-error"
+                self.notice = f"Website trả lỗi HTTP {response.status}. Kiểm tra dịch vụ hoặc URL website."
+        except Exception as exc:
+            # Never echo exception text: it can contain SAML tokens or URLs.
+            error = re.search(r"net::(ERR_[A-Z0-9_]+)", str(exc))
+            code = error.group(1) if error else ""
+            if code.startswith("ERR_CERT_"):
+                self.navigation_error = "certificate"
+                self.notice = "Chứng thư HTTPS không hợp lệ. Administrator có thể bật ngoại lệ chứng thư trong Sửa kết nối."
+            elif isinstance(exc, BrowserTimeoutError):
+                self.navigation_error = "timeout"
+                self.notice = "Website tải quá lâu. Kiểm tra dịch vụ website rồi mở lại phiên."
+            elif self.proxy and self.proxy.blocked_destination:
+                self.navigation_error = "blocked-origin"
+                self.notice = "Địa chỉ chuyển hướng chưa được phép. Administrator cần thêm địa chỉ / cổng SSO trong Sửa kết nối."
+            elif code.startswith("ERR_SSL_"):
+                self.navigation_error = "tls"
+                self.notice = "Không thương lượng được HTTPS. Kiểm tra giao thức TLS và cổng của website."
+            else:
+                self.navigation_error = "connection"
+                self.notice = "Không kết nối được website từ dịch vụ trình duyệt. Kiểm tra URL, DNS và kết nối của container."
 
     async def stop(self, reason="closed"):
         if self.status in {"closed", "failed"}:
@@ -245,7 +308,7 @@ class Desktop:
                 writer.write(struct.pack(">I", 0))
                 await writer.drain()
                 await reader.readexactly(1)
-                title = b"Tram Van Hanh - recorded web console"
+                title = b"Operation Portal - recorded web console"
                 writer.write(struct.pack(">HH", self.width, self.height)
                     + struct.pack(">BBBBHHHBBB3x", *self.pixel_format)
                     + struct.pack(">I", len(title)) + title)
@@ -348,7 +411,7 @@ class Desktop:
                 # producing frames, allowing the API to detect a stalled recorder.
                 draw = ImageDraw.Draw(frame)
                 draw.rectangle((0, 0, self.width, 24), fill="#11223b")
-                text = self.notice or "ĐANG GHI HÌNH · Web console qua Trạm Vận Hành · " + time.strftime("%H:%M:%S UTC", time.gmtime())
+                text = self.notice or "ĐANG GHI HÌNH · Web console qua Operation Portal · " + time.strftime("%H:%M:%S UTC", time.gmtime())
                 try:
                     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
                 except OSError:
@@ -448,7 +511,7 @@ def get_desktop(identifier: UUID):
 @app.get("/sessions/{identifier}", dependencies=[Depends(authenticate)])
 def status(identifier: UUID):
     item = get_desktop(identifier)
-    return {"status": item.status, "reason": item.reason}
+    return {"status": item.status, "reason": item.reason, "navigation_error": item.navigation_error}
 
 
 @app.post("/sessions/{identifier}/activate", dependencies=[Depends(authenticate)])

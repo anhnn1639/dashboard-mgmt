@@ -1,7 +1,7 @@
-"""Per-session CONNECT transport to one validated HTTPS host and pinned IP.
+"""Per-session HTTP/CONNECT transport to one validated origin and pinned IP.
 
 TLS stays end-to-end with Chromium. No request body, credential or URL logging.
-Redirects cannot change the destination, even when browser routing is skipped.
+Redirects can use only administrator-configured origins, each pinned to a validated IP.
 """
 from __future__ import annotations
 
@@ -12,11 +12,17 @@ import hmac
 import secrets
 from urllib.parse import urlsplit
 
+HEADER_LIMIT = 65536
+HEADER_NAME = b"!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz"
+
 
 class PinnedProxy:
-    def __init__(self, host, port, address, enabled):
+    def __init__(self, host, port, address, enabled, scheme="https", resolve=None):
         self.host, self.port, self.address = host, port, address
         self.enabled = enabled
+        self.scheme = scheme
+        self.resolve = resolve
+        self.blocked_destination = False
         self.username, self.password = secrets.token_hex(16), secrets.token_hex(24)
         self.authorization = b"Basic " + base64.b64encode(f"{self.username}:{self.password}".encode())
         self.listener = None
@@ -25,7 +31,7 @@ class PinnedProxy:
         self.closed = False
 
     async def start(self):
-        self.listener = await asyncio.start_server(self.accept, "127.0.0.1", 0, limit=8192)
+        self.listener = await asyncio.start_server(self.accept, "127.0.0.1", 0, limit=HEADER_LIMIT)
         port = self.listener.sockets[0].getsockname()[1]
         return {"server": f"http://127.0.0.1:{port}", "username": self.username, "password": self.password}
 
@@ -39,6 +45,32 @@ class PinnedProxy:
                     and not (parsed.path or parsed.query or parsed.fragment))
         except ValueError:
             return False
+
+    def http_request(self, method, target, version, headers):
+        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+            return None
+        try:
+            parsed = urlsplit(target)
+            if (parsed.scheme != "http" or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.fragment or "\\" in target or any(ord(c) < 33 for c in target)):
+                return None
+            if b"content-length" in headers and (not headers[b"content-length"].isdigit() or b"transfer-encoding" in headers):
+                return None
+            if headers.get(b"transfer-encoding", b"chunked").lower() != b"chunked":
+                return None
+            path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+            host = parsed.netloc
+            upgrade = headers.get(b"upgrade", b"").lower() == b"websocket"
+            forwarded = [f"{method} {path} {version}".encode("ascii"), b"host: " + host.encode("ascii")]
+            forwarded.extend(name + b": " + value for name, value in headers.items()
+                             if name not in {b"host", b"connection", b"upgrade"} and not name.startswith(b"proxy-"))
+            forwarded.append(b"connection: Upgrade" if upgrade else b"connection: close")
+            if upgrade:
+                forwarded.append(b"upgrade: websocket")
+            return b"\r\n".join(forwarded) + b"\r\n\r\n"
+        except (ValueError, UnicodeError):
+            return None
 
     async def reply(self, writer, code):
         challenge = b'Proxy-Authenticate: Basic realm="session"\r\n' if code == 407 else b""
@@ -67,7 +99,7 @@ class PinnedProxy:
         pipes = []
         try:
             header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
-            if len(header) > 8192:
+            if len(header) > HEADER_LIMIT:
                 return
             lines = header[:-4].split(b"\r\n")
             method, authority, version = lines[0].decode("ascii").split(" ")
@@ -75,24 +107,48 @@ class PinnedProxy:
             for line in lines[1:]:
                 name, value = line.split(b":", 1)
                 name = name.lower()
-                if name in headers:
+                if name in headers or not name or any(c not in HEADER_NAME for c in name):
                     return
                 headers[name] = value.strip()
             if not hmac.compare_digest(headers.get(b"proxy-authorization", b""), self.authorization):
                 await self.reply(writer, 407)
                 return
-            if (method != "CONNECT" or version not in {"HTTP/1.0", "HTTP/1.1"}
-                    or not self.matches(authority) or not self.enabled() or self.closed):
+            connect = method == "CONNECT"
+            destination = urlsplit("https://" + authority if connect else authority)
+            scheme = destination.scheme
+            port = destination.port if destination.port is not None else (443 if scheme == "https" else 80)
+            valid = (scheme in {"http", "https"} and destination.hostname
+                     and destination.username is None and destination.password is None
+                     and not destination.fragment and "\\" not in authority
+                     and not any(ord(c) < 33 for c in authority) and 1 <= port <= 65535)
+            if connect:
+                valid = valid and not (destination.path or destination.query) and destination.port is not None
+            forwarded = None if connect else self.http_request(method, authority, version, headers)
+            if (not valid or version not in {"HTTP/1.0", "HTTP/1.1"} or not self.enabled() or self.closed
+                    or (not connect and forwarded is None)):
+                self.blocked_destination = True
                 await self.reply(writer, 403)
                 return
-            # Only the prevalidated literal IP is dialed: never resolve the
-            # CONNECT authority, a redirect destination or changed DNS answer.
-            remote, upstream = await asyncio.wait_for(asyncio.open_connection(self.address, self.port), 5)
+            address = None
+            if (scheme, destination.hostname, port) == (self.scheme, self.host, self.port):
+                address = self.address
+            elif self.resolve:
+                address = await self.resolve(scheme, destination.hostname, port)
+            if not address or not self.enabled() or self.closed:
+                self.blocked_destination = True
+                await self.reply(writer, 403)
+                return
+            # Dial only literal IPs from the administrator's configured origins.
+            remote, upstream = await asyncio.wait_for(asyncio.open_connection(address, port), 5)
             self.writers.add(upstream)
             if not self.enabled() or self.closed:
                 return
-            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await asyncio.wait_for(writer.drain(), 2)
+            if connect:
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await asyncio.wait_for(writer.drain(), 2)
+            else:
+                upstream.write(forwarded)
+                await asyncio.wait_for(upstream.drain(), 2)
             pipes = [asyncio.create_task(self.pipe(reader, upstream)), asyncio.create_task(self.pipe(remote, writer))]
             await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
         except (ValueError, UnicodeError, OSError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):

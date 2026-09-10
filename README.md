@@ -1,4 +1,4 @@
-# Trạm Vận Hành
+# Operation Portal
 
 Control plane tự host để giám sát và vận hành tập trung Windows Server và Linux. Bản hiện tại là MVP có kiến trúc triển khai thực tế, API/agent chạy được và giao diện quản trị responsive. Trước khi dùng cho production quy mô lớn, cần kiểm thử trong môi trường staging, tích hợp IdP/vault của tổ chức và thực hiện pentest.
 
@@ -294,7 +294,7 @@ Giá trị cấu hình phải lấy từ **Distribution** đã publish trong Pul
 - Oracle Linux: chọn máy cùng major version, bấm **Đọc lại nguồn**, đợi Agent trả về các ID thật như `ol7_latest`, `ol8_baseos_latest`, `ol8_appstream`; sau đó nhập `base_url` của RPM Distribution tương ứng cho từng ID. Mỗi URL phải truy cập được `repodata/repomd.xml`.
 - Windows: nhập URL dịch vụ WSUS gốc, ví dụ `http://wsus.company.local:8530` hoặc `https://wsus.company.local:8531`; không nhập URL trang quản trị, không thêm đường dẫn console. WSUS phải đồng bộ đúng product Windows Server, classification và ngôn ngữ cần dùng, đồng thời update phải được approve cho computer group chứa máy đích.
 
-Data plane của bản vá đi trực tiếp từ endpoint được quản trị tới nguồn native: Windows client tới WSUS `8530/8531`, Ubuntu/Oracle client tới Pulp `80/443`. Trạm vận hành không cần mở kết nối tới Pulp hoặc WSUS trong kiến trúc hiện tại; nó chỉ gửi policy qua Agent mTLS `9443`. Nếu repository dùng HTTPS với CA nội bộ, CA đó phải được trust trên từng client. DNS và NTP cũng phải hoạt động. Pulp chỉ cần Internet khi đồng bộ upstream; WSUS cần Microsoft Update/upstream WSUS khi đồng bộ. Group Policy có thể ghi đè cấu hình WSUS do Agent đặt, vì vậy GPO và cấu hình website phải thống nhất.
+Data plane của bản vá đi trực tiếp từ endpoint được quản trị tới nguồn native: Windows client tới WSUS `8530/8531`, Ubuntu/Oracle client tới Pulp `80/443`. Operation Portal không cần mở kết nối tới Pulp hoặc WSUS trong kiến trúc hiện tại; nó chỉ gửi policy qua Agent mTLS `9443`. Nếu repository dùng HTTPS với CA nội bộ, CA đó phải được trust trên từng client. DNS và NTP cũng phải hoạt động. Pulp chỉ cần Internet khi đồng bộ upstream; WSUS cần Microsoft Update/upstream WSUS khi đồng bộ. Group Policy có thể ghi đè cấu hình WSUS do Agent đặt, vì vậy GPO và cấu hình website phải thống nhất.
 
 ## Bảo mật và vận hành production
 
@@ -354,3 +354,14 @@ Không đồng bộ `.env`, `deploy/pki`, certificate agent hoặc recording qua
 - ClamAV `INSTREAM`: <https://docs.clamav.net/manual/Usage/ClamdProtocol.html>
 - Microsoft Defender `MpCmdRun`: <https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus>
 - OWASP File Upload Cheat Sheet: <https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html>
+
+
+## Web console trong Operation Portal
+
+Web console chạy trong trình duyệt riêng trên máy chủ Portal và ghi hình bằng Guacamole. Máy người dùng chỉ cần truy cập Portal qua HTTPS 443. Quản trị viên có thể dùng **Sửa kết nối** để:
+
+- Khai báo URL HTTP hoặc HTTPS. HTTP không mã hóa đoạn Portal tới website.
+- Bật **Cho phép chứng thư HTTPS không hợp lệ (chỉ kết nối này)** cho website dùng chứng thư tự ký, hết hạn hoặc không khớp địa chỉ. Mặc định vẫn xác minh HTTPS; có thể cài public CA tại `WEB_CONSOLE_CA_DIR` để tiếp tục xác minh chứng thư.
+- Khai báo **Địa chỉ chuyển hướng / SSO được phép**, mỗi dòng một origin như `https://sso.example.local` hoặc `https://console.example.local:8443`. Không nhập đường dẫn, tham số SAML hoặc wildcard. Chuyển hướng cùng origin tới đường dẫn khác không cần khai báo thêm.
+
+Ngoại lệ chứng thư áp dụng trong phiên riêng của kết nối đó, gồm các origin SSO đã khai báo. Thay đổi cấu hình được audit và thu hồi phiên dùng cấu hình cũ. Chưa tự điền mật khẩu vault; người dùng đăng nhập và nhập OTP trong phiên ghi hình. Tên dịch vụ, volume và Agent hiện hữu giữ nguyên để tương thích triển khai.

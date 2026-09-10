@@ -1020,10 +1020,10 @@ export function OpsConsole() {
           onClick={() => navigateSection(visibleNavItems[0]?.id ?? "")}
           aria-label="Về tổng quan"
         >
-          <span className="brand-mark">V</span>
+          <span className="brand-mark">O</span>
           <span>
-            <b>TRẠM</b>
-            <small>VẬN HÀNH</small>
+            <b>Operation</b>
+            <small>Portal</small>
           </span>
         </button>
         <nav aria-label="Điều hướng chính">
@@ -1167,7 +1167,7 @@ export function OpsConsole() {
         <div className="content">
           {!selected && <div className="page-head">
             <div>
-              <p className="eyebrow">TRẠM VẬN HÀNH · AP-SOUTHEAST</p>
+              <p className="eyebrow">Operation Portal · AP-SOUTHEAST</p>
               <h1>{title}</h1>
               <p>
                 Giám sát, truy cập và thực thi tác vụ an toàn trên toàn bộ máy
@@ -1576,7 +1576,7 @@ function AccountSettingsModal({
             </form>
           </>
         ) : (
-          <div className="resource-help">Tên hiển thị và mật khẩu của tài khoản AD được quản lý tại Active Directory. Website chỉ hiển thị các thông tin đã đồng bộ; role vẫn do Administrator của Trạm Vận Hành phân quyền.</div>
+          <div className="resource-help">Tên hiển thị và mật khẩu của tài khoản AD được quản lý tại Active Directory. Website chỉ hiển thị các thông tin đã đồng bộ; role vẫn do Administrator của Operation Portal phân quyền.</div>
         )}
         <div className="account-session-actions"><span>Muốn kết thúc phiên làm việc trên thiết bị này?</span><button type="button" className="button danger" onClick={signOut}>Đăng xuất</button></div>
       </div>
@@ -1962,10 +1962,10 @@ function SetupScreen({
       <div className="setup-orbit" />
       <header className="setup-header">
         <div className="login-brand">
-          <span className="brand-mark">V</span>
+          <span className="brand-mark">O</span>
           <div>
-            <b>TRẠM</b>
-            <small>VẬN HÀNH</small>
+            <b>Operation</b>
+            <small>Portal</small>
           </div>
         </div>
         <span className="setup-badge">
@@ -1978,7 +1978,7 @@ function SetupScreen({
           <h1>Khởi tạo trung tâm vận hành</h1>
           <p>
             Kết nối kho dữ liệu, tạo quản trị viên local đầu tiên và xác lập địa
-            chỉ chính thức cho Trạm vận hành.
+            chỉ chính thức cho Operation Portal.
           </p>
           <ol className="setup-steps">
             <li className="active">
@@ -1999,7 +1999,7 @@ function SetupScreen({
               <span>03</span>
               <div>
                 <b>Địa chỉ truy cập</b>
-                <small>URL chính thức của Trạm vận hành</small>
+                <small>URL chính thức của Operation Portal</small>
               </div>
             </li>
           </ol>
@@ -2298,10 +2298,10 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
         <div className="login-glow" />
         <form className="login-card mfa-card" onSubmit={verifyMfa} autoComplete="off">
           <div className="login-brand">
-            <span className="brand-mark">V</span>
+            <span className="brand-mark">O</span>
             <div>
-              <b>TRẠM</b>
-              <small>MFA BẮT BUỘC</small>
+              <b>Operation</b>
+              <small>Portal · MFA</small>
             </div>
           </div>
           <p className="login-eyebrow">MULTI-FACTOR AUTHENTICATION</p>
@@ -2361,10 +2361,10 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
       <div className="login-glow" />
       <form className="login-card" onSubmit={submit}>
         <div className="login-brand">
-          <span className="brand-mark">V</span>
+          <span className="brand-mark">O</span>
           <div>
-            <b>TRẠM</b>
-            <small>VẬN HÀNH</small>
+            <b>Operation</b>
+            <small>Portal</small>
           </div>
         </div>
         <p className="login-eyebrow">TRUY CẬP AN TOÀN</p>
@@ -2387,7 +2387,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
         </div>
         <p className="login-copy">
           {source === "local"
-            ? "Đăng nhập bằng tài khoản Local của Trạm vận hành."
+            ? "Đăng nhập bằng tài khoản Local của Operation Portal."
             : "Xác thực bằng tài khoản LDAP/Active Directory của doanh nghiệp."}
         </p>
         <label>
@@ -4540,13 +4540,13 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
     <section className="agent-package-layout">
       <article className="panel agent-package-intro">
         <p className="eyebrow">ZERO-TOUCH ENROLLMENT</p>
-        <h2>Bộ cài tự nhận đúng Trạm vận hành</h2>
+        <h2>Bộ cài tự nhận đúng Operation Portal</h2>
         <p>
           Domain và chế độ xác minh kết nối được lấy từ cấu hình HTTPS của hệ thống.
           Thông tin nhận diện riêng chỉ được sinh trên máy đích, không nằm trong file tải về.
         </p>
         <form className="package-origin" key={status?.dashboardUrl} onSubmit={saveDashboardUrl}>
-          <span>URL Trạm vận hành dùng để sinh Agent</span>
+          <span>URL Operation Portal dùng để sinh Agent</span>
           <input
             name="dashboard_url"
             type="url"
@@ -4559,7 +4559,7 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
             Tôi hiểu agent cũ vẫn giữ endpoint cũ nếu đổi domain
           </label>
           <button className="button ghost" type="submit">Lưu URL HTTPS</button>
-          <small>Hãy mở Trạm vận hành bằng chính domain mới và kiểm tra kết nối HTTPS trước khi lưu.</small>
+          <small>Hãy mở Operation Portal bằng chính domain mới và kiểm tra kết nối HTTPS trước khi lưu.</small>
         </form>
         <ul>
           <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>

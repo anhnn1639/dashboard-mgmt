@@ -415,6 +415,49 @@ class RolePolicyTests(unittest.TestCase):
             self.assertEqual(db.get(m.DeletionApproval, approval_id).status, "pending")
             self.assertIsNone(db.get(m.ServerRetirement, self.server_id))
 
+    def test_web_policy_is_admin_only_persisted_audited_and_revokes_live_sessions(self):
+        server_id, credential_id = self.network_fixture("web")
+        with m.SessionLocal() as db:
+            config = dict(db.get(m.Server, server_id).inventory["managedTarget"])
+        config["web_ignore_https_errors"] = True
+        config["web_allowed_origins"] = ["https://sso.example.test:8443/"]
+        endpoint = f"/api/v1/managed-targets/{server_id}"
+        self.assertEqual(self.client.put(endpoint, headers=self.headers["operator"], json=config).status_code, 403)
+        saved = self.client.put(endpoint, headers=self.headers["admin"], json=config)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        with m.SessionLocal() as db:
+            stored = db.get(m.Server, server_id).inventory["managedTarget"]
+            self.assertTrue(stored["web_ignore_https_errors"])
+            self.assertEqual(stored["web_allowed_origins"], ["https://sso.example.test:8443"])
+            event = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == server_id, m.AuditEvent.action == "target.configure").order_by(m.AuditEvent.occurred_at.desc())).scalars().first()
+            self.assertTrue(event.detail["web_ignore_https_errors"])
+            self.assertEqual(event.detail["web_allowed_origins"], stored["web_allowed_origins"])
+        # Launch accepts no client override of the administrator's policy.
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}) as prepare, patch.object(m.web_hub, "watch") as watch, patch.object(m, "encrypt_guacamole_json", return_value="opaque"):
+            response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(prepare.call_args.kwargs, {"ignore_https_errors": True, "allowed_origins": ["https://sso.example.test:8443"]})
+            authorize = watch.call_args.args[2]
+            self.assertTrue(authorize())
+            config["web_ignore_https_errors"] = False
+            self.assertEqual(self.client.put(endpoint, headers=self.headers["admin"], json=config).status_code, 200)
+            self.assertFalse(authorize())
+
+    def test_http_targets_and_redirect_validation(self):
+        payload = {"name": "plain-" + uuid.uuid4().hex[:8], "kind": "web", "url": "http://10.80.9.7/ui"}
+        self.assertEqual(self.client.post("/api/v1/managed-targets", headers=self.headers["operator"], json=payload).status_code, 403)
+        saved = self.client.post("/api/v1/managed-targets", headers=self.headers["admin"], json=payload)
+        self.assertEqual(saved.status_code, 201, saved.text)
+        with m.SessionLocal() as db:
+            config = db.get(m.Server, saved.json()["id"]).inventory["managedTarget"]
+            self.assertEqual(config["port"], 80)
+            self.assertFalse(config["web_ignore_https_errors"])
+        for values in (["https://sso.test/path"], ["https://user:pass@sso.test"], ["https://sso.test?SAMLRequest=private"], ["https://*.test"], ["https://sso.test:0"]):
+            response = self.client.post("/api/v1/managed-targets", headers=self.headers["admin"], json={**payload, "web_allowed_origins": values})
+            self.assertEqual(response.status_code, 422, response.text)
+        response = self.client.post("/api/v1/managed-targets", headers=self.headers["admin"], json={**payload, "web_ignore_https_errors": "true"})
+        self.assertEqual(response.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,7 +50,7 @@ test("manual SSH and web connect controls remain visible to authorized roles", a
       const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind, role, token: "test", notify() {}, share() {} }));
       assert.equal(html.includes("↗ Kết nối"), role !== "viewer", `${kind}/${role}`);
       assert.doesNotMatch(html, /href="https?:/);
-      if (kind === "web") { assert.match(html, /Cần kiểm tra dịch vụ phiên/); assert.match(html, /Máy người dùng chỉ cần truy cập Trạm/); }
+      if (kind === "web") { assert.match(html, /Cần kiểm tra dịch vụ phiên/); assert.match(html, /Máy người dùng chỉ cần truy cập Operation Portal/); }
     }
   }
 });
@@ -133,6 +133,13 @@ test("Admin and Operator create forms accept initial credentials without exposin
         assert.equal(html.includes('name="address"'), kind === "network");
         assert.equal(html.includes('name="port"'), kind === "network");
         assert.equal(html.includes('name="url"'), kind === "web");
+        assert.equal(html.includes('name="web_allowed_origins"'), kind === "web");
+        assert.equal(html.includes('name="web_ignore_https_errors"'), kind === "web");
+        if (kind === "web") {
+          assert.match(html, /URL website \(HTTP hoặc HTTPS\)/);
+          assert.equal(/<input(?=[^>]*name="web_ignore_https_errors")(?=[^>]*disabled)[^>]*>/i.test(html), role !== "admin");
+          assert.equal(/<textarea(?=[^>]*name="web_allowed_origins")(?=[^>]*readonly)[^>]*>/i.test(html), role !== "admin");
+        }
         assert.doesNotMatch(html, /name="ssh_legacy_compatibility"|Chỉ bật cho thiết bị cũ/);
         assert.equal(html.includes("SSH tự thương lượng"), kind === "network");
         assert.doesNotMatch(html, /ssh_host_key|SSH public host key/);
@@ -270,7 +277,7 @@ test("server-renders the secure operations console shell", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>Trạm Vận Hành<\/title>/i);
+  assert.match(html, /<title>Operation Portal<\/title>/i);
   assert.match(html, /Đang kiểm tra cấu hình hệ thống/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
@@ -748,7 +755,7 @@ test("remote credentials are admin-managed and clipboard is paste-only", async (
   assert.match(consoleSource, /label: "Tài khoản xác thực"[\s\S]*adminOnly: true/);
   assert.match(consoleSource, /body: JSON\.stringify\(\{ server_id: server\.id, protocol, credential_id: credentialId, width, height \}\)/);
   assert.match(credentialSource, /Chỉ Administrator quản lý/);
-  assert.match(credentialSource, /Mật khẩu được mã hóa ở máy chủ Trạm vận hành, không trả về trình duyệt và không ghi vào nhật ký/);
+  assert.match(credentialSource, /Mật khẩu được mã hóa ở máy chủ Operation Portal, không trả về trình duyệt và không ghi vào nhật ký/);
   assert.match(apiSource, /"disable-copy": "true", "disable-paste": "false"/);
   assert.match(apiSource, /"enable-sftp": "false"[\s\S]*"sftp-disable-upload": "true"[\s\S]*"sftp-disable-download": "true"/);
   assert.match(apiSource, /"enable-drive": "false"[\s\S]*"disable-upload": "true"[\s\S]*"disable-download": "true"/);

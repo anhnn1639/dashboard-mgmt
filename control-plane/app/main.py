@@ -1326,7 +1326,7 @@ SAFE_COOKIE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 app = FastAPI(
-    title="Trạm Vận Hành API",
+    title="Operation Portal API",
     version=RELEASE_VERSION,
     docs_url=None,
     redoc_url=None,
@@ -2109,7 +2109,7 @@ def mfa_login_response(db: Session, user: User) -> dict[str, Any]:
             raise HTTPException(status_code=503, detail="Không thể đọc cấu hình MFA") from exc
     response: dict[str, Any] = {"mfa_required": True, "setup_required": not credential.enrolled, "challenge_token": issue_mfa_challenge(user), "user": {"username": user.username, "displayName": user.display_name, "role": user.role}}
     if not credential.enrolled:
-        uri = pyotp.TOTP(secret).provisioning_uri(name=user.username, issuer_name="Trạm Vận Hành")
+        uri = pyotp.TOTP(secret).provisioning_uri(name=user.username, issuer_name="Operation Portal")
         image = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage)
         stream = io.BytesIO()
         image.save(stream)
@@ -3323,6 +3323,12 @@ def persist_managed_target(payload: ManagedTargetRequest, request: Request, user
         endpoint_changed = any(current.get(key) != getattr(payload, key) for key in ("address", "port", "url"))
         if endpoint_changed and user.role != "admin" and db.execute(select(RemoteCredential.id).where(RemoteCredential.server_id == server.id).limit(1)).scalar_one_or_none():
             raise HTTPException(status_code=403, detail="Kết nối đã gắn tài khoản xác thực; chỉ Administrator được đổi đích truy cập để tránh gửi mật khẩu sang máy khác.")
+    if payload.kind == "web" and user.role != "admin":
+        current = (server.inventory or {}).get("managedTarget", {}) if server else {}
+        if (payload.web_allowed_origins != current.get("web_allowed_origins", [])
+                or payload.web_ignore_https_errors != current.get("web_ignore_https_errors", False)
+                or (payload.url.startswith("http://") and payload.url != current.get("url"))):
+            raise HTTPException(status_code=403, detail="Chỉ Administrator được cấu hình HTTP, địa chỉ chuyển hướng hoặc ngoại lệ chứng thư HTTPS.")
     duplicate = db.execute(select(Server).where(Server.name == payload.name, Server.os_family == payload.kind, Server.id != (server.id if server else ""), Server.id.not_in(retired_server_ids(db)))).scalar_one_or_none()
     if duplicate:
         raise HTTPException(status_code=409, detail="Tên kết nối đã tồn tại")
@@ -3343,7 +3349,7 @@ def persist_managed_target(payload: ManagedTargetRequest, request: Request, user
             # Usage of one's own newly supplied credential, not vault management.
             db.add(RemoteCredentialUserShare(credential_id=credential.id, user_id=user.id, granted_by=user.id))
         audit(db, user.username, "remote_credential.create", credential.id, request, detail={"server_id": server.id, "protocol": credential.protocol, "initial_target_credential": True})
-    audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port, **({"ssh_compatibility": "automatic-modern-first-group14-rsa-sha1"} if payload.kind == "network" else {})})
+    audit(db, user.username, "target.configure", server.id, request, detail={"kind": payload.kind, "address": payload.address, "port": payload.port, **({"ssh_compatibility": "automatic-modern-first-group14-rsa-sha1"} if payload.kind == "network" else {"web_scheme": urlsplit(payload.url).scheme, "web_ignore_https_errors": payload.web_ignore_https_errors, "web_allowed_origins": payload.web_allowed_origins})})
     db.commit()
     return {"id": server.id, "saved": True}
 
@@ -5793,6 +5799,8 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                     or check.get(RevokedSessionToken, claims.get("jti")) is not None
                     or now().timestamp() >= claims.get("exp", 0)
                     or (target.inventory or {}).get("managedTarget", {}).get("url") != target_url
+                    or (target.inventory or {}).get("managedTarget", {}).get("web_ignore_https_errors", False) != config.web_ignore_https_errors
+                    or (target.inventory or {}).get("managedTarget", {}).get("web_allowed_origins", []) != config.web_allowed_origins
                     or account.server_id != server_id or account.protocol != "web"):
                 return False
             return actor.role == "admin" or check.execute(select(RemoteCredentialUserShare).where(
@@ -5823,7 +5831,7 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                 final_db.commit()
 
     try:
-        worker = await web_hub.prepare(session_id, target_url, min(payload.width, 1920), min(payload.height, 1080))
+        worker = await web_hub.prepare(session_id, target_url, min(payload.width, 1920), min(payload.height, 1080), ignore_https_errors=config.web_ignore_https_errors, allowed_origins=config.web_allowed_origins)
         parameters = {
             "hostname": settings.web_console_host, "port": str(worker["port"]),
             "password": worker["password"], "color-depth": "24",
@@ -5846,13 +5854,14 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                       "credential_use": "access-authorization-only", "remote_identity_verified": False,
                       "transport": "recorded-server-browser", "recording": True,
                       "authentication": "manual-in-recorded-browser",
+                      "web_scheme": urlsplit(target_url).scheme, "web_ignore_https_errors": config.web_ignore_https_errors, "web_allowed_origins": config.web_allowed_origins,
                       "clipboard": "paste-only", "native_file_transfer": "disabled"})
         db.commit()
     except Exception as exc:
         db.rollback()
         await web_hub.stop_remote(session_id)
         if isinstance(exc, WebSessionError):
-            raise HTTPException(status_code=503, detail="Không khởi tạo được phiên Web console có ghi hình. Kiểm tra dịch vụ trình duyệt trên Trạm Vận Hành.") from exc
+            raise HTTPException(status_code=503, detail="Không khởi tạo được phiên Web console có ghi hình. Kiểm tra dịch vụ trình duyệt trên Operation Portal.") from exc
         raise
     web_hub.watch(session_id, lambda: recording_file(session_id), authorized, activate, finished)
     return {"sessionId": session_id, "url": guacamole_launch_url(settings.guacamole_url, server.name, encrypted),

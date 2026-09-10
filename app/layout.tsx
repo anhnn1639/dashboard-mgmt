@@ -6,7 +6,7 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin-ext"] 
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin-ext"] });
 
 export const metadata: Metadata = {
-  title: { default: "Trạm Vận Hành", template: "%s · Trạm Vận Hành" },
+  title: { default: "Operation Portal", template: "%s · Operation Portal" },
   description: "Dashboard quản trị tập trung Windows Server, Ubuntu và Oracle Linux.",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
 };

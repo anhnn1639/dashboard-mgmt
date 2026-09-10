@@ -6,7 +6,6 @@ are temporary; the test never connects to production or decrypts a vault.
 import asyncio
 import contextlib
 import hashlib
-import importlib.util
 import json
 import os
 import secrets
@@ -15,7 +14,6 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 
@@ -44,6 +42,10 @@ async def read_instruction(reader):
 
 async def main():
     repository = Path(__file__).resolve().parents[2]
+    profile = os.environ.get('WEB_SMOKE_PROFILE', 'trusted')
+    if profile not in {'trusted', 'untrusted', 'strict-certificate', 'redirect', 'http'}:
+        raise ValueError('Unknown disposable web test profile')
+    target_url = 'http://console.test:8080/ui' if profile == 'http' else 'https://console.test/' + ('redirect-allowed' if profile == 'redirect' else 'ui')
     secret = secrets.token_hex(16)
     token = hashlib.sha256(('tram-web-console:' + secret).encode()).hexdigest()
     clients = []
@@ -56,18 +58,21 @@ async def main():
             path.chmod(0o777 if path == recordings else 0o755)
         run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(fixture / 'ca.key'), '-out', str(ca / 'issuer.crt'), '-days', '1', '-subj', '/CN=Disposable web CI CA')
         run('openssl', 'req', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(fixture / 'server.key'), '-out', str(fixture / 'server.csr'), '-subj', '/CN=console.test')
-        (fixture / 'extensions').write_text('subjectAltName=DNS:console.test\nextendedKeyUsage=serverAuth\n')
+        (fixture / 'extensions').write_text('subjectAltName=DNS:console.test,DNS:sso.test\nextendedKeyUsage=serverAuth\n')
         run('openssl', 'x509', '-req', '-in', str(fixture / 'server.csr'), '-CA', str(ca / 'issuer.crt'), '-CAkey', str(fixture / 'ca.key'), '-CAcreateserial', '-out', str(fixture / 'server.crt'), '-days', '1', '-extfile', str(fixture / 'extensions'))
         (fixture / 'fixture.py').write_bytes((repository / 'tests/web-smoke/fixture.py').read_bytes())
         docker('network', 'create', 'tram-web-smoke')
         try:
             docker('run', '-d', '--name', 'tram-web-forbidden', '--network', 'tram-web-smoke', '--network-alias', 'forbidden.test', '-v', str(fixture) + ':/fixture:ro', 'python:3.12-bookworm', 'python', '/fixture/fixture.py', 'sink')
-            docker('run', '-d', '--name', 'tram-web-fixture', '--network', 'tram-web-smoke', '--network-alias', 'console.test', '-v', str(fixture) + ':/fixture:ro', 'python:3.12-bookworm', 'python', '/fixture/fixture.py')
+            docker('run', '-d', '--name', 'tram-web-fixture', '--network', 'tram-web-smoke', '--network-alias', 'console.test', '--network-alias', 'sso.test', '-v', str(fixture) + ':/fixture:ro', 'python:3.12-bookworm', 'python', '/fixture/fixture.py')
             # Secret travels only via a private stdin env file, never argv/logs.
             envfile = root / 'worker.env'
             envfile.write_text('GUACAMOLE_JSON_SECRET=' + secret + '\n')
             envfile.chmod(0o600)
-            docker('run', '-d', '--name', 'tram-web-worker', '--network', 'tram-web-smoke', '--init', '--read-only', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + str(repository / 'web-console-worker/seccomp_profile.json'), '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002', '--tmpfs', '/home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002', '--shm-size', '512m', '--env-file', str(envfile), '-v', str(ca) + ':/run/web-ca:ro', 'tram-web-smoke-worker')
+            trusted_ca = root / 'empty-ca' if profile in {'untrusted', 'strict-certificate'} else ca
+            trusted_ca.mkdir(exist_ok=True)
+            trusted_ca.chmod(0o755)
+            docker('run', '-d', '--name', 'tram-web-worker', '--network', 'tram-web-smoke', '--init', '--read-only', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + str(repository / 'web-console-worker/seccomp_profile.json'), '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002', '--tmpfs', '/home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002', '--shm-size', '512m', '--env-file', str(envfile), '-v', str(trusted_ca) + ':/run/web-ca:ro', 'tram-web-smoke-worker')
             worker_ip = docker('inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', 'tram-web-worker')
             docker('run', '-d', '--name', 'tram-web-guacd', '--network', 'tram-web-smoke', '-p', '127.0.0.1:14822:4822', '-v', str(recordings) + ':/recordings', 'guacamole/guacd:1.6.0')
             base = 'http://' + worker_ip + ':8081'
@@ -112,7 +117,7 @@ asyncio.run(check())
             if result.returncode:
                 raise RuntimeError('Isolated browser startup failed in disposable fixture')
             identifier = str(uuid.uuid4())
-            prepared = await asyncio.to_thread(http, 'POST', '/sessions', {'session_id': identifier, 'target_url': 'https://console.test/', 'width': 800, 'height': 600})
+            prepared = await asyncio.to_thread(http, 'POST', '/sessions', {'session_id': identifier, 'target_url': target_url, 'width': 800, 'height': 600, 'ignore_https_errors': profile == 'untrusted', 'allowed_origins': ['https://sso.test:4443'] if profile == 'redirect' else []})
             self_test = subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited'])
             assert self_test.returncode != 0, 'Target opened before transport/recording'
             parameters = {'hostname': worker_ip, 'port': str(prepared['port']), 'password': prepared['password'], 'color-depth': '24', 'recording-path': '/recordings', 'create-recording-path': 'true', 'recording-name': identifier + '.guac', 'recording-include-keys': 'false', 'disable-copy': 'true', 'disable-paste': 'false'}
@@ -157,6 +162,20 @@ asyncio.run(check())
             assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited']).returncode != 0
             await asyncio.to_thread(http, 'POST', '/sessions/' + identifier + '/activate', {})
             first_size = recording.stat().st_size
+            if profile == 'strict-certificate':
+                for _ in range(10):
+                    state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
+                    if state['navigation_error'] == 'certificate':
+                        break
+                    await asyncio.to_thread(http, 'POST', '/sessions/' + identifier + '/lease', {})
+                    await asyncio.sleep(1)
+                else:
+                    raise RuntimeError('Untrusted certificate was not rejected in strict mode')
+                assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited']).returncode != 0
+                await asyncio.to_thread(http, 'DELETE', '/sessions/' + identifier)
+                consumer.cancel(); await asyncio.gather(consumer, return_exceptions=True)
+                print('PASS: strict HTTPS rejects untrusted certificate without any website HTTP request')
+                return
             # Wait for both same-origin redirect requests to fail and prove that
             # no TCP connection reached either forbidden destination.
             for attempt in range(20):
@@ -181,14 +200,15 @@ asyncio.run(check())
                 if submitted and recording.stat().st_size > first_size:
                     break
                 await asyncio.sleep(1)
-            assert submitted, 'Form interaction did not reach internal HTTPS fixture'
+            assert submitted, 'Form interaction did not reach internal website fixture'
+            assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/sso-visited']).returncode == 0, 'SSO redirect was not followed'
             assert recording.stat().st_size > first_size, 'Recording stopped growing'
             # Simulate loss of the API/recorder: no lease refresh must end access.
             await asyncio.sleep(17)
             state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
             assert state['status'] == 'failed' and state['reason'] == 'lease-expired', state
             consumer.cancel(); await asyncio.gather(consumer, return_exceptions=True)
-            print('PASS: real sandboxed Chromium HTTPS + Guacamole VNC input + growing recording; no target request before recording; literal-IP/wrong-port redirects blocked before TCP; API lease loss closes browser')
+            print('PASS: ' + profile + ' + real sandboxed Chromium + Guacamole VNC input + growing recording; no target request before recording; literal-IP/wrong-port redirects blocked before TCP; API lease loss closes browser')
         finally:
             for writer in clients:
                 writer.close()

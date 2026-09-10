@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 from restricted_proxy import PinnedProxy
 
@@ -97,3 +98,29 @@ class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.proxy.writers)
         with self.assertRaises(OSError):
             await asyncio.open_connection('127.0.0.1', self.proxy_port)
+
+    async def test_explicit_additional_origin_is_connected_without_resolving_others(self):
+        self.enabled = True
+        async def resolve(scheme, host, port):
+            return "127.0.0.1" if (scheme, host, port) == ("https", "sso.invalid", self.port) else None
+        self.proxy.resolve = AsyncMock(side_effect=resolve)
+        response, reader, writer = await self.connect(f"sso.invalid:{self.port}")
+        self.assertIn(b"200", response)
+        writer.write(b"opaque"); await writer.drain()
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(6), 2), b"opaque")
+        response, _, _ = await self.connect(f"unlisted.invalid:{self.port}")
+        self.assertIn(b"403", response)
+        self.assertEqual(self.hits, 1)
+
+    async def test_http_request_rewrites_authority_and_strips_proxy_credentials(self):
+        self.enabled = True
+        self.proxy.scheme = "http"
+        response, _, _ = await self.connect(f"http://console.invalid:{self.port}/ui?x=1", method="GET")
+        self.assertTrue(response.startswith(b"GET /ui?x=1 HTTP/1.1"))
+        self.assertIn(f"host: console.invalid:{self.port}".encode(), response)
+        self.assertIn(b"connection: close", response)
+        self.assertNotIn(b"Proxy-Authorization", response)
+        self.assertNotIn(self.proxy.authorization, response)
+        response, _, _ = await self.connect(f"http://other.invalid:{self.port}/", method="GET")
+        self.assertIn(b"403", response)
+        self.assertEqual(self.hits, 1)

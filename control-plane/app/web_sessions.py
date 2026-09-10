@@ -62,9 +62,9 @@ class WebSessionHub:
 
         return await asyncio.to_thread(send)
 
-    async def prepare(self, session_id: str, target_url: str, width: int, height: int) -> dict:
+    async def prepare(self, session_id: str, target_url: str, width: int, height: int, *, ignore_https_errors: bool = False, allowed_origins: list[str] | None = None) -> dict:
         result = await self.call("POST", "/sessions", {"session_id": session_id, "target_url": target_url,
-                                                       "width": width, "height": height})
+                                                       "width": width, "height": height, "ignore_https_errors": ignore_https_errors, "allowed_origins": allowed_origins or []})
         if (type(result.get("port")) is not int or not 1024 <= result["port"] <= 65535
                 or not isinstance(result.get("password"), str)
                 or not re.fullmatch(r"[A-Za-z0-9]{8}", result["password"])):

@@ -1,1 +1,1 @@
-"""Trạm Vận Hành control plane."""
+"""Operation Portal control plane."""

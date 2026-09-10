@@ -35,7 +35,7 @@ export function ManagedSessionModal({ target, token, close, notify }: {
     event.preventDefault();
     if (!selected || busy) return;
     const popup = window.open("about:blank", "_blank");
-    if (!popup) { setError("Trình duyệt đã chặn cửa sổ phiên. Cho phép popup cho Trạm vận hành rồi thử lại."); return; }
+    if (!popup) { setError("Trình duyệt đã chặn cửa sổ phiên. Cho phép popup cho Operation Portal rồi thử lại."); return; }
     popup.opener = null;
     setBusy(true); setError("");
     try {
@@ -46,7 +46,7 @@ export function ManagedSessionModal({ target, token, close, notify }: {
       if (destination.origin !== window.location.origin || !destination.pathname.startsWith("/guacamole/")) throw new Error("Địa chỉ phiên truy cập không hợp lệ.");
       try { window.localStorage.removeItem("GUAC_AUTH_TOKEN"); } catch { /* Browser storage may be disabled. */ }
       popup.location.href = destination.href;
-      notify(protocol === "web" ? "Đã tạo phiên Web console qua Trạm Vận Hành. Website sẽ mở sau khi ghi hình sẵn sàng." : "Đã tạo phiên SSH có ghi hình. Có thể paste văn bản vào phiên.");
+      notify(protocol === "web" ? "Đã tạo phiên Web console qua Operation Portal. Website sẽ mở sau khi ghi hình sẵn sàng." : "Đã tạo phiên SSH có ghi hình. Có thể paste văn bản vào phiên.");
       close();
     } catch (reason) {
       popup.close();
@@ -60,7 +60,7 @@ export function ManagedSessionModal({ target, token, close, notify }: {
       <label>Username<select value={selected} required disabled={loading || busy || !choices.length} onChange={(event) => setSelected(event.target.value)}><option value="">{loading ? "Đang tải tài khoản…" : "Chọn tài khoản…"}</option>{choices.map((item) => <option key={item.id} value={item.id}>{item.username}{item.label !== item.username ? ` · ${item.label}` : ""}</option>)}</select></label>
       {!loading && !choices.length && !error && <div className="warning-box">Chưa có tài khoản được phép sử dụng. Administrator cần tạo hoặc chia sẻ tài khoản trong mục Tài khoản xác thực.</div>}
       <p className="resource-help">Chỉ sử dụng tài khoản được cấp quyền. Mật khẩu đã lưu không trả về máy người dùng; phiên được ghi lại để kiểm toán.</p>
-      {protocol === "web" && <p className="resource-help">Website được mở từ máy chủ Trạm Vận Hành. Chờ màn hình ghi hình sẵn sàng, rồi đăng nhập và nhập OTP ngay trong phiên. Tài khoản đã lưu hiện chỉ dùng để kiểm tra quyền; chưa tự điền mật khẩu.</p>}
+      {protocol === "web" && <p className="resource-help">Website được mở từ máy chủ Operation Portal. Chờ màn hình ghi hình sẵn sàng, rồi đăng nhập và nhập OTP ngay trong phiên. Tài khoản đã lưu hiện chỉ dùng để kiểm tra quyền; chưa tự điền mật khẩu.</p>}
       <div className="modal-actions"><button type="button" className="button ghost" disabled={busy} onClick={close}>Hủy</button><button className="button primary" disabled={loading || busy || !selected}>{busy ? "Đang chuẩn bị kết nối…" : "Kết nối"}</button></div>
     </form>
   </ModalShell>;

@@ -28,6 +28,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         Path('/tmp/visited').touch()
+        if self.path == '/ui':
+            self.send_response(302)
+            self.send_header('Location', '/websso/SAML2/SSO/fixture?SAMLRequest=disposable')
+            self.end_headers()
+            return
+        if self.path == '/redirect-allowed':
+            self.send_response(302)
+            self.send_header('Location', 'https://sso.test:4443/ui')
+            self.end_headers()
+            return
+        if self.path.startswith('/websso/SAML2/SSO/'):
+            Path('/tmp/sso-visited').touch()
         if self.path in ('/redirect-ip', '/redirect-port'):
             Path('/tmp/' + self.path[1:] + '-attempted').touch()
             destination = ('https://' + socket.gethostbyname('forbidden.test') + '/blocked'
@@ -61,6 +73,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         self.rfile.read(length)  # Never retain or print input values.
+        assert not self.headers.get('Proxy-Authorization'), 'Proxy credential reached website'
         Path('/tmp/submitted').touch()
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
@@ -72,4 +85,9 @@ server = ThreadingHTTPServer(('0.0.0.0', 443), Handler)
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain('/fixture/server.crt', '/fixture/server.key')
 server.socket = tls.wrap_socket(server.socket, server_side=True)
+sso = ThreadingHTTPServer(('0.0.0.0', 4443), Handler)
+sso.socket = tls.wrap_socket(sso.socket, server_side=True)
+plain = ThreadingHTTPServer(('0.0.0.0', 8080), Handler)
+for additional in (sso, plain):
+    threading.Thread(target=additional.serve_forever, daemon=True).start()
 server.serve_forever()

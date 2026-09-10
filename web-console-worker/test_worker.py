@@ -140,3 +140,31 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+    async def test_configured_redirects_only_resolve_once_and_never_admit_script_origins(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/ui", allowed_origins=["https://sso.test:8443", "http://old.test:80"]))
+        desktop.status = "active"
+        self.assertTrue(desktop.permitted("https://sso.test:8443/websso/SAML2/SSO?value=hidden"))
+        self.assertTrue(desktop.permitted("ws://old.test/socket"))
+        self.assertFalse(desktop.permitted("https://sso.test:443/"))
+        with patch.object(w, "pinned_address", new_callable=AsyncMock, return_value="10.80.9.9") as resolve:
+            self.assertIsNone(await desktop.resolve_destination("https", "outside.test", 443))
+            resolve.assert_not_awaited()
+            self.assertEqual(await desktop.resolve_destination("https", "sso.test", 8443), "10.80.9.9")
+            self.assertEqual(await desktop.resolve_destination("https", "sso.test", 8443), "10.80.9.9")
+            resolve.assert_awaited_once()
+        with patch.object(w, "pinned_address", new_callable=AsyncMock, side_effect=ValueError("unsafe target")):
+            self.assertIsNone(await desktop.resolve_destination("http", "old.test", 80))
+        desktop.deadline = time.monotonic() - 1
+        self.assertIsNone(await desktop.resolve_destination("https", "sso.test", 8443))
+
+    async def test_navigation_errors_do_not_expose_saml_tokens(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
+        desktop.page = type("Page", (), {"goto": AsyncMock(side_effect=RuntimeError("net::ERR_CERT_AUTHORITY_INVALID https://console.test/?SAMLRequest=PRIVATE"))})()
+        await desktop.navigate()
+        self.assertEqual(desktop.navigation_error, "certificate")
+        self.assertNotIn("PRIVATE", desktop.notice)
+        self.assertIn("chứng thư", desktop.notice)
+        desktop.page.goto.side_effect = w.BrowserTimeoutError("private-url")
+        await desktop.navigate()
+        self.assertEqual(desktop.navigation_error, "timeout")
