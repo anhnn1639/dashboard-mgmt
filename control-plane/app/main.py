@@ -52,6 +52,7 @@ from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificat
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest
+from .schema_migrations import detach_recording_history_users
 
 
 class Settings(BaseSettings):
@@ -424,9 +425,11 @@ class RecordingDeletionRequest(Base):
     session_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     reason: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
-    requested_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    # Historical identities, like AuditEvent.actor and DeletionApproval:
+    # deleting a login must never delete or rewrite this history.
+    requested_by: Mapped[str] = mapped_column(String(36), index=True)
     requested_by_username: Mapped[str] = mapped_column(String(80))
-    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     approved_by_username: Mapped[str] = mapped_column(String(80), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1415,6 +1418,7 @@ def activate_database(database_url: str, *, initialize_schema: bool = True) -> E
             connection.execute(text("SELECT 1"))
         if initialize_schema:
             Base.metadata.create_all(candidate)
+            detach_recording_history_users(candidate)
     except Exception as exc:
         if candidate is not engine:
             candidate.dispose()
@@ -2719,6 +2723,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
         with candidate.connect() as connection:
             connection.execute(text("SELECT 1"))
         Base.metadata.create_all(candidate)
+        detach_recording_history_users(candidate)
         candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
         with candidate_factory() as db:
             ensure_builtin_roles(db)
@@ -2992,16 +2997,21 @@ def delete_platform_users(payload: PlatformUsersDeleteRequest, request: Request,
     remaining_admins = db.execute(select(func.count()).select_from(User).where(User.role == "admin", User.enabled.is_(True), User.id.not_in(user_ids))).scalar_one()
     if deleting_admins and remaining_admins == 0:
         raise HTTPException(status_code=409, detail="Không thể xóa quản trị viên cuối cùng")
-    referenced = set(db.execute(select(RecordingDeletionRequest.requested_by).where(RecordingDeletionRequest.requested_by.in_(user_ids))).scalars().all())
-    referenced.update(item for item in db.execute(select(RecordingDeletionRequest.approved_by).where(RecordingDeletionRequest.approved_by.in_(user_ids))).scalars().all() if item)
-    if referenced:
-        raise HTTPException(status_code=409, detail="Có tài khoản đã phát sinh yêu cầu recording; hãy khóa tài khoản thay vì xóa để giữ toàn vẹn audit")
+    # Cancel pending destructive intents, not their history or recordings.
+    # Conditional UPDATE serializes against an administrator's approval claim.
+    cancelled_recordings = db.execute(update(RecordingDeletionRequest).where(
+        RecordingDeletionRequest.requested_by.in_(user_ids), RecordingDeletionRequest.status == "pending",
+    ).values(status="cancelled", completed_at=now(), error="Tài khoản tạo yêu cầu đã bị xóa; recording được giữ nguyên.").returning(RecordingDeletionRequest.id)).scalars().all()
+    cancelled_approvals = db.execute(update(DeletionApproval).where(
+        DeletionApproval.requested_by.in_(user_ids), DeletionApproval.status == "pending",
+    ).values(status="cancelled", reviewed_at=now(), reviewed_by=actor.id).returning(DeletionApproval.id)).scalars().all()
     db.execute(delete(MFACredential).where(MFACredential.user_id.in_(user_ids)))
+    db.execute(delete(RevokedSessionToken).where(RevokedSessionToken.user_id.in_(user_ids)))
     db.execute(delete(PlatformGroupMember).where(PlatformGroupMember.user_id.in_(user_ids)))
     db.execute(delete(ServerUserShare).where(ServerUserShare.user_id.in_(user_ids)))
     db.execute(delete(RemoteCredentialUserShare).where(RemoteCredentialUserShare.user_id.in_(user_ids)))
     db.execute(delete(User).where(User.id.in_(user_ids)))
-    audit(db, actor.username, "identity.user.delete", "platform-users", request, detail={"users": [{"id": user.id, "username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local"} for user in users]})
+    audit(db, actor.username, "identity.user.delete", "platform-users", request, detail={"users": [{"id": user.id, "username": user.username, "source": "ldap" if user.password_hash == "!LDAP" else "local"} for user in users], "cancelled_recording_requests": cancelled_recordings, "cancelled_deletion_approvals": cancelled_approvals})
     db.commit()
     return {"deleted": len(users)}
 

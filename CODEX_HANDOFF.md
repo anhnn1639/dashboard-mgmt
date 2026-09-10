@@ -1,4 +1,12 @@
-# Bàn giao Codex — 08/09/2026
+# Bàn giao Codex — 10/09/2026
+
+## Xóa user có lịch sử recording và phạm vi pentest — 10/09/2026
+
+- Người dùng yêu cầu sửa lỗi xóa tài khoản trước, sau đó pentest website `https://ops.sbsi.vn/` từ phía **guest/không đăng nhập**. Kiểm thử chức năng bên trong/role/remote production để phase sau; không DoS/brute-force/phá dữ liệu, không chạy lệnh trên endpoint thật. Regression dữ liệu giả cho bản sửa user vẫn chạy biệt lập.
+- Nguyên nhân HTTP 409 trong ảnh: `recording_deletion_requests.requested_by`/`approved_by` là FK tới `users`, dù đã có snapshot username. Đổi hai trường thành ID lịch sử dạng String(36), giống bảng `deletion_approvals`, giữ nguyên ID/tên/row/audit hash/recording. Migration PostgreSQL tự chạy khi activate/setup DB, chỉ gỡ đúng hai FK cũ, nhận cả tên constraint tùy chỉnh, có transaction/advisory lock và lock timeout 5s; không xóa/cập nhật dòng lịch sử. `create_all` đơn thuần không đủ cho DB đã triển khai.
+- Admin xóa được user từng gửi/duyệt recording; vẫn chặn user khác, tự xóa, xóa Admin cuối, batch sai/trùng/thiếu ID. Xóa login/MFA/share/token thu hồi của đúng user, giữ credential vault và lịch sử. JWT cũ bị từ chối vì ID user không còn tồn tại, kể cả sau khi tạo lại cùng username. Yêu cầu xóa recording/thiết bị còn pending của user bị hủy và được ghi ID trong audit xóa user, không tự thực thi; lịch sử deleted/failed hoặc đã được approve (deleting) giữ nguyên. Audit lỗi thì rollback cả xóa tài khoản và hủy yêu cầu.
+- Local **100 API pass, 3 PostgreSQL integration skip** do không có PostgreSQL/Docker local; thêm PostgreSQL 16 CI loopback-only trong schema ngẫu nhiên, tái tạo FK trước sửa rồi kiểm migration chạy hai lần, xóa thật và bảo toàn lịch sử. Kết quả CI sẽ được xác minh sau push. Không thêm SQLite cho dữ liệu ứng dụng; SQLite vẫn chỉ là fixture unit-test có sẵn.
+- Chưa deploy production. Sau pull cần rebuild/recreate **API** để chạy migration trước khi thử lại nút xóa; không cần thay Agent hoặc xóa audit/recording thủ công. Xóa user LDAP chỉ xóa mapping ở Trạm, user vẫn có thể được tạo lại nếu tiếp tục được AD cho phép đăng nhập/đồng bộ. Không tự xóa user thật trong phiên kiểm thử này.
 
 ## Bỏ menu Log máy chủ — 08/09/2026
 
