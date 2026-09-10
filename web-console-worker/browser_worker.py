@@ -40,7 +40,10 @@ def origin(url: str) -> tuple[str, str, int]:
     host = parsed.hostname.lower()
     if not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:]+", host):
         raise ValueError("invalid hostname")
-    return ("https", host, parsed.port or 443)
+    port = parsed.port if parsed.port is not None else 443
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid port")
+    return ("https", host, port)
 
 
 def allowed_url(url: str, target: str) -> bool:

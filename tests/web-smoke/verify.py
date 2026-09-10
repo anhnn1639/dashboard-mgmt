@@ -86,6 +86,24 @@ async def main():
                         raise
                     await asyncio.sleep(1)
 
+            # Disposable-fixture diagnostics only; no production URL/account.
+            preflight = """import asyncio, uuid
+from playwright.async_api import async_playwright
+from browser_worker import Desktop, CreateSession
+async def check():
+    async with async_playwright() as pw:
+        d = Desktop(CreateSession(session_id=uuid.uuid4(), target_url='https://console.test/', width=800, height=600))
+        try:
+            await d.start(pw)
+            print('Browser startup preflight passed')
+        finally:
+            await d.stop()
+asyncio.run(check())
+"""
+            result = subprocess.run(['docker', 'exec', '-i', 'tram-web-worker', 'python', '-'], input=preflight, capture_output=True, text=True)
+            print((result.stdout + result.stderr).replace(secret, '[redacted]')[-7000:])
+            if result.returncode:
+                raise RuntimeError('Isolated browser startup failed in disposable fixture')
             identifier = str(uuid.uuid4())
             prepared = await asyncio.to_thread(http, 'POST', '/sessions', {'session_id': identifier, 'target_url': 'https://console.test/', 'width': 800, 'height': 600})
             self_test = subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited'])
@@ -156,8 +174,8 @@ async def main():
                 writer.close()
             for container in ('tram-web-worker', 'tram-web-guacd', 'tram-web-fixture'):
                 with contextlib.suppress(Exception):
-                    logs = docker('logs', container)
-                    print(container + ': ' + logs.replace(secret, '[redacted]')[-4000:])
+                    result = subprocess.run(['docker', 'logs', container], capture_output=True, text=True)
+                    print(container + ': ' + (result.stdout + result.stderr).replace(secret, '[redacted]')[-4000:])
                 with contextlib.suppress(Exception):
                     docker('rm', '-f', container)
             with contextlib.suppress(Exception):
