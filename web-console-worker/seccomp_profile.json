@@ -697,12 +697,8 @@
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
-			"comment": "",
-			"includes": {
-				"caps": [
-					"CAP_SYS_CHROOT"
-				]
-			},
+			"comment": "Allow Chromium chroot inside its user namespace; container capabilities remain dropped.",
+			"includes": {},
 			"excludes": {}
 		},
 		{
