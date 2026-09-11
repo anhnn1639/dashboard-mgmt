@@ -81,7 +81,7 @@ class SavedAccountLogin:
     def allowed(self, frame):
         page = self.desktop.page
         # Only the top-level website and its same-origin embedded login UI.
-        return (self.desktop.input_enabled() and self.desktop.permitted(page.url)
+        return (self.desktop.automation_enabled() and self.desktop.permitted(page.url)
                 and self.desktop.permitted(frame.url)
                 and self.site(frame.url) == self.site(page.url))
 
@@ -94,7 +94,8 @@ class SavedAccountLogin:
         if not self.allowed(frame):
             return False
         destination = await button.evaluate("e => e.hasAttribute('formaction') ? e.formAction : e.form?.action || location.href")
-        return self.desktop.permitted(destination) and self.site(destination) == self.site(frame.url)
+        return (self.allowed(frame) and self.desktop.permitted(destination)
+                and self.site(destination) == self.site(frame.url))
 
     async def attempt(self, frame):
         if not self.allowed(frame):
@@ -154,6 +155,9 @@ class SavedAccountLogin:
         try:
             async with asyncio.timeout(45):
                 while self.desktop.input_enabled() and time.monotonic() < deadline:
+                    if not self.desktop.automation_enabled():
+                        await asyncio.sleep(.1)
+                        continue
                     for frame in list(self.desktop.page.frames):
                         try:
                             if await self.attempt(frame):

@@ -1,5 +1,13 @@
 # Bàn giao Codex — 11/09/2026
 
+## Hồi quy capture sau tự đăng nhập — 11/09/2026
+
+- User báo trước nâng tự đăng nhập thì Web console mở được; sau nâng Guacamole dừng ở frame chuẩn bị rồi đóng. Audit cung cấp: recording.started và credential.release success lúc13:36:28, session.web.closed reason=web-capture-failed lúc13:36:32. Log worker xác nhận `Web frame failed stage=capture kind=TimeoutError` (hai lần). Đã loại giả thuyết giải mã/quyền từ bằng chứng này; không cần user gửi credential hay URL Guacamole.
+- Tái hiện bằng browser thật/fixture: renderer bận JavaScript6s, Page.captureScreenshot quá hạn4s; chụp lại trên cùng CDP session thành công khoảng5.8s. Code cũ đóng VNC ngay lần timeout đầu, nên một lần browser bận ngắn cũng phá phiên. Các smoke trước chỉ có font/network chậm, chưa có main thread bận; CIpass trước không bao phủ ca này.
+- Worker thử chụp lại một lần khi TimeoutError, tổng giới hạn8s thấp hơn watchdog ghi hình10s. Trong phục hồi vẫn cho website tải qua policy mạng/lease hiện tại, tạm ngừng input/autofill; không tạo ảnh cũ, ảnh giả hoặc đồng hồ để giả ghi hình còn sống. Nếu vẫn không chụp được thì đóng phiên và xóa bản sao credential như cũ.
+- Tự đăng nhập đợi hình website thật được gửi qua VNC trước khi dò/điền form. Mỗi lần document chính chuyển hướng, phải có hình document mới trước khi tự điền bước tiếp theo. Giữ URL/origin đã lưu, kiểm quyền, bắt buộc recording, OTPmanual và chỉ một lần gửi password; không thay API/PostgreSQL/Agent hay port.
+- Local **55/55 worker pass bằng Chromium thật**, gồm main thread bận6s, ảnh VNC đúng pixel mới, pauseinput, timeoutvĩnhviễn/xóasecrets, leasehết, chuyển document/kích hoạt trong drain không mở autofill sớm, nhả Ctrl/nútchuộtgiữ sau recovery trước mởinput và recheckcapturegate sauawaitDOM. Thêm profileCI thứ8 auto-login-busy: website bận6s, đòi logretrythật, đăng nhập SSO hai bước, recordingtăng, trang tĩnh18s và đóng khi mấtlease. SyntaxPython/YAML/diffpass. Chưa có kết luận CI của bản capture, chưa deploy production.
+
 ## Web console tự đăng nhập bằng tài khoản đã lưu — 11/09/2026
 
 - **Hoàn tất và đã push/đối chiếu main**: tự đăng nhập `02dd8131a716591a93b3b8e0fc56cb0a03beaa7a`, deploy diagnostics `1e537ca7e406df0b5edfd4c6ac938b3aac31e34c`, kiểm thử đầy đủ tại `ccb17b0cff40b6b1522790f305a491d6247e354a`. **CI34569305946 success cả8job**: API/PostgreSQL/Agent, Node/UI, edge,4SSH, Web console Chromium sandbox +7profile ghi hình (auto-login hai bướcHTTP302, trusted,legacy-false,untrusted,redirect,http,delayed-font). Commit sau chỉ cập nhật bàn giao, không đổi source đã được CI xác minh.

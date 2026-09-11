@@ -13,6 +13,10 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 
+PROFILE = os.environ.get('WEB_SMOKE_PROFILE', '')
+AUTO_LOGIN = PROFILE in {'auto-login', 'auto-login-busy'}
+
+
 class ForbiddenConnection(socketserver.BaseRequestHandler):
     def handle(self):
         # Mark TCP arrival, including TLS that would fail certificate validation.
@@ -75,8 +79,15 @@ class Handler(BaseHTTPRequestHandler):
             Path('/tmp/font-response-finished').touch()
             self.send_error(404)
             return
-        if self.path == '/login-password' and os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login':
+        if self.path == '/login-password' and AUTO_LOGIN:
             return self.minimal(b'<form method="post" action="/login-finish"><input type="password" name="password" autocomplete="current-password"><button>Sign in</button></form>')
+        if self.path.startswith('/renderer-busy-finished?') and PROFILE == 'auto-login-busy':
+            elapsed = int(parse_qs(self.path.partition('?')[2])['elapsed'][0])
+            assert elapsed >= 6000, 'Busy-renderer fixture did not run for six seconds'
+            Path('/tmp/renderer-busy-finished').write_text(str(elapsed))
+            self.send_response(204)
+            self.end_headers()
+            return
         if self.path == '/ui':
             self.send_response(302)
             self.send_header('Location', '/websso/SAML2/SSO/fixture?SAMLRequest=disposable')
@@ -105,9 +116,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-        delayed_font = b'<style>@font-face{font-family:DelayedFixture;src:url(/slow-font.woff2)}body{font-family:DelayedFixture,sans-serif!important}</style>' if os.environ.get('WEB_SMOKE_PROFILE') == 'delayed-font' else b''
-        login_form = b'<form method="post" action="/login-username"><input name="username" autocomplete="username" disabled><button>Next</button></form>' if os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login' else b'<form method="post"><input name="value" disabled><button>Submit fixture</button></form>'
-        self.wfile.write(b'<!doctype html><html>' + delayed_font + b"""<body style="background:#def;color:#123;font:24px sans-serif">
+        delayed_font = b'<style>@font-face{font-family:DelayedFixture;src:url(/slow-font.woff2)}body{font-family:DelayedFixture,sans-serif!important}</style>' if PROFILE == 'delayed-font' else b''
+        # Occupy the renderer before there is a login form or target frame to
+        # record. The original four-second capture deadline closed this session.
+        busy_renderer = b'''<script>
+          const busyStarted=performance.now();
+          while(performance.now()-busyStarted<6000) {}
+          window.fixtureBusyFinished=fetch('/renderer-busy-finished?elapsed='+Math.floor(performance.now()-busyStarted));
+        </script>''' if PROFILE == 'auto-login-busy' else b''
+        login_form = b'<form method="post" action="/login-username"><input name="username" autocomplete="username" disabled><button>Next</button></form>' if AUTO_LOGIN else b'<form method="post"><input name="value" disabled><button>Submit fixture</button></form>'
+        self.wfile.write(b'<!doctype html><html>' + delayed_font + busy_renderer + b"""<body style="background:#def;color:#123;font:24px sans-serif">
         <h1>Recorded internal console fixture</h1>
         """ + login_form + b"""
         <script>
@@ -119,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
             ws.onmessage=event=>{if(event.data==='confirmed'){ws.close();resolve();}else reject();};
             setTimeout(reject,10000);
           });
+          await window.fixtureBusyFinished;
           await fetch('/checks-finished');
           const input=document.querySelector('input'); input.disabled=false; input.focus();
         });
@@ -130,9 +149,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         body = self.rfile.read(length)  # Disposable fixtures only.
-        if os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login':
+        if AUTO_LOGIN:
             values = parse_qs(body.decode())
             if self.path == '/login-username':
+                if PROFILE == 'auto-login-busy':
+                    assert Path('/tmp/renderer-busy-finished').exists(), 'Login preceded the busy renderer fixture'
                 assert values == {'username': ['fixture-user']}, 'Saved username did not reach the first step'
                 assert not self.headers.get('Proxy-Authorization'), 'Proxy credential reached website'
                 Path('/tmp/auto-username-submitted').touch()

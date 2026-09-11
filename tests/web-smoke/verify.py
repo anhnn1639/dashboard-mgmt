@@ -48,9 +48,10 @@ async def read_instruction(reader):
 async def main():
     repository = Path(__file__).resolve().parents[2]
     profile = os.environ.get('WEB_SMOKE_PROFILE', 'trusted')
-    if profile not in {'trusted', 'untrusted', 'legacy-false', 'redirect', 'http', 'delayed-font', 'auto-login'}:
+    if profile not in {'trusted', 'untrusted', 'legacy-false', 'redirect', 'http', 'delayed-font', 'auto-login', 'auto-login-busy'}:
         raise ValueError('Unknown disposable web test profile')
-    target_url = 'http://console.test:8080/ui' if profile == 'http' else 'https://console.test/' + ('redirect-allowed' if profile in {'redirect', 'auto-login'} else 'ui')
+    auto_login = profile in {'auto-login', 'auto-login-busy'}
+    target_url = 'http://console.test:8080/ui' if profile == 'http' else 'https://console.test/' + ('redirect-allowed' if profile == 'redirect' or auto_login else 'ui')
     secret = secrets.token_hex(16)
     token = hashlib.sha256(('tram-web-console:' + secret).encode()).hexdigest()
     clients = []
@@ -133,7 +134,7 @@ asyncio.run(check())
                     'allowed_origins': []})
             else:
                 prepared = await hub.prepare(identifier, target_url, 1920, 1080,
-                                             allowed_origins=['https://sso.test:4443'] if profile in {'redirect', 'auto-login'} else [])
+                                             allowed_origins=['https://sso.test:4443'] if profile == 'redirect' or auto_login else [])
             recording = recordings / (identifier + '.guac')
             activated = asyncio.Event()
             closures = []
@@ -141,7 +142,7 @@ asyncio.run(check())
             async def activate():
                 assert recording.exists() and recording.stat().st_size > 0, 'Production watcher activated without a recording'
                 assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/visited']).returncode != 0, 'Target opened before recording gate'
-                activation = {'credentials': {'username': 'fixture-user', 'password': 'fixture-password'}} if profile == 'auto-login' else {}
+                activation = {'credentials': {'username': 'fixture-user', 'password': 'fixture-password'}} if auto_login else {}
                 await hub.call('POST', '/sessions/' + identifier + '/activate', activation)
                 activated.set()
 
@@ -232,7 +233,7 @@ asyncio.run(check())
             submitted = False
             for attempt in range(12):
                 require_live()
-                if attempt == 3 and profile != 'auto-login':
+                if attempt == 3 and not auto_login:
                     for key in (ord('a'), 0xff0d):
                         writer.write(instruction('key', key, 1) + instruction('key', key, 0))
                     await writer.drain()
@@ -241,12 +242,18 @@ asyncio.run(check())
                     break
                 await asyncio.sleep(1)
             assert submitted, 'Form interaction did not reach internal website fixture'
-            if profile == 'auto-login':
+            if auto_login:
                 assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/auto-login-submitted']).returncode == 0
                 login_state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
                 assert login_state['login_state'] == 'submitted'
                 assert 'fixture-password' not in json.dumps(login_state)
                 print('PASS: saved account automatically completed username/password steps across real HTTP 302 SSO after recording activation')
+            if profile == 'auto-login-busy':
+                elapsed = docker('exec', 'tram-web-fixture', 'cat', '/tmp/renderer-busy-finished')
+                assert int(elapsed) >= 6000, 'Renderer did not remain busy past the original capture deadline'
+                logs = subprocess.run(['docker', 'logs', 'tram-web-worker'], check=True, capture_output=True, text=True)
+                assert 'Web capture waiting for busy renderer; retrying within recording deadline' in logs.stdout + logs.stderr, 'Capture recovery branch was not exercised'
+                print('PASS: a six-second busy renderer triggered bounded capture recovery and saved-account SSO completed with growing recording')
             assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/sso-visited']).returncode == 0, 'SSO redirect was not followed'
             assert recording.stat().st_size > first_size, 'Recording stopped growing'
             # Keep a mostly static page open past the recording-stall timeout.

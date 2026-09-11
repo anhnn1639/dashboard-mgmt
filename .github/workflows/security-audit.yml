@@ -44,7 +44,7 @@ jobs:
       - name: Build isolated browser with Chromium sandbox
         id: browser_image
         run: docker build -t tram-web-smoke-worker web-console-worker
-      - name: Verify saved-account forms in a real sandboxed browser
+      - name: Verify saved-account forms and capture recovery in a real sandboxed browser
         if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: >-
           docker run --rm --init --read-only --cap-drop=ALL
@@ -53,10 +53,14 @@ jobs:
           --tmpfs /home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002 --shm-size 512m
           -e TRAM_TEST_BROWSER=chromium
           -v "${{ github.workspace }}/web-console-worker/test_auto_login.py:/app/test_auto_login.py:ro"
-          --entrypoint python tram-web-smoke-worker -m unittest test_auto_login -v
+          -v "${{ github.workspace }}/web-console-worker/test_capture_recovery.py:/app/test_capture_recovery.py:ro"
+          --entrypoint python tram-web-smoke-worker -m unittest test_auto_login test_capture_recovery -v
       - name: Verify saved-account SSO login after recording activation
         if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=auto-login python tests/web-smoke/verify.py
+      - name: Verify busy-renderer capture recovery preserves recording and saved-account SSO
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
+        run: WEB_SMOKE_PROFILE=auto-login-busy python tests/web-smoke/verify.py
       - name: Verify internal HTTPS access, recording gate and lease shutdown
         if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: python tests/web-smoke/verify.py

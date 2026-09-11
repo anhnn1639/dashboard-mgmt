@@ -44,7 +44,7 @@ class LoginPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(desktop.login.username, "")
 
     async def test_stalled_form_cancellation_clears_secrets(self):
-        desktop = SimpleNamespace(input_enabled=lambda: True, page=SimpleNamespace(frames=[]))
+        desktop = SimpleNamespace(input_enabled=lambda: True, automation_enabled=lambda: True, page=SimpleNamespace(frames=[]))
         login = SavedAccountLogin(desktop, LoginCredentials(username="fixture-user", password="fixture-password"))
         login.start()
         await asyncio.sleep(0)
@@ -91,6 +91,7 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url='https://console.test/login', allowed_origins=['https://sso.test']))
         self.desktop.page = self.page
         self.desktop.status = 'active'
+        self.desktop.website_frame_ready = True  # DOM fixtures supply the recording gate separately.
         self.desktop.deadline = time.monotonic() + 120
 
     async def asyncTearDown(self):
@@ -118,6 +119,24 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
             while len(self.posts) < count:
                 await asyncio.sleep(.01)
         self.assertEqual(self.login.state, 'submitted')
+
+    async def test_login_waits_for_first_website_frame_and_capture_recovery(self):
+        await self.open('<form method="post"><input name="username"><input type="password" name="password"><button>Login</button></form>')
+        self.desktop.website_frame_ready = False
+        self.login.start()
+        await asyncio.sleep(.3)
+        self.assertEqual(await self.page.locator('input[name=username]').input_value(), '')
+        self.assertFalse(self.posts)
+        self.desktop.website_frame_ready = True
+        self.desktop.capture_recovering = True
+        await asyncio.sleep(.3)
+        self.assertEqual(await self.page.locator('input[name=password]').input_value(), '')
+        self.assertFalse(self.posts)
+        self.desktop.capture_recovering = False
+        await asyncio.wait_for(self.login.task, 8)
+        await self.wait_for_posts(1)
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual((self.login.username, self.login.password), ('', ''))
 
     async def test_standard_vcenter_style_form_is_filled_and_submitted_once(self):
         await self.open('<form method="post" action="/login"><input id="userName" name="username"><input id="password" type="password" name="password"><button id="submit">Login</button></form>')

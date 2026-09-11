@@ -188,6 +188,10 @@ KEYS = {0xff08: "Backspace", 0xff09: "Tab", 0xff0d: "Enter", 0xff1b: "Escape",
         0xffe9: "Alt", 0xffea: "Alt"}
 
 
+CAPTURE_ATTEMPT_SECONDS = 4
+CAPTURE_RECOVERY_SECONDS = 8
+
+
 class Desktop:
     def __init__(self, payload: CreateSession):
         self.id = str(payload.session_id)
@@ -205,6 +209,9 @@ class Desktop:
         self.listener = self.writer = self.browser = self.context = self.page = None
         self.client_task = self.navigation_task = self.proxy = None
         self.capture = None
+        self.capture_recovering = False
+        self.website_frame_ready = False
+        self.document_revision = 0
         self.login = None
         self.frame_requested = asyncio.Event()
         self.pixel_format = (32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
@@ -221,6 +228,51 @@ class Desktop:
         now = time.monotonic()
         return self.status == "active" and now < self.deadline and now - self.created < 3600
 
+    def interaction_enabled(self):
+        # Page loading still uses the normal network lease while capture recovers.
+        return self.input_enabled() and not self.capture_recovering
+
+    def automation_enabled(self):
+        return self.interaction_enabled() and self.website_frame_ready
+
+    def frame_navigated(self, frame):
+        if frame == self.page.main_frame:
+            self.document_revision += 1
+            self.website_frame_ready = False
+
+    async def release_held_input(self):
+        # Releases arriving during capture recovery were intentionally deferred.
+        # Clear held modifiers/buttons after fresh pixels reach the recorder,
+        # before accepting any new input, so Ctrl/drag cannot remain stuck.
+        async with asyncio.timeout(1):
+            async with self.input_lock:
+                for key in tuple(self.keys):
+                    await self.page.keyboard.up(key)
+                    self.keys.discard(key)
+                for bit, name in ((1, "left"), (2, "middle"), (4, "right")):
+                    if self.buttons & bit:
+                        await self.page.mouse.up(button=name)
+                self.buttons = 0
+
+    async def capture_surface(self):
+        # A busy Chromium renderer can recover after one screenshot timeout.
+        # Keep the total below the API's 10s recording-stall watchdog. Never
+        # emit old frames or an artificial audit clock during this interval.
+        async with asyncio.timeout(CAPTURE_RECOVERY_SECONDS):
+            for attempt in range(2):
+                if not self.input_enabled():
+                    raise TimeoutError("Capture lease expired")
+                try:
+                    return await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
+                        "format": "png", "fromSurface": True, "captureBeyondViewport": False,
+                    }), CAPTURE_ATTEMPT_SECONDS)
+                except TimeoutError:
+                    self.capture_recovering = True
+                    self.website_frame_ready = False
+                    if attempt:
+                        raise
+                    logging.getLogger(__name__).warning("Web capture waiting for busy renderer; retrying within recording deadline")
+
     async def start(self, playwright):
         ip = await pinned_address(self.url)
         scheme, host, port = origin(self.url)
@@ -236,6 +288,7 @@ class Desktop:
         await self.context.add_init_script(INIT_SCRIPT)
         self.page = await self.context.new_page()
         self.page.on("request", self.observe_request)
+        self.page.on("framenavigated", self.frame_navigated)
         self.capture = await self.context.new_cdp_session(self.page)
         self.page.on("dialog", lambda dialog: dialog.dismiss())
         self.page.on("download", lambda download: download.cancel())
@@ -439,7 +492,7 @@ class Desktop:
     async def key(self, keysym, down):
         if down and self.login:
             self.login.cancel()
-        if not self.input_enabled():
+        if not self.interaction_enabled():
             return
         key = KEYS.get(keysym)
         if key is None:
@@ -461,7 +514,7 @@ class Desktop:
     async def mouse(self, mask, x, y):
         if mask & 7 and self.login:
             self.login.cancel()
-        if not self.input_enabled() or y < 28:
+        if not self.interaction_enabled() or y < 28:
             return
         await self.page.mouse.move(min(x, self.width - 1), min(y - 28, self.height - 29))
         for bit, name in ((1, "left"), (2, "middle"), (4, "right")):
@@ -479,14 +532,15 @@ class Desktop:
             while self.status in {"connected", "active"}:
                 await self.frame_requested.wait()
                 self.frame_requested.clear()
+                revision = None
                 if self.status == "active":
                     # Record the actual composited surface while the website
                     # loads. Playwright page.screenshot waits for fonts/DOM
                     # readiness and can tear down healthy sessions on slow SSO.
                     stage = "capture"
-                    captured = await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
-                        "format": "png", "fromSurface": True, "captureBeyondViewport": False,
-                    }), 4)
+                    revision = self.document_revision
+                    captured_url = getattr(self.page, "url", "")
+                    captured = await self.capture_surface()
                     stage = "decode"
                     data = base64.b64decode(captured["data"], validate=True)
                     content = Image.open(io.BytesIO(data)).convert("RGB")
@@ -521,6 +575,14 @@ class Desktop:
                 stage = "transport"
                 writer.write(struct.pack(">BBHHHHHi", 0, 0, 1, 0, 0, self.width, self.height, 0) + raw)
                 await asyncio.wait_for(writer.drain(), 5)
+                if self.status == "active" and revision is not None:
+                    if self.capture_recovering:
+                        stage = "input-reset"
+                        await self.release_held_input()
+                    self.capture_recovering = False
+                    if (revision == self.document_revision and captured_url == getattr(self.page, "url", "")
+                            and self.permitted(captured_url)):
+                        self.website_frame_ready = True
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             raise
@@ -528,6 +590,10 @@ class Desktop:
             # Fixed stage/class only; browser exceptions can contain SSO URLs.
             logging.getLogger(__name__).warning("Web frame failed stage=%s kind=%s", stage, type(exc).__name__)
             self.reason = "capture-failed"
+            self.capture_recovering = True
+            self.website_frame_ready = False
+            if self.login:
+                self.login.cancel()
             writer.close()
 
 
