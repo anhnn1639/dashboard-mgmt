@@ -361,7 +361,7 @@ Không đồng bộ `.env`, `deploy/pki`, certificate agent hoặc recording qua
 Web console chạy trong trình duyệt riêng trên máy chủ Portal và ghi hình bằng Guacamole. Máy người dùng chỉ cần truy cập Portal qua HTTPS 443. Quản trị viên có thể dùng **Sửa kết nối** để:
 
 - Khai báo URL HTTP hoặc HTTPS. HTTP không mã hóa đoạn Portal tới website.
-- Bật **Cho phép chứng thư HTTPS không hợp lệ (chỉ kết nối này)** cho website dùng chứng thư tự ký, hết hạn hoặc không khớp địa chỉ. Mặc định vẫn xác minh HTTPS; có thể cài public CA tại `WEB_CONSOLE_CA_DIR` để tiếp tục xác minh chứng thư.
+- Chứng thư nội bộ, tự ký, hết hạn hoặc không khớp địa chỉ được xử lý tự động trong trình duyệt Web console, không có checkbox và không cần lưu lại kết nối cũ. Chính sách này chỉ áp dụng trình duyệt phiên; không thay HTTPS Portal, Agent mTLS, LDAP hoặc dịch vụ khác.
 - Khai báo **Địa chỉ chuyển hướng / SSO được phép**, mỗi dòng một origin như `https://sso.example.local` hoặc `https://console.example.local:8443`. Không nhập đường dẫn, tham số SAML hoặc wildcard. Chuyển hướng cùng origin tới đường dẫn khác không cần khai báo thêm.
 
-Ngoại lệ chứng thư áp dụng trong phiên riêng của kết nối đó, gồm các origin SSO đã khai báo. Thay đổi cấu hình được audit và thu hồi phiên dùng cấu hình cũ. Chưa tự điền mật khẩu vault; người dùng đăng nhập và nhập OTP trong phiên ghi hình. Tên dịch vụ, volume và Agent hiện hữu giữ nguyên để tương thích triển khai.
+Xử lý chứng thư tự động áp dụng trong phiên riêng của kết nối đó, gồm các origin SSO đã khai báo; danh tính website không được xác minh bằng chứng thư trong phiên này. Danh sách redirect vẫn giới hạn đúng địa chỉ đã cấu hình. Đổi URL hoặc danh sách SSO được audit và thu hồi phiên dùng cấu hình cũ. Chưa tự điền mật khẩu vault; người dùng đăng nhập và nhập OTP trong phiên ghi hình. Tên dịch vụ, volume và Agent hiện hữu giữ nguyên để tương thích triển khai.

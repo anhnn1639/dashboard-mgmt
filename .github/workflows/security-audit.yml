@@ -43,14 +43,16 @@ jobs:
         run: docker build -t tram-web-smoke-worker web-console-worker
       - name: Verify internal HTTPS access, recording gate and lease shutdown
         run: python tests/web-smoke/verify.py
-      - name: Verify untrusted certificate requires configured exception
-        run: WEB_SMOKE_PROFILE=strict-certificate python tests/web-smoke/verify.py
-      - name: Verify recorded access with configured certificate exception
+      - name: Verify automatic certificate handling accepts a stale false flag
+        run: WEB_SMOKE_PROFILE=legacy-false python tests/web-smoke/verify.py
+      - name: Verify automatic certificate handling without a per-target flag
         run: WEB_SMOKE_PROFILE=untrusted python tests/web-smoke/verify.py
       - name: Verify recorded SSO across configured host and port
         run: WEB_SMOKE_PROFILE=redirect python tests/web-smoke/verify.py
       - name: Verify recorded HTTP website without certificate
         run: WEB_SMOKE_PROFILE=http python tests/web-smoke/verify.py
+      - name: Verify delayed web fonts do not stop recording or close the browser
+        run: WEB_SMOKE_PROFILE=delayed-font python tests/web-smoke/verify.py
       - name: Remove disposable web test services
         if: ${{ always() }}
         run: |

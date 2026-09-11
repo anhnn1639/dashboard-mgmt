@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import hashlib
 import struct
 import time
@@ -33,6 +35,15 @@ class WorkerPolicyTests(unittest.TestCase):
             self.assertEqual(response.status_code, 422)
             self.assertNotIn("private-test-value", response.text)
             self.assertEqual(client.get("/docs").status_code, 404)
+
+    def test_automatic_certificate_handling_keeps_destination_boundary(self):
+        for legacy in (None, False, True):
+            options = {} if legacy is None else {"ignore_https_errors": legacy}
+            desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/", **options))
+            self.assertTrue(desktop.ignore_https_errors)
+            self.assertTrue(desktop.permitted("https://console.test/websso"))
+            self.assertFalse(desktop.permitted("https://unlisted.test/"))
+            self.assertFalse(desktop.permitted("https://console.test:8443/"))
 
     def test_invalid_dimensions_and_host_resolver_injection(self):
         for url in ("https://host,MAP*evil/", "https://evil example/", "https://foo/*#fragment"):
@@ -168,3 +179,28 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         desktop.page.goto.side_effect = w.BrowserTimeoutError("private-url")
         await desktop.navigate()
         self.assertEqual(desktop.navigation_error, "timeout")
+
+    async def test_recording_captures_surface_without_waiting_for_web_fonts(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/", width=800, height=600))
+        png = io.BytesIO()
+        w.Image.new("RGB", (800, 572), "#abcdef").save(png, format="PNG")
+        desktop.capture = type("Capture", (), {"send": AsyncMock(return_value={"data": base64.b64encode(png.getvalue()).decode()})})()
+        desktop.page = type("Page", (), {"screenshot": AsyncMock(side_effect=AssertionError("Must not wait for fonts"))})()
+        written = []
+        class Writer:
+            def write(self, data):
+                written.append(data)
+                desktop.status = "closed"
+            async def drain(self):
+                pass
+            def close(self):
+                raise AssertionError("Healthy surface capture must not close the transport")
+        desktop.status = "active"
+        desktop.frame_requested.set()
+        await asyncio.wait_for(desktop.frames(Writer()), 2)
+        desktop.page.screenshot.assert_not_awaited()
+        self.assertEqual(desktop.capture.send.call_args.args[0], "Page.captureScreenshot")
+        self.assertEqual(len(written), 1)
+        self.assertEqual(len(written[0]), 16 + 800 * 600 * 4)
+        # Row28 is the first website pixel, encoded as default RFB BGRX.
+        self.assertEqual(written[0][16 + 28 * 800 * 4:16 + 28 * 800 * 4 + 4], bytes([0xef, 0xcd, 0xab, 0]))

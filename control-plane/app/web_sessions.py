@@ -62,9 +62,9 @@ class WebSessionHub:
 
         return await asyncio.to_thread(send)
 
-    async def prepare(self, session_id: str, target_url: str, width: int, height: int, *, ignore_https_errors: bool = False, allowed_origins: list[str] | None = None) -> dict:
+    async def prepare(self, session_id: str, target_url: str, width: int, height: int, *, allowed_origins: list[str] | None = None) -> dict:
         result = await self.call("POST", "/sessions", {"session_id": session_id, "target_url": target_url,
-                                                       "width": width, "height": height, "ignore_https_errors": ignore_https_errors, "allowed_origins": allowed_origins or []})
+                                                       "width": width, "height": height, "allowed_origins": allowed_origins or []})
         if (type(result.get("port")) is not int or not 1024 <= result["port"] <= 65535
                 or not isinstance(result.get("password"), str)
                 or not re.fullmatch(r"[A-Za-z0-9]{8}", result["password"])):
@@ -90,19 +90,35 @@ class WebSessionHub:
         active = False
         last_size = 0
         progressed = started
+        failure_stage = "web-service-failed"
         try:
             while time.monotonic() - started < 3600:
+                failure_stage = "web-authorization-failed"
                 if not authorize():
                     reason = "web-access-revoked"
                     break
+                failure_stage = "web-status-unavailable"
                 state = await self.call("GET", "/sessions/" + session_id)
                 if state.get("status") in {"closed", "failed"}:
                     reason = "closed" if state["status"] == "closed" else "web-browser-failed"
+                    # Only fixed worker codes may enter the durable audit trail.
+                    # Never propagate a URL, exception, capability or SSO token.
+                    worker_reason = state.get("reason")
+                    if state["status"] == "failed" and worker_reason in {
+                        "capture-failed", "transport-failed", "lease-expired",
+                        "prepare-failed", "prepare-cancelled", "service-stopped",
+                    }:
+                        reason = "web-" + worker_reason
                     break
+                if state.get("status") not in {"waiting", "connected", "active"}:
+                    reason = "web-status-invalid"
+                    break
+                failure_stage = "web-recording-unreadable"
                 path = recording()
                 size = path.stat().st_size if path else 0
                 if not active:
                     if size > 0 and state.get("status") == "connected":
+                        failure_stage = "web-activation-failed"
                         await activate()
                         active = True
                         last_size, progressed = size, time.monotonic()
@@ -115,6 +131,7 @@ class WebSessionHub:
                     if not size or size < last_size or time.monotonic() - progressed > 10:
                         reason = "web-recording-stopped"
                         break
+                    failure_stage = "web-lease-failed"
                     await self.call("POST", "/sessions/" + session_id + "/lease", {})
                 await asyncio.sleep(1)
             else:
@@ -122,9 +139,19 @@ class WebSessionHub:
         except asyncio.CancelledError:
             reason = "web-service-stopped"
             raise
-        except Exception:
-            # Fail closed on recording I/O, database or broker failure.
-            reason = "web-service-failed"
+        except Exception as exc:
+            # Fail closed on recording I/O, database or broker failure, retaining
+            # the stage without storing exception contents from external sites.
+            reason = failure_stage
+            if isinstance(exc, WebSessionError):
+                if str(exc) == "access-revoked":
+                    reason = "web-access-revoked"
+                elif failure_stage == "web-recording-unreadable" and str(exc) in {
+                    "recording-root-missing", "recording-root-invalid",
+                    "recording-permission-denied", "recording-root-unreadable",
+                    "recording-invalid-session",
+                }:
+                    reason = "web-" + str(exc)
         finally:
             await self.stop_remote(session_id)
             try:

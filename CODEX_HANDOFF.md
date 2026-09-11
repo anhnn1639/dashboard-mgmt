@@ -1,4 +1,15 @@
-# Bàn giao Codex — 10/09/2026
+# Bàn giao Codex — 11/09/2026
+
+## Web console: ghi hình ổn định và chứng thư tự động — 11/09/2026
+
+- User báo máy client không tới vCenter thì Guacamole đen, máy client tới được vCenter thì hiện "Đang chuẩn bị ghi hình" rồi lỗi remote server closed. Ảnh chỉ chứng minh lỗi trước/đầu activation; máy client không cần đường mạng tới vCenter vì browser chạy ở Portal. Chưa có log production để kết luận duy nhất nguyên nhân; không truy cập server/credential production từ workspace.
+- User muốn bỏ cả checkbox cert và khai báo redirect. Auto-review đã chặn patch mở mọi origin và luôn bỏ TLS; sau câu hỏi rủi ro cụ thể, user trả lời **Cho phép tự động trong Web console**, nhưng reviewer vẫn từ chối vì cần payload/đích nhận cụ thể. Cả hai patch bị chặn trước thực thi, không lách. User sau đó nói **tạm bỏ qua** phần redirect và tiếp tục sửa các lỗi khác; rồi yêu cầu riêng bỏ checkbox **Cho phép chứng thư HTTPS không hợp lệ**. Patch tự xử lý cert trong **ranh giới origin đã cấu hình giữ nguyên** được chấp nhận. Không hỏi lại xác nhận này.
+- Đã bỏ riêng checkbox và payload cert trên UI; worker tự xử lý cert trong context riêng của phiên. Metadata/API cũ thiếu cờ, false/true đều được nhận nhưng không điều khiển policy/không persist lại; phiên mới dùng ngay không cần sửa/lưu lại target. API không truyền password vault, audit certificate_policy=automatic-session-compatibility; HTTP/redirect vẫn Admin, RBAC/MFA/recording/lease và DNS IP pin giữ nguyên. Không đổi trust của Portal/Agent/LDAP.
+- Sửa capture: page.screenshot(timeout=4000) chờ font/DOM nên font/SSO chậm có thể đóng VNC với capture-failed và client chỉ thấy frame chuẩn bị cuối cùng. Chuyển sang Chromium Page.captureScreenshot để ghi đúng surface hiện tại khi trang đang tải, không chờ document.fonts.ready; capture vẫn deadline4s và fail-closed nếu hỏng. Không dùng ảnh cũ để giả recording sống.
+- Watcher giữ lý do lỗi cố định theo giai đoạn authorization/status/recording/activation/lease và allowlist mã worker; không echo URL, SAML, exception hay capability. web_recording_file phân biệt root mất/hỏng/không đọc được với file chưa được ghi, không chờ120s vô ích khi mount hỏng. Nhật ký session.web.closed giữ nguyên nhân; không bỏ cổng ghi hình trước activation.
+- Local API 122 tests (119 pass, 3 PostgreSQL skip), worker17/17, UI35/35, TypeScript/lint/build pass. Smoke CI nay dùng WebSessionHub.watch thật (bản cũ manual activate/lease),1920x1080+resize,ảnh/input,giữ trang tĩnh18s,API outage→leaseexpired. Sáu profile gồm HTTPS,certlạ khôngcờ,cờcũfalse,SSO được cấu hình,HTTP,font tải12s. CI đang chờ push/chạy.
+- Chưa deploy production. Sau source/CI hoàn tất dùng script deploy với đúng overlay hiện tại để recreate đồng bộ API/dashboard/Guacamole/web-console, mở phiên mới. Không cần nâng Agent. Tự động redirect bất kỳ vẫn tạm gác; danh sách SSO hiện có giữ nguyên.
+
 
 ## Operation Portal; web HTTP, ngoại lệ chứng thư và SSO — 10/09/2026
 

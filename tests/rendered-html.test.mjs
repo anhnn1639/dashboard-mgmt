@@ -134,10 +134,10 @@ test("Admin and Operator create forms accept initial credentials without exposin
         assert.equal(html.includes('name="port"'), kind === "network");
         assert.equal(html.includes('name="url"'), kind === "web");
         assert.equal(html.includes('name="web_allowed_origins"'), kind === "web");
-        assert.equal(html.includes('name="web_ignore_https_errors"'), kind === "web");
+        assert.doesNotMatch(html, /name="web_ignore_https_errors"|Cho phép chứng thư HTTPS không hợp lệ/);
         if (kind === "web") {
           assert.match(html, /URL website \(HTTP hoặc HTTPS\)/);
-          assert.equal(/<input(?=[^>]*name="web_ignore_https_errors")(?=[^>]*disabled)[^>]*>/i.test(html), role !== "admin");
+          assert.match(html, /tự xử lý chứng thư/);
           assert.equal(/<textarea(?=[^>]*name="web_allowed_origins")(?=[^>]*readonly)[^>]*>/i.test(html), role !== "admin");
         }
         assert.doesNotMatch(html, /name="ssh_legacy_compatibility"|Chỉ bật cho thiết bị cũ/);

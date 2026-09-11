@@ -6,6 +6,7 @@ The API controls a short lease; no target request or input before activation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -77,7 +78,9 @@ class CreateSession(BaseModel):
     session_id: UUID
     target_url: str = Field(max_length=2048)
     allowed_origins: list[str] = Field(default_factory=list, max_length=16)
-    ignore_https_errors: bool = Field(default=False, strict=True)
+    # Backward compatibility only. Certificate handling is automatic within
+    # the unchanged configured-origin boundary of each recorded browser.
+    ignore_https_errors: bool = Field(default=False, strict=True, exclude=True)
     width: int = Field(default=1440, ge=800, le=1920)
     height: int = Field(default=900, ge=600, le=1080)
 
@@ -129,7 +132,7 @@ class Desktop:
     def __init__(self, payload: CreateSession):
         self.id = str(payload.session_id)
         self.url = payload.target_url
-        self.ignore_https_errors = payload.ignore_https_errors
+        self.ignore_https_errors = True
         self.navigation_error = ""
         self.allowed_origins = frozenset([origin(self.url), *(origin(value) for value in payload.allowed_origins)])
         self.destinations = {}
@@ -141,6 +144,7 @@ class Desktop:
         self.deadline = self.created + 120
         self.listener = self.writer = self.browser = self.context = self.page = None
         self.client_task = self.navigation_task = self.proxy = None
+        self.capture = None
         self.frame_requested = asyncio.Event()
         self.pixel_format = (32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
         self.buttons = 0
@@ -176,6 +180,7 @@ class Desktop:
             Object.defineProperty(globalThis,k,{value:undefined,writable:false,configurable:false}); }
             window.open = () => null;""")
         self.page = await self.context.new_page()
+        self.capture = await self.context.new_cdp_session(self.page)
         self.page.on("dialog", lambda dialog: dialog.dismiss())
         self.page.on("download", lambda download: download.cancel())
         self.context.on("page", self.extra_page)
@@ -245,7 +250,7 @@ class Desktop:
             code = error.group(1) if error else ""
             if code.startswith("ERR_CERT_"):
                 self.navigation_error = "certificate"
-                self.notice = "Chứng thư HTTPS không hợp lệ. Administrator có thể bật ngoại lệ chứng thư trong Sửa kết nối."
+                self.notice = "Website từ chối chứng thư HTTPS. Kiểm tra dịch vụ hoặc yêu cầu chứng thư phía máy khách."
             elif isinstance(exc, BrowserTimeoutError):
                 self.navigation_error = "timeout"
                 self.notice = "Website tải quá lâu. Kiểm tra dịch vụ website rồi mở lại phiên."
@@ -401,7 +406,13 @@ class Desktop:
                 await self.frame_requested.wait()
                 self.frame_requested.clear()
                 if self.status == "active":
-                    data = await self.page.screenshot(type="png", timeout=4000)
+                    # Record the actual composited surface while the website
+                    # loads. Playwright page.screenshot waits for fonts/DOM
+                    # readiness and can tear down healthy sessions on slow SSO.
+                    captured = await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
+                        "format": "png", "fromSurface": True, "captureBeyondViewport": False,
+                    }), 4)
+                    data = base64.b64decode(captured["data"], validate=True)
                     content = Image.open(io.BytesIO(data)).convert("RGB")
                     frame = Image.new("RGB", (self.width, self.height), "#11223b")
                     frame.paste(content, (0, 28))

@@ -1,9 +1,11 @@
 """Disposable HTTPS form and forbidden TCP sinks. No production systems."""
+import os
 import socket
 import socketserver
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,6 +30,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         Path('/tmp/visited').touch()
+        if self.path == '/slow-font.woff2':
+            Path('/tmp/font-requested').touch()
+            time.sleep(12)
+            Path('/tmp/font-response-finished').touch()
+            self.send_error(404)
+            return
         if self.path == '/ui':
             self.send_response(302)
             self.send_header('Location', '/websso/SAML2/SSO/fixture?SAMLRequest=disposable')
@@ -56,7 +64,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"""<!doctype html><html><body style="background:#def;color:#123;font:24px sans-serif">
+        delayed_font = b'<style>@font-face{font-family:DelayedFixture;src:url(/slow-font.woff2)}body{font-family:DelayedFixture,sans-serif!important}</style>' if os.environ.get('WEB_SMOKE_PROFILE') == 'delayed-font' else b''
+        self.wfile.write(b'<!doctype html><html>' + delayed_font + b"""<body style="background:#def;color:#123;font:24px sans-serif">
         <h1>Recorded internal console fixture</h1>
         <form method="post"><input name="value" disabled><button>Submit fixture</button></form>
         <script>

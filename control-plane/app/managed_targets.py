@@ -31,7 +31,8 @@ class ManagedTargetRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     url: str = Field(default="", max_length=2048)
     web_allowed_origins: list[str] = Field(default_factory=list, max_length=16)
-    web_ignore_https_errors: bool = Field(default=False, strict=True)
+    # Retired checkbox: accept legacy rows/forms, but do not persist it again.
+    web_ignore_https_errors: bool = Field(default=False, strict=True, exclude=True, repr=False)
     ssh_host_key: str = Field(default="", max_length=2048)
     # Accept old persisted metadata/stale forms, but never use or re-serialize
     # the retired opt-in. All registered SSH targets now negotiate automatically.
