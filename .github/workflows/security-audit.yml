@@ -46,6 +46,7 @@ jobs:
         run: |
           docker build -t portal-guacamole-smoke deploy/guacamole
           docker build -t portal-guacamole-browser web-console-worker
+          docker build -t portal-guacamole-sshd tests/ssh-smoke
       - name: Verify real frontend, JSON authentication, MIME, SSH/RDP transport and clipboard errors
         run: python tests/guacamole-smoke/verify.py
 

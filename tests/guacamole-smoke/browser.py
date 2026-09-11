@@ -15,13 +15,13 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from playwright.async_api import async_playwright
 
 
-def encrypted_fixture(key_hex, protocol):
+def encrypted_fixture(key_hex, protocol, parameters=None):
     key = bytes.fromhex(key_hex)
+    parameters = parameters or {"hostname": "127.0.0.1", "port": "1",
+                                "username": "fixture-user", "password": "fixture-password",
+                                "disable-copy": "true", "disable-paste": "false"}
     payload = {"username": "browser-fixture-" + protocol, "expires": int((time.time() + 90) * 1000),
-               "connections": {"fixture-" + protocol: {"protocol": protocol, "parameters": {
-                   "hostname": "127.0.0.1", "port": "1",
-                   "username": "fixture-user", "password": "fixture-password",
-                   "disable-copy": "true", "disable-paste": "false"}}}}
+               "connections": {"fixture-" + protocol: {"protocol": protocol, "parameters": parameters}}}
     body = json.dumps(payload, separators=(",", ":")).encode()
     signed = hmac.new(key, body, hashlib.sha256).digest() + body
     padder = padding.PKCS7(128).padder()
@@ -64,6 +64,10 @@ async def main():
                 assert not errors, "Frontend raised JavaScript exceptions"
                 print("PASS: " + protocol + " frontend authenticates and shows connection failure with clipboard " + clipboard)
                 await context.close()
+            spec = importlib.util.spec_from_file_location("connected", "/fixture-connected.py")
+            connected = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(connected)
+            await connected.verify_connected_ssh(browser, base_url, key, encrypted_fixture)
             spec = importlib.util.spec_from_file_location("native_paste", "/fixture-native-paste.py")
             native_paste = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(native_paste)
