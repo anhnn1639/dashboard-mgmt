@@ -17,9 +17,12 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
     hostname = os.environ["SSH_FIXTURE_HOST"]
     password = os.environ["SSH_FIXTURE_PASSWORD"]
     public_key = os.environ["SSH_FIXTURE_KEY"]
-    for mode in ("granted", "denied", "pending"):
-        context = await browser.new_context(locale="en-US")
-        try:
+    # Reuse browser auth storage across launches, just like Portal popup tabs.
+    # Existing tabs must not force a new launch to reuse an older connection.
+    context = await browser.new_context(locale="en-US")
+    previous_page = None
+    try:
+        for mode in ("granted", "denied", "pending"):
             # No real OS clipboard content is read by the asynchronous API.
             behavior = {
                 "granted": "return Promise.resolve('older fixture text');",
@@ -75,6 +78,10 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             await page.keyboard.press("Control+v")
             await page.wait_for_function(FRAME, arg=1, timeout=10000)
             assert not errors, "Connected Guacamole frontend raised a JavaScript error"
-            print("PASS: real SSH browser displays first frame, native paste reaches shell and next frame remains visible; clipboard " + mode)
-        finally:
-            await context.close()
+            if previous_page is not None:
+                await previous_page.wait_for_function(FRAME, arg=1, timeout=2000)
+                assert not await previous_page.get_by_text("The remote desktop server", exact=False).count()
+            previous_page = page
+            print("PASS: real SSH browser displays first frame, native paste reaches shell and next frame remains visible across shared browser auth; clipboard " + mode)
+    finally:
+        await context.close()
