@@ -11,6 +11,8 @@
 
 - Bản a90eceb2aa18914f7f3c7baa2080e8755ddeafca đã push/đối chiếu main. CI34585138363 xác nhận probe trên Guacamole1.6.0 thật: JSONidentity + cleanup, CSStext/css và SSH/RDPselect đều pass. Browserfixture chạy trực tiếp trênUbuntu bị AppArmor chặn sandbox trước khi mở trang; chuyển fixture vào chính image/profile sandboxWebworker đã có, không tắt sandbox/không đổisysctlhost. NodeCI bắt unusedcatchvariable; đã sửa và chạy lạieslint +clipboardtestpass. Chờ kết quảbrowserfixture/container; chưa deployproduction.
 
+- CI34585759357 trên7233ccb: Guacamole frontend thật **PASS cả SSH và RDP**: authJSON, CSSMIME, lỗi đích hiển thị, clipboard synchronous throw và never-resolve không ngăn tunnel. Node/API/PostgreSQL/edge và3SSH khácpass; ciscolegacy hết giờ buildUbuntu. Web7profilepass nhưngdelayedfontlỗi; diagnosticsđãxácđịnh chính xác **Not attached to an active page**. Đây là Chromium151 frame IsActive=false tronglifecycletransition, khôngphảiCDPsessiondetached. Sửa retry đúngchuỗi này trêncùngsession trong8s hiệncó, khôngreattach/nớigiớihạn. Thêmregressiongiữinput/autologinđóng đếnframecủadocumentmới, inactivevĩnhviễn vẫnđóng/xóacredential. Local toàn bộ62/62workerpass vớiChromiumthật (44.690s), gồm2regressioninactivepage mới. ChờCIbản này, khôngtuyênbốproductionđãhếtlỗi.
+
 ## CI capture cập nhật
 
 - Sourcea1f6db0, CI34575863866: standalone25browsertests pass;7/8webprofiles pass; delayed-font thất bại stagecapture kindError sau submit, lý do cụ thể bị log an toàn che. SSHciscolegacy lỗi tảiUbuntu package, chưa chạySSH; cácjobkhácpass.

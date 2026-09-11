@@ -148,6 +148,56 @@ class CaptureRecoveryTests(unittest.IsolatedAsyncioTestCase):
         desktop.capture.send.assert_awaited_once()
         desktop.login.cancel()
 
+    async def test_navigation_temporarily_inactive_page_waits_for_new_recorded_pixels(self):
+        desktop, writer = self.desktop(), FrameWriter()
+        desktop.website_frame_ready = True
+        calls = 0
+
+        async def capture(_method, _params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                desktop.frame_navigated(desktop.page.main_frame)
+                raise w.BrowserError("CDPSession.send: Protocol error (Page.captureScreenshot): Not attached to an active page")
+            if calls == 2:
+                self.assertTrue(desktop.capture_recovering)
+                self.assertFalse(desktop.automation_enabled())
+                self.assertFalse(desktop.interaction_enabled())
+                self.assertFalse(writer.writes)
+            return self.surface()
+
+        desktop.capture = SimpleNamespace(send=AsyncMock(side_effect=capture))
+        task = asyncio.create_task(desktop.frames(writer))
+        try:
+            await asyncio.wait_for(writer.drained.wait(), 1)
+            # A navigation during the capture invalidates that frame's readiness.
+            # Request the next frame, as guacd does after receiving an update.
+            self.assertFalse(desktop.website_frame_ready)
+            desktop.frame_requested.set()
+            async with asyncio.timeout(2):
+                while not desktop.website_frame_ready:
+                    self.assertFalse(writer.closed, desktop.reason)
+                    await asyncio.sleep(.01)
+            self.assertEqual(calls, 3)
+            self.assertEqual(len(writer.writes), 2)
+            self.assertFalse(writer.closed)
+            self.assertTrue(desktop.interaction_enabled())
+        finally:
+            await self.stop_frame_task(task)
+            desktop.login.cancel()
+
+    async def test_permanently_inactive_page_cannot_keep_recording_or_credentials_alive(self):
+        desktop, writer = self.desktop(), FrameWriter()
+        desktop.capture = SimpleNamespace(send=AsyncMock(side_effect=w.BrowserError(
+            "CDPSession.send: Protocol error (Page.captureScreenshot): Not attached to an active page")))
+        with patch.object(w, "CAPTURE_RECOVERY_SECONDS", .22):
+            await asyncio.wait_for(desktop.frames(writer), 1)
+        self.assertGreater(desktop.capture.send.await_count, 1)
+        self.assertTrue(writer.closed)
+        self.assertFalse(writer.writes)
+        self.assertEqual(desktop.reason, "capture-failed")
+        self.assertEqual((desktop.login.username, desktop.login.password), ("", ""))
+
     async def test_stop_during_capture_preserves_original_reason(self):
         desktop, writer = self.desktop(), FrameWriter()
         async def closed_browser(_method, _params):

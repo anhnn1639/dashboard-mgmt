@@ -260,7 +260,9 @@ class Desktop:
 
     async def capture_surface(self):
         # Before the first paint Chromium may report no surface immediately;
-        # a busy renderer instead times out. Recover only these transient cases
+        # navigation can also leave the old frame briefly inactive while CDP
+        # switches to its replacement. A busy renderer instead times out.
+        # Recover only these transient cases on the same CDP session
         # within the API's unchanged 10s recording-stall watchdog. Never emit
         # old frames or an artificial audit clock during this interval.
         async with asyncio.timeout(CAPTURE_RECOVERY_SECONDS):
@@ -275,7 +277,10 @@ class Desktop:
                         raise CaptureLeaseExpired()
                     return captured
                 except (TimeoutError, BrowserError) as exc:
-                    if isinstance(exc, BrowserError) and "Unable to capture screenshot" not in str(exc):
+                    if isinstance(exc, BrowserError) and not any(
+                            str(exc).endswith(message) for message in (
+                                "Unable to capture screenshot",
+                                "Not attached to an active page")):
                         raise
                     if not self.capture_recovering:
                         logging.getLogger(__name__).warning("Web capture waiting for busy renderer; retrying within recording deadline")
