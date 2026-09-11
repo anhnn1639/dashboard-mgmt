@@ -1,6 +1,6 @@
 # Bàn giao Codex — 11/09/2026
 
-## Clipboard SSH/RDP — sửa thao tác dán trực tiếp, chờ CI và deploy
+## Clipboard SSH/RDP — đã push, CI đạt, chờ deploy
 
 - User báo sau nâng bản mới không copy nội dung bên ngoài để dán vào SSH/RDP được. HTTP công khai hiện xác nhận dashboard production buildId12073fcf2f4a9c026f74179c5ab8ce89e3be27e9, builtAt2026-09-11T13:59:23.473Z; app.css200text/css220byte. Trạng thái production89fe033/rỗng CSS ở các mục cũ bên dưới đã lỗi thời. Chưa điều khiển được tab user vì CUA helper_unknown_error.
 - Tái hiện bằng Chromium thật + Guacamole1.6.0 Keyboard/InputSink/StringWriter: readText bị chặn/throw/treo làm clipboard không cập nhật, Guacamole chặn default Ctrl+V nên browser không phát native paste. Ngoài ra v4 gọi setClipboard, Guacamole phải ghi lại OS clipboard trước khi broadcast; writeText treo có thể giữ nội dung cũ dù read đã xong.
@@ -10,7 +10,8 @@
 - Local: browser18tổ hợp (2protocol ×3phím ×3trạng thái quyền), tiếng Việt/nhiều dòng, clipboard-write treo, prompt trả muộn, đổi focus/mất kết nối/không rõ protocol, local editor và native paste ở non-editor; không chấp nhận ClipboardEvent giả. UI47/47, eslint/TypeScript/build pass; deploy24tests (22pass/2POSIX dànhCI), Python compile và diff check pass.
 - CI bổ sung browser fixture dùng Guacamole JS thật trong container sandbox, và cả4SSH profile gửi clipboard qua guacd tới shell fixture rồi kiểm nội dung nhận được + recording; giữ assertion host-key sai phải bị từ chối. Chưa có RDP Windows đích thật để kiểm login/paste đầu cuối; RDP kiểm luồng browser/protocol.
 - Sourcef78e3d1 đã push/đối chiếu main. CI34622454962: cả4SSH profile đã xác nhận paste qua guacd tới shell + recording, host-key sai bị từ chối; Node và API pass. Guacamole frontend/auth/SSH/RDP lỗi đích pass nhưng fixture mới không tải được script bằng script tag trên HTTP container; đổi fixture lấy đúng resource từ service bằng Playwright request, kiểm HTTP200/nội dung rồi inject vào trang thử riêng. Không đổi extension hay assertion frontend thật. Baselinev4 đã tái hiện thất bại cùng test native permission-denied trên Chromium local.
-- Bước tiếp theo: theo dõi CI; khi đạt, server pull main rồi chạy bash deploy/deploy-dashboard.sh compose.test.yaml, đóng tab remote cũ và mở phiên mới. Chưa deploy bản clipboardv5 từ workspace.
+- Source cuối6924d2095fb31923840c23acbbd21e15f7253cb2 đã push/đối chiếu remote main. CI34622971891 SUCCESS toàn bộ9job: Guacamole frontend/native paste trên Chromium sandbox thật, cả4SSH profile có paste tới shell + recording + host-key rejection, API176/176, Agent111 (1skip đặc thù nền tảng), Node/UI47, edge, Web worker62 và27 browser tests cùng toàn bộ8profile ghi hình/SSO/capture/redirect/HTTP/cert/lease. Không đổi source sau các kiểm thử này; commit kế tiếp chỉ cập nhật bàn giao.
+- Sau khi CI hoàn tất, kiểm HTTP công khai production vẫn buildId12073fcf2f4a9c026f74179c5ab8ce89e3be27e9. Chưa deploy clipboardv5 từ workspace. Bước tiếp theo: trên server git pull --ff-only origin main rồi bash deploy/deploy-dashboard.sh compose.test.yaml; đóng tab remote cũ, tải mới Guacamole và mở phiên mới. Copy nội dung bên ngoài, bấm vào remote rồi Ctrl+V. Không yêu cầu bật quyền clipboard-read cho thao tác native paste.
 
 ## Phê duyệt tập trung và xóa nội dung — đã push, CI đạt, chưa deploy
 
