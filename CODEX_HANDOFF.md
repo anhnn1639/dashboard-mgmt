@@ -1,5 +1,9 @@
 # Bàn giao Codex — 11/09/2026
 
+## Yêu cầu tiếp theo: Phê duyệt tập trung và nội dung đã xóa
+
+- User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đang khảo sát UI/API, chưa triển khai phần này.
+
 ## Hồi quy capture sau tự đăng nhập — 11/09/2026
 
 - User báo trước nâng tự đăng nhập thì Web console mở được; sau nâng Guacamole dừng ở frame chuẩn bị rồi đóng. Audit cung cấp: recording.started và credential.release success lúc13:36:28, session.web.closed reason=web-capture-failed lúc13:36:32. Log worker xác nhận `Web frame failed stage=capture kind=TimeoutError` (hai lần). Đã loại giả thuyết giải mã/quyền từ bằng chứng này; không cần user gửi credential hay URL Guacamole.
@@ -12,6 +16,8 @@
 - CI34573032345 trên `a872fdc8cba85536ae6d339cff6e5ee75e5e2bc1`: cả7profile Web trước delayed-font pass, gồm busy6s + SSO tự đăng nhập; delayed-font đã qua font12s, nhập/submit và recording trang tĩnh18s, nhưng GET trạng thái cuối trả404 sau mất lease. Tái hiện local bằng cleanup chậm: stop công bố failed rồi await trước khi đổi deadline; sweep xóa phiên theo deadline hết hạn cũ. Sửa công bố reason và hạn giữ trạng thái60s trước await, vẫn khóa input/lease ngay; regression mới thất bại404 trên code cũ. SSH cisco-legacy bị timeout10phút khi tải gói Ubuntu, chưa chạy bàiSSH; các6job còn lại pass. Chờ CI bản follow-up, chưa deploy production.
 
 - Rà soát độc lập phát hiện thêm lỗi ghi đè lý do đóng: nếu Chromium đóng khi đang xử lý phím/chuột, exception ở accept() gán transport-failed dù stop() đã đặt lease-expired. Đã giới hạn gán lỗi transport cho phiên chưa kết thúc, thêm regression bắt tay RFB thật rồi đóng browser giữa key down. Không đổi cơ chế input, quyền hoặc thời hạn lease. Kiểm tra sau ghép: toàn bộ 60/60 worker pass bằng Chromium thật (40.167s); diff check pass. Chờ CI Linux/Docker xác nhận bản cuối.
+
+- Source `33c61a6eaa159f2d8456dd2b298d00f7d4afd81b` đã push/đối chiếu main. CI34574548371: 7 job khác đều thành công và cả 8 profile Guacamole/Web recording đều pass (bao gồm delayed-font và mất lease); job Web còn một lỗi trong test độc lập HTTP SSO trước first paint: writer đóng, assertLogs đã che mất nguyên nhân. Local kiểm thử lặp đạt; bổ sung diagnostics chỉ cho fixture tạm (reason, stage và protocol exception), 11/11 capture tests pass sau thay đổi. Chờ CI xác định lỗi này, không nới timeout hoặc bỏ assertion.
 
 ## Web console tự đăng nhập bằng tài khoản đã lưu — 11/09/2026
 

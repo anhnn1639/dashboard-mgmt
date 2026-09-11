@@ -379,7 +379,17 @@ class BusyRendererTests(unittest.IsolatedAsyncioTestCase):
                 target_url=f'http://127.0.0.1:{entry.server_port}/', width=800, height=600,
                 allowed_origins=[f'http://127.0.0.1:{sso.server_port}']))
             desktop.page = await context.new_page()
-            desktop.capture = await context.new_cdp_session(desktop.page)
+            cdp = await context.new_cdp_session(desktop.page)
+            capture_errors = []
+            async def observed_capture(method, params):
+                try:
+                    return await cdp.send(method, params)
+                except w.BrowserError as exc:
+                    # This test uses only disposable websites and credentials.
+                    # Preserve the concrete protocol cause on a CI-only failure.
+                    capture_errors.append(str(exc))
+                    raise
+            desktop.capture = SimpleNamespace(send=observed_capture)
             desktop.page.on('framenavigated', desktop.frame_navigated)
             await context.route('**/*', desktop.route)
             await context.add_init_script(w.INIT_SCRIPT)
@@ -400,7 +410,7 @@ class BusyRendererTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(14):
                     while len(posts) < 2 and not task.done():
                         await asyncio.sleep(.05)
-            self.assertFalse(writer.closed)
+            self.assertFalse(writer.closed, (desktop.reason, desktop.navigation_error, diagnostic.output, capture_errors[-3:]))
             self.assertEqual(posts, [('/first', {'username': ['fixture-user']}, True),
                                      ('/finish', {'password': ['fixture-password']}, True)])
             self.assertTrue(any('retrying within recording deadline' in line for line in diagnostic.output))
