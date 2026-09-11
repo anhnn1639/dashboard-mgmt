@@ -1,4 +1,12 @@
-# Bàn giao Codex — 11/09/2026
+# Bàn giao Codex — 12/09/2026
+
+## Màn hình đen sau deploy clipboardv5 — chưa xác định nguyên nhân
+
+- User ngày12/09 báo sau sửa clipboard SSH và RDP lại đen; yêu cầu tự kiểm website đang mở. Kiểm HTTP công khai xác nhận production đã deploy1460384a774aeefaf236b9ac8a981bab30df6c95, builtAt2026-09-11T16:51:03.108Z; app.js chứav5. Do đó ghi chú production12073fc bên dưới không còn hiện hành.
+- CUAgetState hai lần và ComputerUse qua node_repl/@oai/sky đều không khởi tạo được: windows sandbox failed helper_unknown_error setup refresh had errors / kernel exited. Chưa đọc được tab đăng nhập của user; không dùng browser profile/cookie hay URL encrypted data cũ để thay thế.
+- Tải HTTP công khai và chạy Chromium mới chỉ dùng tài nguyên public: app.js200text/javascript18964byte, app.css200text/css220byte; cảhai Cache-Control:no-cache và Last-Modified2026-09-11T16:55:08Z. HTMLno-cache, JSbundle versionGuacamole1.6.0. Chưa có bằng chứng cache gây lỗi, không yêu cầu xóa toàn bộ cache/cookie.
+- Fixture local đầy đủ frontend thật của server, mock toàn bộ API và WebSocket bằng dữ liệu giả (không gửi credential/không kết nối máy thật): cả3trạng thái readText granted/denied/pending đều khởi tạo tunnel, canvas1024x768 đúng pixel[20,100,180,255], không lỗi JavaScript. Test này kiểm render frontend, không chứng minh SSH/RDP production nhận hình. Tranganonymousv4 vàv5 giống nhau (JSONauth403 vì không có identity), không dùng kết quả đó để kết luận kết nối hoạt động.
+- Chưa sửa source vì chưa tái hiện được nguyên nhân mới; không rollback clipboard hoặc tắt audit theo suy đoán. User đã từ chối tự lấy Console và muốn agent kiểm trực tiếp. Bước cần tiếp: khôi phục công cụ đọc tab đăng nhập hoặc nhận Console/Network lỗi của phiên mới (không URL?data/token), xác định tunnel có được mở/nhận frame không rồi sửa kèm regression cụ thể. CIsuccess34622971891 củav5 là trạng thái trước báo cáo này, không chứng minh production hết lỗi.
 
 ## Clipboard SSH/RDP — đã push, CI đạt, chờ deploy
 
