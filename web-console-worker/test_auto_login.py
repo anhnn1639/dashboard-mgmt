@@ -71,7 +71,9 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
             if request.method == 'POST':
                 self.posts.append((url.hostname, url.path, parse_qs(request.post_data or '')))
                 if url.path == '/first':
-                    await request_route.fulfill(status=302, headers={'Location': 'https://sso.test/password'})
+                    # Chromium bypasses route interception on HTTP redirect hops.
+                    # Real HTTP 302 + two-step SSO is exercised by web-smoke.
+                    await request_route.fulfill(content_type='text/html; charset=utf-8', body='<script>location.href="https://sso.test/password"</script>')
                 else:
                     body = self.routes[('console.test', '/login')] if self.reject_login else '<h1>Signed in fixture</h1>'
                     await request_route.fulfill(content_type='text/html; charset=utf-8', body=body)

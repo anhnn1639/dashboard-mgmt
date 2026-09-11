@@ -75,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
             Path('/tmp/font-response-finished').touch()
             self.send_error(404)
             return
+        if self.path == '/login-password' and os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login':
+            return self.minimal(b'<form method="post" action="/login-finish"><input type="password" name="password" autocomplete="current-password"><button>Sign in</button></form>')
         if self.path == '/ui':
             self.send_response(302)
             self.send_header('Location', '/websso/SAML2/SSO/fixture?SAMLRequest=disposable')
@@ -104,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
         delayed_font = b'<style>@font-face{font-family:DelayedFixture;src:url(/slow-font.woff2)}body{font-family:DelayedFixture,sans-serif!important}</style>' if os.environ.get('WEB_SMOKE_PROFILE') == 'delayed-font' else b''
-        login_form = b'<form method="post"><input name="username" autocomplete="username" disabled><input name="password" type="password" autocomplete="current-password"><button id="submit">Login</button></form>' if os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login' else b'<form method="post"><input name="value" disabled><button>Submit fixture</button></form>'
+        login_form = b'<form method="post" action="/login-username"><input name="username" autocomplete="username" disabled><button>Next</button></form>' if os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login' else b'<form method="post"><input name="value" disabled><button>Submit fixture</button></form>'
         self.wfile.write(b'<!doctype html><html>' + delayed_font + b"""<body style="background:#def;color:#123;font:24px sans-serif">
         <h1>Recorded internal console fixture</h1>
         """ + login_form + b"""
@@ -130,7 +132,16 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)  # Disposable fixtures only.
         if os.environ.get('WEB_SMOKE_PROFILE') == 'auto-login':
             values = parse_qs(body.decode())
-            assert values == {'username': ['fixture-user'], 'password': ['fixture-password']}, 'Saved account did not reach the fixture'
+            if self.path == '/login-username':
+                assert values == {'username': ['fixture-user']}, 'Saved username did not reach the first step'
+                assert not self.headers.get('Proxy-Authorization'), 'Proxy credential reached website'
+                Path('/tmp/auto-username-submitted').touch()
+                self.send_response(302)
+                self.send_header('Location', 'https://console.test/login-password')
+                self.end_headers()
+                return
+            assert self.path == '/login-finish' and Path('/tmp/auto-username-submitted').exists()
+            assert values == {'password': ['fixture-password']}, 'Saved password did not reach the second step'
             Path('/tmp/auto-login-submitted').touch()
         assert not self.headers.get('Proxy-Authorization'), 'Proxy credential reached website'
         Path('/tmp/submitted').touch()

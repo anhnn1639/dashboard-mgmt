@@ -246,7 +246,7 @@ asyncio.run(check())
                 login_state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
                 assert login_state['login_state'] == 'submitted'
                 assert 'fixture-password' not in json.dumps(login_state)
-                print('PASS: saved account automatically filled and submitted once after real recording activation, across configured SSO')
+                print('PASS: saved account automatically completed username/password steps across real HTTP 302 SSO after recording activation')
             assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/sso-visited']).returncode == 0, 'SSO redirect was not followed'
             assert recording.stat().st_size > first_size, 'Recording stopped growing'
             # Keep a mostly static page open past the recording-stall timeout.
