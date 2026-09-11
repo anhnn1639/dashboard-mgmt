@@ -1,5 +1,16 @@
 # Bàn giao Codex — 11/09/2026
 
+## Hoàn thiện review Web console và hồi quy toàn hệ thống — 11/09/2026
+
+- User yêu cầu rà soát/sửa các lỗi còn lại sau snapshot `020edbc`. Đã sửa đủ ba phát hiện còn mở: form chặn Lưu/Enter khi dò chưa xong; hủy/bỏ phản hồi URL cũ và bỏ các origin chỉ do lượt dò cũ tự thêm; reporter gợi ý không còn chặn vòng gia hạn phiên. Form tự thử lại HTTP409 khi lượt dò cũ ở server đang kết thúc, có deadline90s và giữ kết quả lỗi rõ để Admin kiểm tra/lưu thủ công khi website không tới được.
+- Worker: sửa timeout giả đã tái hiện từ CI34557477216: bootstrap fetch nhận headers rồi redirect khiến Chromium không phát requestfinished cho document cũ. Dọn pending đúng lúc document bị thay, giữ request của document mới và giữ pending khi chỉ đổi hash/history. Banner điều hướng giữ origin bị chặn; tài nguyên nền không ghi đè thông báo.
+- Proxy: Chromium dùng CONNECT cho cả ws://; trước đây luôn coi CONNECT là HTTPS nên website HTTP dùng WebSocket không chạy. Sau bắt tay proxy có xác thực, phân loại TLS hoặc handshake WebSocket trước khi mở TCP tới đích, kiểm đúng HTTP/HTTPS origin đã pin, kiểm Host và loại proxy credentials. Không fallback scheme hoặc mở origin mới trong phiên. Smoke thật bổ sung WebSocket echo hai chiều trên mọi profile HTTP/HTTPS/SSO.
+- API: Web authorization/activation/finalization/discovery-audit và báo gợi ý dùng kết nối PostgreSQL async riêng, không chờ pool đồng bộ; deadline5s, connect2s, statement/lock2s, rollback/đóng khi hủy. Mất quyền hoặc lỗi kiểm quyền vẫn đóng browser. Reporter tối đa8origin, một lần ghi đang chạy, chỉ dedup sau commit, retry5s và drain6s sau khi browser đã dừng. SQLAlchemy thêm extra asyncio. Audit writers dùng khóa giao dịch chung (lock wait tối đa2s), flush entity trước khóa tránh đảo thứ tự, timestamp tăng ngay cả khi đồng hồ trùng/lùi để chuỗi hash không phân nhánh.
+- Sửa `remote_sessions.created_by` từ36 lên80 khớp username; migration PostgreSQL idempotent ở cả hai đường khởi tạo, không xóa hoặc đổi giá trị lịch sử. Trước sửa, username LDAP/local dài hơn36 có thể khiến Web/SSH/RDP launch lỗi500.
+- Kiểm thử local hiện tại: worker33/33, API141 (134pass/7test PostgreSQL dành cho CI), Agent111/111; UI44 kiểm thử, TypeScript/eslint và production build được kiểm tra trong lượt sửa. Có regression cho khóa DB chậm/retry/cancel/concurrenthash và migration username trên PostgreSQL riêng trong CI. Browser Chromium thật đã qua ws:// với đúng Desktop.route_socket và delayed fetch6s + meta refresh6s, tới trang cuối không còn timeout giả. Đang chờ CI của commit mới; chưa deploy production, chưa kiểm thử trực tiếp vCenter của người dùng.
+- Lần đẩy tiếp theo phải gồm toàn bộ bản sửa + tests; sau push đối chiếu remote main và chờ cả8job Security audit. Production cần pull/rebuild đồng bộ API + dashboard + web-console bằng đúng Compose overlays hiện dùng; API chạy migration tự động, Agent vẫn0.8.18. Giữ cơ chế tự dò + Admin lưu, chứng thư tự xử lý, ghi hình bắt buộc và cổng443/9443 như cũ.
+
+
 ## Đẩy bản đang hoàn thiện theo yêu cầu người dùng — 11/09/2026
 
 - User yêu cầu **push lên GitHub** sau khi đã được thông báo chỉ sửa xong 2/5 phát hiện review. Đẩy snapshot hiện tại lên main theo yêu cầu; chưa khẳng định hoàn tất mọi chức năng, chưa deploy production.

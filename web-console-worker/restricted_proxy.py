@@ -72,6 +72,39 @@ class PinnedProxy:
         except (ValueError, UnicodeError):
             return None
 
+    async def tunnel_request(self, reader, authority):
+        # Chromium uses CONNECT for both ws:// and TLS. Select the exact
+        # origin from the protocol before opening any target TCP connection.
+        prefix = await asyncio.wait_for(reader.readexactly(5), 5)
+        if prefix[0] == 22 and prefix[1] == 3 and prefix[2] <= 4 and 0 < int.from_bytes(prefix[3:5], "big") <= 18432:
+            return "https", prefix
+        if prefix != b"GET /":
+            return None, None
+        header = prefix + await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        if len(header) > HEADER_LIMIT:
+            return None, None
+        lines = header[:-4].split(b"\r\n")
+        method, path, version = lines[0].decode("ascii").split(" ")
+        headers = {}
+        for line in lines[1:]:
+            name, value = line.split(b":", 1)
+            name = name.lower()
+            if name in headers or not name or any(c not in HEADER_NAME for c in name):
+                return None, None
+            headers[name] = value.strip()
+        expected = urlsplit("http://" + authority)
+        received = urlsplit("http://" + headers.get(b"host", b"").decode("ascii"))
+        if (version != "HTTP/1.1" or not path.startswith("/")
+                or (received.hostname, received.port or 80) != (expected.hostname, expected.port)
+                or received.username is not None or received.password is not None
+                or received.path or received.query or received.fragment
+                or headers.get(b"upgrade", b"").lower() != b"websocket"
+                or b"upgrade" not in {item.strip().lower() for item in headers.get(b"connection", b"").split(b",")}
+                or b"content-length" in headers or b"transfer-encoding" in headers):
+            return None, None
+        forwarded = self.http_request(method, "http://" + authority + path, version, headers)
+        return ("http", forwarded) if forwarded else (None, None)
+
     async def reply(self, writer, code):
         challenge = b'Proxy-Authenticate: Basic realm="session"\r\n' if code == 407 else b""
         writer.write(f"HTTP/1.1 {code} \r\n".encode() + challenge + b"Content-Length: 0\r\nConnection: close\r\n\r\n")
@@ -129,6 +162,13 @@ class PinnedProxy:
                 self.blocked_destination = True
                 await self.reply(writer, 403)
                 return
+            if connect:
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await asyncio.wait_for(writer.drain(), 2)
+                scheme, forwarded = await self.tunnel_request(reader, authority)
+                if scheme is None:
+                    self.blocked_destination = True
+                    return
             address = None
             if (scheme, destination.hostname, port) == (self.scheme, self.host, self.port):
                 address = self.address
@@ -143,12 +183,8 @@ class PinnedProxy:
             self.writers.add(upstream)
             if not self.enabled() or self.closed:
                 return
-            if connect:
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await asyncio.wait_for(writer.drain(), 2)
-            else:
-                upstream.write(forwarded)
-                await asyncio.wait_for(upstream.drain(), 2)
+            upstream.write(forwarded)
+            await asyncio.wait_for(upstream.drain(), 2)
             pipes = [asyncio.create_task(self.pipe(reader, upstream)), asyncio.create_task(self.pipe(remote, writer))]
             await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
         except (ValueError, UnicodeError, OSError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):

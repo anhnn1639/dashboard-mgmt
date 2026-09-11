@@ -1,10 +1,11 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.error import HTTPError
 
-from app.web_sessions import WebSessionError, WebSessionHub
+from app.web_sessions import BlockedOriginReporter, WebSessionError, WebSessionHub
 
 
 class WebHubTests(unittest.IsolatedAsyncioTestCase):
@@ -175,24 +176,101 @@ class WebHubTests(unittest.IsolatedAsyncioTestCase):
                     await hub.discover("https://console.test/ui")
 
     async def test_blocked_origins_are_reported_once_per_session_and_capped(self):
-        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
         seen = []
-
         async def blocked(session_id, origins):
             seen.append((session_id, origins))
-
-        reported: set[str] = set()
-        await hub.report_blocked("session", {"blocked_origins": ["https://sso.test:8443", "https://sso.test:8443/websso?SAMLRequest=secret", 7, "https://cdn.test:443"]}, reported, blocked)
-        await hub.report_blocked("session", {"blocked_origins": ["https://sso.test:8443"]}, reported, blocked)
-        await hub.report_blocked("session", {"blocked_origins": [f"https://host{index}.test:443" for index in range(20)]}, reported, blocked)
-        await hub.report_blocked("session", {"blocked_origins": "https://string.test:443"}, reported, blocked)
+        reporter = BlockedOriginReporter("session", blocked)
+        reporter.offer({"blocked_origins": ["https://sso.test:8443", "https://sso.test:8443/websso?SAMLRequest=secret", 7, "https://cdn.test:443"]})
+        await asyncio.sleep(0)
+        reporter.offer({"blocked_origins": ["https://sso.test:8443"]})
+        reporter.offer({"blocked_origins": [f"https://host{index}.test:443" for index in range(20)]})
+        reporter.offer({"blocked_origins": "https://string.test:443"})
+        await reporter.close()
         self.assertEqual(seen[0], ("session", ["https://sso.test:8443", "https://cdn.test:443"]))
         self.assertEqual(len(seen), 2)
         self.assertEqual(len(seen[1][1]), 6)
-        self.assertEqual(len(reported), 8)
-        # A failing suggestion must never end an otherwise healthy session.
-        await hub.report_blocked("session", {"blocked_origins": ["https://late.test:443"]}, set(),
-                                 AsyncMock(side_effect=RuntimeError("https://sso.test/?SAMLRequest=secret")))
+        self.assertEqual(len(reporter.reported), 8)
+
+    async def test_failed_report_retries_only_uncommitted_origins_without_overlap(self):
+        entered, finish = asyncio.Event(), asyncio.Event()
+        attempts = []
+        async def blocked(identifier, origins):
+            attempts.append(origins)
+            if len(attempts) == 1:
+                raise RuntimeError("commit failed")
+            entered.set()
+            await finish.wait()
+        reporter = BlockedOriginReporter("session", blocked)
+        with patch("app.web_sessions.BLOCKED_RETRY_SECONDS", .01):
+            reporter.offer({"blocked_origins": ["https://sso.test:443"]})
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertEqual(reporter.reported, set())
+            reporter.offer({"blocked_origins": ["https://sso.test:443"]})
+            await asyncio.sleep(.02)
+            self.assertEqual(len(attempts), 2)
+            finish.set()
+            await reporter.close()
+        self.assertEqual(reporter.reported, {"https://sso.test:443"})
+        self.assertFalse(reporter.pending)
+
+    async def test_reporter_timeout_and_cancellation_leave_no_background_task(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                entered = asyncio.Event()
+                async def blocked(identifier, origins):
+                    entered.set()
+                    await asyncio.Event().wait()
+                reporter = BlockedOriginReporter("session", blocked)
+                reporter.offer({"blocked_origins": ["https://sso.test:443"]})
+                await entered.wait()
+                with patch("app.web_sessions.BLOCKED_DRAIN_SECONDS", .02):
+                    closing = asyncio.create_task(reporter.close())
+                    await asyncio.sleep(0)
+                    if cancel:
+                        closing.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await closing
+                    else:
+                        await closing
+                self.assertTrue(reporter.task.done())
+                self.assertFalse(reporter.reported)
+
+    async def test_slow_advisory_report_does_not_delay_leases_or_remote_shutdown(self):
+        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+        entered, release = asyncio.Event(), asyncio.Event()
+        leases = []
+        async def blocked(identifier, origins):
+            entered.set()
+            await release.wait()
+        async def call(method, url, payload=None):
+            if url.endswith("/lease"):
+                leases.append(url)
+                if len(leases) == 2:
+                    return {}
+            if method == "DELETE":
+                self.assertTrue(entered.is_set())
+                self.assertFalse(release.is_set())
+                release.set()
+            return {"status": "closed" if len(leases) == 2 else "connected", "blocked_origins": ["https://sso.test:443"]}
+        hub.call = AsyncMock(side_effect=call)
+        original_sleep = asyncio.sleep
+        async def fast_tick(_seconds):
+            await original_sleep(0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.guac"
+            path.write_bytes(b"recorded-frame")
+            with patch("app.web_sessions.asyncio.sleep", side_effect=fast_tick):
+                await asyncio.wait_for(hub._watch("session", lambda: path, AsyncMock(return_value=True), AsyncMock(), AsyncMock(), blocked), 1)
+        self.assertEqual(len(leases), 2)
+
+    async def test_async_authorization_denial_and_failure_never_activate(self):
+        for authorize, expected in ((AsyncMock(return_value=False), "web-access-revoked"), (AsyncMock(side_effect=TimeoutError), "web-authorization-failed")):
+            hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+            hub.call = AsyncMock(return_value={})
+            activate, closed = AsyncMock(), AsyncMock()
+            await hub._watch("session", lambda: None, authorize, activate, closed)
+            activate.assert_not_awaited()
+            closed.assert_awaited_once_with("session", expected)
 
     async def test_watcher_reports_blocked_origins_before_the_session_closes(self):
         hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)

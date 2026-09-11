@@ -347,7 +347,7 @@ class RolePolicyTests(unittest.TestCase):
             listed = self.client.get("/api/v1/sessions", headers=self.headers["admin"])
             self.assertEqual(listed.status_code, 200, listed.text)
             self.assertEqual(next(item for item in listed.json()["items"] if item["id"] == identifier)["username"], manual_identity)
-            self.assertTrue(authorize())
+            self.assertTrue(self.client.portal.call(authorize))
             with patch.object(m.web_hub, "call", new_callable=AsyncMock, return_value={"status": "active"}) as call:
                 self.client.portal.call(activate)
                 call.assert_awaited_once_with("POST", f"/sessions/{identifier}/activate", {})
@@ -356,7 +356,7 @@ class RolePolicyTests(unittest.TestCase):
                 self.assertEqual(db.get(m.RemoteSession, identifier).remote_username, manual_identity)
                 db.get(m.User, self.ids["operator"]).enabled = False
                 db.commit()
-            self.assertFalse(authorize())
+            self.assertFalse(self.client.portal.call(authorize))
             self.client.portal.call(finish, identifier, "web-access-revoked")
             with m.SessionLocal() as db:
                 self.assertEqual(db.get(m.RemoteSession, identifier).status, "failed")
@@ -439,13 +439,13 @@ class RolePolicyTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(prepare.call_args.kwargs, {"allowed_origins": ["https://sso.example.test:8443"]})
             authorize = watch.call_args.args[2]
-            self.assertTrue(authorize())
+            self.assertTrue(self.client.portal.call(authorize))
             config["web_ignore_https_errors"] = False
             self.assertEqual(self.client.put(endpoint, headers=self.headers["admin"], json=config).status_code, 200)
-            self.assertTrue(authorize())
+            self.assertTrue(self.client.portal.call(authorize))
             config["web_allowed_origins"] = []
             self.assertEqual(self.client.put(endpoint, headers=self.headers["admin"], json=config).status_code, 200)
-            self.assertFalse(authorize())
+            self.assertFalse(self.client.portal.call(authorize))
 
     def test_web_legacy_certificate_flag_never_requires_resaving_to_launch(self):
         server_id, credential_id = self.network_fixture("web")
@@ -465,7 +465,7 @@ class RolePolicyTests(unittest.TestCase):
                     response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
                     self.assertEqual(response.status_code, 200, response.text)
                     self.assertEqual(prepare.call_args.kwargs, {"allowed_origins": []})
-                    self.assertTrue(watch.call_args.args[2]())
+                    self.assertTrue(self.client.portal.call(watch.call_args.args[2]))
                     decrypt.assert_not_called()
 
     def test_redirect_discovery_is_admin_only_validated_and_saves_nothing(self):

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -23,10 +24,83 @@ WORKER_TIMEOUTS = {"/sessions": 30, "/discover": 45}
 DISCOVERY_ERRORS = {"", "certificate", "timeout", "blocked-origin", "tls", "connection", "http-error"}
 # One session may propose at most this many origins to the Administrator.
 BLOCKED_ORIGIN_LIMIT = 8
+BLOCKED_RETRY_SECONDS = 5
+BLOCKED_DRAIN_SECONDS = 6
 
 
 class WebSessionError(Exception):
     pass
+
+
+class BlockedOriginReporter:
+    """Bounded advisory queue, independent of the recording and lease loop."""
+
+    def __init__(self, session_id: str, callback: Callable[[str, list[str]], Awaitable[None]]):
+        self.session_id = session_id
+        self.callback = callback
+        self.pending: dict[str, None] = {}
+        self.reported: set[str] = set()
+        self.wake = asyncio.Event()
+        self.closing = False
+        self.task: asyncio.Task | None = None
+
+    def offer(self, state: dict) -> None:
+        # No I/O or await here: SQL latency must never delay the next lease.
+        values = state.get("blocked_origins")
+        if self.closing or not isinstance(values, list):
+            return
+        for value in values:
+            if len(self.pending) + len(self.reported) >= BLOCKED_ORIGIN_LIMIT:
+                break
+            if is_normalized_origin(value) and value not in self.reported:
+                self.pending.setdefault(value, None)
+        if self.pending:
+            self.wake.set()
+            if self.task is None:
+                self.task = asyncio.create_task(self.run())
+
+    async def run(self) -> None:
+        while True:
+            await self.wake.wait()
+            self.wake.clear()
+            if not self.pending:
+                if self.closing:
+                    return
+                continue
+            batch = list(self.pending)
+            try:
+                await self.callback(self.session_id, batch)
+            except Exception:
+                # Leave uncommitted origins pending. Only one callback can run
+                # at a time, including during retry cooldown and shutdown.
+                if self.closing:
+                    return
+                await asyncio.sleep(BLOCKED_RETRY_SECONDS)
+                self.wake.set()
+            else:
+                self.reported.update(batch)
+                for value in batch:
+                    self.pending.pop(value, None)
+                if self.pending:
+                    self.wake.set()
+            if self.closing and not self.pending:
+                return
+
+    async def close(self) -> None:
+        self.closing = True
+        self.wake.set()
+        if self.task is None:
+            return
+        # Stop the remote browser before draining this best-effort queue. Never
+        # leave a reporter or retry loop attached to an already closed session.
+        try:
+            await asyncio.wait_for(asyncio.shield(self.task), BLOCKED_DRAIN_SECONDS)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+            if isinstance(exc, asyncio.CancelledError):
+                raise
 
 
 class WebSessionHub:
@@ -107,23 +181,10 @@ class WebSessionHub:
             pass
 
     def watch(self, session_id: str, recording: Callable[[], Path | None],
-              authorize: Callable[[], bool], activate: Callable[[], Awaitable[None]],
+              authorize: Callable[[], bool | Awaitable[bool]], activate: Callable[[], Awaitable[None]],
               closed: Callable[[str, str], Awaitable[None]],
               blocked: Callable[[str, list[str]], Awaitable[None]] | None = None) -> None:
         self.tasks[session_id] = asyncio.create_task(self._watch(session_id, recording, authorize, activate, closed, blocked))
-
-    async def report_blocked(self, session_id, state, reported, blocked) -> None:
-        values = state.get("blocked_origins")
-        if not isinstance(values, list):
-            return
-        fresh = [item for item in values if is_normalized_origin(item) and item not in reported][:BLOCKED_ORIGIN_LIMIT - len(reported)]
-        if not fresh:
-            return
-        reported.update(fresh)
-        # Advisory suggestions for the Administrator: a failure to record one
-        # must never end a recorded session that is otherwise healthy.
-        with contextlib.suppress(Exception):
-            await blocked(session_id, fresh)
 
     async def _watch(self, session_id, recording, authorize, activate, closed, blocked=None):
         reason = "web-service-failed"
@@ -132,17 +193,20 @@ class WebSessionHub:
         last_size = 0
         progressed = started
         failure_stage = "web-service-failed"
-        reported: set[str] = set()
+        reporter = BlockedOriginReporter(session_id, blocked) if blocked is not None else None
         try:
             while time.monotonic() - started < 3600:
                 failure_stage = "web-authorization-failed"
-                if not authorize():
+                permitted = authorize()
+                if inspect.isawaitable(permitted):
+                    permitted = await permitted
+                if not permitted:
                     reason = "web-access-revoked"
                     break
                 failure_stage = "web-status-unavailable"
                 state = await self.call("GET", "/sessions/" + session_id)
-                if blocked is not None:
-                    await self.report_blocked(session_id, state, reported, blocked)
+                if reporter is not None:
+                    reporter.offer(state)
                 if state.get("status") in {"closed", "failed"}:
                     reason = "closed" if state["status"] == "closed" else "web-browser-failed"
                     # Only fixed worker codes may enter the durable audit trail.
@@ -197,11 +261,15 @@ class WebSessionHub:
                 }:
                     reason = "web-" + str(exc)
         finally:
-            await self.stop_remote(session_id)
             try:
-                await closed(session_id, reason)
+                await self.stop_remote(session_id)
             finally:
-                self.tasks.pop(session_id, None)
+                try:
+                    if reporter is not None:
+                        await reporter.close()
+                    await closed(session_id, reason)
+                finally:
+                    self.tasks.pop(session_id, None)
 
     async def shutdown(self) -> None:
         tasks = list(self.tasks.values())

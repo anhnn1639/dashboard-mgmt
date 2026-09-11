@@ -213,8 +213,8 @@ asyncio.run(check())
                     break
                 await asyncio.sleep(1)
             else:
-                raise RuntimeError('Redirect rejection fixture did not complete')
-            for path in ('/tmp/redirect-ip-attempted', '/tmp/redirect-port-attempted'):
+                raise RuntimeError('Redirect rejection or WebSocket echo fixture did not complete')
+            for path in ('/tmp/redirect-ip-attempted', '/tmp/redirect-port-attempted', '/tmp/websocket-message'):
                 assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', path]).returncode == 0
             for container in ('tram-web-fixture', 'tram-web-forbidden'):
                 assert subprocess.run(['docker', 'exec', container, 'test', '-f', '/tmp/forbidden-hit']).returncode != 0, 'Forbidden redirect reached a TCP destination'

@@ -68,7 +68,11 @@ class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
         for authority in (f'127.0.0.1:{self.port}', f'other.invalid:{self.port}',
                           'console.invalid:1', '169.254.169.254:443',
                           f'user@console.invalid:{self.port}', f'console.invalid:{self.port}/path'):
-            response, _, _ = await self.connect(authority)
+            response, reader, writer = await self.connect(authority)
+            if b'200' in response:
+                writer.write(b'\x16\x03\x01\x00\x10')
+                await writer.drain()
+                response = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 2)
             self.assertIn(b'403', response, authority)
         response, _, _ = await self.connect(f'http://console.invalid:{self.port}/', method='GET')
         self.assertIn(b'403', response)
@@ -79,9 +83,9 @@ class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
         response, reader, writer = await self.connect()
         self.assertIn(b'200', response)
         # The deliberately unresolvable CONNECT hostname must not be looked up.
-        writer.write(b'tls-bytes-stay-opaque')
+        writer.write(b'\x16\x03\x01\x00\x10opaque-tls-bytes!')
         await writer.drain()
-        self.assertEqual(await asyncio.wait_for(reader.readexactly(21), 2), b'tls-bytes-stay-opaque')
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(22), 2), b'\x16\x03\x01\x00\x10opaque-tls-bytes!')
         self.assertEqual(self.hits, 1)
         self.enabled = False
         self.assertEqual(await asyncio.wait_for(reader.read(), 2), b'')
@@ -106,10 +110,11 @@ class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
         self.proxy.resolve = AsyncMock(side_effect=resolve)
         response, reader, writer = await self.connect(f"sso.invalid:{self.port}")
         self.assertIn(b"200", response)
-        writer.write(b"opaque"); await writer.drain()
-        self.assertEqual(await asyncio.wait_for(reader.readexactly(6), 2), b"opaque")
-        response, _, _ = await self.connect(f"unlisted.invalid:{self.port}")
-        self.assertIn(b"403", response)
+        writer.write(b"\x16\x03\x01\x00\x01x"); await writer.drain()
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(6), 2), b"\x16\x03\x01\x00\x01x")
+        response, reader, writer = await self.connect(f"unlisted.invalid:{self.port}")
+        writer.write(b"\x16\x03\x01\x00\x01x"); await writer.drain()
+        self.assertIn(b"403", await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2))
         self.assertEqual(self.hits, 1)
 
     async def test_http_request_rewrites_authority_and_strips_proxy_credentials(self):
@@ -124,3 +129,38 @@ class PinnedProxyTests(unittest.IsolatedAsyncioTestCase):
         response, _, _ = await self.connect(f"http://other.invalid:{self.port}/", method="GET")
         self.assertIn(b"403", response)
         self.assertEqual(self.hits, 1)
+
+
+    async def test_plain_websocket_connect_uses_only_exact_http_origin(self):
+        self.enabled = True
+        self.proxy.scheme = "http"
+        response, reader, writer = await self.connect()
+        self.assertIn(b"200", response)
+        writer.write(f"GET /socket?x=1 HTTP/1.1\r\nHost: console.invalid:{self.port}\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nProxy-Authorization: secret\r\n\r\n".encode())
+        await writer.drain()
+        forwarded = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+        self.assertTrue(forwarded.startswith(b"GET /socket?x=1 HTTP/1.1"))
+        self.assertIn(b"upgrade: websocket", forwarded)
+        self.assertNotIn(b"secret", forwarded)
+        self.assertEqual(self.hits, 1)
+
+    async def test_tls_cannot_use_http_only_origin_and_ws_cannot_use_https_only_origin(self):
+        self.enabled = True
+        for configured in ("http", "https"):
+            self.proxy.scheme = configured
+            _, reader, writer = await self.connect()
+            payload = b"\x16\x03\x01\x00\x01x" if configured == "http" else f"GET /socket HTTP/1.1\r\nHost: console.invalid:{self.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".encode()
+            writer.write(payload); await writer.drain()
+            self.assertIn(b"403", await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2))
+        self.assertEqual(self.hits, 0)
+
+    async def test_tunneled_plain_http_or_mismatched_websocket_host_never_dials(self):
+        self.enabled = True
+        self.proxy.scheme = "http"
+        for host, upgrade in (("other.invalid", True), ("console.invalid", False)):
+            _, reader, writer = await self.connect()
+            extra = "Upgrade: websocket\r\nConnection: Upgrade\r\n" if upgrade else ""
+            writer.write(f"GET /socket HTTP/1.1\r\nHost: {host}:{self.port}\r\n{extra}\r\n".encode())
+            await writer.drain()
+            self.assertEqual(await asyncio.wait_for(reader.read(), 2), b"")
+        self.assertEqual(self.hits, 0)

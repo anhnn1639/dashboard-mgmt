@@ -52,8 +52,9 @@ from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificat
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest, RedirectDiscoveryRequest, is_normalized_origin, origin_text, web_url_endpoint
-from .schema_migrations import detach_recording_history_users
+from .schema_migrations import detach_recording_history_users, widen_remote_session_actor
 from .web_sessions import WebSessionHub, WebSessionError
+from .web_database import run_postgres
 
 
 class Settings(BaseSettings):
@@ -415,7 +416,7 @@ class RemoteSession(Base):
     server_id: Mapped[str] = mapped_column(ForeignKey("servers.id"), index=True)
     protocol: Mapped[str] = mapped_column(String(10))
     remote_username: Mapped[str] = mapped_column(String(128))
-    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    created_by: Mapped[str] = mapped_column(String(80), index=True)
     status: Mapped[str] = mapped_column(String(30), default="launched", index=True)
     recording_name: Mapped[str] = mapped_column(String(255))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
@@ -1425,6 +1426,7 @@ def activate_database(database_url: str, *, initialize_schema: bool = True) -> E
         if initialize_schema:
             Base.metadata.create_all(candidate)
             detach_recording_history_users(candidate)
+            widen_remote_session_actor(candidate)
     except Exception as exc:
         if candidate is not engine:
             candidate.dispose()
@@ -1802,9 +1804,41 @@ def prune_revoked_session_tokens(db: Session) -> None:
     db.execute(delete(RevokedSessionToken).where(RevokedSessionToken.expires_at <= now()))
 
 
+# Shared by every writer, including asynchronous Web Console callbacks.
+AUDIT_CHAIN_LOCK = 739175932640218
+
+
+def lock_audit_chain(db: Session) -> None:
+    if db.get_bind().dialect.name != "postgresql":
+        return  # Existing disposable unit-test database only.
+    previous_timeout = db.execute(text("SHOW lock_timeout")).scalar_one()
+    db.execute(text("SELECT set_config('lock_timeout', '2000ms', true)"))
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": AUDIT_CHAIN_LOCK})
+    db.execute(text("SELECT set_config('lock_timeout', :value, true)"), {"value": previous_timeout})
+
+
+async def web_database(work):
+    if engine is None or SessionLocal is None:
+        raise WebSessionError("database-unavailable")
+    if engine.dialect.name == "postgresql":
+        return await run_postgres(engine.url, work)
+    # Keep the pre-existing temporary unit-test fixture working. Production
+    # setup validates PostgreSQL and never selects this path.
+    def test_operation():
+        with SessionLocal() as db:
+            return work(db)
+    return await asyncio.to_thread(test_operation)
+
+
 def audit(db: Session, actor: str, action: str, target: str, request: Request | None = None, result: str = "success", detail: dict[str, Any] | None = None) -> None:
+    # Take entity row locks before the shared audit lock, consistently across
+    # callbacks and ordinary API mutations, to avoid inverted lock ordering.
+    db.flush()
+    lock_audit_chain(db)
     previous = db.execute(select(AuditEvent).order_by(AuditEvent.occurred_at.desc()).limit(1)).scalar_one_or_none()
     occurred = now()
+    if previous and occurred <= aware(previous.occurred_at):
+        occurred = aware(previous.occurred_at) + timedelta(microseconds=1)
     payload = json.dumps({"occurred_at": occurred.isoformat(), "actor": actor, "action": action, "target": target, "result": result, "detail": detail or {}}, sort_keys=True, separators=(",", ":"))
     previous_hash = previous.event_hash if previous else "0" * 64
     event_hash = hashlib.sha256((previous_hash + payload).encode()).hexdigest()
@@ -1943,6 +1977,7 @@ def ensure_agent_uninstall_policy_job(db: Session, server: Server, policy: dict[
 
 def prune_audit_events(db: Session) -> int:
     """Delete expired audit rows while preserving a durable hash-chain anchor."""
+    lock_audit_chain(db)
     cutoff = now() - timedelta(days=settings.audit_retention_days)
     expired_count = int(
         db.execute(
@@ -2737,6 +2772,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
             connection.execute(text("SELECT 1"))
         Base.metadata.create_all(candidate)
         detach_recording_history_users(candidate)
+        widen_remote_session_actor(candidate)
         candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
         with candidate_factory() as db:
             ensure_builtin_roles(db)
@@ -3385,10 +3421,14 @@ async def discover_managed_target_redirects(payload: RedirectDiscoveryRequest, r
             if str(exc) == "busy":
                 raise HTTPException(status_code=409, detail="Dịch vụ trình duyệt đang bận. Chờ vài giây rồi bấm lại.") from exc
             raise HTTPException(status_code=503, detail="Không dò được địa chỉ chuyển hướng. Kiểm tra dịch vụ trình duyệt trên Operation Portal.") from exc
-    audit(db, user.username, "target.web.redirect_discovery", origin_text(*web_url_endpoint(payload.url)), request,
-          result="partial" if found["error"] else "success",
-          detail={**found, "probe": "anonymous-no-input-no-recording"})
-    db.commit()
+    actor = user.username
+    target_origin = origin_text(*web_url_endpoint(payload.url))
+    def record_discovery(audit_db):
+        audit(audit_db, actor, "target.web.redirect_discovery", target_origin, request,
+              result="partial" if found["error"] else "success",
+              detail={**found, "probe": "anonymous-no-input-no-recording"})
+        audit_db.commit()
+    await web_database(record_discovery)
     return found
 
 
@@ -5844,48 +5884,54 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
     target_url = config.url
     claims = dict(request.state.authenticated_claims)
 
-    def authorized() -> bool:
-        with SessionLocal() as check:
-            actor = check.get(User, user_id)
-            target = check.get(Server, server_id)
-            account = check.get(RemoteCredential, credential_id)
-            if (not actor or not actor.enabled or not target or not account
-                    or "sessions.launch" not in platform_role_permissions(check, actor.role)
-                    or server_id not in visible_server_ids(check, actor)
-                    or check.get(RevokedSessionToken, claims.get("jti")) is not None
-                    or now().timestamp() >= claims.get("exp", 0)
-                    or (target.inventory or {}).get("managedTarget", {}).get("url") != target_url
-                    or (target.inventory or {}).get("managedTarget", {}).get("web_allowed_origins", []) != config.web_allowed_origins
-                    or account.server_id != server_id or account.protocol != "web"):
-                return False
-            return actor.role == "admin" or check.execute(select(RemoteCredentialUserShare).where(
-                RemoteCredentialUserShare.credential_id == credential_id,
-                RemoteCredentialUserShare.user_id == user_id)).scalar_one_or_none() is not None
+    def check_authorized(check: Session) -> bool:
+        actor = check.get(User, user_id)
+        target = check.get(Server, server_id)
+        account = check.get(RemoteCredential, credential_id)
+        if (not actor or not actor.enabled or not target or not account
+                or "sessions.launch" not in platform_role_permissions(check, actor.role)
+                or server_id not in visible_server_ids(check, actor)
+                or check.get(RevokedSessionToken, claims.get("jti")) is not None
+                or now().timestamp() >= claims.get("exp", 0)
+                or (target.inventory or {}).get("managedTarget", {}).get("url") != target_url
+                or (target.inventory or {}).get("managedTarget", {}).get("web_allowed_origins", []) != config.web_allowed_origins
+                or account.server_id != server_id or account.protocol != "web"):
+            return False
+        return actor.role == "admin" or check.execute(select(RemoteCredentialUserShare).where(
+            RemoteCredentialUserShare.credential_id == credential_id,
+            RemoteCredentialUserShare.user_id == user_id)).scalar_one_or_none() is not None
+
+    async def authorized() -> bool:
+        return await web_database(check_authorized)
 
     async def activate() -> None:
-        if not authorized():
+        if not await authorized():
             raise WebSessionError("access-revoked")
-        # Manual sign-in in the recorded remote browser. The vault is NOT read
-        # or decrypted, and no saved credentials are sent to this worker.
+        # Vault credentials are never sent to the browser worker.
         await web_hub.call("POST", f"/sessions/{session_id}/activate", {})
-        with SessionLocal() as active_db:
+        def mark_active(active_db):
             row = active_db.get(RemoteSession, session_id)
+            if row is None or row.status not in {"waiting", "active"}:
+                raise WebSessionError("access-revoked")
             row.status = "active"
             audit(active_db, "system:web-console", "session.web.recording.started", session_id,
                   detail={"recording": True})
             active_db.commit()
+        await web_database(mark_active)
 
     async def redirect_blocked(identifier: str, origins: list[str]) -> None:
-        # Only a suggestion for Sửa kết nối; the session itself stays blocked
-        # until an Administrator approves the origin.
-        with SessionLocal() as blocked_db:
-            for value in origins:
+        # Advisory only. The live session still uses Administrator-saved origins.
+        def save_suggestions(blocked_db):
+            for value in dict.fromkeys(origins):
+                if not is_normalized_origin(value):
+                    continue
                 audit(blocked_db, "system:web-console", "session.web.redirect_blocked", server_id,
                       result="denied", detail={"session_id": identifier, "origin": value})
             blocked_db.commit()
+        await web_database(save_suggestions)
 
     async def finished(identifier: str, reason: str) -> None:
-        with SessionLocal() as final_db:
+        def mark_finished(final_db):
             row = final_db.get(RemoteSession, identifier)
             if row and row.status not in {"closed", "failed"}:
                 row.status = "closed" if reason == "closed" else "failed"
@@ -5893,6 +5939,7 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                 audit(final_db, "system:web-console", "session.web.closed", identifier,
                       result=row.status, detail={"reason": reason})
                 final_db.commit()
+        await web_database(mark_finished)
 
     try:
         worker = await web_hub.prepare(session_id, target_url, min(payload.width, 1920), min(payload.height, 1080), allowed_origins=config.web_allowed_origins)

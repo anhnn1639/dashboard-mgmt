@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
-from playwright.async_api import TimeoutError as BrowserTimeoutError, async_playwright
+from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, async_playwright
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from restricted_proxy import PinnedProxy
 
@@ -287,7 +287,10 @@ class Desktop:
         if self.input_enabled() and self.permitted(route.request.url):
             await route.continue_()
         else:
-            self.notice = "Địa chỉ ngoài cấu hình kết nối. Administrator có thể khai báo địa chỉ chuyển hướng / SSO trong Sửa kết nối."
+            if self.input_enabled() and route.request.is_navigation_request():
+                self.observe_request(route.request)
+                self.navigation_error = "blocked-origin"
+                self.notice = self.blocked_notice()
             await route.abort("blockedbyclient")
 
     async def route_socket(self, websocket):
@@ -521,7 +524,8 @@ class Discovery:
         self.error = ""
         self.active = True
         self.settled = time.monotonic()
-        self.pending_requests: set = set()
+        self.pending_requests: dict = {}
+        self.committed_navigations: set = set()
 
     def enabled(self) -> bool:
         return self.active
@@ -561,11 +565,41 @@ class Discovery:
             origin(request.url)
         except ValueError:
             return
-        self.pending_requests.add(request)
+        try:
+            frame = request.frame
+        except (AttributeError, BrowserError):
+            frame = None
+        self.pending_requests[request] = frame
         self.observe(request.url, request.is_navigation_request())
 
     def request_finished(self, request):
-        self.pending_requests.discard(request)
+        self.committed_navigations.discard(request)
+        if request in self.pending_requests:
+            self.pending_requests.pop(request)
+            self.settled = time.monotonic()
+
+    def frame_navigated(self, frame):
+        # Hash/history changes fire this event too, without replacing a document.
+        navigation = next((request for request, source in self.pending_requests.items()
+                           if source == frame and request.is_navigation_request()
+                           and request not in self.committed_navigations
+                           and request.url.split("#", 1)[0] == frame.url.split("#", 1)[0]), None)
+        if navigation is None:
+            return
+        self.committed_navigations.add(navigation)
+        # A fetch can resolve on headers and immediately navigate without its
+        # body ever being consumed. Chromium may omit its completion event once
+        # the document is replaced; it must not keep the new page "pending".
+        # Retain the new document request until its own body completes.
+        for request, source_frame in list(self.pending_requests.items()):
+            if request is navigation:
+                continue
+            ancestor = source_frame
+            while ancestor is not None and ancestor != frame:
+                ancestor = ancestor.parent_frame
+            if frame == self.page.main_frame or ancestor == frame:
+                self.pending_requests.pop(request)
+                self.committed_navigations.discard(request)
         self.settled = time.monotonic()
 
     async def extra_page(self, page):
@@ -602,6 +636,7 @@ class Discovery:
             self.page.on("request", self.request_started)
             self.page.on("requestfinished", self.request_finished)
             self.page.on("requestfailed", self.request_finished)
+            self.page.on("framenavigated", self.frame_navigated)
             self.page.on("websocket", lambda socket: self.observe(socket.url, False))
             self.page.on("dialog", lambda dialog: dialog.dismiss())
             self.page.on("download", lambda download: download.cancel())

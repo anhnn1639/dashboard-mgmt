@@ -218,7 +218,7 @@ test("managed form needs no SSH toggle and never submits obsolete flags from sav
         let index = 0;
         const submitted = [];
         const exports = {};
-        const hooks = { ...React, useEffect() {}, useCallback: (fn) => fn, useState: () => [values[index++], () => {}] };
+        const hooks = { ...React, useEffect() {}, useCallback: (fn) => fn, useRef: (value) => ({ current: value }), useState: () => [values[index++], () => {}] };
         runInNewContext(compiled, {
           exports, React,
           require: (name) => name === "react" ? hooks : name === "./managed-target-api" ? { readManagedTargetResponse: (response) => response.json() } : { ModalShell: () => null },
@@ -1017,4 +1017,182 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   assert.equal(forwardedMouse[0].state.right, true);
   assert.equal(forwardedMouse[0].force, true);
   assert.deepEqual(remoteWrites, ["A", "B", "B", "C", "C", "D"]);
+});
+
+// Exercise actual form event handlers with deferred network replies and persistent hooks.
+async function webDiscoveryForm({ role = "admin", target = null } = {}) {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const parent = { states: [[], target ?? "new", null, "", "", "", "ready", false, null], refs: [], effects: [] };
+  const child = { states: [], refs: [], effects: [] };
+  const cleanups = [], requests = [], saves = [], deadlines = [];
+  let frame, stateIndex, refIndex, effectIndex, tree, fields, url = target?.config?.url ?? "";
+  const hooks = { ...React,
+    useState(initial) {
+      const owner = frame, index = stateIndex++;
+      if (!(index in owner.states)) owner.states[index] = initial;
+      return [owner.states[index], (value) => { owner.states[index] = typeof value === "function" ? value(owner.states[index]) : value; }];
+    },
+    useRef(initial) { const index = refIndex++; return frame.refs[index] ??= { current: initial }; },
+    useCallback: (fn) => fn,
+    useImperativeHandle(ref, create) { if (ref) ref.current = create(); },
+    useEffect(effect) { const index = effectIndex++; if (!frame.effects[index]) { frame.effects[index] = true; const cleanup = effect(); if (cleanup) cleanups.push(cleanup); } },
+  };
+  const exports = {};
+  runInNewContext(compiled, { exports, React, URL, AbortController, Error,
+    require: (name) => name === "react" ? hooks : name === "./managed-target-api" ? { readManagedTargetResponse: async (response) => { const data = await response.json(); if (!response.ok) throw new Error(data.detail); return data; } } : { ModalShell: () => null },
+    window: { setTimeout(callback, delay) { if (delay === 1500) queueMicrotask(callback); if (delay === 90_000) deadlines.push(callback); return 1; }, clearTimeout() {} },
+    FormData: class { constructor(values) { this.values = values; } get(key) { return this.values[key] ?? null; } },
+    fetch: async (address, options) => {
+      if (address.endsWith("/redirect-discovery")) return new Promise((resolve, reject) => requests.push({ url: JSON.parse(options.body).url, signal: options.signal, resolve, reject }));
+      if (options.body) saves.push(JSON.parse(options.body));
+      return Response.json({ items: [], saved: true });
+    },
+  });
+  function find(node, match) {
+    if (!node || typeof node !== "object") return null;
+    if (match(node)) return node;
+    for (const value of React.Children.toArray(node.props?.children)) { const found = find(value, match); if (found) return found; }
+    return null;
+  }
+  function render() {
+    frame = parent; stateIndex = refIndex = effectIndex = 0;
+    tree = exports.ManagedTargetsView({ kind: "web", role, token: "test", notify() {}, share() {} });
+    const component = find(tree, (node) => node.type?.name === "WebConsoleFields");
+    if (component) { frame = child; stateIndex = refIndex = effectIndex = 0; fields = component.type(component.props); }
+  }
+  function field(name) { return find(fields, (node) => node.props?.name === name); }
+  render();
+  return { requests, saves,
+    get error() { return parent.states[4]; },
+    get discovery() { return child.states[1]; },
+    get origins() { return field("web_allowed_origins").props.value; },
+    change(value, blur = true) {
+      url = value; field("url").props.onChange({ currentTarget: { value } }); render();
+      if (blur) field("url").props.onBlur?.({ currentTarget: { value } });
+      render();
+    },
+    editOrigins(value) { field("web_allowed_origins").props.onChange({ target: { value } }); render(); },
+    async submit() {
+      const form = find(tree, (node) => node.type === "form");
+      await form.props.onSubmit({ preventDefault() {}, currentTarget: { name: "Console", url, web_allowed_origins: this.origins, username: "fixture", password: "fixture" } });
+      render();
+    },
+    async reply(index, data, status = 200) { requests[index].resolve(Response.json({ navigation: [], resources: [], blocked: [], error: "", ...data }, { status })); await waitForImmediate(); render(); },
+    async fail(index) { requests[index].reject(new Error("old request failed")); await waitForImmediate(); render(); },
+    expire() { deadlines.at(-1)(); render(); },
+    unmount() { cleanups.forEach((cleanup) => cleanup()); },
+  };
+}
+
+test("web save waits for current discovery even with Enter or blur followed immediately by Save", async () => {
+  for (const blur of [false, true]) {
+    const form = await webDiscoveryForm();
+    form.change("https://console.example.test/ui", blur);
+    await form.submit(); await form.submit();
+    assert.equal(form.saves.length, 0);
+    assert.equal(form.requests.length, 1, "submit and blur must not create duplicate probes");
+    assert.match(form.error, /chờ dò địa chỉ/);
+    await form.reply(0, { navigation: ["https://sso.example.test:443"] });
+    await form.submit();
+    assert.equal(form.saves.length, 1);
+    assert.deepEqual(form.saves[0].web_allowed_origins, ["https://sso.example.test:443"]);
+  }
+});
+
+test("late discovery reply cannot add old URL origins or replace the new result", async () => {
+  const form = await webDiscoveryForm();
+  form.change("https://old.example.test");
+  form.change("https://new.example.test");
+  assert.equal(form.requests[0].signal.aborted, true);
+  await form.reply(1, { navigation: ["https://new-sso.example.test:443"] });
+  await form.reply(0, { navigation: ["https://old-sso.example.test:443"] });
+  assert.equal(form.discovery.url, "https://new.example.test");
+  assert.equal(form.origins, "https://new-sso.example.test:443");
+  await form.submit();
+  assert.equal(form.saves[0].url, "https://new.example.test");
+  assert.deepEqual(form.saves[0].web_allowed_origins, ["https://new-sso.example.test:443"]);
+});
+
+test("URL change removes previous probe's automatic additions but preserves explicit origins", async () => {
+  const form = await webDiscoveryForm();
+  form.editOrigins("https://manual.example.test");
+  form.change("https://old.example.test");
+  await form.reply(0, { navigation: ["https://manual.example.test:443", "https://old-sso.example.test:443", "https://old-sso.example.test:443"] });
+  assert.equal(form.origins.split("\n").length, 2);
+  form.change("https://new.example.test");
+  assert.equal(form.origins, "https://manual.example.test");
+  await form.submit();
+  assert.equal(form.saves.length, 0);
+  await form.reply(1, {});
+  await form.submit();
+  assert.deepEqual(form.saves[0].web_allowed_origins, ["https://manual.example.test"]);
+});
+
+test("canceled discovery failures and unmounted responses do not mutate the form", async () => {
+  const form = await webDiscoveryForm();
+  form.change("https://old.example.test");
+  form.change("https://new.example.test", false);
+  await form.fail(0);
+  assert.equal(form.discovery, null);
+  await form.submit();
+  form.unmount();
+  assert.equal(form.requests[1].signal.aborted, true);
+  await form.reply(1, { navigation: ["https://late.example.test:443"] });
+  assert.equal(form.origins, "");
+});
+
+test("completed failed probe permits reviewed manual save; unchanged targets and Operator save normally", async () => {
+  const form = await webDiscoveryForm();
+  form.change("https://unreachable.example.test");
+  await form.reply(0, { detail: "Không kết nối được website" }, 502);
+  assert.match(form.discovery.error, /Không kết nối/);
+  form.editOrigins("https://known-sso.example.test");
+  await form.submit();
+  assert.equal(form.saves.length, 1);
+  const existing = await webDiscoveryForm({ target: { id: "existing", config: { url: "https://saved.example.test", web_allowed_origins: ["https://saved-sso.example.test"] } } });
+  await existing.submit();
+  assert.equal(existing.requests.length, 0);
+  assert.equal(existing.saves.length, 1);
+  const operator = await webDiscoveryForm({ role: "operator" });
+  operator.change("https://console.example.test");
+  await operator.submit();
+  assert.equal(operator.requests.length, 0);
+  assert.equal(operator.saves.length, 1);
+});
+
+
+test("new URL discovery retries a busy worker instead of saving an empty result", async () => {
+  const form = await webDiscoveryForm();
+  form.change("https://old.example.test");
+  form.change("https://new.example.test");
+  await form.reply(1, { detail: "Discovery already running" }, 409);
+  assert.equal(form.discovery.busy, true);
+  assert.equal(form.requests.length, 3);
+  assert.equal(form.requests[2].url, "https://new.example.test");
+  await form.submit();
+  assert.equal(form.saves.length, 0);
+  await form.reply(2, { navigation: ["https://new-sso.example.test:443"] });
+  await form.submit();
+  assert.deepEqual(form.saves[0].web_allowed_origins, ["https://new-sso.example.test:443"]);
+  await form.reply(0, { navigation: ["https://old-sso.example.test:443"] });
+  assert.equal(form.origins, "https://new-sso.example.test:443");
+});
+
+
+test("unresponsive discovery has a deadline and ignores replies arriving after timeout", async () => {
+  const form = await webDiscoveryForm();
+  form.change("https://slow.example.test");
+  await form.submit();
+  assert.equal(form.saves.length, 0);
+  form.expire();
+  assert.equal(form.requests[0].signal.aborted, true);
+  assert.equal(form.discovery.busy, false);
+  assert.match(form.discovery.error, /quá thời gian/);
+  await form.reply(0, { navigation: ["https://late.example.test:443"] });
+  assert.equal(form.origins, "");
+  assert.match(form.discovery.error, /quá thời gian/);
 });

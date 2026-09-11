@@ -1,4 +1,6 @@
 """Disposable HTTPS form and forbidden TCP sinks. No production systems."""
+import base64
+import hashlib
 import os
 import socket
 import socketserver
@@ -37,6 +39,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         Path('/tmp/visited').touch()
+        if self.path == '/socket':
+            assert self.headers.get('Upgrade', '').lower() == 'websocket'
+            assert not self.headers.get('Proxy-Authorization')
+            key = self.headers['Sec-WebSocket-Key']
+            self.protocol_version = 'HTTP/1.1'
+            self.send_response(101)
+            self.send_header('Upgrade', 'websocket')
+            self.send_header('Connection', 'Upgrade')
+            self.send_header('Sec-WebSocket-Accept', base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode())
+            self.end_headers()
+            frame = self.rfile.read(2)
+            assert frame[0] == 129 and frame[1] & 128 and frame[1] & 127 < 126
+            mask = self.rfile.read(4)
+            body = self.rfile.read(frame[1] & 127)
+            assert bytes(value ^ mask[index % 4] for index, value in enumerate(body)) == b'fixture'
+            self.wfile.write(b'\x81\x09confirmed'); self.wfile.flush()
+            Path('/tmp/websocket-message').touch()
+            return
         if self.path == '/discover':
             return self.minimal(b"<script>fetch('/discover-bootstrap').then(()=>location.href='https://sso.test:4443/discover-landing')</script>")
         if self.path == '/discover-bootstrap':
@@ -89,6 +109,12 @@ class Handler(BaseHTTPRequestHandler):
         <script>
         Promise.allSettled(['/redirect-ip','/redirect-port'].map(url=>fetch(url))).then(async results=>{
           if(!results.every(item=>item.status==='rejected')) return;
+          await new Promise((resolve,reject)=>{
+            const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/socket');
+            ws.onopen=()=>ws.send('fixture'); ws.onerror=reject;
+            ws.onmessage=event=>{if(event.data==='confirmed'){ws.close();resolve();}else reject();};
+            setTimeout(reject,10000);
+          });
           await fetch('/checks-finished');
           const input=document.querySelector('input'); input.disabled=false; input.focus();
         });

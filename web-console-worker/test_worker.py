@@ -93,7 +93,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_route_stays_closed_until_activation_and_blocks_other_origins(self):
         desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
-        route = type("Route", (), {"request": type("Request", (), {"url": "https://console.test/"})(), "continue_": AsyncMock(), "abort": AsyncMock()})()
+        route = type("Route", (), {"request": type("Request", (), {"url": "https://console.test/", "is_navigation_request": staticmethod(lambda: True)})(), "continue_": AsyncMock(), "abort": AsyncMock()})()
         await desktop.route(route)
         route.abort.assert_awaited_once()
         desktop.status = "active"
@@ -102,6 +102,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         route.request.url = "https://sso-other.test/"
         await desktop.route(route)
         self.assertEqual(route.continue_.await_count, 1)
+        self.assertIn("https://sso-other.test:443", desktop.notice)
+        self.assertEqual(desktop.navigation_error, "blocked-origin")
+        notice = desktop.notice
+        route.request.url = "https://tracker.test/pixel"
+        route.request.is_navigation_request = lambda: False
+        await desktop.route(route)
+        self.assertEqual(desktop.notice, notice)
 
 
     async def test_expired_lease_blocks_input_routes_and_activation_immediately(self):

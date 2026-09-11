@@ -31,3 +31,19 @@ def detach_recording_history_users(engine: Engine) -> int:
                 connection.execute(text(f'ALTER TABLE recording_deletion_requests DROP CONSTRAINT {name}'))
                 removed += 1
     return removed
+
+
+def widen_remote_session_actor(engine: Engine) -> bool:
+    """The session actor is a username snapshot, matching User.username(80)."""
+    if engine.dialect.name != "postgresql":
+        return False
+    with engine.begin() as connection:
+        connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+        connection.execute(text("SELECT pg_advisory_xact_lock(741603110)"))
+        columns = inspect(connection).get_columns("remote_sessions")
+        actor = next(column for column in columns if column["name"] == "created_by")
+        length = getattr(actor["type"], "length", None)
+        if length is None or length >= 80:
+            return False
+        connection.execute(text("ALTER TABLE remote_sessions ALTER COLUMN created_by TYPE VARCHAR(80)"))
+        return True
