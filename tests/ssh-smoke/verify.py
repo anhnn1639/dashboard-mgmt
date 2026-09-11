@@ -4,6 +4,7 @@ No production target, saved credential, or agent is used. The random fixture
 password is passed through stdin/in-memory protocol only and never logged.
 """
 import asyncio
+import base64
 import contextlib
 import os
 import secrets
@@ -100,7 +101,7 @@ async def main():
                 port = await hub.create_listener(identifier, "fixture", address, 22)
                 pin = key if valid else key[:-12] + ("A" if key[-12] != "A" else "B") + key[-11:]
                 marker = "/tmp/tram-auth-ok" if valid else "/tmp/tram-pin-bypassed"
-                parameters = {"hostname": gateway, "port": str(port), "username": "smoke", "password": secret, "host-key": f"[{gateway}]:{port} {pin}", "command": f"touch {marker}; printf 'SSH_SMOKE_OK\\n'; sleep 1", "recording-path": "/recordings", "recording-name": identifier, "create-recording-path": "true", "disable-copy": "true", "disable-paste": "false", "enable-sftp": "false"}
+                parameters = {"hostname": gateway, "port": str(port), "username": "smoke", "password": secret, "host-key": f"[{gateway}]:{port} {pin}", "command": f"touch {marker}; printf 'SSH_SMOKE_OK\\n'; IFS= read -r pasted; printf '%s' \"$pasted\" > /tmp/tram-paste-ok", "recording-path": "/recordings", "recording-name": identifier, "create-recording-path": "true", "disable-copy": "true", "disable-paste": "false", "enable-sftp": "false"}
                 reader, writer = await asyncio.open_connection("127.0.0.1", 14822)
                 writer.write(instruction("select", "ssh"))
                 await writer.drain()
@@ -110,6 +111,7 @@ async def main():
                 writer.write(instruction("size", 1024, 768, 96) + instruction("audio") + instruction("video") + instruction("image", "image/png") + instruction("connect", *("VERSION_1_5_0" if name.startswith("VERSION_") else parameters.get(name, "") for name in args[1:])))
                 await writer.drain()
                 errored = False
+                paste_sent = False
                 try:
                     async with asyncio.timeout(30):
                         while True:
@@ -118,6 +120,16 @@ async def main():
                                 errored = True
                                 break
                             if message[0] == "sync":
+                                if valid and not paste_sent:
+                                    ready = subprocess.run(["docker", "exec", "tram-smoke-sshd", "test", "-f", marker], capture_output=True)
+                                    if ready.returncode == 0:
+                                        writer.write(instruction("clipboard", 0, "text/plain")
+                                            + instruction("blob", 0, base64.b64encode(b"SSH_PASTE_FIXTURE\n").decode())
+                                            + instruction("end", 0)
+                                            + instruction("key", 65507, 1) + instruction("key", 65505, 1)
+                                            + instruction("key", 86, 1) + instruction("key", 86, 0)
+                                            + instruction("key", 65505, 0) + instruction("key", 65507, 0))
+                                        paste_sent = True
                                 writer.write(instruction("sync", message[1]))
                                 await writer.drain()
                             if message[0] == "disconnect":
@@ -135,7 +147,9 @@ async def main():
                     recording = Path(directory) / identifier
                     if not recording.exists() or recording.stat().st_size == 0:
                         raise RuntimeError("Session produced no recording")
-                    print("PASS: real SSH password authentication through relay; nonempty Guacamole recording")
+                    assert paste_sent, "SSH clipboard test never reached a ready terminal"
+                    assert docker("exec", "tram-smoke-sshd", "cat", "/tmp/tram-paste-ok") == "SSH_PASTE_FIXTURE", "SSH did not receive pasted clipboard text exactly"
+                    print("PASS: real SSH authentication, inbound clipboard paste and nonempty Guacamole recording")
                 else:
                     result = subprocess.run(["docker", "exec", "tram-smoke-sshd", "test", "-f", marker], capture_output=True)
                     if result.returncode == 0 or not errored:

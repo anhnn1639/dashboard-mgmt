@@ -71,7 +71,7 @@ compose_check "Dashboard managed connections" dashboard \
 compose_check "Guacamole clipboard extension" guacamole \
   test -r /etc/guacamole/extensions/tram-clipboard-sync.jar
 compose_check "Guacamole clipboard extension version" guacamole \
-  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v4.js"
+  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v5.js"
 
 verify_step "Guacamole JSON authentication and SSH/RDP protocols" 75 docker compose -f compose.yaml -f "$override" exec -T --interactive=true api gosu ops python - < deploy/verify-guacamole.py
 

@@ -211,7 +211,7 @@ services:
         aliases: [guacd]
 
   guacamole:
-    image: tram-guacamole:1.6.0-clipboard-sync.4
+    image: tram-guacamole:1.6.0-clipboard-sync.5
     build:
       context: ./deploy/guacamole
       dockerfile: Dockerfile

@@ -1,5 +1,16 @@
 # Bàn giao Codex — 11/09/2026
 
+## Clipboard SSH/RDP — sửa thao tác dán trực tiếp, chờ CI và deploy
+
+- User báo sau nâng bản mới không copy nội dung bên ngoài để dán vào SSH/RDP được. HTTP công khai hiện xác nhận dashboard production buildId12073fcf2f4a9c026f74179c5ab8ce89e3be27e9, builtAt2026-09-11T13:59:23.473Z; app.css200text/css220byte. Trạng thái production89fe033/rỗng CSS ở các mục cũ bên dưới đã lỗi thời. Chưa điều khiển được tab user vì CUA helper_unknown_error.
+- Tái hiện bằng Chromium thật + Guacamole1.6.0 Keyboard/InputSink/StringWriter: readText bị chặn/throw/treo làm clipboard không cập nhật, Guacamole chặn default Ctrl+V nên browser không phát native paste. Ngoài ra v4 gọi setClipboard, Guacamole phải ghi lại OS clipboard trước khi broadcast; writeText treo có thể giữ nội dung cũ dù read đã xong.
+- Extensionv5 bắt native paste tin cậy trên window trước bàn phím Guacamole, giữ default browser Ctrl+V/Ctrl+Shift+V/Shift+Insert. Gửi text/plain trực tiếp tới đúng một client đang focused/CONNECTED, kiểm lại focus sau chờ; bỏ đọc cũ và giá trị trả muộn. Không gọi writeText, không lưu nội dung vào browser storage/log. Tách phím dán theo protocol: SSH/telnet Ctrl+Shift+V (keysym uppercase V), RDP/VNC Ctrl+V. Release/restore modifier để không thừa V/Insert/Control/Shift.
+- Đồng bộ đọc clipboard nền vẫn có giới hạn2s và hỗ trợ mouse khi browser cho phép read; gửi guacClipboard trực tiếp thay vì vòng ghi trở lại OS. Chuột phải/chuột giữa vẫn cần quyền đọc clipboard tự động; thao tác bàn phím native không cần quyền đó. Giữ paste-only disable-copy=true/disable-paste=false, kiểm quyền/MFA/recording và tất cả cổng như cũ.
+- Bump đồng bộ Compose image, manifest, Dockerfile và deploy version probe sang clipboard-sync.5/v5.js để không dùng nhầm image cũ. Không sửa API, Agent, PostgreSQL, tự đăng nhập hay cơ chế ghi hình.
+- Local: browser18tổ hợp (2protocol ×3phím ×3trạng thái quyền), tiếng Việt/nhiều dòng, clipboard-write treo, prompt trả muộn, đổi focus/mất kết nối/không rõ protocol, local editor và native paste ở non-editor; không chấp nhận ClipboardEvent giả. UI47/47, eslint/TypeScript/build pass; deploy24tests (22pass/2POSIX dànhCI), Python compile và diff check pass.
+- CI bổ sung browser fixture dùng Guacamole JS thật trong container sandbox, và cả4SSH profile gửi clipboard qua guacd tới shell fixture rồi kiểm nội dung nhận được + recording; giữ assertion host-key sai phải bị từ chối. Chưa có RDP Windows đích thật để kiểm login/paste đầu cuối; RDP kiểm luồng browser/protocol.
+- Bước tiếp theo: push main, theo dõi CI; khi đạt, server pull main rồi chạy bash deploy/deploy-dashboard.sh compose.test.yaml, đóng tab remote cũ và mở phiên mới. Chưa deploy bản clipboardv5 từ workspace.
+
 ## Phê duyệt tập trung và xóa nội dung — đã push, CI đạt, chưa deploy
 
 - Source `be3a1406cc720a58e7633a9913e91f6e90c92159` đã push và đối chiếu remote main; working tree sạch sau commit. **CI34600584785 SUCCESS toàn bộ9job**: Node/UI47, API176/176 gồm PostgreSQL migration/row-lock recovery/symlink Linux, Agent, Guacamole frontend SSH/RDP, Web console toàn bộ8profile, edge và cả4profile SSH. Lần đầu modern/rsa-modern lỗi kết nối security.ubuntu.com:80 trước khi tạo sshd; rerun riêng hai job này đã pass. Không đổi source sau các kiểm thử này; commit kế tiếp chỉ cập nhật bàn giao.

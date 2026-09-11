@@ -792,7 +792,7 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /build --pull --no-cache guacamole/);
   assert.match(deployScript, /force-recreate api dashboard guacamole/);
   assert.match(deployScript, /tram-clipboard-sync\.jar/);
-  assert.match(deployScript, /tram-clipboard-sync-v4\.js/);
+  assert.match(deployScript, /tram-clipboard-sync-v5\.js/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -813,19 +813,19 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v4.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v5.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.equal(manifest.namespace, "tram-clipboard-sync-v4");
-  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v4.js"]);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v5");
+  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v5.js"]);
   assert.deepEqual(manifest.css, ["tram-clipboard-sync.css"]);
   const extensionCSS = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.css", import.meta.url), "utf8");
   assert.ok(extensionCSS.trim().length > 0, "CSS bundle must carry a resource with text/css MIME");
-  assert.match(dockerfile, /guac-manifest\.json tram-clipboard-sync-v4\.js tram-clipboard-sync\.css/);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.4[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.match(dockerfile, /guac-manifest\.json tram-clipboard-sync-v5\.js tram-clipboard-sync\.css/);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.5[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
-  assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*service\.setClipboard\(new ClipboardData/);
+  assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*\$broadcast\('guacClipboard', new ClipboardData/);
   assert.match(extension, /addEventListener\('focus', resyncIfNeeded, true\)/);
   assert.match(extension, /isPasteShortcut[\s\S]*resyncClipboard\(true\)/);
   assert.match(extension, /isMousePasteButton[\s\S]*resyncClipboard\(true\)/);
@@ -863,7 +863,7 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
       configureClipboard = definition.at(-1);
     },
     run(definition) {
-      startClipboard = definition.at(-1);
+      if (definition.includes("clipboardService")) startClipboard = definition.at(-1);
     },
   };
   const clientModule = {
@@ -951,7 +951,9 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   configureClipboard({
     decorator(name, definition) {
       assert.equal(name, "clipboardService");
-      definition.at(-1)(clipboardService, fakeWindow, FakeClipboardData);
+      definition.at(-1)(clipboardService, fakeWindow, FakeClipboardData, {
+        $broadcast(name, data) { assert.equal(name, "guacClipboard"); remoteWrites.push(data.data); remoteClipboard = data.data; }
+      });
     },
   });
   configureManagedClient({

@@ -63,6 +63,8 @@ async def main():
                    "--tmpfs", "/home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002",
                    "--shm-size", "512m", "--env-file", str(envfile),
                    "-v", str(ROOT / "tests/guacamole-smoke/browser.py") + ":/fixture-browser.py:ro",
+                   "-v", str(ROOT / "tests/guacamole-smoke/native-paste.py") + ":/fixture-native-paste.py:ro",
+                   "-v", str(ROOT / "deploy/guacamole/clipboard-sync/tram-clipboard-sync-v5.js") + ":/fixture-clipboard.js:ro",
                    "--entrypoint", "python", "portal-guacamole-browser",
                    "/fixture-browser.py", f"http://{guacamole}:8080/guacamole")
             print(browser_output)

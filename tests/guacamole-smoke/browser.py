@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import sys
@@ -63,6 +64,10 @@ async def main():
                 assert not errors, "Frontend raised JavaScript exceptions"
                 print("PASS: " + protocol + " frontend authenticates and shows connection failure with clipboard " + clipboard)
                 await context.close()
+            spec = importlib.util.spec_from_file_location("native_paste", "/fixture-native-paste.py")
+            native_paste = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native_paste)
+            await native_paste.verify_native_paste(browser, base_url, "/fixture-clipboard.js")
         finally:
             await browser.close()
 

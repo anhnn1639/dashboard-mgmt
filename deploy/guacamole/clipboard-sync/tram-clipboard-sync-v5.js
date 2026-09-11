@@ -9,6 +9,7 @@
 
     var pendingClipboardSync = null;
     var clipboardMayHaveChanged = true;
+    var abortClipboardRead = null;
 
     function afterClipboardSync(callback) {
         var sync = pendingClipboardSync;
@@ -33,10 +34,44 @@
         // created by ManagedClient so this also works in production SSH/RDP sessions.
         var sendKeyEvent = client.sendKeyEvent.bind(client);
         var sendMouseState = client.sendMouseState.bind(client);
+        var modifiers = {};
+        var modifierKeys = [0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE7, 0xFFE8, 0xFFE9, 0xFFEA, 0xFFEB, 0xFFEC];
+        client.__tramPasteText = function pasteText(text, stillFocused, protocol) {
+            // Native paste is authoritative. An old permission prompt must not
+            // hold it or overwrite its contents when answered later.
+            if (abortClipboardRead)
+                abortClipboardRead();
+            return afterClipboardSync(function pasteIntoCurrentConnection() {
+                if (!stillFocused())
+                    return;
+                var writer = new Guacamole.StringWriter(client.createClipboardStream('text/plain'));
+                writer.sendText(text);
+                writer.sendEnd();
+                // SSH's terminal handles Ctrl+Shift+V (uppercase keysym V);
+                // RDP and the Web console browser use Ctrl+V. Shift+Insert is
+                // not a paste shortcut in Guacamole's SSH terminal.
+                // Release/restore forwarded modifiers around the exact shortcut.
+                var held = modifierKeys.filter(function isHeld(key) { return modifiers[key]; });
+                held.forEach(function release(key) { sendKeyEvent(0, key); });
+                var terminal = protocol === 'ssh' || protocol === 'telnet';
+                var pasteKeysym = terminal ? 0x56 : 0x76;
+                sendKeyEvent(1, 0xFFE3);
+                if (terminal)
+                    sendKeyEvent(1, 0xFFE1);
+                sendKeyEvent(1, pasteKeysym);
+                sendKeyEvent(0, pasteKeysym);
+                if (terminal)
+                    sendKeyEvent(0, 0xFFE1);
+                sendKeyEvent(0, 0xFFE3);
+                held.forEach(function restore(key) { sendKeyEvent(1, key); });
+            });
+        };
 
         client.sendKeyEvent = function sendKeyEventAfterClipboardSync() {
             var args = Array.prototype.slice.call(arguments);
             return afterClipboardSync(function forwardKeyEvent() {
+                if (modifierKeys.indexOf(args[1]) !== -1)
+                    modifiers[args[1]] = !!args[0];
                 return sendKeyEvent.apply(client, args);
             });
         };
@@ -61,8 +96,8 @@
     }
 
     angular.module('clipboard').config(['$provide', function configureClipboardSync($provide) {
-        $provide.decorator('clipboardService', ['$delegate', '$window', 'ClipboardData',
-                function decorateClipboardService(service, $window, ClipboardData) {
+        $provide.decorator('clipboardService', ['$delegate', '$window', 'ClipboardData', '$rootScope',
+                function decorateClipboardService(service, $window, ClipboardData, $rootScope) {
 
             var originalResyncClipboard = service.resyncClipboard.bind(service);
 
@@ -86,6 +121,7 @@
                 var synchronized = false;
                 pendingClipboardSync = new Promise(function synchronizeClipboard(resolve) {
                     var settled = false;
+                    abortClipboardRead = function cancelSupersededRead() { finish(false); };
                     // A permission prompt may never settle. It must not hold
                     // all remote keyboard/mouse input indefinitely.
                     var timeout = $window.setTimeout(function clipboardDeadline() {
@@ -111,8 +147,11 @@
                                 .then(function clipboardRead(text) {
                                     // An older prompt resolving after the deadline
                                     // must not overwrite a newer remote clipboard.
+                                    // setClipboard() writes back to the local OS
+                                    // before broadcasting. That separate permission
+                                    // prompt can stall inbound paste indefinitely.
                                     if (!settled)
-                                        return service.setClipboard(new ClipboardData({
+                                        return $rootScope.$broadcast('guacClipboard', new ClipboardData({
                                             type: 'text/plain',
                                             data: text
                                         }));
@@ -134,6 +173,7 @@
                         if (synchronized)
                             clipboardMayHaveChanged = false;
                         pendingClipboardSync = null;
+                        abortClipboardRead = null;
                     });
 
                 return pendingClipboardSync;
@@ -223,5 +263,71 @@
         document.addEventListener('mousedown', resyncForMouse, true);
 
         resyncIfNeeded();
+    }]);
+    angular.module('clipboard').run(['$document', '$window', 'guacClientManager',
+            function installNativePaste($document, $window, guacClientManager) {
+        var document = $document[0];
+        var suppressedKeys = {};
+
+        function focusedClient() {
+            var clients = guacClientManager.getManagedClients();
+            var focused = Object.keys(clients).map(function getClient(id) { return clients[id]; })
+                .filter(function isFocused(item) {
+                    return item.clientProperties.focused
+                        && item.clientState.connectionState === 'CONNECTED'
+                        && ['ssh', 'telnet', 'rdp', 'vnc'].indexOf(item.protocol) !== -1;
+                });
+            return focused.length === 1 ? focused[0] : null;
+        }
+
+        function isLocalEditor(target) {
+            if (!target || !target.closest)
+                return false;
+            // Guacamole InputSink is a zero-sized textarea directly in body.
+            // Let it receive native paste while leaving visible Portal fields alone.
+            var sink = target.tagName === 'TEXTAREA' && target.parentElement === document.body
+                && target.style.width === '0px' && target.style.height === '0px';
+            return !sink && !!target.closest('input,textarea,select,[contenteditable="true"],[contenteditable=""]');
+        }
+
+        function pasteKey(event) {
+            var key = String(event.key || '').toLowerCase();
+            return ((event.ctrlKey || event.metaKey) && key === 'v')
+                || (event.shiftKey && key === 'insert');
+        }
+
+        $window.addEventListener('keydown', function allowNativePaste(event) {
+            if (!event.isTrusted || !pasteKey(event) || isLocalEditor(event.target) || !focusedClient())
+                return;
+            suppressedKeys[event.code || event.key] = true;
+            // Keep the browser default: it generates the trusted paste event.
+            // Guacamole must not cancel it or also forward V to the remote host.
+            event.stopImmediatePropagation();
+        }, true);
+        $window.addEventListener('keyup', function finishNativePasteKey(event) {
+            var key = event.code || event.key;
+            if (suppressedKeys[key]) {
+                delete suppressedKeys[key];
+                event.stopImmediatePropagation();
+            }
+        }, true);
+        $window.addEventListener('blur', function clearSuppressedKeys() { suppressedKeys = {}; }, true);
+        $window.addEventListener('paste', function receiveNativePaste(event) {
+            if (!event.isTrusted || isLocalEditor(event.target))
+                return;
+            var managed = focusedClient();
+            if (!managed || !event.clipboardData || !managed.client.__tramPasteText)
+                return;
+            var types = Array.prototype.slice.call(event.clipboardData.types || []);
+            if (types.indexOf('text/plain') === -1)
+                return;
+            var text = event.clipboardData.getData('text/plain');
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            clipboardMayHaveChanged = false;
+            managed.client.__tramPasteText(text, function sameActiveConnection() {
+                return focusedClient() === managed;
+            }, managed.protocol);
+        }, true);
     }]);
 }());
