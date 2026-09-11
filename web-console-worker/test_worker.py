@@ -91,6 +91,54 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(desktop.client_task, 2)
         self.assertEqual(desktop.status, "closed")
 
+    async def test_shutdown_during_rfb_key_preserves_terminal_reason(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
+        key_started, browser_closed = asyncio.Event(), asyncio.Event()
+
+        async def interrupted_key(_key):
+            key_started.set()
+            await browser_closed.wait()
+            raise w.BrowserError("Target page, context or browser has been closed")
+
+        async def close_browser():
+            browser_closed.set()
+
+        async def no_frames(_writer):
+            await asyncio.Event().wait()
+
+        desktop.page = type("Page", (), {"keyboard": type("Keyboard", (), {
+            "down": staticmethod(interrupted_key)})(), "goto": AsyncMock(return_value=None)})()
+        desktop.browser = type("Browser", (), {"close": staticmethod(close_browser)})()
+        desktop.frames = no_frames
+        desktop.listener = await asyncio.start_server(desktop.accept, "127.0.0.1", 0)
+        port = desktop.listener.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            async with asyncio.timeout(3):
+                self.assertEqual(await reader.readexactly(12), b"RFB 003.008\n")
+                writer.write(b"RFB 003.008\n"); await writer.drain()
+                self.assertEqual(await reader.readexactly(2), b"\x01\x02")
+                writer.write(b"\x02"); await writer.drain()
+                challenge = await reader.readexactly(16)
+                writer.write(w.challenge_response(desktop.password, challenge)); await writer.drain()
+                self.assertEqual(await reader.readexactly(4), b"\0\0\0\0")
+                writer.write(b"\x01"); await writer.drain()
+                header = await reader.readexactly(24)
+                await reader.readexactly(struct.unpack(">I", header[20:24])[0])
+                await desktop.activate()
+                writer.write(b"\x04" + struct.pack(">B2xI", 1, ord("a"))); await writer.drain()
+                await key_started.wait()
+                # The browser closes while accept() is still inside key().
+                await desktop.stop("lease-expired")
+                await desktop.client_task
+            self.assertEqual((desktop.status, desktop.reason), ("failed", "lease-expired"))
+        finally:
+            browser_closed.set()
+            writer.close(); await writer.wait_closed()
+            if desktop.client_task:
+                await asyncio.wait_for(desktop.client_task, 2)
+            await desktop.stop()
+
     async def test_route_stays_closed_until_activation_and_blocks_other_origins(self):
         desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
         route = type("Route", (), {"request": type("Request", (), {"url": "https://console.test/", "is_navigation_request": staticmethod(lambda: True)})(), "continue_": AsyncMock(), "abort": AsyncMock()})()
@@ -137,6 +185,38 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         desktop.created = time.monotonic() - 3601
         desktop.deadline = time.monotonic() + 10
         self.assertFalse(desktop.input_enabled())
+
+    async def test_terminal_state_survives_sweep_while_cleanup_is_pending(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
+        desktop.status = "active"
+        desktop.deadline = time.monotonic() - 1
+        cleaning, release = asyncio.Event(), asyncio.Event()
+        async def slow_cleanup():
+            cleaning.set()
+            await release.wait()
+        desktop.proxy = type("Proxy", (), {"stop": staticmethod(slow_cleanup)})()
+        with patch.dict(w.desktops, {desktop.id: desktop}, clear=True):
+            closing = asyncio.create_task(desktop.stop("lease-expired"))
+            sweeping = None
+            try:
+                await asyncio.wait_for(cleaning.wait(), 1)
+                sweeping = asyncio.create_task(w.sweep())
+                # Let the sweeper inspect a terminal desktop before close ends.
+                await asyncio.sleep(.02)
+                self.assertIs(w.get_desktop(uuid.UUID(desktop.id)), desktop)
+                self.assertEqual((desktop.status, desktop.reason), ("failed", "lease-expired"))
+                self.assertFalse(desktop.input_enabled())
+                with self.assertRaises(HTTPException):
+                    w.lease(uuid.UUID(desktop.id))
+                release.set()
+                await asyncio.wait_for(closing, 1)
+                self.assertGreater(desktop.deadline, time.monotonic() + 59)
+            finally:
+                release.set()
+                if sweeping:
+                    sweeping.cancel()
+                    await asyncio.gather(sweeping, return_exceptions=True)
+                await asyncio.gather(closing, return_exceptions=True)
 
     async def test_sweep_starts_all_expired_cleanup_concurrently(self):
         started = [asyncio.Event(), asyncio.Event()]

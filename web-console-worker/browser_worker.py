@@ -398,11 +398,15 @@ class Desktop:
         if self.status in {"closed", "failed"}:
             return
         self.status = "closed" if reason == "closed" else "failed"
+        self.reason = reason
+        # Publish terminal retention before cleanup yields. The transport and
+        # sweeper can close concurrently after lease expiry; retaining the old
+        # expired deadline lets sweep erase the status before the API reads it.
+        self.deadline = time.monotonic() + 60
         if self.login:
             self.login.cancel()
             if self.login.task:
                 await asyncio.gather(self.login.task, return_exceptions=True)
-        self.reason = reason
         if self.proxy:
             await self.proxy.stop()
         if self.listener:
@@ -492,7 +496,10 @@ class Desktop:
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         except Exception:
-            self.reason = "transport-failed"
+            # Closing Chromium can interrupt an awaited key/mouse operation.
+            # Keep the terminal cause already published by stop().
+            if self.status not in {"closed", "failed"}:
+                self.reason = "transport-failed"
         finally:
             if frame_task:
                 frame_task.cancel()
