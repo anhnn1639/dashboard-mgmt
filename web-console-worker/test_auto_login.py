@@ -64,11 +64,14 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.routes = {}
         self.posts = []
         self.reject_login = False
+        self.post_delay = 0
         self.login = None
         async def route(request_route):
             request = request_route.request
             url = urlsplit(request.url)
             if request.method == 'POST':
+                if self.post_delay:
+                    await asyncio.sleep(self.post_delay)
                 self.posts.append((url.hostname, url.path, parse_qs(request.post_data or '')))
                 if url.path == '/first':
                     # Chromium bypasses route interception on HTTP redirect hops.
@@ -108,9 +111,18 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.login.task, 8)
         self.assertEqual((self.login.username, self.login.password), ('', ''))
 
+    async def wait_for_posts(self, count):
+        # A frame click can complete before its network handler observes the POST.
+        # Wait for the observed request, without resubmitting the login form.
+        async with asyncio.timeout(3):
+            while len(self.posts) < count:
+                await asyncio.sleep(.01)
+        self.assertEqual(self.login.state, 'submitted')
+
     async def test_standard_vcenter_style_form_is_filled_and_submitted_once(self):
         await self.open('<form method="post" action="/login"><input id="userName" name="username"><input id="password" type="password" name="password"><button id="submit">Login</button></form>')
         await self.run_login()
+        await self.wait_for_posts(1)
         self.assertEqual(self.posts, [('console.test', '/login', {'username':['fixture-user'], 'password':['fixture-password']})])
         self.assertEqual(self.login.state, 'submitted')
         await asyncio.sleep(.6)
@@ -120,6 +132,7 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.reject_login = True
         await self.open('<form method="post"><input name="username"><input name="password" type="password"><button>Login</button></form>')
         await self.run_login()
+        await self.wait_for_posts(1)
         await self.page.locator('input[name=password]').wait_for()
         await asyncio.sleep(.7)
         self.assertEqual(len(self.posts), 1)
@@ -130,14 +143,17 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.routes[('sso.test','/password')] = '<form method="post" action="/finish"><input type="password" name="password" autocomplete="current-password"><button>Sign in</button></form>'
         await self.open('<form method="post" action="/first"><input name="username" autocomplete="username"><button>Next</button></form>')
         await self.run_login()
+        await self.wait_for_posts(2)
         self.assertEqual(len(self.posts), 2)
         self.assertEqual(self.posts[0][2], {'username':['fixture-user']})
         self.assertEqual(self.posts[1], ('sso.test','/finish',{'password':['fixture-password']}))
 
     async def test_delayed_form_and_same_origin_iframe(self):
+        self.post_delay = .1
         self.routes[('console.test','/frame')] = '<script>setTimeout(()=>document.body.innerHTML=\'<form method="post" action="/finish"><input name="username"><input name="password" type="password"><button>Đăng nhập</button></form>\',800)</script><body>Loading</body>'
         await self.open('<iframe src="/frame"></iframe>')
         await self.run_login()
+        await self.wait_for_posts(1)
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(self.posts[0][2]['password'], ['fixture-password'])
 
@@ -173,6 +189,7 @@ class LoginBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.login.username_submitted)
         await self.page.locator('input[name=password]').evaluate('e=>e.disabled=false')
         await self.run_login()
+        await self.wait_for_posts(1)
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(self.posts[0][2], {'username':['fixture-user'], 'password':['fixture-password']})
 

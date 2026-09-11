@@ -42,8 +42,10 @@ jobs:
           python -m pip install -r web-console-worker/requirements.txt httpx2==2.12.0
           python -m unittest discover -s web-console-worker -p "test*.py" -v
       - name: Build isolated browser with Chromium sandbox
+        id: browser_image
         run: docker build -t tram-web-smoke-worker web-console-worker
       - name: Verify saved-account forms in a real sandboxed browser
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: >-
           docker run --rm --init --read-only --cap-drop=ALL
           --security-opt no-new-privileges --security-opt seccomp=web-console-worker/seccomp_profile.json
@@ -53,18 +55,25 @@ jobs:
           -v "${{ github.workspace }}/web-console-worker/test_auto_login.py:/app/test_auto_login.py:ro"
           --entrypoint python tram-web-smoke-worker -m unittest test_auto_login -v
       - name: Verify saved-account SSO login after recording activation
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=auto-login python tests/web-smoke/verify.py
       - name: Verify internal HTTPS access, recording gate and lease shutdown
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: python tests/web-smoke/verify.py
       - name: Verify automatic certificate handling accepts a stale false flag
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=legacy-false python tests/web-smoke/verify.py
       - name: Verify automatic certificate handling without a per-target flag
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=untrusted python tests/web-smoke/verify.py
       - name: Verify recorded SSO and automatic redirect discovery across host and port
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=redirect python tests/web-smoke/verify.py
       - name: Verify recorded HTTP website without certificate
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=http python tests/web-smoke/verify.py
       - name: Verify delayed web fonts do not stop recording or close the browser
+        if: ${{ !cancelled() && steps.browser_image.outcome == 'success' }}
         run: WEB_SMOKE_PROFILE=delayed-font python tests/web-smoke/verify.py
       - name: Remove disposable web test services
         if: ${{ always() }}
