@@ -49,7 +49,9 @@ async def main():
         docker("network", "create", prefix)
         try:
             docker("run", "-d", "--name", sshd, "--network", prefix,
-                   "-v", str(results) + ":/paste-results", "portal-guacamole-sshd")
+                   "-v", str(results) + ":/paste-results", "portal-guacamole-sshd",
+                   "/usr/sbin/sshd", "-D", "-e", "-o", "PasswordAuthentication=yes",
+                   "-o", "PermitRootLogin=no", "-o", "HostKeyAlgorithms=ssh-ed25519")
             docker("exec", "-i", sshd, "chpasswd", input="smoke:" + ssh_password + "\n")
             ssh_key = " ".join(docker("exec", sshd, "cat", "/etc/ssh/ssh_host_ed25519_key.pub").split()[:2])
             with envfile.open("a") as stream:
