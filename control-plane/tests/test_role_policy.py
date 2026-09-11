@@ -314,9 +314,9 @@ class RolePolicyTests(unittest.TestCase):
             decrypt.assert_not_called()
             relay.assert_not_awaited()
 
-    def test_web_launch_uses_internal_recorded_browser_without_vault_decryption(self):
+    def test_web_login_decrypts_selected_account_only_after_recording_activation(self):
         server_id, credential_id = self.network_fixture("web")
-        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}) as prepare, patch.object(m.web_hub, "watch") as watch, patch.object(m, "decrypt_remote_credential_password") as decrypt, patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture") as encrypt:
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}) as prepare, patch.object(m.web_hub, "watch") as watch, patch.object(m, "decrypt_remote_credential_password", return_value="fixture-web-password") as decrypt, patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture") as encrypt:
             response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertTrue(response.json()["recording"])
@@ -333,27 +333,38 @@ class RolePolicyTests(unittest.TestCase):
             self.assertEqual(connection["parameters"]["disable-copy"], "true")
             self.assertEqual(connection["parameters"]["disable-paste"], "false")
             identifier, _probe, authorize, activate, finish = watch.call_args.args
-            manual_identity = "Đăng nhập thủ công (chưa xác minh tài khoản)"
+            with m.SessionLocal() as db:
+                selected_identity = db.get(m.RemoteCredential, credential_id).username
             with m.SessionLocal() as db:
                 session = db.get(m.RemoteSession, identifier)
-                self.assertEqual(session.remote_username, manual_identity)
-                self.assertNotEqual(session.remote_username, db.get(m.RemoteCredential, credential_id).username)
+                self.assertEqual(session.remote_username, selected_identity)
+                self.assertEqual(session.remote_username, db.get(m.RemoteCredential, credential_id).username)
                 launched = db.execute(select(m.AuditEvent).where(
                     m.AuditEvent.action == "session.web.launch", m.AuditEvent.target == server_id)).scalar_one()
                 self.assertEqual(launched.detail["credential_id"], credential_id)
-                self.assertEqual(launched.detail["credential_use"], "access-authorization-only")
+                self.assertEqual(launched.detail["credential_use"], "recorded-browser-login")
                 self.assertIs(launched.detail["remote_identity_verified"], False)
-                self.assertEqual(launched.detail["authentication"], "manual-in-recorded-browser")
+                self.assertEqual(launched.detail["authentication"], "saved-account-single-attempt")
             listed = self.client.get("/api/v1/sessions", headers=self.headers["admin"])
             self.assertEqual(listed.status_code, 200, listed.text)
-            self.assertEqual(next(item for item in listed.json()["items"] if item["id"] == identifier)["username"], manual_identity)
+            self.assertEqual(next(item for item in listed.json()["items"] if item["id"] == identifier)["username"], selected_identity)
             self.assertTrue(self.client.portal.call(authorize))
-            with patch.object(m.web_hub, "call", new_callable=AsyncMock, return_value={"status": "active"}) as call:
+            sent = []
+            async def activated(method, path, body):
+                sent.append((method, path, json.loads(json.dumps(body))))
+                return {"status": "active"}
+            with patch.object(m.web_hub, "call", side_effect=activated):
                 self.client.portal.call(activate)
-                call.assert_awaited_once_with("POST", f"/sessions/{identifier}/activate", {})
+            self.assertEqual(sent, [("POST", f"/sessions/{identifier}/activate", {"credentials": {"username": selected_identity, "password": "fixture-web-password"}})])
+            decrypt.assert_called_once()
+            self.assertNotIn("fixture-web-password", response.text)
+            self.assertNotIn("fixture-web-password", str(encrypt.call_args))
             with m.SessionLocal() as db:
                 self.assertEqual(db.get(m.RemoteSession, identifier).status, "active")
-                self.assertEqual(db.get(m.RemoteSession, identifier).remote_username, manual_identity)
+                self.assertEqual(db.get(m.RemoteSession, identifier).remote_username, selected_identity)
+                audits = db.execute(select(m.AuditEvent).where(m.AuditEvent.target == identifier)).scalars().all()
+                self.assertNotIn("fixture-web-password", json.dumps([item.detail for item in audits]))
+                self.assertTrue(any(item.action == "session.web.credential.release" for item in audits))
                 db.get(m.User, self.ids["operator"]).enabled = False
                 db.commit()
             self.assertFalse(self.client.portal.call(authorize))
@@ -361,6 +372,23 @@ class RolePolicyTests(unittest.TestCase):
             with m.SessionLocal() as db:
                 self.assertEqual(db.get(m.RemoteSession, identifier).status, "failed")
                 self.assertIsNotNone(db.get(m.RemoteSession, identifier).finished_at)
+
+    def test_web_account_rotation_before_recording_prevents_secret_release(self):
+        server_id, credential_id = self.network_fixture("web")
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}), patch.object(m.web_hub, "watch") as watch, patch.object(m, "decrypt_remote_credential_password") as decrypt, patch.object(m, "encrypt_guacamole_json", return_value="opaque-fixture"):
+            response = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
+            self.assertEqual(response.status_code, 200)
+            authorize, activate = watch.call_args.args[2:4]
+            self.assertTrue(self.client.portal.call(authorize))
+            with m.SessionLocal() as db:
+                db.get(m.RemoteCredential, credential_id).password_encrypted = "rotated-ciphertext"
+                db.commit()
+            self.assertFalse(self.client.portal.call(authorize))
+            with patch.object(m.web_hub, "call", new_callable=AsyncMock) as call:
+                with self.assertRaises(m.WebSessionError):
+                    self.client.portal.call(activate)
+                call.assert_not_called()
+            decrypt.assert_not_called()
 
     def test_web_launch_requires_both_target_and_credential_share_and_cleans_failure(self):
         server_id, credential_id = self.network_fixture("web")

@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import hmac
 import io
+import logging
 import ipaddress
 import os
 import re
@@ -31,6 +32,7 @@ from PIL import Image, ImageDraw, ImageFont
 from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, async_playwright
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from restricted_proxy import PinnedProxy
+from auto_login import ActivationRequest, SavedAccountLogin
 
 
 def origin(url: str) -> tuple[str, str, int]:
@@ -203,6 +205,7 @@ class Desktop:
         self.listener = self.writer = self.browser = self.context = self.page = None
         self.client_task = self.navigation_task = self.proxy = None
         self.capture = None
+        self.login = None
         self.frame_requested = asyncio.Event()
         self.pixel_format = (32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
         self.buttons = 0
@@ -299,7 +302,7 @@ class Desktop:
         else:
             await websocket.close()
 
-    async def activate(self):
+    async def activate(self, credentials=None):
         if self.status != "connected" or time.monotonic() >= self.deadline or time.monotonic() - self.created >= 3600:
             raise HTTPException(409, "Recording transport is not connected")
         self.status = "active"
@@ -308,6 +311,9 @@ class Desktop:
         # Return promptly so that the API can renew the recording lease while
         # a slow internal site loads. Browser navigation is independently bounded.
         self.navigation_task = asyncio.create_task(self.navigate())
+        if credentials is not None:
+            self.login = SavedAccountLogin(self, credentials)
+            self.login.start()
 
     async def navigate(self):
         self.navigation_error = ""
@@ -327,6 +333,10 @@ class Desktop:
         if self.status in {"closed", "failed"}:
             return
         self.status = "closed" if reason == "closed" else "failed"
+        if self.login:
+            self.login.cancel()
+            if self.login.task:
+                await asyncio.gather(self.login.task, return_exceptions=True)
         self.reason = reason
         if self.proxy:
             await self.proxy.stop()
@@ -427,6 +437,8 @@ class Desktop:
                 await writer.wait_closed()
 
     async def key(self, keysym, down):
+        if down and self.login:
+            self.login.cancel()
         if not self.input_enabled():
             return
         key = KEYS.get(keysym)
@@ -447,6 +459,8 @@ class Desktop:
             await self.page.keyboard.up(key)
 
     async def mouse(self, mask, x, y):
+        if mask & 7 and self.login:
+            self.login.cancel()
         if not self.input_enabled() or y < 28:
             return
         await self.page.mouse.move(min(x, self.width - 1), min(y - 28, self.height - 29))
@@ -484,7 +498,12 @@ class Desktop:
                 # producing frames, allowing the API to detect a stalled recorder.
                 draw = ImageDraw.Draw(frame)
                 draw.rectangle((0, 0, self.width, 24), fill="#11223b")
-                text = self.notice or "ĐANG GHI HÌNH · Web console qua Operation Portal · " + time.strftime("%H:%M:%S UTC", time.gmtime())
+                login_notice = ""
+                if self.login and self.login.state in {"waiting-form", "waiting-password"}:
+                    login_notice = "Đang tự đăng nhập bằng tài khoản đã chọn…"
+                elif self.login and self.login.state == "manual-required":
+                    login_notice = "Cần thao tác trong phiên: nhập OTP/CAPTCHA hoặc hoàn tất biểu mẫu đăng nhập."
+                text = (self.notice or login_notice or "ĐANG GHI HÌNH · Web console qua Operation Portal") + " · " + time.strftime("%H:%M:%S UTC", time.gmtime())
                 try:
                     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
                 except OSError:
@@ -765,12 +784,13 @@ def get_desktop(identifier: UUID):
 def status(identifier: UUID):
     item = get_desktop(identifier)
     return {"status": item.status, "reason": item.reason, "navigation_error": item.navigation_error,
-            "blocked_origins": list(item.blocked_origins)}
+            "blocked_origins": list(item.blocked_origins),
+            "login_state": item.login.state if item.login else "manual"}
 
 
 @app.post("/sessions/{identifier}/activate", dependencies=[Depends(authenticate)])
-async def activate(identifier: UUID):
-    await get_desktop(identifier).activate()
+async def activate(identifier: UUID, payload: ActivationRequest):
+    await get_desktop(identifier).activate(payload.credentials)
     return {"status": "active"}
 
 

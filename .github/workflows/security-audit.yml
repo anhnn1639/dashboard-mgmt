@@ -31,7 +31,7 @@ permissions:
 jobs:
   web-console-smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,6 +43,17 @@ jobs:
           python -m unittest discover -s web-console-worker -p "test*.py" -v
       - name: Build isolated browser with Chromium sandbox
         run: docker build -t tram-web-smoke-worker web-console-worker
+      - name: Verify saved-account forms in a real sandboxed browser
+        run: >-
+          docker run --rm --init --read-only --cap-drop=ALL
+          --security-opt no-new-privileges --security-opt seccomp=web-console-worker/seccomp_profile.json
+          --tmpfs /tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002
+          --tmpfs /home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002 --shm-size 512m
+          -e TRAM_TEST_BROWSER=chromium
+          -v "${{ github.workspace }}/web-console-worker/test_auto_login.py:/app/test_auto_login.py:ro"
+          --entrypoint python tram-web-smoke-worker -m unittest test_auto_login -v
+      - name: Verify saved-account SSO login after recording activation
+        run: WEB_SMOKE_PROFILE=auto-login python tests/web-smoke/verify.py
       - name: Verify internal HTTPS access, recording gate and lease shutdown
         run: python tests/web-smoke/verify.py
       - name: Verify automatic certificate handling accepts a stale false flag

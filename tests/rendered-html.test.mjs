@@ -1196,3 +1196,12 @@ test("unresponsive discovery has a deadline and ignores replies arriving after t
   assert.equal(form.origins, "");
   assert.match(form.discovery.error, /quá thời gian/);
 });
+
+
+test("Web console explains recorded automatic login and manual OTP without requesting a password", async () => {
+  const source = await readFile(new URL("../app/managed-session-modal.tsx", import.meta.url), "utf8");
+  assert.match(source, /tự điền tài khoản đã chọn và đăng nhập sau khi ghi hình sẵn sàng/);
+  assert.match(source, /OTP\/CAPTCHA/);
+  assert.doesNotMatch(source, /chưa tự điền mật khẩu|chỉ dùng để kiểm tra quyền/);
+  assert.doesNotMatch(source, /name="password"|type="password"/);
+});

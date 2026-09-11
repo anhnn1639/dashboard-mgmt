@@ -5882,6 +5882,7 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
     session_id = str(uuid.uuid4())
     server_id, user_id, credential_id = server.id, user.id, credential.id
     target_url = config.url
+    credential_revision = (credential.username, credential.password_encrypted, credential.updated_at)
     claims = dict(request.state.authenticated_claims)
 
     def check_authorized(check: Session) -> bool:
@@ -5895,7 +5896,8 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                 or now().timestamp() >= claims.get("exp", 0)
                 or (target.inventory or {}).get("managedTarget", {}).get("url") != target_url
                 or (target.inventory or {}).get("managedTarget", {}).get("web_allowed_origins", []) != config.web_allowed_origins
-                or account.server_id != server_id or account.protocol != "web"):
+                or account.server_id != server_id or account.protocol != "web"
+                or (account.username, account.password_encrypted, account.updated_at) != credential_revision):
             return False
         return actor.role == "admin" or check.execute(select(RemoteCredentialUserShare).where(
             RemoteCredentialUserShare.credential_id == credential_id,
@@ -5905,19 +5907,30 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
         return await web_database(check_authorized)
 
     async def activate() -> None:
-        if not await authorized():
-            raise WebSessionError("access-revoked")
-        # Vault credentials are never sent to the browser worker.
-        await web_hub.call("POST", f"/sessions/{session_id}/activate", {})
-        def mark_active(active_db):
-            row = active_db.get(RemoteSession, session_id)
-            if row is None or row.status not in {"waiting", "active"}:
+        # The recording watcher calls this only after nonempty .guac output.
+        # Recheck the selected account in the same transaction as its release.
+        def release_credentials(active_db):
+            if not check_authorized(active_db):
                 raise WebSessionError("access-revoked")
+            row = active_db.get(RemoteSession, session_id)
+            if row is None or row.status != "waiting":
+                raise WebSessionError("access-revoked")
+            account = active_db.get(RemoteCredential, credential_id)
+            password = decrypt_remote_credential_password(account)
             row.status = "active"
             audit(active_db, "system:web-console", "session.web.recording.started", session_id,
                   detail={"recording": True})
+            audit(active_db, "system:web-console", "session.web.credential.release", session_id,
+                  detail={"credential_id": credential_id, "authentication": "saved-account-single-attempt"})
             active_db.commit()
-        await web_database(mark_active)
+            return {"username": account.username, "password": password}
+        credentials = await web_database(release_credentials)
+        try:
+            # Private broker only. The browser client receives a Guacamole URL
+            # and never receives the selected website password in its response.
+            await web_hub.call("POST", f"/sessions/{session_id}/activate", {"credentials": credentials})
+        finally:
+            credentials.clear()
 
     async def redirect_blocked(identifier: str, origins: list[str]) -> None:
         # Advisory only. The live session still uses Administrator-saved origins.
@@ -5955,16 +5968,16 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
         encrypted = encrypt_guacamole_json({"username": user.username,
             "expires": int((now() + timedelta(minutes=2)).timestamp() * 1000),
             "connections": {server.name: {"protocol": "vnc", "parameters": parameters}}})
-        # The selected credential authorizes access; manual website sign-in
-        # does not establish which account the operator actually uses.
+        # Selected username is an audit snapshot; website login success and
+        # subsequent account switching cannot be inferred from form submission.
         db.add(RemoteSession(id=session_id, server_id=server_id, protocol="web",
-            remote_username="Đăng nhập thủ công (chưa xác minh tài khoản)", created_by=user.username, status="waiting",
+            remote_username=credential.username, created_by=user.username, status="waiting",
             recording_name=session_id + ".guac"))
         audit(db, user.username, "session.web.launch", server_id, request,
               detail={"session_id": session_id, "credential_id": credential_id,
-                      "credential_use": "access-authorization-only", "remote_identity_verified": False,
+                      "credential_use": "recorded-browser-login", "remote_identity_verified": False,
                       "transport": "recorded-server-browser", "recording": True,
-                      "authentication": "manual-in-recorded-browser",
+                      "authentication": "saved-account-single-attempt",
                       "web_scheme": urlsplit(target_url).scheme, "certificate_policy": "automatic-session-compatibility", "web_allowed_origins": config.web_allowed_origins,
                       "clipboard": "paste-only", "native_file_transfer": "disabled"})
         db.commit()
