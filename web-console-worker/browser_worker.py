@@ -192,6 +192,10 @@ CAPTURE_ATTEMPT_SECONDS = 4
 CAPTURE_RECOVERY_SECONDS = 8
 
 
+class CaptureLeaseExpired(Exception):
+    pass
+
+
 class Desktop:
     def __init__(self, payload: CreateSession):
         self.id = str(payload.session_id)
@@ -255,23 +259,31 @@ class Desktop:
                 self.buttons = 0
 
     async def capture_surface(self):
-        # A busy Chromium renderer can recover after one screenshot timeout.
-        # Keep the total below the API's 10s recording-stall watchdog. Never
-        # emit old frames or an artificial audit clock during this interval.
+        # Before the first paint Chromium may report no surface immediately;
+        # a busy renderer instead times out. Recover only these transient cases
+        # within the API's unchanged 10s recording-stall watchdog. Never emit
+        # old frames or an artificial audit clock during this interval.
         async with asyncio.timeout(CAPTURE_RECOVERY_SECONDS):
-            for attempt in range(2):
+            while True:
                 if not self.input_enabled():
-                    raise TimeoutError("Capture lease expired")
+                    raise CaptureLeaseExpired()
                 try:
-                    return await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
+                    captured = await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
                         "format": "png", "fromSurface": True, "captureBeyondViewport": False,
                     }), CAPTURE_ATTEMPT_SECONDS)
-                except TimeoutError:
+                    if not self.input_enabled():
+                        raise CaptureLeaseExpired()
+                    return captured
+                except (TimeoutError, BrowserError) as exc:
+                    if isinstance(exc, BrowserError) and "Unable to capture screenshot" not in str(exc):
+                        raise
+                    if not self.capture_recovering:
+                        logging.getLogger(__name__).warning("Web capture waiting for busy renderer; retrying within recording deadline")
                     self.capture_recovering = True
                     self.website_frame_ready = False
-                    if attempt:
-                        raise
-                    logging.getLogger(__name__).warning("Web capture waiting for busy renderer; retrying within recording deadline")
+                    # Yield between transient no-surface errors instead of
+                    # flooding Chromium while the first document is painting.
+                    await asyncio.sleep(.1)
 
     async def start(self, playwright):
         ip = await pinned_address(self.url)
@@ -587,9 +599,16 @@ class Desktop:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Fixed stage/class only; browser exceptions can contain SSO URLs.
-            logging.getLogger(__name__).warning("Web frame failed stage=%s kind=%s", stage, type(exc).__name__)
-            self.reason = "capture-failed"
+            # Sweep/stop may close Chromium while capture is in flight. Preserve
+            # that existing reason rather than relabeling lease loss as capture.
+            if self.status not in {"connected", "active"}:
+                return
+            if isinstance(exc, CaptureLeaseExpired) or (self.status == "active" and not self.input_enabled()):
+                self.reason = "lease-expired"
+            else:
+                # Fixed stage/class only; browser exceptions can contain SSO URLs.
+                logging.getLogger(__name__).warning("Web frame failed stage=%s kind=%s", stage, type(exc).__name__)
+                self.reason = "capture-failed"
             self.capture_recovering = True
             self.website_frame_ready = False
             if self.login:
