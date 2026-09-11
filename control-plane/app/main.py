@@ -52,7 +52,8 @@ from .agent_packages import LINUX_AGENT_PATH, bootstrap_package_secret, LINUX_OF
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest, RedirectDiscoveryRequest, is_normalized_origin, origin_text, web_url_endpoint
-from .schema_migrations import detach_recording_history_users, widen_remote_session_actor
+from .schema_migrations import detach_recording_history_users, widen_remote_session_actor, add_recording_deletion_timestamp
+from .recording_storage import deletion_files, delete_recording
 from .web_sessions import WebSessionHub, WebSessionError
 from .web_database import run_postgres
 
@@ -421,6 +422,7 @@ class RemoteSession(Base):
     recording_name: Mapped[str] = mapped_column(String(255))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recording_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class RecordingDeletionRequest(Base):
@@ -1427,6 +1429,7 @@ def activate_database(database_url: str, *, initialize_schema: bool = True) -> E
             Base.metadata.create_all(candidate)
             detach_recording_history_users(candidate)
             widen_remote_session_actor(candidate)
+            add_recording_deletion_timestamp(candidate)
     except Exception as exc:
         if candidate is not engine:
             candidate.dispose()
@@ -2083,6 +2086,7 @@ def prune_recording_files(db: Session) -> dict[str, Any]:
         db.merge(SystemSetting(key=RECORDING_RETENTION_STATUS_KEY, value=json.dumps(result, separators=(",", ":"))))
         return result
     active_session_ids = set(db.execute(select(RemoteSession.id).where(RemoteSession.status.not_in({"closed", "failed"}))).scalars().all())
+    removed_sessions = set()
     for candidate in candidates:
         session_id = recording_session_id_from_name(candidate.name)
         if not session_id or session_id in active_session_ids or candidate.is_symlink():
@@ -2095,6 +2099,15 @@ def prune_recording_files(db: Session) -> dict[str, Any]:
             resolved.unlink()
             result["deletedFiles"] += 1
             result["deletedBytes"] += stat.st_size
+            removed_sessions.add(session_id)
+        except OSError:
+            result["errors"] += 1
+    for session_id in removed_sessions:
+        try:
+            if not deletion_files(settings.recording_root, session_id):
+                session = db.get(RemoteSession, session_id)
+                if session and session.status in {"closed", "failed"}:
+                    session.recording_deleted_at = timestamp
         except OSError:
             result["errors"] += 1
     db.merge(SystemSetting(key=RECORDING_RETENTION_STATUS_KEY, value=json.dumps(result, separators=(",", ":"))))
@@ -2773,6 +2786,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
         Base.metadata.create_all(candidate)
         detach_recording_history_users(candidate)
         widen_remote_session_actor(candidate)
+        add_recording_deletion_timestamp(candidate)
         candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
         with candidate_factory() as db:
             ensure_builtin_roles(db)
@@ -4857,11 +4871,13 @@ class DeletionReviewRequest(BaseModel):
 
 @app.get("/api/v1/deletion-approvals")
 def list_deletion_approvals(user: User = Depends(require_any_permission("deletions.request", "deletions.approve")), db: Session = Depends(db_session)):
-    query = select(DeletionApproval, Server.name, DeletionApproval.requested_by_username).join(Server, Server.id == DeletionApproval.server_id)
+    query = select(DeletionApproval, Server.name, DeletionApproval.requested_by_username, Job.status).join(Server, Server.id == DeletionApproval.server_id).outerjoin(Job, Job.id == DeletionApproval.job_id)
     if user.role != "admin":
         query = query.where(DeletionApproval.requested_by == user.id)
-    rows = db.execute(query.order_by(DeletionApproval.created_at.desc()).limit(200)).all()
-    return {"items": [{"id": row.id, "serverName": name, "action": row.action, "parameters": row.parameters, "reason": row.reason, "status": row.status, "requestedBy": username, "reviewedBy": row.reviewed_by, "jobId": row.job_id, "createdAt": aware(row.created_at).isoformat()} for row, name, username in rows]}
+    active = (DeletionApproval.status == "pending") & (DeletionApproval.created_at > now() - timedelta(hours=24))
+    rows = db.execute(query.where(active).order_by(DeletionApproval.created_at.desc())).all()
+    rows += db.execute(query.where(~active).order_by(DeletionApproval.created_at.desc()).limit(200)).all()
+    return {"items": [{"id": row.id, "serverName": name, "action": row.action, "parameters": row.parameters, "reason": row.reason, "status": row.status, "requestedBy": username, "reviewedBy": row.reviewed_by, "jobId": row.job_id, "createdAt": aware(row.created_at).isoformat(), "requestedById": row.requested_by, "expiresAt": (aware(row.created_at) + timedelta(hours=24)).isoformat(), "jobStatus": job_status} for row, name, username, job_status in rows]}
 
 
 @app.post("/api/v1/deletion-approvals/{approval_id}/review")
@@ -5533,13 +5549,85 @@ def list_audit(
 
 @app.get("/api/v1/sessions")
 def list_sessions(user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
-    rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).where(RemoteSession.server_id.in_(visible_server_ids(db, user))).order_by(RemoteSession.started_at.desc()).limit(200)).all()
+    reconcile_interrupted_recording_deletions(db)
+    reconcile_deleted_recordings(db)
+    rows = db.execute(select(RemoteSession, Server.name).join(Server, Server.id == RemoteSession.server_id).where(RemoteSession.recording_deleted_at.is_(None), RemoteSession.server_id.in_(visible_server_ids(db, user))).order_by(RemoteSession.started_at.desc()).limit(200)).all()
     items = []
     for item, server_name in rows:
         paths, recording_status = recording_probe(item.id)
         path = paths[0] if paths else None
-        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username if user.role == "admin" else "Tài khoản được quản trị", "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": path.stat().st_size if path else 0, "recordingStatus": recording_status, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
+        size = 0
+        if path:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                path, recording_status = None, "missing"
+        try:
+            deletable = item.status in {"closed", "failed"} and bool(deletion_files(settings.recording_root, item.id))
+        except OSError:
+            deletable = False
+        items.append({"id": item.id, "serverId": item.server_id, "serverName": server_name, "protocol": item.protocol, "username": item.remote_username if user.role == "admin" else "Tài khoản được quản trị", "createdBy": item.created_by, "status": item.status, "recordingName": item.recording_name, "recordingAvailable": path is not None, "recordingSizeBytes": size, "recordingDeletable": deletable, "recordingStatus": recording_status, "startedAt": aware(item.started_at).isoformat(), "finishedAt": aware(item.finished_at).isoformat() if item.finished_at else None})
     return {"items": items}
+
+
+def reconcile_interrupted_recording_deletions(db: Session) -> None:
+    """Recover durable approvals whose worker exited after filesystem changes.
+
+    The deletion worker holds a row lock for its entire filesystem phase.
+    SKIP LOCKED leaves live work alone; the two-minute grace also covers the
+    small gap between committing the approval and taking that lock.
+    This reconciles metadata only and never removes another file.
+    """
+    interrupted = db.execute(select(RecordingDeletionRequest).where(
+        RecordingDeletionRequest.status == "deleting",
+        RecordingDeletionRequest.approved_at < now() - timedelta(minutes=2)
+    ).with_for_update(skip_locked=True)).scalars().all()
+    for deletion in interrupted:
+        sessions = db.execute(select(RemoteSession).where(
+            RemoteSession.id.in_(deletion.session_ids))).scalars().all()
+        if len(sessions) != len(deletion.session_ids) or any(
+                item.status not in {"closed", "failed"} for item in sessions):
+            continue
+        try:
+            remaining = {item.id: deletion_files(settings.recording_root, item.id) for item in sessions}
+        except OSError:
+            continue
+        timestamp = now()
+        for session in sessions:
+            if not remaining[session.id]:
+                session.recording_deleted_at = session.recording_deleted_at or timestamp
+        complete = not any(remaining.values())
+        deletion.status = "deleted" if complete else "failed"
+        deletion.completed_at = timestamp
+        deletion.error = "" if complete else "Lượt xóa trước bị gián đoạn; có thể gửi lại phần tệp còn lại để phê duyệt."
+        audit(db, "system:recording-deletion", "session.recording.delete.recovered", deletion.id,
+              result="success" if complete else "partial",
+              detail={"session_ids": deletion.session_ids, "remaining_sessions": [key for key, value in remaining.items() if value]})
+    if interrupted:
+        db.commit()
+
+
+def reconcile_deleted_recordings(db: Session) -> None:
+    """Repair old successful deletions only after verifying healthy empty storage."""
+    requests = db.execute(select(RecordingDeletionRequest).where(
+        RecordingDeletionRequest.status == "deleted")).scalars().all()
+    completed = {session_id: item.completed_at or item.approved_at or item.created_at
+                 for item in requests for session_id in item.session_ids}
+    if not completed:
+        return
+    sessions = db.execute(select(RemoteSession).where(
+        RemoteSession.id.in_(completed), RemoteSession.recording_deleted_at.is_(None),
+        RemoteSession.status.in_(["closed", "failed"]))).scalars().all()
+    changed = False
+    for session in sessions:
+        try:
+            if not deletion_files(settings.recording_root, session.id):
+                session.recording_deleted_at = completed[session.id]
+                changed = True
+        except OSError:
+            continue
+    if changed:
+        db.commit()
 
 
 def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[list[Path], str]:
@@ -5560,6 +5648,7 @@ def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[
     except OSError:
         return [], "root_unreadable"
     matches: list[Path] = []
+    modified: dict[Path, float] = {}
     saw_empty = False
     saw_denied = False
     for candidate in candidates:
@@ -5570,7 +5659,8 @@ def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[
             resolved = candidate.resolve(strict=True)
             if resolved.parent != root or not resolved.is_file():
                 continue
-            if resolved.stat().st_size <= 0:
+            metadata = resolved.stat()
+            if metadata.st_size <= 0:
                 saw_empty = True
                 continue
         except PermissionError:
@@ -5583,7 +5673,8 @@ def recording_probe(session_id: str, include_typescript: bool = False) -> tuple[
             if suffix == ".typescript" or suffix.startswith(".typescript."):
                 continue
         matches.append(resolved)
-    ordered = sorted(matches, key=lambda item: item.stat().st_mtime, reverse=True)
+        modified[resolved] = metadata.st_mtime
+    ordered = sorted(matches, key=lambda item: modified[item], reverse=True)
     if ordered:
         return ordered, "available"
     if saw_denied:
@@ -5658,10 +5749,13 @@ def update_recording_retention(payload: RecordingRetentionRequest, request: Requ
 
 @app.get("/api/v1/recording-deletion-requests")
 def list_recording_deletion_requests(user: User = Depends(require_any_permission("recordings.delete", "deletions.request")), db: Session = Depends(db_session)):
+    reconcile_interrupted_recording_deletions(db)
     query = select(RecordingDeletionRequest)
     if user.role != "admin":
         query = query.where(RecordingDeletionRequest.requested_by == user.id)
-    rows = db.execute(query.order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
+    active = RecordingDeletionRequest.status.in_(["pending", "deleting"])
+    rows = db.execute(query.where(active).order_by(RecordingDeletionRequest.created_at.desc())).scalars().all()
+    rows += db.execute(query.where(~active).order_by(RecordingDeletionRequest.created_at.desc()).limit(100)).scalars().all()
     return {"items": [recording_deletion_json(item, db) for item in rows]}
 
 
@@ -5670,14 +5764,17 @@ def create_recording_deletion_request(payload: RecordingDeletionCreateRequest, r
     session_ids = list(dict.fromkeys(payload.session_ids))
     if len(session_ids) != len(payload.session_ids) or any(not re.fullmatch(r"[0-9a-fA-F-]{36}", item) for item in session_ids):
         raise HTTPException(status_code=400, detail="Danh sách recording không hợp lệ hoặc bị trùng")
-    sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(session_ids))).scalars().all()
+    sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(session_ids)).order_by(RemoteSession.id).with_for_update()).scalars().all()
     if any(item.server_id not in visible_server_ids(db, user) for item in sessions):
         raise HTTPException(status_code=404, detail="Session not found")
     if len(sessions) != len(session_ids):
         raise HTTPException(status_code=404, detail="Có session không còn tồn tại")
-    if any(item.status not in {"closed", "failed"} for item in sessions):
-        raise HTTPException(status_code=409, detail="Chỉ được yêu cầu xóa recording của phiên đã kết thúc")
-    unavailable = [item.id for item in sessions if recording_file(item.id) is None]
+    if any(item.recording_deleted_at or item.status not in {"closed", "failed"} for item in sessions):
+        raise HTTPException(status_code=409, detail="Chỉ được yêu cầu xóa recording còn tồn tại của phiên đã kết thúc")
+    try:
+        unavailable = [item.id for item in sessions if not deletion_files(settings.recording_root, item.id)]
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail="Không đọc được kho recording; chưa tạo yêu cầu xóa") from exc
     if unavailable:
         raise HTTPException(status_code=409, detail="Có recording chưa sẵn sàng; hãy tải lại danh sách")
     pending = db.execute(select(RecordingDeletionRequest).where(RecordingDeletionRequest.status.in_(["pending", "deleting"]))).scalars().all()
@@ -5699,7 +5796,14 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
         raise HTTPException(status_code=404, detail="Yêu cầu xóa recording không tồn tại")
     if deletion.requested_by == user.id:
         raise HTTPException(status_code=409, detail="Người tạo yêu cầu không được tự duyệt; cần quản trị viên thứ hai")
+    requester = db.get(User, deletion.requested_by)
+    if (not requester or not requester.enabled or
+            not {"recordings.delete", "deletions.request"}.intersection(platform_role_permissions(db, requester.role))):
+        raise HTTPException(status_code=409, detail="Người yêu cầu không còn quyền xóa recording")
     sessions = db.execute(select(RemoteSession).where(RemoteSession.id.in_(deletion.session_ids))).scalars().all()
+    if len(sessions) != len(deletion.session_ids) or any(
+            item.server_id not in visible_server_ids(db, requester) for item in sessions):
+        raise HTTPException(status_code=409, detail="Quyền truy cập phiên của người yêu cầu đã thay đổi")
     if any(item.status not in {"closed", "failed"} for item in sessions):
         raise HTTPException(status_code=409, detail="Không được xóa recording của phiên chưa kết thúc")
     claimed_at = now()
@@ -5707,14 +5811,25 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
     if result.rowcount != 1:
         db.rollback()
         raise HTTPException(status_code=409, detail="Yêu cầu này không còn ở trạng thái chờ duyệt")
+    audit(db, user.username, "session.recording.delete.approving", deletion_id, request,
+          detail={"requested_by": deletion.requested_by_username, "session_ids": deletion.session_ids})
     db.commit()
-    deletion = db.get(RecordingDeletionRequest, deletion_id)
+    # Keep this lock through all unlinks and the completion audit transaction.
+    # Recovery skips this row while the worker is still processing it.
+    deletion = db.execute(select(RecordingDeletionRequest).where(
+        RecordingDeletionRequest.id == deletion_id).with_for_update()
+        .execution_options(populate_existing=True)).scalar_one()
+    if deletion.status != "deleting":
+        return recording_deletion_json(deletion, db)
     deleted_files: list[str] = []
     try:
+        # Validate the whole batch before removing the first file.
         for session_id in deletion.session_ids:
-            for path in recording_files(session_id, include_typescript=True):
-                path.unlink()
-                deleted_files.append(path.name)
+            deletion_files(settings.recording_root, session_id)
+        for session_id in deletion.session_ids:
+            delete_recording(settings.recording_root, session_id, deleted_files)
+            session = db.get(RemoteSession, session_id)
+            session.recording_deleted_at = now()
         deletion.status = "deleted"
         deletion.completed_at = now()
         audit(db, user.username, "session.recording.delete.approve", deletion.id, request, detail={"requested_by": deletion.requested_by_username, "session_ids": deletion.session_ids, "files_deleted": len(deleted_files)})
@@ -5727,6 +5842,29 @@ def approve_recording_deletion_request(deletion_id: str, request: Request, user:
         db.commit()
         raise HTTPException(status_code=500, detail="Không thể xóa toàn bộ recording; xem nhật ký kiểm toán") from exc
     return recording_deletion_json(deletion, db)
+
+
+@app.post("/api/v1/recording-deletion-requests/{deletion_id}/reject")
+def reject_recording_deletion_request(deletion_id: str, request: Request,
+        user: User = Depends(require_permission("recordings.delete")), db: Session = Depends(db_session)):
+    require_server_admin(user)
+    deletion = db.get(RecordingDeletionRequest, deletion_id)
+    if not deletion:
+        raise HTTPException(status_code=404, detail="Yêu cầu xóa recording không tồn tại")
+    if deletion.requested_by == user.id:
+        raise HTTPException(status_code=409, detail="Người tạo yêu cầu không được tự duyệt; cần quản trị viên thứ hai")
+    timestamp = now()
+    claimed = db.execute(update(RecordingDeletionRequest).where(
+        RecordingDeletionRequest.id == deletion_id, RecordingDeletionRequest.status == "pending"
+    ).values(status="rejected", approved_by=user.id, approved_by_username=user.username,
+             approved_at=timestamp, completed_at=timestamp))
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Yêu cầu này đã được xử lý")
+    audit(db, user.username, "session.recording.delete.reject", deletion_id, request,
+          detail={"session_ids": deletion.session_ids, "requested_by": deletion.requested_by_username})
+    db.commit()
+    return recording_deletion_json(db.get(RecordingDeletionRequest, deletion_id), db)
 
 
 def require_remote_credential_admin(user: User) -> None:
@@ -5864,7 +6002,7 @@ def list_available_remote_credentials(server_id: str, protocol: Literal["ssh", "
 @app.get("/api/v1/sessions/{session_id}/recording")
 def read_recording(session_id: str, request: Request, user: User = Depends(require_permission("recordings.view")), db: Session = Depends(db_session)):
     session = db.get(RemoteSession, session_id)
-    if not session or session.server_id not in visible_server_ids(db, user):
+    if not session or session.recording_deleted_at or session.server_id not in visible_server_ids(db, user):
         raise HTTPException(status_code=404, detail="Session not found")
     path = recording_file(session.id)
     if not path:

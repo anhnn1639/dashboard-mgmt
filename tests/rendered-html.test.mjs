@@ -419,8 +419,8 @@ test("firewall rules are searchable and filterable", async () => {
 test("recording deletion requires a distinct second administrator", async () => {
   const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
   assert.match(source, /recording-deletion-requests/);
-  assert.match(source, /Người tạo yêu cầu không được tự duyệt/);
-  assert.match(source, /Chờ quản trị viên khác/);
+  assert.match(source, /Xem yêu cầu tại Phê duyệt/);
+  assert.doesNotMatch(source, /approveRecordingDeletion|recording-approval-list/);
   assert.match(source, /Gửi yêu cầu xóa/);
   assert.match(source, /selectedRecordingIds/);
   assert.match(source, /Lý do \/ ticket là bắt buộc/);
@@ -1259,4 +1259,73 @@ test("Web console explains recorded automatic login and manual OTP without reque
   assert.match(source, /OTP\/CAPTCHA/);
   assert.doesNotMatch(source, /chưa tự điền mật khẩu|chỉ dùng để kiểm tra quyền/);
   assert.doesNotMatch(source, /name="password"|type="password"/);
+});
+
+
+test("central approvals merge both queues, preserve review payloads and enforce distinct authorized admins", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const source = await readFile(new URL("../app/role-workspaces.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const exports = {};
+  const calls = [];
+  const operation = { id: "same-id", serverName: "Server A", action: "server.delete", parameters: {}, reason: "ticket",
+    requestedBy: "alice", requestedById: "alice-id", status: "pending", createdAt: "2026-09-11T10:00:00Z", expiresAt: "2099-01-01T00:00:00Z" };
+  const recording = { id: "same-id", sessions: [{ label: "Recording A" }], requestedBy: "alice-id", requestedByUsername: "alice", status: "pending", createdAt: "2026-09-11T11:00:00Z" };
+  runInNewContext(compiled, { exports, React, require, fetch: async (path, options) => {
+    calls.push(path);
+    assert.equal(options.cache, "no-store");
+    return { ok: true, json: async () => ({ items: [path.includes("recording") ? recording : operation] }) };
+  } });
+  const items = await exports.loadApprovals("fixture", ["deletions.approve", "recordings.delete"]);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].kind, "recording");
+  assert.equal(items[1].kind, "operation");
+  for (const item of items) {
+    assert.equal(item.requestedBy, "alice");
+    assert.equal(item.requestedById, "alice-id");
+    assert.equal(exports.canReviewApproval(item, { id: "alice-id", role: "admin", permissions: ["recordings.delete", "deletions.approve"] }), false);
+    assert.equal(exports.canReviewApproval(item, { id: "bob", role: "operator", permissions: ["recordings.delete", "deletions.approve"] }), false);
+    assert.equal(exports.canReviewApproval(item, { id: "bob", role: "admin", permissions: [] }), false);
+    assert.equal(exports.canReviewApproval(item, { id: "bob", role: "admin", permissions: ["recordings.delete", "deletions.approve"] }), true);
+    assert.equal(exports.canReviewApproval({ ...item, status: "deleted" }, { id: "bob", role: "admin", permissions: ["recordings.delete", "deletions.approve"] }), false);
+    for (const decision of ["approve", "reject"]) {
+      const request = exports.approvalReviewRequest(item, decision);
+      assert.equal(request.url, item.kind === "recording" ? `/api/v1/recording-deletion-requests/same-id/${decision}` : "/api/v1/deletion-approvals/same-id/review");
+      assert.equal(request.body, item.kind === "recording" ? undefined : JSON.stringify({ decision }));
+    }
+  }
+  assert.equal(exports.approvalStatus({ ...items[1], expiresAt: "2000-01-01T00:00:00Z" }), "expired");
+  calls.length = 0;
+  assert.equal((await exports.loadApprovals("fixture", ["recordings.delete"])).length, 1);
+  assert.deepEqual(calls, ["/api/v1/recording-deletion-requests"]);
+  calls.length = 0;
+  assert.equal((await exports.loadApprovals("fixture", ["deletions.approve"])).length, 1);
+  assert.deepEqual(calls, ["/api/v1/deletion-approvals"]);
+  calls.length = 0;
+  assert.equal((await exports.loadApprovals("fixture", [])).length, 0);
+  assert.deepEqual(calls, []);
+});
+
+test("late approval refresh cannot restore a row removed by a newer response", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const source = await readFile(new URL("../app/role-workspaces.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const exports = {}, callbacks = [], pending = [], writes = [];
+  let index = 0;
+  const hooks = { ...React, useState: (value) => { const slot = index++; return [value, (next) => { if (slot === 0) writes.push(next); }]; },
+    useRef: (value) => ({ current: value }), useCallback: (fn) => { callbacks.push(fn); return fn; }, useEffect() {} };
+  runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : require(name),
+    fetch: () => new Promise((resolve) => pending.push(resolve)) });
+  exports.ApprovalsView({ token: "fixture", currentUser: { id: "bob", role: "admin", permissions: ["recordings.delete"] } });
+  const first = callbacks[0](), second = callbacks[0]();
+  pending[1]({ ok: true, json: async () => ({ items: [] }) });
+  await second;
+  pending[0]({ ok: true, json: async () => ({ items: [{ id: "old", sessions: [], createdAt: "2026-01-01", status: "pending" }] }) });
+  await first;
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].length, 0);
 });

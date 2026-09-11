@@ -5,7 +5,7 @@ import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEven
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 import { UpdateSourceSettingsView } from "./update-source-settings";
 import { RemoteCredentialsView } from "./remote-credentials";
-import { DeletionApprovalsView, ReadOnlyWorkspace } from "./role-workspaces";
+import { ApprovalsView, ReadOnlyWorkspace } from "./role-workspaces";
 import { ManagedTargetsView } from "./managed-targets";
 
 type OSFamily = "linux" | "windows";
@@ -105,7 +105,7 @@ const navItems: Array<{ id: string; icon: string; label: string; group: string; 
   { id: "web", icon: "◎", label: "Web console", group: "infrastructure", permissions: ["servers.view"] },
   { id: "sessions", icon: "↗", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
   { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["jobs.view"] },
-  { id: "approvals", icon: "✓", label: "Phê duyệt xóa", group: "operations", permissions: ["deletions.request", "deletions.approve"] },
+  { id: "approvals", icon: "✓", label: "Phê duyệt", group: "operations", permissions: ["deletions.request", "deletions.approve", "recordings.delete"] },
   { id: "configuration-view", icon: "⚙", label: "Xem cấu hình", group: "operations", permissions: ["configuration.view"] },
   { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
   { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
@@ -956,7 +956,7 @@ export function OpsConsole() {
     window.history.pushState(null, "", sectionRoute(section));
   }
 
-  const title = active === "network" ? "Thiết bị mạng" : active === "web" ? "Web console" : active === "approvals" ? "Phê duyệt xóa" : active === "logs" ? "Log máy chủ" : active === "configuration-view" ? "Xem cấu hình" :
+  const title = active === "network" ? "Thiết bị mạng" : active === "web" ? "Web console" : active === "approvals" ? "Phê duyệt" : active === "logs" ? "Log máy chủ" : active === "configuration-view" ? "Xem cấu hình" :
     active === "linux"
       ? "Máy chủ Linux"
       : active === "windows"
@@ -1346,7 +1346,7 @@ export function OpsConsole() {
               permissions={currentUser.permissions}
               readOnly={currentUser.role === "viewer"}
             />
-          ) : active === "approvals" ? <DeletionApprovalsView token={token} isAdmin={currentUser.role === "admin"} /> : active === "logs" || active === "configuration-view" ? <ReadOnlyWorkspace key={active} token={token} kind={active === "logs" ? "logs" : "configuration"} /> : active === "sessions" ? (
+          ) : active === "approvals" ? <ApprovalsView token={token} currentUser={currentUser} /> : active === "logs" || active === "configuration-view" ? <ReadOnlyWorkspace key={active} token={token} kind={active === "logs" ? "logs" : "configuration"} /> : active === "sessions" ? (
             <SessionsView token={token} />
           ) : active === "jobs" ? (
             <JobsView token={token} servers={servers} />
@@ -3679,6 +3679,7 @@ type SessionRecord = {
   createdBy: string;
   status: string;
   recordingAvailable: boolean;
+  recordingDeletable?: boolean;
   recordingSizeBytes: number;
   recordingStatus?: string;
   startedAt: string;
@@ -3854,16 +3855,42 @@ function AuditView({ token }: { token: string }) {
   const [retentionModal, setRetentionModal] = useState(false);
   const [recordingBusy, setRecordingBusy] = useState(false);
   const [recordingMessage, setRecordingMessage] = useState("");
-  const loadSessions = useCallback(() =>
-    fetch("/api/v1/sessions", { headers: { Authorization: `Bearer ${token}` } })
-      .then((response) => (response.ok ? response.json() : Promise.reject()))
-      .then((data) => setSessions(data.items ?? []))
-      .catch(() => setSessions([])), [token]);
-  const loadDeletionRequests = useCallback(() =>
-    fetch("/api/v1/recording-deletion-requests", { headers: { Authorization: `Bearer ${token}` } })
-      .then((response) => (response.ok ? response.json() : Promise.reject()))
-      .then((data) => setDeletionRequests(data.items ?? []))
-      .catch(() => setDeletionRequests([])), [token]);
+  const sessionLoadGeneration = useRef(0);
+  const deletionLoadGeneration = useRef(0);
+  const pendingRecordingIds = useRef(new Set<string>());
+  const loadSessions = useCallback(async () => {
+    const generation = ++sessionLoadGeneration.current;
+    try {
+      const response = await fetch("/api/v1/sessions", { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (!response.ok) throw new Error("Không tải được danh sách video. Hãy làm mới để thử lại.");
+      const data = await response.json();
+      if (generation !== sessionLoadGeneration.current) return;
+      const updated: SessionRecord[] = data.items ?? [];
+      const selectableIds = new Set(updated.filter((item) => ["closed", "failed"].includes(item.status)
+        && (item.recordingDeletable ?? item.recordingAvailable) && !pendingRecordingIds.current.has(item.id)).map((item) => item.id));
+      const ids = new Set(updated.map((item) => item.id));
+      setSessions(updated);
+      setSelectedRecordingIds((selected) => selected.filter((id) => selectableIds.has(id)));
+      setSelectedRecording((selected) => selected && ids.has(selected.id) ? selected : null);
+    } catch (error) {
+      if (generation === sessionLoadGeneration.current)
+        setRecordingMessage(error instanceof Error ? error.message : "Không tải được danh sách video.");
+    }
+  }, [token]);
+  const loadDeletionRequests = useCallback(async () => {
+    const generation = ++deletionLoadGeneration.current;
+    try {
+      const response = await fetch("/api/v1/recording-deletion-requests", { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (generation !== deletionLoadGeneration.current) return;
+      const updated: RecordingDeletionRequest[] = data.items ?? [];
+      const pending = new Set(updated.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
+      pendingRecordingIds.current = pending;
+      setDeletionRequests(updated);
+      setSelectedRecordingIds((selected) => selected.filter((id) => !pending.has(id)));
+    } catch { /* Keep the last list on a transient read failure. */ }
+  }, [token]);
   const loadRecordingRetention = useCallback(() =>
     fetch("/api/v1/settings/recording-retention", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
@@ -3890,18 +3917,26 @@ function AuditView({ token }: { token: string }) {
     }
   }, [auditResult, token]);
   useEffect(() => {
+    const sessionsGeneration = sessionLoadGeneration, requestsGeneration = deletionLoadGeneration;
     fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then(setCurrentUser)
       .catch(() => setCurrentUser(null));
-    void loadSessions();
-    void loadDeletionRequests();
-    void loadRecordingRetention();
+    const initial = window.setTimeout(() => { void loadSessions(); void loadDeletionRequests(); void loadRecordingRetention(); }, 0);
+    return () => { ++sessionsGeneration.current; ++requestsGeneration.current; window.clearTimeout(initial); };
   }, [token, loadSessions, loadDeletionRequests, loadRecordingRetention]);
   useEffect(() => {
     const auditTimer = window.setTimeout(() => void loadAudit(), 300);
     return () => window.clearTimeout(auditTimer);
   }, [loadAudit]);
+  useEffect(() => {
+    if (tab !== "recordings") return;
+    const refresh = () => { void loadSessions(); void loadDeletionRequests(); };
+    const initial = window.setTimeout(refresh, 0);
+    const timer = window.setInterval(refresh, 10000);
+    window.addEventListener("focus", refresh);
+    return () => { window.clearTimeout(initial); window.clearInterval(timer); window.removeEventListener("focus", refresh); };
+  }, [tab, loadSessions, loadDeletionRequests]);
   const normalizedAuditSearch = normalizeSearchText(auditSearch);
   const visibleAuditRows = useMemo(() => normalizedAuditSearch
     ? rows.filter((row) => normalizeSearchText([
@@ -3917,10 +3952,11 @@ function AuditView({ token }: { token: string }) {
       ].join(" ")).includes(normalizedAuditSearch))
     : rows, [normalizedAuditSearch, rows]);
   const pendingSessionIds = new Set(deletionRequests.filter((item) => ["pending", "deleting"].includes(item.status)).flatMap((item) => item.sessionIds));
-  const selectableSessions = sessions.filter((session) => ["closed", "failed"].includes(session.status) && session.recordingAvailable && !pendingSessionIds.has(session.id));
+  const selectableSessions = sessions.filter((session) => ["closed", "failed"].includes(session.status) && (session.recordingDeletable ?? session.recordingAvailable) && !pendingSessionIds.has(session.id));
+  const selectableBatch = selectableSessions.slice(0, 100);
   const selectedSessions = sessions.filter((session) => selectedRecordingIds.includes(session.id));
   function toggleRecording(sessionId: string) {
-    setSelectedRecordingIds((current) => current.includes(sessionId) ? current.filter((item) => item !== sessionId) : [...current, sessionId]);
+    setSelectedRecordingIds((current) => current.includes(sessionId) ? current.filter((item) => item !== sessionId) : current.length < 100 ? [...current, sessionId] : current);
   }
   async function requestRecordingDeletion() {
     if (selectedRecordingIds.length === 0) return setDeleteValidation("Hãy chọn ít nhất một recording còn khả dụng.");
@@ -3937,7 +3973,7 @@ function AuditView({ token }: { token: string }) {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) return setDeleteValidation(data.detail ?? "Không thể tạo yêu cầu xóa recording.");
-      setRecordingMessage("Đã tạo yêu cầu. Video chỉ bị xóa sau khi một quản trị viên khác duyệt.");
+      setRecordingMessage("Đã gửi đến Phê duyệt. Video sẽ được xóa khi một quản trị viên khác duyệt.");
       setSelectedRecordingIds([]);
       setDeleteModal(false);
       setDeleteReason("");
@@ -3974,15 +4010,6 @@ function AuditView({ token }: { token: string }) {
     } finally {
       setRecordingBusy(false);
     }
-  }
-  async function approveRecordingDeletion(item: RecordingDeletionRequest) {
-    setRecordingBusy(true);
-    setRecordingMessage("");
-    const response = await fetch(`/api/v1/recording-deletion-requests/${item.id}/approve`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-    const data = await response.json().catch(() => ({}));
-    setRecordingMessage(response.ok ? `Đã duyệt và xóa ${item.sessionIds.length} recording.` : data.detail ?? "Không thể duyệt yêu cầu xóa");
-    await Promise.all([loadSessions(), loadDeletionRequests()]);
-    setRecordingBusy(false);
   }
   return (
     <>
@@ -4061,24 +4088,18 @@ function AuditView({ token }: { token: string }) {
           <div className="recording-management">
             {currentUser?.permissions?.some((permission) => ["recordings.delete", "deletions.request"].includes(permission)) && (
               <div className="recording-actions">
-                <label><input type="checkbox" checked={selectableSessions.length > 0 && selectableSessions.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableSessions.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableSessions.map((session) => session.id))} /> Chọn tất cả video khả dụng</label>
+                <label><input type="checkbox" checked={selectableBatch.length > 0 && selectableBatch.every((session) => selectedRecordingIds.includes(session.id))} onChange={() => setSelectedRecordingIds(selectableBatch.every((session) => selectedRecordingIds.includes(session.id)) ? [] : selectableBatch.map((session) => session.id))} /> Chọn video có thể xóa (tối đa 100)</label>
                 <span>{selectedRecordingIds.length} video đang chọn</span>
                 {currentUser.role === "admin" && <><span>{retention.enabled ? `Tự động xóa sau ${retention.days} ngày` : "Tự động xóa đang tắt"}</span><button className="resource-icon-button settings" type="button" title="Cấu hình thời gian lưu recording" onClick={() => setRetentionModal(true)}>⚙</button></>}
                 <button className="button danger" disabled={selectedRecordingIds.length === 0} onClick={() => { setDeleteValidation(""); setDeleteModal(true); }}>Xóa video đã chọn</button>
               </div>
             )}
             {recordingMessage && <div className="recording-message">{recordingMessage}</div>}
-            {currentUser?.permissions?.includes("recordings.delete") && deletionRequests.some((item) => item.status === "pending") && (
-              <div className="recording-approval-list">
-                <h3>Yêu cầu xóa đang chờ Administrator duyệt</h3>
-                {deletionRequests.filter((item) => item.status === "pending").map((item) => (
-                  <div key={item.id}>
-                    <p><b>{item.requestedByUsername}</b><small>{item.sessions.map((session) => session.label).join("\n")}</small><em>{item.reason}</em></p>
-                    <button className="button primary" disabled={recordingBusy || item.requestedBy === currentUser.id} title={item.requestedBy === currentUser.id ? "Người tạo yêu cầu không được tự duyệt" : "Duyệt và xóa video"} onClick={() => void approveRecordingDeletion(item)}>{item.requestedBy === currentUser.id ? "Chờ quản trị viên khác" : "Duyệt & xóa"}</button>
-                  </div>
-                ))}
-              </div>
-            )}
+            <div className="recording-actions">
+              <button className="button ghost" onClick={() => { void loadSessions(); void loadDeletionRequests(); }}>Làm mới</button>
+              {currentUser?.permissions?.some((permission) => ["recordings.delete", "deletions.request"].includes(permission)) &&
+                <a className="button ghost" href="#/approvals">Xem yêu cầu tại Phê duyệt</a>}
+            </div>
             <div className="recording-list audit-recordings">
             {sessions.length ? (
               sessions.map((session) => (

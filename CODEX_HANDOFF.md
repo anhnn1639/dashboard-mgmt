@@ -1,5 +1,20 @@
 # Bàn giao Codex — 11/09/2026
 
+## Phê duyệt tập trung và xóa nội dung — bản sửa hoàn tất, chờ CI/deploy
+
+- Menu đổi thành **Phê duyệt**; hợp nhất yêu cầu xóa thiết bị/tài nguyên và video, giữ đúng quyền của từng API. Trang video chỉ gửi yêu cầu và dẫn tới Phê duyệt. Admin khác người gửi mới được duyệt/từ chối; kiểm lại quyền/người yêu cầu trước xóa. Các yêu cầu đang chờ không bị 100/200 dòng lịch sử mới che mất. Có bộ lọc lịch sử và trạng thái thực thi tác vụ.
+- PostgreSQL thêm nullable `remote_sessions.recording_deleted_at` bằng migration idempotent ở cả activate/setup. Chỉ đánh dấu sau khi đã xóa hết biến thể; danh sách lọc trước LIMIT, playback từ chối marker. Giữ nguyên session, actor snapshot và audit. Đối soát request deleted cũ chỉ ẩn khi kho truy cập được và không còn file; file rỗng/typescript vẫn phải được xóa, không coi lỗi mount là đã xóa.
+- Xóa duyệt: khóa phiên khi tạo request để tránh trùng; audit chấp thuận được commit trước unlink. Kiểm toàn bộ batch trước khi xóa, không theo symlink/không xóa directory; giữ số tệp thực đã xóa và marker các phiên hoàn tất nếu batch lỗi. Phân biệt có thể phát/có thể xóa để retry phần còn typescript. Retention chỉ đánh dấu sau khi hết mọi biến thể, không đụng phiên đang hoạt động.
+- Bổ sung phục hồi request deleting bị ngắt sau khi xóa file nhưng chưa commit audit/kết quả: worker giữ row lock xuyên suốt giai đoạn filesystem; đối soát sau 2 phút dùng SKIP LOCKED, bỏ qua worker còn chạy, chỉ cập nhật metadata và audit, không unlink. Phiên đã hết file được ẩn; phần còn file trở thành failed để gửi yêu cầu mới. Kho lỗi thì chưa kết luận.
+- UI tự làm mới khi mở tab/quay lại/cứ 10 giây và nút Làm mới; bỏ lựa chọn/player của video đã xóa, loại lựa chọn mới bị pending/không còn hợp lệ, bỏ phản hồi tải cũ và giới hạn 100 video mỗi yêu cầu đúng API.
+- Kiểm thử trước chốt: Toàn bộ API176 tests (164 pass/12 skip Windows/PostgreSQL), gồm15 bài recording (14 pass/1 symlink dành Linux). UI47/47, TypeScript/eslint và production build pass; bổ sung PostgreSQL migration + row-lock recovery cho CI. Kiểm giao diện fixture hai loại yêu cầu bằng Chromium local; chưa đọc được phiên Portal production do CUA vẫn lỗi helper_unknown_error.
+- Chưa deploy production. Sau push/CI, server cần pull main rồi chạy đúng lệnh user dùng: `bash deploy/deploy-dashboard.sh compose.test.yaml`. Các bản sửa trước đã đổi Guacamole image/extension thành clipboard-sync.4; deploy rebuild đồng bộ dashboard/API/Guacamole/Web console, không đổi Agent/cổng/dữ liệu.
+
+## CI SSH/RDP và Web console cập nhật
+
+- CI34593287702 trên302cd46: **Web console pass toàn bộ**, gồm standalone Chromium +8 profile (SSO đã lưu, bận6s, cert tự động, redirect/HTTP/delayed-font/recording/lease). Guacamole frontend SSH/RDP, Node, API/PostgreSQL, edge, SSH ed25519 và cisco-legacy pass. Chưa có xác nhận hết lỗi trên production.
+- Hai job SSH hết 10 phút vì tải package index Ubuntu: modern tải32.6MB trong539s, đã in cả3SSH PASS trước timeout cleanup; rsa-modern còn tải index, chưa chạy sshd. Sửa riêng image SSH fixture chỉ tải component main (tất cả15 gói cài đều ở main), giữ signed Ubuntu security/updates, retry tải3 và timeout20s, update --error-on=any. Không nới thời hạn job hay bỏ profile/assertion. Chờ CI xác nhận image sau sửa.
+
 ## SSH/RDP màn hình đen và kiểm tra frontend — đang xử lý
 
 - Production user chụp git HEAD89fe033; API/Guacamole được recreate2h trước, guacd1.6.0 healthy3tuần. Log bổ sung có JSON authentication success nhưng đoạn log không có kết nối SSH/RDP tương ứng; VNC lỗi là Webconsole cũ. Một Agent10.64.11.50 checkin422/tunnel403, cácAgentkhác200; không đủ bằng chứng quy màn hình đen chung về Agent đó.
@@ -18,9 +33,9 @@
 - Sourcea1f6db0, CI34575863866: standalone25browsertests pass;7/8webprofiles pass; delayed-font thất bại stagecapture kindError sau submit, lý do cụ thể bị log an toàn che. SSHciscolegacy lỗi tảiUbuntu package, chưa chạySSH; cácjobkhácpass.
 - Thêm sitecustomize chỉ mount vào container smoke để in lỗiCDP cụ thể từ website/tài khoản fixture. Không logexception thô ởproduction, không mở rộng retry mọiBrowserError. Stress local75navigation+POST chỉ tái hiệnTimeout, chưa tái hiệnError củaCI. ChờCI diagnostics để sửa đúng nguyên nhân.
 
-## Yêu cầu tiếp theo: Phê duyệt tập trung và nội dung đã xóa
+## Yêu cầu gốc: Phê duyệt tập trung và nội dung đã xóa
 
-- User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đang khảo sát UI/API, chưa triển khai phần này.
+- User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đã triển khai trong bản sửa ở đầu tài liệu; chờ xác nhận CI và deploy.
 
 ## Hồi quy capture sau tự đăng nhập — 11/09/2026
 

@@ -47,3 +47,17 @@ def widen_remote_session_actor(engine: Engine) -> bool:
             return False
         connection.execute(text("ALTER TABLE remote_sessions ALTER COLUMN created_by TYPE VARCHAR(80)"))
         return True
+
+
+def add_recording_deletion_timestamp(engine: Engine) -> bool:
+    """Keep session/audit history while hiding recordings removed successfully."""
+    if engine.dialect.name != "postgresql":
+        return False
+    with engine.begin() as connection:
+        connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+        connection.execute(text("SELECT pg_advisory_xact_lock(741603111)"))
+        if any(column["name"] == "recording_deleted_at"
+               for column in inspect(connection).get_columns("remote_sessions")):
+            return False
+        connection.execute(text("ALTER TABLE remote_sessions ADD COLUMN recording_deleted_at TIMESTAMPTZ NULL"))
+        return True

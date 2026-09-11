@@ -93,6 +93,50 @@ class WebDatabasePostgresTests(unittest.IsolatedAsyncioTestCase):
         await run_postgres(self.url, self.append)
 
 
+    async def test_recording_recovery_skips_live_worker_row_lock(self):
+        import tempfile
+        from datetime import timedelta
+        from sqlalchemy.orm import Session
+        m.Base.metadata.create_all(self.engine)
+        identifier, session_id, server_id = (str(uuid.uuid4()) for _ in range(3))
+        with Session(self.engine) as db:
+            db.add(m.Server(id=server_id, name="fixture", os_family="linux", os_name="fixture"))
+            db.flush()
+            db.add(m.RemoteSession(id=session_id, server_id=server_id, protocol="ssh",
+                remote_username="fixture", created_by="fixture", status="closed", recording_name=session_id))
+            db.add(m.RecordingDeletionRequest(id=identifier, session_ids=[session_id], reason="fixture",
+                status="deleting", requested_by=str(uuid.uuid4()), requested_by_username="fixture",
+                approved_at=m.now() - timedelta(minutes=3)))
+            db.commit()
+        with tempfile.TemporaryDirectory() as directory, patch.object(m.settings, "recording_root", directory):
+            with Session(self.engine) as worker:
+                worker.execute(select(m.RecordingDeletionRequest).where(
+                    m.RecordingDeletionRequest.id == identifier).with_for_update()).scalar_one()
+                started = time.monotonic()
+                with Session(self.engine) as recovery:
+                    m.reconcile_interrupted_recording_deletions(recovery)
+                    self.assertEqual(recovery.get(m.RecordingDeletionRequest, identifier).status, "deleting")
+                self.assertLess(time.monotonic() - started, 2)
+                worker.rollback()
+            with Session(self.engine) as recovery:
+                m.reconcile_interrupted_recording_deletions(recovery)
+                self.assertEqual(recovery.get(m.RecordingDeletionRequest, identifier).status, "deleted")
+                self.assertIsNotNone(recovery.get(m.RemoteSession, session_id).recording_deleted_at)
+
+    async def test_recording_deletion_marker_upgrade_preserves_old_sessions(self):
+        from app.schema_migrations import add_recording_deletion_timestamp
+        from sqlalchemy import inspect
+        with self.engine.begin() as db:
+            db.execute(text("CREATE TABLE remote_sessions (id VARCHAR(36) PRIMARY KEY, created_by VARCHAR(80) NOT NULL)"))
+            db.execute(text("INSERT INTO remote_sessions VALUES ('fixture', 'historical actor')"))
+        self.assertTrue(add_recording_deletion_timestamp(self.engine))
+        self.assertFalse(add_recording_deletion_timestamp(self.engine))
+        column = next(item for item in inspect(self.engine).get_columns("remote_sessions") if item["name"] == "recording_deleted_at")
+        self.assertTrue(column["nullable"])
+        with self.engine.connect() as db:
+            self.assertEqual(tuple(db.execute(text("SELECT id, created_by, recording_deleted_at FROM remote_sessions")).one()),
+                             ("fixture", "historical actor", None))
+
     async def test_long_username_schema_upgrade_preserves_history_and_is_idempotent(self):
         from app.schema_migrations import widen_remote_session_actor
         self.assertEqual(m.RemoteSession.__table__.c.created_by.type.length, 80)
