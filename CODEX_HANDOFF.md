@@ -1,7 +1,9 @@
 # Bàn giao Codex — 11/09/2026
 
-## Phê duyệt tập trung và xóa nội dung — bản sửa hoàn tất, chờ CI/deploy
+## Phê duyệt tập trung và xóa nội dung — đã push, CI đạt, chưa deploy
 
+- Source `be3a1406cc720a58e7633a9913e91f6e90c92159` đã push và đối chiếu remote main; working tree sạch sau commit. **CI34600584785 SUCCESS toàn bộ9job**: Node/UI47, API176/176 gồm PostgreSQL migration/row-lock recovery/symlink Linux, Agent, Guacamole frontend SSH/RDP, Web console toàn bộ8profile, edge và cả4profile SSH. Lần đầu modern/rsa-modern lỗi kết nối security.ubuntu.com:80 trước khi tạo sshd; rerun riêng hai job này đã pass. Không đổi source sau các kiểm thử này; commit kế tiếp chỉ cập nhật bàn giao.
+- Đọc HTTP công khai xác nhận production vẫn buildId `89fe03391608606394c84ae9b7058577e721326f`, builtAt2026-09-11T06:29:51.027Z (13:29 Việt Nam); app.css vẫn200 application/octet-stream và0byte. Do đó các bản sửa hiện chưa có hiệu lực trên website. CUA reset + getState vẫn helper_unknown_error, không đọc/điều khiển được tab user đã đăng nhập.
 - Menu đổi thành **Phê duyệt**; hợp nhất yêu cầu xóa thiết bị/tài nguyên và video, giữ đúng quyền của từng API. Trang video chỉ gửi yêu cầu và dẫn tới Phê duyệt. Admin khác người gửi mới được duyệt/từ chối; kiểm lại quyền/người yêu cầu trước xóa. Các yêu cầu đang chờ không bị 100/200 dòng lịch sử mới che mất. Có bộ lọc lịch sử và trạng thái thực thi tác vụ.
 - PostgreSQL thêm nullable `remote_sessions.recording_deleted_at` bằng migration idempotent ở cả activate/setup. Chỉ đánh dấu sau khi đã xóa hết biến thể; danh sách lọc trước LIMIT, playback từ chối marker. Giữ nguyên session, actor snapshot và audit. Đối soát request deleted cũ chỉ ẩn khi kho truy cập được và không còn file; file rỗng/typescript vẫn phải được xóa, không coi lỗi mount là đã xóa.
 - Xóa duyệt: khóa phiên khi tạo request để tránh trùng; audit chấp thuận được commit trước unlink. Kiểm toàn bộ batch trước khi xóa, không theo symlink/không xóa directory; giữ số tệp thực đã xóa và marker các phiên hoàn tất nếu batch lỗi. Phân biệt có thể phát/có thể xóa để retry phần còn typescript. Retention chỉ đánh dấu sau khi hết mọi biến thể, không đụng phiên đang hoạt động.
@@ -13,7 +15,7 @@
 ## CI SSH/RDP và Web console cập nhật
 
 - CI34593287702 trên302cd46: **Web console pass toàn bộ**, gồm standalone Chromium +8 profile (SSO đã lưu, bận6s, cert tự động, redirect/HTTP/delayed-font/recording/lease). Guacamole frontend SSH/RDP, Node, API/PostgreSQL, edge, SSH ed25519 và cisco-legacy pass. Chưa có xác nhận hết lỗi trên production.
-- Hai job SSH hết 10 phút vì tải package index Ubuntu: modern tải32.6MB trong539s, đã in cả3SSH PASS trước timeout cleanup; rsa-modern còn tải index, chưa chạy sshd. Sửa riêng image SSH fixture chỉ tải component main (tất cả15 gói cài đều ở main), giữ signed Ubuntu security/updates, retry tải3 và timeout20s, update --error-on=any. Không nới thời hạn job hay bỏ profile/assertion. Chờ CI xác nhận image sau sửa.
+- Hai job SSH hết 10 phút vì tải package index Ubuntu: modern tải32.6MB trong539s, đã in cả3SSH PASS trước timeout cleanup; rsa-modern còn tải index, chưa chạy sshd. Sửa riêng image SSH fixture chỉ tải component main (tất cả15 gói cài đều ở main), giữ signed Ubuntu security/updates, retry tải3 và timeout20s, update --error-on=any. Không nới thời hạn job hay bỏ profile/assertion. CI34600584785 đã xác nhận cả4profile SSH sau rerun lỗi mạng tạm thời.
 
 ## SSH/RDP màn hình đen và kiểm tra frontend — đang xử lý
 
@@ -35,7 +37,7 @@
 
 ## Yêu cầu gốc: Phê duyệt tập trung và nội dung đã xóa
 
-- User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đã triển khai trong bản sửa ở đầu tài liệu; chờ xác nhận CI và deploy.
+- User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đã triển khai và CI xác nhận trong bản sửa ở đầu tài liệu; còn deploy production.
 
 ## Hồi quy capture sau tự đăng nhập — 11/09/2026
 
