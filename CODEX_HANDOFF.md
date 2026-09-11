@@ -9,6 +9,8 @@
 - Bổ sung deploy/verify-guacamole.py: JSONidentity ngẫu nhiên khôngconnection/credential, expires30s, DELETEtoken; chờTomcat có hạn, lỗi403failngay; bắt tay selectSSH/RDP rồi đóng trướcconnect; kiểmapp.css MIME/nộidung. Không truy cập endpoint thật/không sửaPostgreSQL. Deploy chỉbáođạt sauprobe. CI mới chạy customGuacamole thật+guacd qua loopback, browser/tài khoản giả và đíchclosedport trongcontainer để đòi lỗi kết nối hiển thị khi clipboardthrows/treo. Đây là coveragefrontend/auth/transport, không chứng minhRDPlogin thật.
 - Kiểm thử local trước commit: UI45/45pass; deploy24cases gồm22pass/2POSIX-onlyskip, có JSONemptyidentity giải mã/HMAC/cleanup, CSS saiMIME/rỗng, protocolfragmented/durationbound, startupretry, deployfailsclosed; Python/YAML/shellsyntaxpass. Chưa cóDockerlocal nên smokeGuacamole thật sẽ xác nhậntrênCI saupush. Chưadeployproduction; yêu cầu Phê duyệt tập trung vẫn chờ sau lỗi remote.
 
+- Bản a90eceb2aa18914f7f3c7baa2080e8755ddeafca đã push/đối chiếu main. CI34585138363 xác nhận probe trên Guacamole1.6.0 thật: JSONidentity + cleanup, CSStext/css và SSH/RDPselect đều pass. Browserfixture chạy trực tiếp trênUbuntu bị AppArmor chặn sandbox trước khi mở trang; chuyển fixture vào chính image/profile sandboxWebworker đã có, không tắt sandbox/không đổisysctlhost. NodeCI bắt unusedcatchvariable; đã sửa và chạy lạieslint +clipboardtestpass. Chờ kết quảbrowserfixture/container; chưa deployproduction.
+
 ## CI capture cập nhật
 
 - Sourcea1f6db0, CI34575863866: standalone25browsertests pass;7/8webprofiles pass; delayed-font thất bại stagecapture kindError sau submit, lý do cụ thể bị log an toàn che. SSHciscolegacy lỗi tảiUbuntu package, chưa chạySSH; cácjobkhácpass.

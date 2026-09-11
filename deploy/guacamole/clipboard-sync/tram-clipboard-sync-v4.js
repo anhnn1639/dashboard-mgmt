@@ -124,7 +124,7 @@
                             finish(false);
                         });
                     }
-                    catch (error) {
+                    catch {
                         // Some browser/extension APIs throw synchronously instead
                         // of rejecting. Do not abort Angular application startup.
                         finish(false);
