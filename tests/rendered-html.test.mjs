@@ -792,7 +792,7 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /build --pull --no-cache guacamole/);
   assert.match(deployScript, /force-recreate api dashboard guacamole/);
   assert.match(deployScript, /tram-clipboard-sync\.jar/);
-  assert.match(deployScript, /tram-clipboard-sync-v3\.js/);
+  assert.match(deployScript, /tram-clipboard-sync-v4\.js/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -813,12 +813,16 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v3.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v4.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.equal(manifest.namespace, "tram-clipboard-sync-v3");
-  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v3.js"]);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.3[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v4");
+  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v4.js"]);
+  assert.deepEqual(manifest.css, ["tram-clipboard-sync.css"]);
+  const extensionCSS = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.css", import.meta.url), "utf8");
+  assert.ok(extensionCSS.trim().length > 0, "CSS bundle must carry a resource with text/css MIME");
+  assert.match(dockerfile, /guac-manifest\.json tram-clipboard-sync-v4\.js tram-clipboard-sync\.css/);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.4[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
   assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*service\.setClipboard\(new ClipboardData/);
@@ -842,6 +846,8 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   let remoteClipboard = "";
   let holdNextRead = false;
   let rejectNextRead = false;
+  let throwNextRead = false;
+  const clipboardTimers = new Map();
   let resolveRead = () => {};
 
   const clipboardService = {
@@ -866,9 +872,20 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
     },
   };
   const fakeWindow = {
+    setTimeout(callback, delay) {
+      assert.equal(delay, 2000);
+      const id = Symbol("clipboard-deadline");
+      clipboardTimers.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) { clipboardTimers.delete(id); },
     navigator: {
       clipboard: {
         readText() {
+          if (throwNextRead) {
+            throwNextRead = false;
+            throw new Error("clipboard synchronous denial");
+          }
           if (rejectNextRead) {
             rejectNextRead = false;
             return Promise.reject(new Error("clipboard permission denied"));
@@ -1017,6 +1034,44 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   assert.equal(forwardedMouse[0].state.right, true);
   assert.equal(forwardedMouse[0].force, true);
   assert.deepEqual(remoteWrites, ["A", "B", "B", "C", "C", "D"]);
+  assert.equal(clipboardTimers.size, 0, "successful reads cancel their deadline");
+
+  // A synchronous browser API exception previously escaped the initial
+  // Angular run hook and prevented even the remote tunnel from starting.
+  throwNextRead = true;
+  assert.doesNotThrow(() => clipboardService.resyncClipboard(true));
+  client.sendKeyEvent(1, 0x61);
+  await waitForImmediate();
+  assert.equal(forwardedKeys.at(-1).keysym, 0x61);
+  assert.equal(clipboardTimers.size, 0);
+
+  // An unanswered permission prompt must release input at the deadline,
+  // and an eventual late answer must not overwrite a newer successful read.
+  holdNextRead = true;
+  clipboardService.resyncClipboard(true);
+  const finishOldRead = resolveRead;
+  const beforeKeys = forwardedKeys.length;
+  client.sendKeyEvent(1, 0x62);
+  client.sendMouseState(new FakeMouseState(15, 25, true, false, false, false, false), true);
+  assert.equal(forwardedKeys.length, beforeKeys);
+  for (const callback of [...clipboardTimers.values()]) callback();
+  await waitForImmediate();
+  assert.equal(forwardedKeys.length, beforeKeys + 1);
+  assert.equal(forwardedMouse.at(-1).state.left, true);
+  assert.equal(clipboardTimers.size, 0);
+  holdNextRead = false;
+  browserClipboard = "E";
+  await clipboardService.resyncClipboard(true);
+  finishOldRead("STALE");
+  await waitForImmediate();
+  assert.equal(remoteClipboard, "E");
+  assert.equal(remoteWrites.includes("STALE"), false);
+
+  // A fallback browser implementation without Clipboard API is also guarded.
+  fakeWindow.navigator.clipboard = undefined;
+  clipboardService.resyncClipboard(true);
+  await waitForImmediate();
+  assert.equal(clipboardTimers.size, 0);
 });
 
 // Exercise actual form event handlers with deferred network replies and persistent hooks.

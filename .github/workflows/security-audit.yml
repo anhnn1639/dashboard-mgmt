@@ -20,6 +20,8 @@ on:
       - deploy/verify-api-routes.py
       - deploy/verify-recording-storage.sh
       - deploy/verify-recording-storage.py
+      - deploy/verify-guacamole.py
+      - deploy/guacamole/**
       - tests/**
       - package.json
       - pnpm-lock.yaml
@@ -29,6 +31,23 @@ permissions:
   contents: read
 
 jobs:
+  guacamole-frontend-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install disposable browser test dependencies
+        run: |
+          python -m pip install cryptography==50.0.0 playwright==1.62.0
+          python -m playwright install --with-deps chromium
+      - name: Build the deployed Guacamole extension
+        run: docker build -t portal-guacamole-smoke deploy/guacamole
+      - name: Verify real frontend, JSON authentication, MIME, SSH/RDP transport and clipboard errors
+        run: python tests/guacamole-smoke/verify.py
+
   web-console-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

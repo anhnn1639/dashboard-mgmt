@@ -79,7 +79,7 @@ async def main():
             trusted_ca = root / 'empty-ca' if profile in {'untrusted', 'legacy-false'} else ca
             trusted_ca.mkdir(exist_ok=True)
             trusted_ca.chmod(0o755)
-            docker('run', '-d', '--name', 'tram-web-worker', '--network', 'tram-web-smoke', '--init', '--read-only', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + str(repository / 'web-console-worker/seccomp_profile.json'), '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002', '--tmpfs', '/home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002', '--shm-size', '512m', '--env-file', str(envfile), '-v', str(trusted_ca) + ':/run/web-ca:ro', 'tram-web-smoke-worker')
+            docker('run', '-d', '--name', 'tram-web-worker', '--network', 'tram-web-smoke', '--init', '--read-only', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + str(repository / 'web-console-worker/seccomp_profile.json'), '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m,uid=10002,gid=10002', '--tmpfs', '/home/worker:rw,nosuid,nodev,size=32m,uid=10002,gid=10002', '--shm-size', '512m', '--env-file', str(envfile), '-e', 'PYTHONPATH=/capture-diagnostics:/app', '-v', str(repository / 'tests/web-smoke/capture-diagnostics') + ':/capture-diagnostics:ro', '-v', str(trusted_ca) + ':/run/web-ca:ro', 'tram-web-smoke-worker')
             worker_ip = docker('inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', 'tram-web-worker')
             docker('run', '-d', '--name', 'tram-web-guacd', '--network', 'tram-web-smoke', '-p', '127.0.0.1:14822:4822', '-v', str(recordings) + ':/recordings', 'guacamole/guacd:1.6.0')
             base = 'http://' + worker_ip + ':8081'

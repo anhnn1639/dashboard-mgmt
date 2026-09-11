@@ -21,7 +21,7 @@ class DeploymentShellTests(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / "deploy").mkdir()
         (self.root / "bin").mkdir()
-        for name in ("deploy-dashboard.sh", "verify-recording-storage.sh", "verify-recording-storage.py", "verify-api-routes.py"):
+        for name in ("deploy-dashboard.sh", "verify-recording-storage.sh", "verify-recording-storage.py", "verify-api-routes.py", "verify-guacamole.py"):
             shutil.copyfile(ROOT / "deploy" / name, self.root / "deploy" / name)
         for name in ("compose.yaml", "compose.test.yaml", "compose.external.yaml"):
             (self.root / name).touch()
@@ -44,9 +44,12 @@ case "$*" in
     source=$(cat)
     case "$*" in
       *"gosu ops python -"*)
-        case "$source" in *'def verify_recording_storage('*) ;; *) exit 94;; esac
-        [ "${FAKE_FAIL:-}" != read ] || exit 17
-        stage=read
+        case "$source" in
+          *'def verify_recording_storage('*) stage=read;;
+          *'def verify_authentication('*) stage=guacamole;;
+          *) exit 94;;
+        esac
+        [ "${FAKE_FAIL:-}" != "$stage" ] || exit 17
         ;;
       *"api python -"*)
         case "$source" in *'def verify_routes('*) ;; *) exit 94;; esac
@@ -111,6 +114,7 @@ esac
         self.assertIn("[recording 2/3]", result.stdout)
         self.assertIn("[recording 3/3]", result.stdout)
         self.assertIn("stage:health", calls)
+        self.assertIn("stage:guacamole", calls)
         self.assertIn("timeout:--kill-after=5s:75s", calls)
         self.assertEqual(calls.count("stage:cleanup"), 1)
 
@@ -120,6 +124,13 @@ esac
         self.assertIn("API service user", result.stderr)
         self.assertIn("guacd rm -f -- " + MARKER, calls)
         self.assertNotIn("stage:revision", calls)
+        self.assertNotIn("Deployment verified", result.stdout)
+
+    def test_guacamole_failure_cannot_claim_deployment_success(self):
+        result, calls = self.run_script("deploy-dashboard.sh", FAKE_FAIL="guacamole")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Guacamole JSON authentication and SSH/RDP protocols", result.stderr)
+        self.assertNotIn("stage:health", calls)
         self.assertNotIn("Deployment verified", result.stdout)
 
     def test_invalid_marker_is_never_used_as_cleanup_target(self):

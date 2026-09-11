@@ -1,5 +1,19 @@
 # Bàn giao Codex — 11/09/2026
 
+## SSH/RDP màn hình đen và kiểm tra frontend — đang xử lý
+
+- Production user chụp git HEAD89fe033; API/Guacamole được recreate2h trước, guacd1.6.0 healthy3tuần. Log bổ sung có JSON authentication success nhưng đoạn log không có kết nối SSH/RDP tương ứng; VNC lỗi là Webconsole cũ. Một Agent10.64.11.50 checkin422/tunnel403, cácAgentkhác200; không đủ bằng chứng quy màn hình đen chung về Agent đó.
+- User cho kiểm tra Portal đang đăng nhập, đã mở tab trong Codex. Công cụ browser/CUA nhiều lần không khởi động (windows sandbox failed: helper_unknown_error), chưa đọc hoặc điều khiển được phiên production. Không dùng capability URL người dùng đã dán để đăng nhập thay thế. Công cụ shell có lúc bị auto-review từ chối do usage limit; đã hoạt động lại sau user tiếp tục.
+- Console mới: app.css trả application/octet-stream; kiểm HTTP công khai xác nhận200 và0byte. Đây là bundle CSS extension rỗng của Guacamole1.6.0; CSS chính1.guacamole.*.css vẫn200text/css87368bytes. **Không kết luận đây là nguyên nhân màn hình đen**. Fixture browser sạch với tài nguyên thực, API giả và app.css lỗi vẫn đi đến tunnel. Thêm stylesheet comment-only vào extension để app.css có resource MIMEtext/css, không đổi layout/không bỏnosniff.
+- Fixture clipboard promise bị reject hoặc treo vẫn khởi tạo tunnel; **synchronous exception từreadText phá Angular startup và không mở tunnel**. Codev3 cũng giữ phím/chuột vô hạn nếu clipboard không settle. Sửa extensionv4: chặn cả exceptionđồngbộ, deadline2s cho mỗi lượt, nhả input, bỏ giá trị trả về muộn; giữ forcedrefresh cho Ctrl+V/middle/rightclick và paste-only. Chưa có bằng chứng production gặp synchronousexception; không tuyên bố sửa dứt điểm blackscreen.
+- Bổ sung deploy/verify-guacamole.py: JSONidentity ngẫu nhiên khôngconnection/credential, expires30s, DELETEtoken; chờTomcat có hạn, lỗi403failngay; bắt tay selectSSH/RDP rồi đóng trướcconnect; kiểmapp.css MIME/nộidung. Không truy cập endpoint thật/không sửaPostgreSQL. Deploy chỉbáođạt sauprobe. CI mới chạy customGuacamole thật+guacd qua loopback, browser/tài khoản giả và đíchclosedport trongcontainer để đòi lỗi kết nối hiển thị khi clipboardthrows/treo. Đây là coveragefrontend/auth/transport, không chứng minhRDPlogin thật.
+- Kiểm thử local trước commit: UI45/45pass; deploy24cases gồm22pass/2POSIX-onlyskip, có JSONemptyidentity giải mã/HMAC/cleanup, CSS saiMIME/rỗng, protocolfragmented/durationbound, startupretry, deployfailsclosed; Python/YAML/shellsyntaxpass. Chưa cóDockerlocal nên smokeGuacamole thật sẽ xác nhậntrênCI saupush. Chưadeployproduction; yêu cầu Phê duyệt tập trung vẫn chờ sau lỗi remote.
+
+## CI capture cập nhật
+
+- Sourcea1f6db0, CI34575863866: standalone25browsertests pass;7/8webprofiles pass; delayed-font thất bại stagecapture kindError sau submit, lý do cụ thể bị log an toàn che. SSHciscolegacy lỗi tảiUbuntu package, chưa chạySSH; cácjobkhácpass.
+- Thêm sitecustomize chỉ mount vào container smoke để in lỗiCDP cụ thể từ website/tài khoản fixture. Không logexception thô ởproduction, không mở rộng retry mọiBrowserError. Stress local75navigation+POST chỉ tái hiệnTimeout, chưa tái hiệnError củaCI. ChờCI diagnostics để sửa đúng nguyên nhân.
+
 ## Yêu cầu tiếp theo: Phê duyệt tập trung và nội dung đã xóa
 
 - User yêu cầu sau khi hoàn tất lỗi Web console: đổi mục “Phê duyệt xóa” thành “Phê duyệt”, gom tất cả luồng duyệt vào đây, gồm video hiện phải vào từng bản ghi để duyệt. Xóa thành công phải bỏ nội dung khỏi danh sách website, không giữ dòng video dẫn tới file không còn tồn tại; vẫn giữ lịch sử audit. Đang khảo sát UI/API, chưa triển khai phần này.

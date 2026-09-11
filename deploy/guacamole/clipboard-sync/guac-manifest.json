@@ -1,8 +1,11 @@
 {
   "guacamoleVersion": "1.6.0",
   "name": "Tram clipboard synchronization",
-  "namespace": "tram-clipboard-sync-v3",
+  "namespace": "tram-clipboard-sync-v4",
   "js": [
-    "tram-clipboard-sync-v3.js"
+    "tram-clipboard-sync-v4.js"
+  ],
+  "css": [
+    "tram-clipboard-sync.css"
   ]
 }

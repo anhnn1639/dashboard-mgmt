@@ -83,28 +83,53 @@
                     });
                 }
 
-                var browserClipboard = $window.navigator && $window.navigator.clipboard;
-                if (!browserClipboard || !browserClipboard.readText) {
-                    originalResyncClipboard();
-                    clipboardMayHaveChanged = false;
-                    return Promise.resolve();
-                }
-
                 var synchronized = false;
-                pendingClipboardSync = Promise.resolve(browserClipboard.readText())
-                    .then(function clipboardRead(text) {
-                        return service.setClipboard(new ClipboardData({
-                            type: 'text/plain',
-                            data: text
-                        }));
-                    })
-                    .then(function clipboardSent() {
-                        synchronized = true;
-                    })
-                    .catch(function ignoreClipboardReadFailure() {
-                        // Do not overwrite the operating-system clipboard with
-                        // stale Guacamole data when browser permission is denied.
-                    })
+                pendingClipboardSync = new Promise(function synchronizeClipboard(resolve) {
+                    var settled = false;
+                    // A permission prompt may never settle. It must not hold
+                    // all remote keyboard/mouse input indefinitely.
+                    var timeout = $window.setTimeout(function clipboardDeadline() {
+                        finish(false);
+                    }, 2000);
+
+                    function finish(success) {
+                        if (settled)
+                            return;
+                        settled = true;
+                        synchronized = success;
+                        $window.clearTimeout(timeout);
+                        resolve();
+                    }
+
+                    try {
+                        var browserClipboard = $window.navigator && $window.navigator.clipboard;
+                        var update;
+                        if (!browserClipboard || !browserClipboard.readText)
+                            update = originalResyncClipboard();
+                        else {
+                            update = Promise.resolve(browserClipboard.readText())
+                                .then(function clipboardRead(text) {
+                                    // An older prompt resolving after the deadline
+                                    // must not overwrite a newer remote clipboard.
+                                    if (!settled)
+                                        return service.setClipboard(new ClipboardData({
+                                            type: 'text/plain',
+                                            data: text
+                                        }));
+                                });
+                        }
+                        Promise.resolve(update).then(function clipboardSent() {
+                            finish(true);
+                        }, function ignoreClipboardReadFailure() {
+                            finish(false);
+                        });
+                    }
+                    catch (error) {
+                        // Some browser/extension APIs throw synchronously instead
+                        // of rejecting. Do not abort Angular application startup.
+                        finish(false);
+                    }
+                })
                     .finally(function clipboardSyncComplete() {
                         if (synchronized)
                             clipboardMayHaveChanged = false;
