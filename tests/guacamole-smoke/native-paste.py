@@ -93,9 +93,16 @@ async def verify_native_paste(browser, base_url, extension_path):
         await page.route("**/native-paste-fixture", lambda route: route.fulfill(
             content_type="text/html", body='<html><body><textarea id="local"></textarea><button id="remote">Remote</button></body></html>'))
         await page.goto(base_url + "/native-paste-fixture")
-        await page.add_script_tag(url=base_url + "/guacamole-common-js/all.min.js")
+        # Load the deployed library into the isolated harness. The complete
+        # frontend above separately verifies browser loading of its own assets.
+        # Avoid applying that application's response policies to our fake page.
+        library = await context.request.get(base_url + "/guacamole-common-js/all.min.js")
+        assert library.status == 200, ("Guacamole library", library.status)
+        source = await library.text()
+        assert "Guacamole" in source and "StringWriter" in source
+        await page.add_script_tag(content=source)
         await page.add_script_tag(content=HARNESS)
-        await page.add_script_tag(content=Path(extension_path).read_text())
+        await page.add_script_tag(content=Path(extension_path).read_text(encoding="utf-8"))
         await page.evaluate("fixture.start()")
         for protocol in ('ssh', 'rdp'):
             await page.evaluate('(protocol) => fixture.protocol(protocol)', protocol)

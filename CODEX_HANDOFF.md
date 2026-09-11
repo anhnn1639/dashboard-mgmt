@@ -9,7 +9,8 @@
 - Bump đồng bộ Compose image, manifest, Dockerfile và deploy version probe sang clipboard-sync.5/v5.js để không dùng nhầm image cũ. Không sửa API, Agent, PostgreSQL, tự đăng nhập hay cơ chế ghi hình.
 - Local: browser18tổ hợp (2protocol ×3phím ×3trạng thái quyền), tiếng Việt/nhiều dòng, clipboard-write treo, prompt trả muộn, đổi focus/mất kết nối/không rõ protocol, local editor và native paste ở non-editor; không chấp nhận ClipboardEvent giả. UI47/47, eslint/TypeScript/build pass; deploy24tests (22pass/2POSIX dànhCI), Python compile và diff check pass.
 - CI bổ sung browser fixture dùng Guacamole JS thật trong container sandbox, và cả4SSH profile gửi clipboard qua guacd tới shell fixture rồi kiểm nội dung nhận được + recording; giữ assertion host-key sai phải bị từ chối. Chưa có RDP Windows đích thật để kiểm login/paste đầu cuối; RDP kiểm luồng browser/protocol.
-- Bước tiếp theo: push main, theo dõi CI; khi đạt, server pull main rồi chạy bash deploy/deploy-dashboard.sh compose.test.yaml, đóng tab remote cũ và mở phiên mới. Chưa deploy bản clipboardv5 từ workspace.
+- Sourcef78e3d1 đã push/đối chiếu main. CI34622454962: cả4SSH profile đã xác nhận paste qua guacd tới shell + recording, host-key sai bị từ chối; Node và API pass. Guacamole frontend/auth/SSH/RDP lỗi đích pass nhưng fixture mới không tải được script bằng script tag trên HTTP container; đổi fixture lấy đúng resource từ service bằng Playwright request, kiểm HTTP200/nội dung rồi inject vào trang thử riêng. Không đổi extension hay assertion frontend thật. Baselinev4 đã tái hiện thất bại cùng test native permission-denied trên Chromium local.
+- Bước tiếp theo: theo dõi CI; khi đạt, server pull main rồi chạy bash deploy/deploy-dashboard.sh compose.test.yaml, đóng tab remote cũ và mở phiên mới. Chưa deploy bản clipboardv5 từ workspace.
 
 ## Phê duyệt tập trung và xóa nội dung — đã push, CI đạt, chưa deploy
 
