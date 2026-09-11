@@ -50,7 +50,17 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             identifier = base64.urlsafe_b64encode(b"fixture-ssh\0c\0json").decode().rstrip("=")
             url = base_url + "/#/client/" + identifier + "?data=" + quote(encrypt(key, "ssh", parameters), safe="")
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_function(FRAME, arg=2, timeout=20000)
+            try:
+                await page.wait_for_function(FRAME, arg=2, timeout=20000)
+            except Exception:
+                print("Fixture first-frame diagnostics:", mode, errors,
+                      (await page.locator("body").inner_text())[:500],
+                      await page.locator("canvas").evaluate_all("""(canvases) => canvases.map(c => ({
+                          width: c.width, height: c.height, visible: c.checkVisibility(),
+                          rect: c.getBoundingClientRect().toJSON(),
+                          pixel: c.width > 20 && c.height > 40 ? Array.from(c.getContext('2d').getImageData(20,40,1,1).data) : []
+                      }))"""))
+                raise
 
             # A separate page supplies a trusted copy, like an external editor.
             editor = await context.new_page()

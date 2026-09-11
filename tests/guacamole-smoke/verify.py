@@ -94,6 +94,9 @@ async def main():
                 marker = 'protocol "' + protocol + '"'
                 assert logs.count(marker) > baseline.count(marker), "Browser never reached guacd for " + protocol
         finally:
+            for container in (guacd, sshd):
+                with contextlib.suppress(Exception):
+                    print("Fixture diagnostics " + container + ":\n" + docker("logs", container).replace(ssh_password, "[redacted]")[-5000:])
             for container in (browser_container, guacamole, guacd, sshd):
                 with contextlib.suppress(Exception):
                     docker("rm", "-f", container)
