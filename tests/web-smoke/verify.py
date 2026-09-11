@@ -273,6 +273,11 @@ asyncio.run(check())
             consumer.cancel(); await asyncio.gather(consumer, return_exceptions=True)
             print('PASS: ' + profile + ' + production recording watcher + 1920x1080 Chromium + resized Guacamole VNC input + static-page recording; no target request before recording; literal-IP/wrong-port redirects blocked before TCP; API lease loss closes browser')
         finally:
+            if sys.exc_info()[0] is not None and hub is not None:
+                with contextlib.suppress(Exception):
+                    failed_state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
+                    print('Worker failure state: ' + json.dumps({key: failed_state.get(key) for key in ('status', 'reason', 'navigation_error')}))
+                print('Recording watcher closure codes: ' + json.dumps(closures))
             if hub is not None:
                 await hub.shutdown()
             for writer in clients:

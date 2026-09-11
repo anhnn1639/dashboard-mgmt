@@ -460,6 +460,7 @@ class Desktop:
         self.buttons = mask
 
     async def frames(self, writer):
+        stage = "waiting"
         try:
             while self.status in {"connected", "active"}:
                 await self.frame_requested.wait()
@@ -468,9 +469,11 @@ class Desktop:
                     # Record the actual composited surface while the website
                     # loads. Playwright page.screenshot waits for fonts/DOM
                     # readiness and can tear down healthy sessions on slow SSO.
+                    stage = "capture"
                     captured = await asyncio.wait_for(self.capture.send("Page.captureScreenshot", {
                         "format": "png", "fromSurface": True, "captureBeyondViewport": False,
                     }), 4)
+                    stage = "decode"
                     data = base64.b64decode(captured["data"], validate=True)
                     content = Image.open(io.BytesIO(data)).convert("RGB")
                     frame = Image.new("RGB", (self.width, self.height), "#11223b")
@@ -489,18 +492,22 @@ class Desktop:
                 draw.text((8, 3), text, fill="white", font=font)
                 # Slightly changing pixel also drives progress before activation.
                 draw.point((self.width - 1, 0), fill=(int(time.monotonic() * 2) % 255, 20, 30))
+                stage = "encode"
                 fmt = self.pixel_format
                 rgb = frame.tobytes()
                 raw = bytearray(self.width * self.height * 4)
                 for channel, shift in enumerate(fmt[7:]):
                     offset = shift // 8 if fmt[2] == 0 else 3 - shift // 8
                     raw[offset::4] = rgb[channel::3]
+                stage = "transport"
                 writer.write(struct.pack(">BBHHHHHi", 0, 0, 1, 0, 0, self.width, self.height, 0) + raw)
                 await asyncio.wait_for(writer.drain(), 5)
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            # Fixed stage/class only; browser exceptions can contain SSO URLs.
+            logging.getLogger(__name__).warning("Web frame failed stage=%s kind=%s", stage, type(exc).__name__)
             self.reason = "capture-failed"
             writer.close()
 

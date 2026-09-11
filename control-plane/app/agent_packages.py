@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import secrets
 import tarfile
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +47,15 @@ def dashboard_netloc(dashboard_url: str) -> str:
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("Dashboard URL must be an origin-only HTTPS URL before generating an agent")
     return parsed.netloc
+
+
+def bootstrap_package_secret() -> str:
+    # Keep the existing MSI filename/Agent parser and 32-byte random source.
+    # Base64url may contain the same double hyphen used between claim fields.
+    while True:
+        value = secrets.token_urlsafe(32)
+        if "--" not in value and not value.endswith("-"):
+            return value
 
 
 def windows_msi_filename(dashboard_url: str, package_id: str, package_secret: str, ca_fingerprint: str) -> str:

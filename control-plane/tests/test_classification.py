@@ -198,6 +198,19 @@ def agent_checkin_payload(agent_id: str, version: str, *, active_job_ids: list[s
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_windows_bootstrap_secret_cannot_collide_with_filename_separators(self):
+        from app import agent_packages as packages
+        valid = "a" * 43
+        with patch.object(packages.secrets, "token_urlsafe", side_effect=["x" * 20 + "--" + "x" * 21, "x" * 42 + "-", valid]) as random:
+            generated = packages.bootstrap_package_secret()
+        self.assertEqual(generated, valid)
+        self.assertEqual(random.call_count, 3)
+        self.assertTrue(all(call.args == (32,) for call in random.call_args_list))
+        filename = packages.windows_msi_filename("https://ops.example.test", str(uuid.uuid4()), generated, "system")
+        parts = filename[:-4].split("--")
+        self.assertEqual(len(parts), 5)
+        self.assertEqual(parts[3], valid)
+
     access_token = ""
 
     @classmethod

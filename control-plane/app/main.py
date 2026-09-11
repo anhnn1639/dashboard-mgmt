@@ -48,7 +48,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, decrypt_file_chunk, encrypt_file_chunk, normalize_upload_name, scan_stream_with_clamav
-from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
+from .agent_packages import LINUX_AGENT_PATH, bootstrap_package_secret, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest, RedirectDiscoveryRequest, is_normalized_origin, origin_text, web_url_endpoint
@@ -4169,7 +4169,7 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
     bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
     bootstrap_tls_pin = ca_fingerprint if settings.web_tls_trust == "internal-ca" else "system"
     package_id = str(uuid.uuid4())
-    package_secret = secrets.token_urlsafe(32)
+    package_secret = bootstrap_package_secret()
     safe_label = safe_package_label(payload.label)
     expires_at = now() + timedelta(minutes=payload.expires_minutes)
     try:
