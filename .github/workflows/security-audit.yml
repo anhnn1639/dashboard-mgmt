@@ -18,6 +18,8 @@ on:
       - deploy/nginx-dashboard.conf.example
       - deploy/deploy-dashboard.sh
       - deploy/verify-api-routes.py
+      - deploy/verify-recording-storage.sh
+      - deploy/verify-recording-storage.py
       - tests/**
       - package.json
       - pnpm-lock.yaml
@@ -99,7 +101,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate deployment script syntax
-        run: sh -n deploy/deploy-dashboard.sh
+        run: |
+          sh -n deploy/deploy-dashboard.sh
+          sh -n deploy/verify-recording-storage.sh
       - name: Validate Caddy configuration
         run: >-
           docker run --rm

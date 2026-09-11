@@ -30,6 +30,7 @@ docker compose -f compose.yaml -f "$override" up -d --force-recreate api dashboa
 # Probe the running process, not just source files inside the image. A missing
 # route is HTTP 404; the correct protected route is HTTP 401 without credentials.
 docker compose -f compose.yaml -f "$override" exec -T api python - < deploy/verify-api-routes.py
+sh deploy/verify-recording-storage.sh "$override"
 docker compose -f compose.yaml -f "$override" exec -T api \
   sh -c 'command -v ssh-keyscan >/dev/null && command -v ssh >/dev/null && test -r /app/app/direct_sessions.py'
 
