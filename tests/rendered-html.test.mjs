@@ -792,7 +792,7 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /build --pull --no-cache guacamole/);
   assert.match(deployScript, /force-recreate api dashboard guacamole/);
   assert.match(deployScript, /tram-clipboard-sync\.jar/);
-  assert.match(deployScript, /tram-clipboard-sync-v5\.js/);
+  assert.match(deployScript, /tram-clipboard-sync-v6\.js/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -813,16 +813,16 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v5.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v6.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.equal(manifest.namespace, "tram-clipboard-sync-v5");
-  assert.deepEqual(manifest.js, ["tram-clipboard-sync-v5.js"]);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v6");
+  assert.deepEqual(manifest.js, ["tram-session-auth-v1.js", "tram-clipboard-sync-v6.js"]);
   assert.deepEqual(manifest.css, ["tram-clipboard-sync.css"]);
   const extensionCSS = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.css", import.meta.url), "utf8");
   assert.ok(extensionCSS.trim().length > 0, "CSS bundle must carry a resource with text/css MIME");
-  assert.match(dockerfile, /guac-manifest\.json tram-clipboard-sync-v5\.js tram-clipboard-sync\.css/);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.5[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.match(dockerfile, /guac-manifest\.json tram-session-auth-v1\.js tram-clipboard-sync-v6\.js tram-clipboard-sync\.css/);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.6[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
   assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*\$broadcast\('guacClipboard', new ClipboardData/);
@@ -1330,4 +1330,51 @@ test("late approval refresh cannot restore a row removed by a newer response", a
   await first;
   assert.equal(writes.length, 1);
   assert.equal(writes[0].length, 0);
+});
+
+test("Portal remote launches isolate authentication without revoking other tabs", async () => {
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-session-auth-v1.js", import.meta.url), "utf8");
+  const persisted = new Map([["GUAC_AUTH_TOKEN", "old-tab-token"], ["language", "vi"]]);
+  const accesses = [];
+  function tab(hash) {
+    const storage = {
+      getItem(key) { accesses.push(["get", key]); return persisted.get(key) ?? null; },
+      setItem(key, value) { accesses.push(["set", key]); persisted.set(key, value); },
+      removeItem(key) { accesses.push(["remove", key]); persisted.delete(key); },
+    };
+    let decorated;
+    runInNewContext(extension, { angular: { module(name) {
+      assert.equal(name, "storage");
+      return { config(definition) {
+        definition.at(-1)({ decorator(name, definition) {
+          assert.equal(name, "localStorageService");
+          decorated = definition.at(-1)(storage, { location: { hash } });
+        } });
+      } };
+    } } });
+    return decorated;
+  }
+
+  const first = tab("#/client/fixture?data=first-fixture");
+  assert.equal(first.getItem("GUAC_AUTH_TOKEN"), null, "New launch must ignore the old connection token");
+  first.setItem("GUAC_AUTH_TOKEN", "first-token");
+  const second = tab("#/client/fixture?view=remote&data=second-fixture");
+  assert.equal(second.getItem("GUAC_AUTH_TOKEN"), null);
+  second.setItem("GUAC_AUTH_TOKEN", "second-token");
+  assert.equal(first.getItem("GUAC_AUTH_TOKEN"), "first-token");
+  assert.equal(second.getItem("GUAC_AUTH_TOKEN"), "second-token");
+  second.removeItem("GUAC_AUTH_TOKEN");
+  assert.equal(second.getItem("GUAC_AUTH_TOKEN"), null);
+  assert.equal(first.getItem("GUAC_AUTH_TOKEN"), "first-token");
+  assert.equal(persisted.get("GUAC_AUTH_TOKEN"), "old-tab-token");
+  assert.ok(!accesses.some(([, key]) => key === "GUAC_AUTH_TOKEN"), "Launch must never touch another tab's stored token");
+  assert.equal(first.getItem("language"), "vi");
+  first.setItem("language", "en");
+  assert.equal(second.getItem("language"), "en");
+  first.removeItem("language");
+  assert.equal(second.getItem("language"), null);
+
+  for (const hash of ["", "#/", "#/client/fixture", "#/client/fixture?data=", "#/client/fixture?metadata=fixture"]) {
+    assert.equal(tab(hash).getItem("GUAC_AUTH_TOKEN"), "old-tab-token", "Normal Guacamole authentication remains unchanged");
+  }
 });

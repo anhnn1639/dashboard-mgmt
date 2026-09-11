@@ -1,5 +1,12 @@
 # Bàn giao Codex — 12/09/2026
 
+## Đã tái hiện lỗi dùng lại phiên Guacamole cũ — đang sửa
+
+- CI34658899036 mở3tab trong cùng browser context cho cùng username nhưng3cấu hình JSON khác nhau: các tab đều có hình/paste nhưng cả3 dùng recording browser-granted/browser-granted.1/browser-granted.2 và cùngfilekếtquả. Chứng minh Guacamole giữ connection parameters của token từ lần đầu, bỏ parameters của lần launch mới; fixture freshcontext từngtab thì cả3pass. Trong Portal cổngrelay/sessionrecording thay đổi mỗi lần; token cũ trỏ relay đã dùng/đóng có thể làm kết nối mới thất bại. Đây là lỗi đã tái hiện, phù hợp log Requested tunnel destination does not exist trước đây; chưa kiểm trực tiếp phiên production doCUALỗi.
+- Sửa Guacamole extension: chỉ với URL client có data launch từPortal, giữ GUAC_AUTH_TOKEN trong bộ nhớ của trang, không đọc/ghi/xóa token chung localStorage, không revoke token cửa sổ khác. Mỗi tranglaunch xác thực JSON mới lấy đúng relay/account/recording; giữ auth/RBAC/MFA/expiry/recording server như cũ. Không tăng2phút tuổi link; reload/tabđãdeploy phải mở Kết nối mới từPortal. Các tùy chọn Guacamole khác vẫn dùng storage như trước.
+- Bump image/manifest/clipboard filename đồng bộ6; thêm tram-session-auth-v1.js và deploy probe kiểm file đó. Logic nativeclipboardv5 giữ nguyên trongv6. Unit kiểm nhiều tab, logout không đụngtokenkhác, ignore tokencũ, preference/standaloneGuacamole không đổi.
+- CIbrowser nâng để seed tokenhợp lệcũ trỏclosedport; tất cả launchmới phảibỏqua, cófirstframe/paste/secondframe, kếtquảtarget+recordingriêngmỗi lần; đồngthờiđòi tokenlegacy vẫnvalid vàkhôngbịghiđè. Chờ kiểmthử bảnfix/pushCI; chưadeployproduction.
+
 ## Màn hình đen sau deploy clipboardv5 — chưa xác định nguyên nhân
 
 - User ngày12/09 báo sau sửa clipboard SSH và RDP lại đen; yêu cầu tự kiểm website đang mở. Kiểm HTTP công khai xác nhận production đã deploy1460384a774aeefaf236b9ac8a981bab30df6c95, builtAt2026-09-11T16:51:03.108Z; app.js chứav5. Do đó ghi chú production12073fc bên dưới không còn hiện hành.

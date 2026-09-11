@@ -1,5 +1,6 @@
 """Full Guacamole frontend -> real SSH -> paste -> another rendered frame."""
 import base64
+import json
 import os
 from urllib.parse import quote
 
@@ -21,6 +22,14 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
     # Existing tabs must not force a new launch to reuse an older connection.
     context = await browser.new_context(locale="en-US")
     previous_page = None
+    # Seed a valid legacy token whose connection goes to a closed port. Launches
+    # must ignore it without deleting/revoking it out from under existing tabs.
+    legacy = await context.request.post(base_url + "/api/tokens",
+                                        form={"data": encrypt(key, "ssh")})
+    assert legacy.status == 200, "Could not seed legacy fixture authentication"
+    legacy_token = (await legacy.json())["authToken"]
+    await context.add_init_script("localStorage.setItem('GUAC_AUTH_TOKEN', JSON.stringify("
+                                  + json.dumps(legacy_token) + "));")
     try:
         for mode in ("granted", "denied", "pending"):
             # No real OS clipboard content is read by the asynchronous API.
@@ -81,6 +90,10 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             if previous_page is not None:
                 await previous_page.wait_for_function(FRAME, arg=1, timeout=2000)
                 assert not await previous_page.get_by_text("The remote desktop server", exact=False).count()
+            stored = await page.evaluate("JSON.parse(localStorage.getItem('GUAC_AUTH_TOKEN'))")
+            assert stored == legacy_token, "New launch overwrote another tab's persistent authentication"
+            valid = await context.request.head(base_url + "/api/session", headers={"Guacamole-Token": legacy_token})
+            assert valid.status == 200, "New launch revoked another tab's authentication"
             previous_page = page
             print("PASS: real SSH browser displays first frame, native paste reaches shell and next frame remains visible across shared browser auth; clipboard " + mode)
     finally:
