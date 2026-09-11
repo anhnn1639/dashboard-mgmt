@@ -7,6 +7,112 @@ import { ManagedSessionModal } from "./managed-session-modal";
 
 type TargetConfig = { name: string; kind: "network" | "web"; address?: string; port?: number; url: string; web_allowed_origins?: string[]; credential?: { username: string; password: string } };
 type Target = { id: string; name: string; kind: "network" | "web"; address: string; config: TargetConfig | null; connectionReady: boolean };
+type RedirectDiscovery = { navigation: string[]; resources: string[]; blocked: string[]; error: string };
+type RedirectSuggestion = { origin: string; count: number; lastSeen: string };
+
+const discoveryNotes: Record<string, string> = {
+  timeout: "Website tải chậm nên có thể còn địa chỉ chưa xuất hiện.",
+  "http-error": "Website trả lỗi HTTP; danh sách chỉ gồm địa chỉ đã kịp ghi nhận.",
+  tls: "Không thương lượng được HTTPS với website.",
+  certificate: "Website từ chối chứng thư HTTPS.",
+  connection: "Không kết nối được website từ máy chủ Operation Portal.",
+  "blocked-origin": "Website chuyển tới địa chỉ không dùng được (DNS lỗi hoặc trỏ về loopback/link-local).",
+};
+
+function originLines(value: string) {
+  return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+/** Compare what the Administrator typed with the API's scheme://host:port form. */
+function originKey(value: string) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.hostname}:${parsed.port || (parsed.protocol === "https:" ? "443" : "80")}`;
+  } catch {
+    return value.trim();
+  }
+}
+
+function originList(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function WebConsoleFields({ token, role, target }: { token: string; role: string; target: Target | null }) {
+  const admin = role === "admin";
+  const saved = target?.config ?? null;
+  const [edited, setEdited] = useState<string | null>(null);
+  const [discovery, setDiscovery] = useState<{ url: string; busy: boolean; result: RedirectDiscovery | null; error: string } | null>(null);
+  const [suggestions, setSuggestions] = useState<RedirectSuggestion[] | null>(null);
+  const origins = edited ?? (saved?.web_allowed_origins ?? []).join("\n");
+  const known = new Set(originLines(origins).map(originKey));
+
+  useEffect(() => {
+    if (!admin || !target) return;
+    const abort = new AbortController();
+    // Origins blocked in recent recorded sessions, offered as one-click adds.
+    const initial = window.setTimeout(() => {
+      void fetch(`/api/v1/managed-targets/${target.id}/redirect-suggestions`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store", signal: abort.signal })
+        .then((response) => response.ok ? response.json() : null)
+        .then((data) => { if (Array.isArray(data?.items)) setSuggestions(data.items as RedirectSuggestion[]); })
+        .catch(() => { /* Suggestions are optional; the form stays usable. */ });
+    }, 0);
+    return () => { window.clearTimeout(initial); abort.abort(); };
+  }, [admin, target, token]);
+
+  function addOrigins(values: string[]) {
+    setEdited((current) => {
+      const existing = originLines(current ?? (saved?.web_allowed_origins ?? []).join("\n"));
+      const seen = new Set(existing.map(originKey));
+      return [...existing, ...values.filter((value) => !seen.has(originKey(value)))].join("\n");
+    });
+  }
+
+  async function discover(url: string) {
+    setDiscovery({ url, busy: true, result: null, error: "" });
+    try {
+      const response = await fetch("/api/v1/managed-targets/redirect-discovery", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ url }) });
+      const data = await readManagedTargetResponse(response, "discover");
+      const result: RedirectDiscovery = { navigation: originList(data.navigation), resources: originList(data.resources), blocked: originList(data.blocked), error: typeof data.error === "string" ? data.error : "" };
+      addOrigins(result.navigation);
+      setDiscovery({ url, busy: false, result, error: "" });
+    } catch (reason) {
+      setDiscovery({ url, busy: false, result: null, error: reason instanceof Error ? reason.message : "Không dò được địa chỉ chuyển hướng." });
+    }
+  }
+
+  function chip(value: string, label: string) {
+    const added = known.has(originKey(value));
+    return <button key={value} type="button" className="origin-chip" disabled={added} onClick={() => addOrigins([value])}>{added ? "✓" : "＋"} {label}</button>;
+  }
+
+  return <>
+    <label>URL website (HTTP hoặc HTTPS)<input name="url" type="url" placeholder="https://vcenter.example.local/ui/" defaultValue={saved?.url} required
+      onBlur={admin ? (event) => { const value = event.currentTarget.value.trim(); if (value && value !== (discovery?.url ?? saved?.url)) void discover(value); } : undefined} /></label>
+    <label>Địa chỉ chuyển hướng / SSO được phép<textarea name="web_allowed_origins" value={origins} onChange={(event) => setEdited(event.target.value)} placeholder={"https://sso.example.local\nhttps://console.example.local:8443"} readOnly={!admin} rows={3} /></label>
+    {admin && <div className="redirect-discovery">
+      <div className="redirect-discovery-actions">
+        <button type="button" className="button ghost" disabled={Boolean(discovery?.busy)} onClick={(event) => {
+          const field = event.currentTarget.form?.elements.namedItem("url");
+          if (field instanceof HTMLInputElement && field.value.trim()) void discover(field.value.trim());
+        }}>{discovery?.busy ? "Đang dò…" : "⟳ Tự dò địa chỉ chuyển hướng"}</button>
+        {discovery?.busy && <span role="status">Đang mở website trong trình duyệt riêng của Operation Portal, chờ tối đa khoảng 30 giây…</span>}
+      </div>
+      {discovery?.error && <p className="resource-help warning" role="alert">{discovery.error}</p>}
+      {discovery?.result && <>
+        <p className="resource-help" role="status">{discovery.result.navigation.length
+          ? `Đã tự thêm ${discovery.result.navigation.length} địa chỉ mà website chuyển tới. Kiểm tra danh sách rồi bấm Lưu kết nối.`
+          : "Website không chuyển sang địa chỉ khác trước bước đăng nhập. Nếu phiên bị chặn sau khi đăng nhập, địa chỉ đó sẽ tự hiện ở đây."}{discovery.result.error ? ` ${discoveryNotes[discovery.result.error] ?? ""}` : ""}</p>
+        {discovery.result.resources.length > 0 && <div className="origin-chip-list"><span>Trang còn tải tài nguyên từ:</span>{discovery.result.resources.map((value) => chip(value, value))}</div>}
+        {discovery.result.blocked.length > 0 && <p className="resource-help warning">Không dùng được (DNS lỗi hoặc địa chỉ nội bộ bị cấm): {discovery.result.blocked.join(", ")}</p>}
+      </>}
+      {suggestions && suggestions.length > 0 && <div className="origin-chip-list"><span>Phiên gần đây bị chặn khi chuyển tới:</span>{suggestions.map((item) => chip(item.origin, `${item.origin} · ${item.count} lần`))}</div>}
+    </div>}
+    <p className="resource-help">{admin
+      ? "Operation Portal tự mở URL trong trình duyệt riêng để dò địa chỉ website chuyển tới và thêm sẵn vào danh sách; bạn chỉ kiểm tra rồi lưu. Mỗi dòng một địa chỉ gồm HTTP/HTTPS, tên miền hoặc IP và cổng, không có đường dẫn hay tham số đăng nhập. Chỉ địa chỉ trong danh sách mới truy cập được trong phiên."
+      : "Danh sách địa chỉ chuyển hướng do Administrator quản lý. Mọi đường dẫn trên URL gốc và các địa chỉ này đều truy cập được, kể cả sau chuyển hướng."}</p>
+    <p className="resource-help">Operation Portal tự xử lý chứng thư nội bộ, tự ký hoặc không hợp lệ trong phiên Web console. Phiên vẫn được ghi hình.</p>
+  </>;
+}
 
 export function ManagedTargetsView({ kind, token, role, notify, share }: { kind: "network" | "web"; token: string; role: string; notify: (message: string) => void; share: (target: { id: string; name: string }) => void }) {
   const [targets, setTargets] = useState<Target[]>([]);
@@ -64,8 +170,7 @@ export function ManagedTargetsView({ kind, token, role, notify, share }: { kind:
       <form className="resource-form" onSubmit={save}>
         {error && <div className="danger-panel" role="alert">{error}</div>}
         <label>{kind === "web" ? "Tên web console" : "Tên kết nối"}<input name="name" defaultValue={selected?.name} minLength={2} maxLength={100} required /></label>
-        {kind === "network" ? <div className="form-grid"><label>Địa chỉ IPv4 của thiết bị<input name="address" placeholder="10.64.70.20" defaultValue={selected?.address} required /></label><label>Cổng SSH<input name="port" type="number" min={1} max={65535} defaultValue={selected?.port ?? 22} required /></label></div> : <label>URL website (HTTP hoặc HTTPS)<input name="url" type="url" placeholder="https://vcenter.example.local/ui/" defaultValue={selected?.url} required /></label>}
-        {kind === "web" && <><label>Địa chỉ chuyển hướng / SSO được phép<textarea name="web_allowed_origins" defaultValue={selected?.web_allowed_origins?.join("\n") ?? ""} placeholder={"https://sso.example.local\nhttps://console.example.local:8443"} readOnly={role !== "admin"} rows={3} /></label><p className="resource-help">Mỗi dòng một địa chỉ gồm HTTP/HTTPS, tên miền hoặc IP và cổng. Không nhập đường dẫn hoặc tham số đăng nhập. Mọi đường dẫn trên URL gốc và các địa chỉ này đều truy cập được, kể cả sau chuyển hướng.</p><p className="resource-help">Operation Portal tự xử lý chứng thư nội bộ, tự ký hoặc không hợp lệ trong phiên Web console. Phiên vẫn được ghi hình.</p></>}
+        {kind === "network" ? <div className="form-grid"><label>Địa chỉ IPv4 của thiết bị<input name="address" placeholder="10.64.70.20" defaultValue={selected?.address} required /></label><label>Cổng SSH<input name="port" type="number" min={1} max={65535} defaultValue={selected?.port ?? 22} required /></label></div> : <WebConsoleFields token={token} role={role} target={editing !== "new" ? editing : null} />}
         {kind === "network" && <p className="resource-help">SSH tự thương lượng, ưu tiên thuật toán mới và tự thử Group14/RSA-SHA1 khi thiết bị cũ cần. Không cần bật thêm tùy chọn. Khóa máy chủ vẫn được kiểm tra và phiên vẫn được ghi hình.</p>}
         {editing === "new" ? <fieldset><legend>Tài khoản xác thực ban đầu</legend><div className="form-grid"><label>Username<input name="username" required maxLength={128} autoComplete="off" /></label><label>Password<input name="password" type="password" required maxLength={1024} autoComplete="new-password" /></label></div><p className="resource-help">Lưu mã hóa vào Tài khoản xác thực. Sau khi lưu, chỉ Administrator được quản lý tài khoản; người kết nối chỉ chọn username được phép sử dụng.</p></fieldset> : <p className="resource-help">Tài khoản đã lưu không thay đổi tại đây. Administrator quản lý username/password trong mục Tài khoản xác thực.</p>}
         <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setEditing(null)}>Hủy</button><button disabled={busy} className="button primary">{busy ? "Đang lưu…" : "Lưu kết nối"}</button></div>

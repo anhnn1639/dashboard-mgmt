@@ -169,6 +169,26 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         desktop.deadline = time.monotonic() - 1
         self.assertIsNone(await desktop.resolve_destination("https", "sso.test", 8443))
 
+    async def test_blocked_navigations_become_suggestions_without_paths_or_tokens(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/ui", allowed_origins=["https://sso.test:8443"]))
+        desktop.status = "active"
+
+        def request(url, navigation=True):
+            return type("Request", (), {"url": url, "is_navigation_request": staticmethod(lambda: navigation)})()
+
+        desktop.observe_request(request("https://console.test/websso/SAML2/SSO?SAMLRequest=PRIVATE"))
+        desktop.observe_request(request("https://sso.test:8443/websso"))
+        # Page scripts must not be able to propose origins, only navigations.
+        desktop.observe_request(request("https://tracker.test/pixel", False))
+        desktop.observe_request(request("https://sso-new.test:8443/login?SAMLRequest=PRIVATE"))
+        desktop.observe_request(request("https://sso-new.test:8443/retry"))
+        self.assertEqual(desktop.blocked_origins, ["https://sso-new.test:8443"])
+        self.assertIn("https://sso-new.test:8443", desktop.notice)
+        self.assertNotIn("PRIVATE", desktop.notice)
+        for index in range(12):
+            desktop.observe_request(request(f"https://extra{index}.test/"))
+        self.assertEqual(len(desktop.blocked_origins), 8)
+
     async def test_navigation_errors_do_not_expose_saml_tokens(self):
         desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/"))
         desktop.page = type("Page", (), {"goto": AsyncMock(side_effect=RuntimeError("net::ERR_CERT_AUTHORITY_INVALID https://console.test/?SAMLRequest=PRIVATE"))})()
@@ -179,6 +199,62 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         desktop.page.goto.side_effect = w.BrowserTimeoutError("private-url")
         await desktop.navigate()
         self.assertEqual(desktop.navigation_error, "timeout")
+
+    async def test_discovery_reports_origins_only_and_separates_unreachable_ones(self):
+        probe = w.Discovery("https://console.test/ui")
+        probe.destinations.update({("https", "sso.test", 8443): "10.80.9.9", ("https", "cdn.test", 443): "10.80.9.10",
+                                   ("https", "broken.test", 443): None})
+        probe.observe("https://console.test/websso/SAML2/SSO?SAMLRequest=PRIVATE", True)
+        probe.observe("https://sso.test:8443/websso?SAMLRequest=PRIVATE", True)
+        probe.observe("https://sso.test:8443/theme.css", False)
+        probe.observe("https://cdn.test/app.js", False)
+        probe.observe("https://broken.test/logo.png", False)
+        probe.observe("data:text/html,ignored", False)
+        result = probe.result()
+        self.assertEqual(result, {"navigation": ["https://sso.test:8443"], "resources": ["https://cdn.test:443"],
+                                  "blocked": ["https://broken.test:443"], "error": ""})
+        self.assertNotIn("PRIVATE", str(result))
+
+    async def test_discovery_promotes_a_resource_origin_the_site_navigates_to(self):
+        probe = w.Discovery("https://console.test/ui")
+        probe.destinations[("https", "sso.test", 443)] = "10.80.9.9"
+        probe.observe("https://sso.test/theme.css", False)
+        probe.observe("https://sso.test/login", True)
+        self.assertEqual(probe.result()["navigation"], ["https://sso.test:443"])
+        self.assertEqual(probe.result()["resources"], [])
+
+    async def test_discovery_resolves_once_and_keeps_the_unicast_address_check(self):
+        probe = w.Discovery("https://console.test/ui")
+        with patch.object(w, "pinned_address", new_callable=AsyncMock, return_value="10.80.9.9") as resolve:
+            self.assertEqual(await probe.resolve_destination("https", "sso.test", 8443), "10.80.9.9")
+            self.assertEqual(await probe.resolve_destination("https", "sso.test", 8443), "10.80.9.9")
+            resolve.assert_awaited_once()
+        with patch.object(w, "pinned_address", new_callable=AsyncMock, side_effect=ValueError("unsafe target")):
+            self.assertIsNone(await probe.resolve_destination("https", "metadata.test", 80))
+        probe.active = False
+        self.assertIsNone(await probe.resolve_destination("https", "sso.test", 8443))
+
+    async def test_discovery_endpoint_requires_the_secret_and_refuses_parallel_probes(self):
+        client = TestClient(w.app)
+        with patch.dict(w.os.environ, {"GUACAMOLE_JSON_SECRET": "a" * 32}):
+            self.assertEqual(client.post("/discover", json={"target_url": "https://console.test/"}).status_code, 401)
+            headers = {"Authorization": "Bearer " + hashlib.sha256(("tram-web-console:" + "a" * 32).encode()).hexdigest()}
+            invalid = client.post("/discover", headers=headers, json={"target_url": "https://user:private-test-value@console.test/"})
+            self.assertEqual(invalid.status_code, 422)
+            self.assertNotIn("private-test-value", invalid.text)
+            await w.discovery_lock.acquire()
+            try:
+                self.assertEqual(client.post("/discover", headers=headers, json={"target_url": "https://console.test/"}).status_code, 409)
+            finally:
+                w.discovery_lock.release()
+
+    async def test_session_status_reports_blocked_origins_for_the_api(self):
+        desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/ui"))
+        desktop.blocked_origins.append("https://sso-new.test:8443")
+        with patch.dict(w.os.environ, {"GUACAMOLE_JSON_SECRET": "a" * 32}), patch.dict(w.desktops, {desktop.id: desktop}):
+            headers = {"Authorization": "Bearer " + hashlib.sha256(("tram-web-console:" + "a" * 32).encode()).hexdigest()}
+            state = TestClient(w.app).get("/sessions/" + desktop.id, headers=headers).json()
+        self.assertEqual(state["blocked_origins"], ["https://sso-new.test:8443"])
 
     async def test_recording_captures_surface_without_waiting_for_web_fonts(self):
         desktop = w.Desktop(w.CreateSession(session_id=uuid.uuid4(), target_url="https://console.test/", width=800, height=600))
@@ -204,3 +280,23 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(written[0]), 16 + 800 * 600 * 4)
         # Row28 is the first website pixel, encoded as default RFB BGRX.
         self.assertEqual(written[0][16 + 28 * 800 * 4:16 + 28 * 800 * 4 + 4], bytes([0xef, 0xcd, 0xab, 0]))
+
+    async def test_discovery_caps_combined_blocked_results_and_marks_unresolved(self):
+        probe = w.Discovery("https://console.test/ui")
+        for index in range(16):
+            probe.observe(f"https://nav{index}.test/login", True)
+            probe.observe(f"https://resource{index}.test/app.js", False)
+            probe.destinations[("https", f"nav{index}.test", 443)] = None
+        result = probe.result()
+        self.assertEqual(len(result["blocked"]), 16)
+        self.assertEqual(result["navigation"], [])
+        self.assertEqual(result["resources"], [])
+
+    async def test_discovery_tracks_pending_requests_without_saving_urls(self):
+        probe = w.Discovery("https://console.test/ui")
+        request = type("Request", (), {"url": "https://console.test/boot?secret=private", "is_navigation_request": lambda self: False})()
+        probe.request_started(request)
+        self.assertIn(request, probe.pending_requests)
+        probe.request_finished(request)
+        self.assertFalse(probe.pending_requests)
+        self.assertNotIn("private", str(probe.result()))

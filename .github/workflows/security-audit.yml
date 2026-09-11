@@ -49,7 +49,7 @@ jobs:
         run: WEB_SMOKE_PROFILE=legacy-false python tests/web-smoke/verify.py
       - name: Verify automatic certificate handling without a per-target flag
         run: WEB_SMOKE_PROFILE=untrusted python tests/web-smoke/verify.py
-      - name: Verify recorded SSO across configured host and port
+      - name: Verify recorded SSO and automatic redirect discovery across host and port
         run: WEB_SMOKE_PROFILE=redirect python tests/web-smoke/verify.py
       - name: Verify recorded HTTP website without certificate
         run: WEB_SMOKE_PROFILE=http python tests/web-smoke/verify.py

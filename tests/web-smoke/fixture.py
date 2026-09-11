@@ -28,8 +28,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def minimal(self, body):
+        # Disposable login pages contain only controlled fixture destinations.
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'<!doctype html><html><body>' + body + b'</body></html>')
+
     def do_GET(self):
         Path('/tmp/visited').touch()
+        if self.path == '/discover':
+            return self.minimal(b"<script>fetch('/discover-bootstrap').then(()=>location.href='https://sso.test:4443/discover-landing')</script>")
+        if self.path == '/discover-bootstrap':
+            time.sleep(6)
+            return self.minimal(b'Bootstrap ready')
+        if self.path == '/discover-landing':
+            Path('/tmp/discover-landing-visited').touch()
+            return self.minimal(b'<meta http-equiv="refresh" content="6;url=https://console.test/discover-final"><h1>Discovered SSO landing page</h1>')
+        if self.path == '/discover-final':
+            Path('/tmp/discover-final-visited').touch()
+            return self.minimal(b'<h1>Discovery complete</h1>')
         if self.path == '/slow-font.woff2':
             Path('/tmp/font-requested').touch()
             time.sleep(12)

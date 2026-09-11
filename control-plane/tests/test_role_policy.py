@@ -1,4 +1,5 @@
 """API-level role/approval regressions. Reuse the existing disposable test DB."""
+import asyncio
 import base64
 import json
 import unittest
@@ -466,6 +467,62 @@ class RolePolicyTests(unittest.TestCase):
                     self.assertEqual(prepare.call_args.kwargs, {"allowed_origins": []})
                     self.assertTrue(watch.call_args.args[2]())
                     decrypt.assert_not_called()
+
+    def test_redirect_discovery_is_admin_only_validated_and_saves_nothing(self):
+        server_id, _ = self.network_fixture("web")
+        endpoint = "/api/v1/managed-targets/redirect-discovery"
+        payload = {"url": "https://console.example.test/ui"}
+        found = {"navigation": ["https://sso.example.test:8443"], "resources": ["https://cdn.example.test:443"], "blocked": [], "error": ""}
+        # Without the browser service the dashboard gets a service error, not a probe.
+        self.assertEqual(self.client.post(endpoint, headers=self.headers["admin"], json=payload).status_code, 503)
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "discover", new_callable=AsyncMock, return_value=found) as discover:
+            for role in ("operator", "viewer", "connector", "auditor"):
+                self.assertEqual(self.client.post(endpoint, headers=self.headers[role], json=payload).status_code, 403, role)
+            discover.assert_not_awaited()
+            response = self.client.post(endpoint, headers=self.headers["admin"], json=payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), found)
+            self.assertEqual(discover.call_args.args, ("https://console.example.test/ui",))
+            # A rejected URL never reaches the browser service.
+            for invalid in ("https://user:secret@console.example.test/", "ftp://console.example.test/", "https://console.example.test/#saml", "https://*.example.test/"):
+                self.assertEqual(self.client.post(endpoint, headers=self.headers["admin"], json={"url": invalid}).status_code, 422, invalid)
+            self.assertEqual(discover.await_count, 1)
+        with m.SessionLocal() as db:
+            event = db.execute(select(m.AuditEvent).where(m.AuditEvent.action == "target.web.redirect_discovery").order_by(m.AuditEvent.occurred_at.desc())).scalars().first()
+            self.assertEqual(event.target, "https://console.example.test:443")
+            self.assertEqual(event.detail["navigation"], ["https://sso.example.test:8443"])
+            # Discovery proposes; only saving the connection changes a session.
+            self.assertEqual(db.get(m.Server, server_id).inventory["managedTarget"]["web_allowed_origins"], [])
+
+    def test_blocked_session_redirects_become_admin_only_suggestions(self):
+        server_id, credential_id = self.network_fixture("web")
+        endpoint = f"/api/v1/managed-targets/{server_id}/redirect-suggestions"
+        with patch.object(m.web_hub, "base_url", "http://web-console:8081"), patch.object(m.web_hub, "secret", lambda: "a" * 32), patch.object(m.web_hub, "prepare", new_callable=AsyncMock, return_value={"port": 45000, "password": "vnc12345"}), patch.object(m.web_hub, "watch") as watch, patch.object(m, "encrypt_guacamole_json", return_value="opaque"):
+            launched = self.client.post("/api/v1/sessions/launch", headers=self.headers["operator"], json={"server_id": server_id, "protocol": "web", "credential_id": credential_id})
+            self.assertEqual(launched.status_code, 200, launched.text)
+            session_id = launched.json()["sessionId"]
+            report_blocked = watch.call_args.kwargs["blocked"]
+        asyncio.run(report_blocked(session_id, ["https://sso.example.test:8443", "https://portal.example.test:9443"]))
+        asyncio.run(report_blocked(session_id, ["https://sso.example.test:8443"]))
+        for role in ("operator", "viewer", "connector"):
+            self.assertEqual(self.client.get(endpoint, headers=self.headers[role]).status_code, 403, role)
+        items = self.client.get(endpoint, headers=self.headers["admin"]).json()["items"]
+        self.assertEqual({item["origin"]: item["count"] for item in items},
+                         {"https://sso.example.test:8443": 2, "https://portal.example.test:9443": 1})
+        with m.SessionLocal() as db:
+            events = db.execute(select(m.AuditEvent).where(m.AuditEvent.action == "session.web.redirect_blocked", m.AuditEvent.target == server_id)).scalars().all()
+            self.assertEqual(len(events), 3)
+            self.assertEqual({event.result for event in events}, {"denied"})
+            # Origins only: no path, query or SAML token reaches the audit trail.
+            self.assertEqual({event.detail["session_id"] for event in events}, {session_id})
+            self.assertEqual(sorted({event.detail["origin"] for event in events}), ["https://portal.example.test:9443", "https://sso.example.test:8443"])
+            config = dict(db.get(m.Server, server_id).inventory["managedTarget"])
+        # An approved origin stops being suggested; SSH targets have no list.
+        config["web_allowed_origins"] = ["https://sso.example.test:8443"]
+        self.assertEqual(self.client.put(f"/api/v1/managed-targets/{server_id}", headers=self.headers["admin"], json=config).status_code, 200)
+        remaining = self.client.get(endpoint, headers=self.headers["admin"]).json()["items"]
+        self.assertEqual([item["origin"] for item in remaining], ["https://portal.example.test:9443"])
+        self.assertEqual(self.client.get(f"/api/v1/managed-targets/{self.server_id}/redirect-suggestions", headers=self.headers["admin"]).status_code, 404)
 
     def test_http_targets_and_redirect_validation(self):
         payload = {"name": "plain-" + uuid.uuid4().hex[:8], "kind": "web", "url": "http://10.80.9.7/ui"}

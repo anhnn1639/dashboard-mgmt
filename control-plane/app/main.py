@@ -51,7 +51,7 @@ from .file_security import MalwareDetected, ScannerUnavailable, decrypt_file, de
 from .agent_packages import LINUX_AGENT_PATH, LINUX_OFFLINE_PROFILES, certificate_sha256, linux_run_bundle, safe_package_label, validate_linux_agent, validate_linux_offline_archive, validate_windows_msi, windows_msi_filename
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
-from .managed_targets import ManagedTargetRequest
+from .managed_targets import ManagedTargetRequest, RedirectDiscoveryRequest, is_normalized_origin, origin_text, web_url_endpoint
 from .schema_migrations import detach_recording_history_users
 from .web_sessions import WebSessionHub, WebSessionError
 
@@ -1319,6 +1319,8 @@ tunnel_hub = TunnelHub(
 )
 direct_hub = DirectSessionHub(settings.tunnel_bind_host, mark_tunnel_closed)
 web_hub = WebSessionHub(settings.web_console_url, lambda: settings.guacamole_json_secret)
+# One redirect probe at a time: discovery opens a real browser on the Portal.
+web_discovery_lock = asyncio.Lock()
 
 SESSION_COOKIE_NAME = "tram_ops_session"
 SESSION_COOKIE_MARKER = "cookie-session"
@@ -3364,6 +3366,51 @@ def update_managed_target(server_id: str, payload: ManagedTargetRequest, request
     if server.os_family not in {"network", "web"}:
         raise HTTPException(status_code=404, detail="Không tìm thấy kết nối")
     return persist_managed_target(payload, request, user, db, server)
+
+
+@app.post("/api/v1/managed-targets/redirect-discovery")
+async def discover_managed_target_redirects(payload: RedirectDiscoveryRequest, request: Request, user: User = Depends(require_permission("targets.manage")), db: Session = Depends(db_session)):
+    # Discovery only proposes origins for the form. What a recorded session may
+    # reach still comes from the Administrator-approved list in PostgreSQL.
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được dò và cấu hình địa chỉ chuyển hướng.")
+    if not web_hub.configured:
+        raise HTTPException(status_code=503, detail="Dịch vụ Web console chưa sẵn sàng. Cần triển khai đồng bộ API và dịch vụ trình duyệt có ghi hình.")
+    if web_discovery_lock.locked():
+        raise HTTPException(status_code=409, detail="Đang dò một website khác. Chờ vài giây rồi bấm lại.")
+    async with web_discovery_lock:
+        try:
+            found = await web_hub.discover(payload.url)
+        except WebSessionError as exc:
+            if str(exc) == "busy":
+                raise HTTPException(status_code=409, detail="Dịch vụ trình duyệt đang bận. Chờ vài giây rồi bấm lại.") from exc
+            raise HTTPException(status_code=503, detail="Không dò được địa chỉ chuyển hướng. Kiểm tra dịch vụ trình duyệt trên Operation Portal.") from exc
+    audit(db, user.username, "target.web.redirect_discovery", origin_text(*web_url_endpoint(payload.url)), request,
+          result="partial" if found["error"] else "success",
+          detail={**found, "probe": "anonymous-no-input-no-recording"})
+    db.commit()
+    return found
+
+
+@app.get("/api/v1/managed-targets/{server_id}/redirect-suggestions")
+def list_managed_target_redirect_suggestions(server_id: str, user: User = Depends(require_permission("targets.manage")), db: Session = Depends(db_session)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ Administrator được dò và cấu hình địa chỉ chuyển hướng.")
+    server = visible_server(db, user, server_id)
+    if server.os_family != "web":
+        raise HTTPException(status_code=404, detail="Không tìm thấy kết nối")
+    allowed = set((server.inventory or {}).get("managedTarget", {}).get("web_allowed_origins") or [])
+    rows = db.execute(select(AuditEvent.detail, AuditEvent.occurred_at).where(
+        AuditEvent.action == "session.web.redirect_blocked", AuditEvent.target == server.id,
+        AuditEvent.occurred_at >= now() - timedelta(days=30)).order_by(AuditEvent.occurred_at.desc()).limit(500)).all()
+    items: dict[str, dict[str, Any]] = {}
+    for detail, occurred_at in rows:
+        value = (detail or {}).get("origin")
+        # Session data is untrusted input: keep only exact stored-form origins.
+        if not is_normalized_origin(value) or value in allowed or len(items) >= 16:
+            continue
+        items.setdefault(value, {"origin": value, "count": 0, "lastSeen": occurred_at.isoformat()})["count"] += 1
+    return {"items": list(items.values())}
 
 
 @app.get("/api/v1/configuration-snapshot")
@@ -5828,6 +5875,15 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
                   detail={"recording": True})
             active_db.commit()
 
+    async def redirect_blocked(identifier: str, origins: list[str]) -> None:
+        # Only a suggestion for Sửa kết nối; the session itself stays blocked
+        # until an Administrator approves the origin.
+        with SessionLocal() as blocked_db:
+            for value in origins:
+                audit(blocked_db, "system:web-console", "session.web.redirect_blocked", server_id,
+                      result="denied", detail={"session_id": identifier, "origin": value})
+            blocked_db.commit()
+
     async def finished(identifier: str, reason: str) -> None:
         with SessionLocal() as final_db:
             row = final_db.get(RemoteSession, identifier)
@@ -5871,7 +5927,7 @@ async def launch_web_session(payload: SessionLaunchRequest, request: Request, us
         if isinstance(exc, WebSessionError):
             raise HTTPException(status_code=503, detail="Không khởi tạo được phiên Web console có ghi hình. Kiểm tra dịch vụ trình duyệt trên Operation Portal.") from exc
         raise
-    web_hub.watch(session_id, lambda: web_recording_file(session_id), authorized, activate, finished)
+    web_hub.watch(session_id, lambda: web_recording_file(session_id), authorized, activate, finished, blocked=redirect_blocked)
     return {"sessionId": session_id, "url": guacamole_launch_url(settings.guacamole_url, server.name, encrypted),
             "expiresIn": 120, "recording": True}
 

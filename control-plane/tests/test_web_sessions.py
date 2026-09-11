@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 
 from app.web_sessions import WebSessionError, WebSessionHub
 
@@ -153,6 +154,64 @@ class WebHubTests(unittest.IsolatedAsyncioTestCase):
             "session_id": "session", "target_url": "https://console.example.test/ui",
             "width": 800, "height": 600, "allowed_origins": ["https://sso.example.test:8443"],
         })
+
+    async def test_discovery_accepts_only_stored_form_origins_from_the_worker(self):
+        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+        hub.call = AsyncMock(return_value={"navigation": ["https://sso.test:8443", "https://sso.test:8443"],
+                                           "resources": ["https://cdn.test:443"], "blocked": [], "error": "timeout"})
+        found = await hub.discover("https://console.test/ui")
+        self.assertEqual(found, {"navigation": ["https://sso.test:8443"], "resources": ["https://cdn.test:443"],
+                                 "blocked": [], "error": "timeout"})
+        self.assertEqual(hub.call.call_args.args, ("POST", "/discover", {"target_url": "https://console.test/ui"}))
+        for invalid in ({"navigation": ["https://sso.test:8443/websso?SAMLRequest=secret"], "resources": [], "blocked": [], "error": ""},
+                        {"navigation": ["https://sso.test"], "resources": [], "blocked": [], "error": ""},
+                        {"navigation": ["https://sso.test:99999"], "resources": [], "blocked": [], "error": ""},
+                        {"navigation": ["https://sso.test:8443"] * 17, "resources": [], "blocked": [], "error": ""},
+                        {"navigation": [], "resources": [], "blocked": [], "error": "unexpected"},
+                        {"resources": [], "blocked": [], "error": ""}):
+            with self.subTest(invalid=invalid):
+                hub.call = AsyncMock(return_value=invalid)
+                with self.assertRaises(WebSessionError):
+                    await hub.discover("https://console.test/ui")
+
+    async def test_blocked_origins_are_reported_once_per_session_and_capped(self):
+        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+        seen = []
+
+        async def blocked(session_id, origins):
+            seen.append((session_id, origins))
+
+        reported: set[str] = set()
+        await hub.report_blocked("session", {"blocked_origins": ["https://sso.test:8443", "https://sso.test:8443/websso?SAMLRequest=secret", 7, "https://cdn.test:443"]}, reported, blocked)
+        await hub.report_blocked("session", {"blocked_origins": ["https://sso.test:8443"]}, reported, blocked)
+        await hub.report_blocked("session", {"blocked_origins": [f"https://host{index}.test:443" for index in range(20)]}, reported, blocked)
+        await hub.report_blocked("session", {"blocked_origins": "https://string.test:443"}, reported, blocked)
+        self.assertEqual(seen[0], ("session", ["https://sso.test:8443", "https://cdn.test:443"]))
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(seen[1][1]), 6)
+        self.assertEqual(len(reported), 8)
+        # A failing suggestion must never end an otherwise healthy session.
+        await hub.report_blocked("session", {"blocked_origins": ["https://late.test:443"]}, set(),
+                                 AsyncMock(side_effect=RuntimeError("https://sso.test/?SAMLRequest=secret")))
+
+    async def test_watcher_reports_blocked_origins_before_the_session_closes(self):
+        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+        hub.call = AsyncMock(return_value={"status": "failed", "reason": "lease-expired",
+                                           "blocked_origins": ["https://sso.test:8443"]})
+        blocked, activate, closed = AsyncMock(), AsyncMock(), AsyncMock()
+        await hub._watch("session", lambda: None, lambda: True, activate, closed, blocked)
+        blocked.assert_awaited_once_with("session", ["https://sso.test:8443"])
+        closed.assert_awaited_once_with("session", "web-lease-expired")
+        activate.assert_not_awaited()
+
+    async def test_worker_conflict_is_reported_as_busy_not_unavailable(self):
+        hub = WebSessionHub("http://web-console:8081", lambda: "a" * 32)
+        for code, expected in ((409, "busy"), (500, "unavailable")):
+            with self.subTest(code=code):
+                error = HTTPError("http://web-console:8081/discover", code, "conflict", {}, None)
+                with patch("app.web_sessions.build_opener", side_effect=error), self.assertRaises(WebSessionError) as raised:
+                    await hub.call("POST", "/discover", {"target_url": "https://console.test/ui"})
+                self.assertEqual(str(raised.exception), expected)
 
     async def test_missing_service_fails_without_network(self):
         hub = WebSessionHub("", lambda: "a" * 32)

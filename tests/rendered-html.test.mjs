@@ -148,6 +148,53 @@ test("Admin and Operator create forms accept initial credentials without exposin
   }
 });
 
+test("web console form offers automatic redirect discovery to Admin only", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const role of ["admin", "operator"]) {
+    const editing = { id: "existing", config: { name: "console", kind: "web", url: "https://vcenter.example.test/ui/", web_allowed_origins: ["https://sso.example.test:8443"] } };
+    const values = [[], editing, null, "", "", "", "ready", false];
+    let index = 0;
+    const hooks = { ...React, useState: () => [values[index++], () => {}] };
+    const exports = {};
+    runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : name === "./server-resource-tabs" ? { ModalShell: (props) => React.createElement("div", null, Reflect.get(props, "children")) } : {} });
+    const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind: "web", role, token: "test", notify() {}, share() {} }));
+    assert.equal(html.includes("Tự dò địa chỉ chuyển hướng"), role === "admin", role);
+    assert.equal(/<textarea(?=[^>]*name="web_allowed_origins")(?=[^>]*readonly)[^>]*>/i.test(html), role !== "admin");
+    assert.match(html, /https:\/\/sso\.example\.test:8443/);
+    assert.doesNotMatch(html, /SAMLRequest/);
+  }
+});
+
+test("discovered and previously blocked origins are added with one click", async () => {
+  const { default: ts } = await import("typescript");
+  const require = createRequire(import.meta.url);
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const source = await readFile(new URL("../app/managed-targets.tsx", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const editing = { id: "existing", config: { name: "console", kind: "web", url: "https://vcenter.example.test/ui/", web_allowed_origins: [] } };
+  const discovery = { url: "https://vcenter.example.test/ui/", busy: false, error: "", result: { navigation: ["https://sso.example.test:8443"], resources: ["https://cdn.example.test:443"], blocked: ["https://localhost:8443"], error: "timeout" } };
+  const suggestions = [{ origin: "https://portal.example.test:9443", count: 3, lastSeen: "2026-09-10T02:00:00.000Z" }, { origin: "https://sso.example.test:8443", count: 1, lastSeen: "2026-09-10T02:00:00.000Z" }];
+  // Hook slots after the catalog view: allowlist text, discovery state, suggestions.
+  const values = [[], editing, null, "", "", "", "ready", false, null, "https://sso.example.test:8443", discovery, suggestions];
+  let index = 0;
+  const hooks = { ...React, useState: () => [values[index++], () => {}] };
+  const exports = {};
+  runInNewContext(compiled, { exports, React, require: (name) => name === "react" ? hooks : name === "./server-resource-tabs" ? { ModalShell: (props) => React.createElement("div", null, Reflect.get(props, "children")) } : {} });
+  const html = renderToStaticMarkup(React.createElement(exports.ManagedTargetsView, { kind: "web", role: "admin", token: "test", notify() {}, share() {} }));
+  assert.match(html, /Đã tự thêm 1 địa chỉ/);
+  assert.match(html, /Website tải chậm/);
+  assert.match(html, /＋ https:\/\/cdn\.example\.test:443/);
+  assert.match(html, /＋ https:\/\/portal\.example\.test:9443 · 3 lần/);
+  assert.match(html, /<button[^>]*disabled[^>]*>✓ https:\/\/sso\.example\.test:8443 · 1 lần/);
+  assert.match(html, /Không dùng được[^<]*https:\/\/localhost:8443/);
+});
+
 test("managed form needs no SSH toggle and never submits obsolete flags from saved targets", async () => {
   const { default: ts } = await import("typescript");
   const require = createRequire(import.meta.url);

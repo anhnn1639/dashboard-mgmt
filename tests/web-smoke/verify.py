@@ -258,6 +258,18 @@ asyncio.run(check())
             await asyncio.sleep(17)
             state = await asyncio.to_thread(http, 'GET', '/sessions/' + identifier)
             assert state['status'] == 'failed' and state['reason'] == 'lease-expired', state
+            if profile == 'redirect':
+                # Origin discovery: no recording, no input, and only the origins
+                # the website itself navigates to, in stored scheme://host:port form.
+                discovered = await hub.discover('https://console.test/discover')
+                assert discovered['navigation'] == ['https://sso.test:4443'], discovered
+                assert discovered['blocked'] == [] and discovered['error'] == '', discovered
+                assert 'https://sso.test:4443' not in discovered['resources'], discovered
+                assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/discover-landing-visited']).returncode == 0, 'Discovery never followed the script redirect'
+                assert subprocess.run(['docker', 'exec', 'tram-web-fixture', 'test', '-f', '/tmp/discover-final-visited']).returncode == 0, 'Discovery stopped before delayed meta refresh'
+                print('PASS: discovery follows bootstrap fetch delayed 6 seconds and meta refresh delayed 6 seconds; explicit origins remain required for recorded sessions')
+                for container in ('tram-web-fixture', 'tram-web-forbidden'):
+                    assert subprocess.run(['docker', 'exec', container, 'test', '-f', '/tmp/forbidden-hit']).returncode != 0, 'Discovery reached a destination the website never navigated to'
             consumer.cancel(); await asyncio.gather(consumer, return_exceptions=True)
             print('PASS: ' + profile + ' + production recording watcher + 1920x1080 Chromium + resized Guacamole VNC input + static-page recording; no target request before recording; literal-IP/wrong-port redirects blocked before TCP; API lease loss closes browser')
         finally:

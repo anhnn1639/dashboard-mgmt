@@ -8,6 +8,49 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+HOSTNAME = re.compile(r"[a-z0-9.-]+|[0-9a-f:]+")
+# Stored form only: scheme://host:port, never a path, query or credential.
+NORMALIZED_ORIGIN = re.compile(r"https?://(?:[a-z0-9.-]{1,120}|\[[0-9a-f:]{2,39}\]):[0-9]{1,5}")
+
+
+def web_url_endpoint(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment or "\\" in url or any(ord(c) < 33 for c in url):
+        raise ValueError("Web consoles require HTTP or HTTPS without embedded credentials or fragments")
+    if len(parsed.hostname) > 120 or not HOSTNAME.fullmatch(parsed.hostname):
+        raise ValueError("Web console hostname is too long")
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid web console port")
+    return parsed.scheme, parsed.hostname, port
+
+
+def origin_text(scheme: str, host: str, port: int) -> str:
+    return f"{scheme}://{'[' + host + ']' if ':' in host else host}:{port}"
+
+
+def normalize_origin(value: str) -> str:
+    item = urlsplit(value.strip())
+    if (item.scheme not in {"http", "https"} or not item.hostname or item.username is not None
+            or item.password is not None or item.path not in {"", "/"} or item.query or item.fragment
+            or "\\" in value or any(ord(c) < 33 for c in value) or len(item.hostname) > 120
+            or not HOSTNAME.fullmatch(item.hostname)):
+        raise ValueError("Redirect entries must be HTTP/HTTPS origins without paths, queries or credentials")
+    port = item.port if item.port is not None else (443 if item.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid redirect port")
+    return origin_text(item.scheme, item.hostname, port)
+
+
+def is_normalized_origin(value: object) -> bool:
+    """Accept only the exact stored form; used for data from the browser worker."""
+    if not isinstance(value, str) or not NORMALIZED_ORIGIN.fullmatch(value):
+        return False
+    try:
+        return normalize_origin(value) == value
+    except ValueError:
+        return False
+
 
 class InitialTargetCredential(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -51,31 +94,25 @@ class ManagedTargetRequest(BaseModel):
             if self.url or self.web_ignore_https_errors or self.web_allowed_origins:
                 raise ValueError("SSH targets cannot contain browser settings")
         else:
-            parsed = urlsplit(self.url)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment or "\\" in self.url or any(ord(c) < 33 for c in self.url):
-                raise ValueError("Web consoles require HTTP or HTTPS without embedded credentials or fragments")
-            if len(parsed.hostname) > 120 or not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:]+", parsed.hostname):
-                raise ValueError("Web console hostname is too long")
             # URL is authoritative; ignore legacy address/port fields.
-            self.address = parsed.hostname
-            self.port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
-            if not 1 <= self.port <= 65535:
-                raise ValueError("Invalid web console port")
+            _, self.address, self.port = web_url_endpoint(self.url)
             self.ssh_host_key = ""
             allowed = []
             for value in self.web_allowed_origins:
-                item = urlsplit(value.strip())
-                if (item.scheme not in {"http", "https"} or not item.hostname or item.username is not None
-                        or item.password is not None or item.path not in {"", "/"} or item.query or item.fragment
-                        or "\\" in value or any(ord(c) < 33 for c in value) or len(item.hostname) > 120
-                        or not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:]+", item.hostname)):
-                    raise ValueError("Redirect entries must be HTTP/HTTPS origins without paths, queries or credentials")
-                port = item.port if item.port is not None else (443 if item.scheme == "https" else 80)
-                if not 1 <= port <= 65535:
-                    raise ValueError("Invalid redirect port")
-                host = "[" + item.hostname + "]" if ":" in item.hostname else item.hostname
-                normalized = f"{item.scheme}://{host}:{port}"
+                normalized = normalize_origin(value)
                 if normalized not in allowed:
                     allowed.append(normalized)
             self.web_allowed_origins = sorted(allowed)
         return self
+
+
+class RedirectDiscoveryRequest(BaseModel):
+    """Administrator-supplied URL to open once, without input, to list origins."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    url: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def valid_url(cls, value: str) -> str:
+        web_url_endpoint(value)
+        return value

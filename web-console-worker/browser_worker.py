@@ -49,6 +49,18 @@ def origin(url: str) -> tuple[str, str, int]:
     return (scheme, host, port)
 
 
+def origin_text(value: tuple[str, str, int]) -> str:
+    scheme, host, port = value
+    return f"{scheme}://{'[' + host + ']' if ':' in host else host}:{port}"
+
+
+def validate_web_target(value: str) -> str:
+    origin(value)
+    if not value.startswith(("http://", "https://")) or urlsplit(value).fragment:
+        raise ValueError("HTTP or HTTPS target required")
+    return value
+
+
 def allowed_url(url: str, target: str) -> bool:
     try:
         return origin(url) == origin(target)
@@ -73,6 +85,44 @@ async def pinned_address(url: str) -> str:
     return sorted(ips, key=lambda ip: (":" in ip, ip))[0]
 
 
+BROWSER_ARGS = ["--proxy-bypass-list=<-loopback>", "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+BROWSER_ENV = {"HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "TEMP", "TMP"}
+# Block WebRTC/WebTransport's non-HTTP transports before any site script.
+INIT_SCRIPT = """for (const k of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
+            Object.defineProperty(globalThis,k,{value:undefined,writable:false,configurable:false}); }
+            window.open = () => null;"""
+NAVIGATION_NOTICES = {
+    "certificate": "Website từ chối chứng thư HTTPS. Kiểm tra dịch vụ hoặc yêu cầu chứng thư phía máy khách.",
+    "timeout": "Website tải quá lâu. Kiểm tra dịch vụ website rồi mở lại phiên.",
+    "blocked-origin": "Địa chỉ chuyển hướng chưa được phép. Administrator cần thêm địa chỉ / cổng SSO trong Sửa kết nối.",
+    "tls": "Không thương lượng được HTTPS. Kiểm tra giao thức TLS và cổng của website.",
+    "connection": "Không kết nối được website từ dịch vụ trình duyệt. Kiểm tra URL, DNS và kết nối của container.",
+}
+
+
+async def launch_browser(playwright, proxy):
+    # One hardened launch path for recorded sessions and for origin discovery.
+    return await playwright.chromium.launch(headless=True, chromium_sandbox=True, timeout=20000,
+        proxy=proxy, args=BROWSER_ARGS,
+        env={k: v for k, v in os.environ.items() if k in BROWSER_ENV})
+
+
+def navigation_error_code(exc: Exception, blocked_destination: bool) -> str:
+    # Never echo exception text: it can contain SAML tokens or URLs.
+    error = re.search(r"net::(ERR_[A-Z0-9_]+)", str(exc))
+    code = error.group(1) if error else ""
+    if code.startswith("ERR_CERT_"):
+        return "certificate"
+    if isinstance(exc, BrowserTimeoutError):
+        return "timeout"
+    if blocked_destination:
+        return "blocked-origin"
+    if code.startswith("ERR_SSL_"):
+        return "tls"
+    return "connection"
+
+
 class CreateSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_id: UUID
@@ -87,10 +137,7 @@ class CreateSession(BaseModel):
     @field_validator("target_url")
     @classmethod
     def validate_url(cls, value):
-        origin(value)
-        if not value.startswith(("http://", "https://")) or urlsplit(value).fragment:
-            raise ValueError("HTTP or HTTPS target required")
-        return value
+        return validate_web_target(value)
 
     @field_validator("allowed_origins")
     @classmethod
@@ -101,6 +148,16 @@ class CreateSession(BaseModel):
             if parsed.scheme not in {"http", "https"} or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or len(value) > 256:
                 raise ValueError("Only explicit HTTP/HTTPS origins are accepted")
         return values
+
+
+class DiscoverRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_url: str = Field(max_length=2048)
+
+    @field_validator("target_url")
+    @classmethod
+    def validate_url(cls, value):
+        return validate_web_target(value)
 
 
 def authenticate(authorization: str = Header(default="")):
@@ -120,6 +177,7 @@ def challenge_response(password: str, challenge: bytes) -> bytes:
     return cipher.update(challenge) + cipher.finalize()
 
 
+DISCOVERY_LIMIT = 16
 KEYS = {0xff08: "Backspace", 0xff09: "Tab", 0xff0d: "Enter", 0xff1b: "Escape",
         0xffff: "Delete", 0xff50: "Home", 0xff57: "End", 0xff51: "ArrowLeft",
         0xff52: "ArrowUp", 0xff53: "ArrowRight", 0xff54: "ArrowDown",
@@ -151,6 +209,9 @@ class Desktop:
         self.keys = set()
         self.clipboard = ""
         self.input_lock = asyncio.Lock()
+        # Origins this session navigated to but may not reach, reported to the
+        # API as Administrator suggestions. Origins only, never a path or token.
+        self.blocked_origins: list[str] = []
         self.notice = "Đang chuẩn bị ghi hình kiểm toán. Vui lòng chờ…"
 
     def input_enabled(self):
@@ -162,24 +223,16 @@ class Desktop:
         scheme, host, port = origin(self.url)
         self.destinations[(scheme, host, port)] = ip
         self.proxy = PinnedProxy(host, port, ip, self.input_enabled, scheme=scheme, resolve=self.resolve_destination)
-        proxy = await self.proxy.start()
-        self.browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, timeout=20000,
-            proxy=proxy,
-            args=["--proxy-bypass-list=<-loopback>", "--disable-quic",
-                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
-            env={k: v for k, v in os.environ.items() if k in {
-                "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "TEMP", "TMP"}})
+        self.browser = await launch_browser(playwright, await self.proxy.start())
         self.context = await self.browser.new_context(viewport={"width": self.width, "height": self.height - 28},
             accept_downloads=False, ignore_https_errors=self.ignore_https_errors, service_workers="block")
         self.context.set_default_timeout(3000)
         self.context.set_default_navigation_timeout(15000)
         await self.context.route("**/*", self.route)
         await self.context.route_web_socket("**/*", self.route_socket)
-        # Block WebRTC/WebTransport's non-HTTP transports before any site script.
-        await self.context.add_init_script("""for (const k of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
-            Object.defineProperty(globalThis,k,{value:undefined,writable:false,configurable:false}); }
-            window.open = () => null;""")
+        await self.context.add_init_script(INIT_SCRIPT)
         self.page = await self.context.new_page()
+        self.page.on("request", self.observe_request)
         self.capture = await self.context.new_cdp_session(self.page)
         self.page.on("dialog", lambda dialog: dialog.dismiss())
         self.page.on("download", lambda download: download.cancel())
@@ -211,6 +264,24 @@ class Desktop:
             return origin(url) in self.allowed_origins
         except ValueError:
             return False
+
+    def observe_request(self, request):
+        # Only document navigations become Administrator suggestions, so page
+        # scripts cannot propose an origin the website never redirected to.
+        if not request.is_navigation_request() or self.permitted(request.url):
+            return
+        try:
+            value = origin_text(origin(request.url))
+        except ValueError:
+            return
+        if value not in self.blocked_origins and len(self.blocked_origins) < 8:
+            self.blocked_origins.append(value)
+        self.notice = self.blocked_notice()
+
+    def blocked_notice(self):
+        if self.blocked_origins:
+            return f"Địa chỉ chuyển hướng chưa được phép: {self.blocked_origins[-1]}. Administrator thêm địa chỉ này trong Sửa kết nối."
+        return NAVIGATION_NOTICES["blocked-origin"]
 
     async def route(self, route):
         if self.input_enabled() and self.permitted(route.request.url):
@@ -245,24 +316,9 @@ class Desktop:
                 self.navigation_error = "http-error"
                 self.notice = f"Website trả lỗi HTTP {response.status}. Kiểm tra dịch vụ hoặc URL website."
         except Exception as exc:
-            # Never echo exception text: it can contain SAML tokens or URLs.
-            error = re.search(r"net::(ERR_[A-Z0-9_]+)", str(exc))
-            code = error.group(1) if error else ""
-            if code.startswith("ERR_CERT_"):
-                self.navigation_error = "certificate"
-                self.notice = "Website từ chối chứng thư HTTPS. Kiểm tra dịch vụ hoặc yêu cầu chứng thư phía máy khách."
-            elif isinstance(exc, BrowserTimeoutError):
-                self.navigation_error = "timeout"
-                self.notice = "Website tải quá lâu. Kiểm tra dịch vụ website rồi mở lại phiên."
-            elif self.proxy and self.proxy.blocked_destination:
-                self.navigation_error = "blocked-origin"
-                self.notice = "Địa chỉ chuyển hướng chưa được phép. Administrator cần thêm địa chỉ / cổng SSO trong Sửa kết nối."
-            elif code.startswith("ERR_SSL_"):
-                self.navigation_error = "tls"
-                self.notice = "Không thương lượng được HTTPS. Kiểm tra giao thức TLS và cổng của website."
-            else:
-                self.navigation_error = "connection"
-                self.notice = "Không kết nối được website từ dịch vụ trình duyệt. Kiểm tra URL, DNS và kết nối của container."
+            self.navigation_error = navigation_error_code(exc, bool(self.proxy and self.proxy.blocked_destination))
+            self.notice = (self.blocked_notice() if self.navigation_error == "blocked-origin"
+                           else NAVIGATION_NOTICES[self.navigation_error])
 
     async def stop(self, reason="closed"):
         if self.status in {"closed", "failed"}:
@@ -446,9 +502,138 @@ class Desktop:
             writer.close()
 
 
+class Discovery:
+    """Open the configured URL once, with no input, no clipboard and no RFB
+    transport, and report only the origins the website itself navigates to or
+    loads. Nothing is typed or stored, results never contain a path, query or
+    SAML token, and every destination keeps the unicast DNS/IP validation that
+    recorded sessions use. The Administrator still decides what gets saved.
+    """
+
+    def __init__(self, url: str):
+        self.url = url
+        self.target = origin(url)
+        self.navigation: list[tuple[str, str, int]] = []
+        self.resources: list[tuple[str, str, int]] = []
+        self.destinations: dict[tuple[str, str, int], str | None] = {}
+        self.destination_lock = asyncio.Lock()
+        self.page = None
+        self.error = ""
+        self.active = True
+        self.settled = time.monotonic()
+        self.pending_requests: set = set()
+
+    def enabled(self) -> bool:
+        return self.active
+
+    async def resolve_destination(self, scheme, host, port):
+        key = (scheme, host, port)
+        async with self.destination_lock:
+            if key not in self.destinations:
+                if len(self.destinations) >= 1 + 2 * DISCOVERY_LIMIT:
+                    return None
+                host_text = "[" + host + "]" if ":" in host else host
+                try:
+                    self.destinations[key] = await asyncio.wait_for(pinned_address(f"{scheme}://{host_text}:{port}"), 3)
+                except (ValueError, OSError, TimeoutError):
+                    self.destinations[key] = None
+            return self.destinations[key] if self.active else None
+
+    def observe(self, url: str, navigation: bool) -> None:
+        try:
+            key = origin(url)
+        except ValueError:
+            return
+        if navigation:
+            self.settled = time.monotonic()
+        if key == self.target:
+            return
+        if navigation:
+            if key in self.resources:
+                self.resources.remove(key)
+            if key not in self.navigation and len(self.navigation) < DISCOVERY_LIMIT:
+                self.navigation.append(key)
+        elif key not in self.navigation and key not in self.resources and len(self.resources) < DISCOVERY_LIMIT:
+            self.resources.append(key)
+
+    def request_started(self, request):
+        try:
+            origin(request.url)
+        except ValueError:
+            return
+        self.pending_requests.add(request)
+        self.observe(request.url, request.is_navigation_request())
+
+    def request_finished(self, request):
+        self.pending_requests.discard(request)
+        self.settled = time.monotonic()
+
+    async def extra_page(self, page):
+        if page != self.page:
+            await page.close()
+
+    def result(self) -> dict:
+        def reachable(key):
+            return bool(self.destinations.get(key))
+
+        return {"navigation": [origin_text(key) for key in self.navigation if reachable(key)],
+                "resources": [origin_text(key) for key in self.resources if reachable(key)],
+                "blocked": [origin_text(key) for key in self.navigation + self.resources if not reachable(key)][:DISCOVERY_LIMIT],
+                "error": self.error}
+
+    async def run(self, playwright) -> dict:
+        proxy = browser = None
+        try:
+            scheme, host, port = self.target
+            try:
+                address = await asyncio.wait_for(pinned_address(self.url), 5)
+            except (ValueError, OSError, TimeoutError):
+                self.error = "connection"
+                return self.result()
+            self.destinations[self.target] = address
+            proxy = PinnedProxy(host, port, address, self.enabled, scheme=scheme, resolve=self.resolve_destination)
+            browser = await launch_browser(playwright, await proxy.start())
+            context = await browser.new_context(viewport={"width": 1280, "height": 800},
+                accept_downloads=False, ignore_https_errors=True, service_workers="block")
+            context.set_default_timeout(3000)
+            context.set_default_navigation_timeout(15000)
+            await context.add_init_script(INIT_SCRIPT)
+            self.page = await context.new_page()
+            self.page.on("request", self.request_started)
+            self.page.on("requestfinished", self.request_finished)
+            self.page.on("requestfailed", self.request_finished)
+            self.page.on("websocket", lambda socket: self.observe(socket.url, False))
+            self.page.on("dialog", lambda dialog: dialog.dismiss())
+            self.page.on("download", lambda download: download.cancel())
+            context.on("page", self.extra_page)
+            deadline = time.monotonic() + 25
+            try:
+                response = await self.page.goto(self.url, wait_until="domcontentloaded")
+                if response is not None and response.status >= 400:
+                    self.error = "http-error"
+            except Exception as exc:
+                self.error = navigation_error_code(exc, proxy.blocked_destination)
+            # A quiet gap does not mean that login discovery has finished:
+            # bootstrap fetches, timers and meta refresh can navigate later.
+            # Observe the whole bounded window, including those delayed hops.
+            while time.monotonic() < deadline:
+                await asyncio.sleep(min(0.25, deadline - time.monotonic()))
+            if not self.error and (self.pending_requests or time.monotonic() - self.settled < 4):
+                self.error = "timeout"
+        finally:
+            self.active = False
+            if proxy:
+                await proxy.stop()
+            if browser:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(browser.close(), 5)
+        return self.result()
+
+
 desktops: dict[str, Desktop] = {}
 playwright = None
 creation_lock = asyncio.Lock()
+discovery_lock = asyncio.Lock()
 
 
 async def sweep():
@@ -512,6 +697,21 @@ async def create(payload: CreateSession):
             raise HTTPException(503, "Cannot prepare browser") from None
 
 
+@app.post("/discover", dependencies=[Depends(authenticate)])
+async def discover(payload: DiscoverRequest):
+    if discovery_lock.locked():
+        raise HTTPException(409, "Another discovery is running")
+    async with discovery_lock:
+        probe = Discovery(payload.target_url)
+        try:
+            async with asyncio.timeout(40):
+                return await probe.run(playwright)
+        except TimeoutError:
+            return {**probe.result(), "error": "timeout"}
+        except Exception:
+            raise HTTPException(503, "Cannot prepare browser") from None
+
+
 def get_desktop(identifier: UUID):
     item = desktops.get(str(identifier))
     if item is None:
@@ -522,7 +722,8 @@ def get_desktop(identifier: UUID):
 @app.get("/sessions/{identifier}", dependencies=[Depends(authenticate)])
 def status(identifier: UUID):
     item = get_desktop(identifier)
-    return {"status": item.status, "reason": item.reason, "navigation_error": item.navigation_error}
+    return {"status": item.status, "reason": item.reason, "navigation_error": item.navigation_error,
+            "blocked_origins": list(item.blocked_origins)}
 
 
 @app.post("/sessions/{identifier}/activate", dependencies=[Depends(authenticate)])

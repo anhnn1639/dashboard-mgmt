@@ -1,8 +1,9 @@
 /** Read the API response without leaking HTML proxy errors into the form. */
-export async function readManagedTargetResponse(response: Response, operation: "list" | "create" | "edit" | "delete") {
+export async function readManagedTargetResponse(response: Response, operation: "list" | "create" | "edit" | "delete" | "discover") {
   const data = await response.json().catch(() => null);
   if (!response.ok) {
     if (response.status === 404) {
+      if (operation === "discover") throw new Error("API chưa hỗ trợ tự dò địa chỉ chuyển hướng (HTTP 404). Cần cập nhật đồng bộ API với giao diện rồi thử lại.");
       throw new Error(operation === "list" || operation === "create"
         ? "API chưa có chức năng Thiết bị mạng / Web console (HTTP 404). Cần cập nhật đồng bộ API và giao diện; nếu đã cập nhật, kiểm tra proxy /api/ đang trỏ đúng dịch vụ API."
         : "Kết nối không còn tồn tại hoặc API chưa được cập nhật. Hãy tải lại danh sách trước khi thử lại.");

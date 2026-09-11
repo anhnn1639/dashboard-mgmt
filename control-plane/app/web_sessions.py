@@ -6,6 +6,7 @@ owned by PostgreSQL in main.py. The worker never receives dashboard cookies.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -14,6 +15,14 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
+
+from .managed_targets import is_normalized_origin
+
+# Discovery opens a real website, so it needs more than the control timeout.
+WORKER_TIMEOUTS = {"/sessions": 30, "/discover": 45}
+DISCOVERY_ERRORS = {"", "certificate", "timeout", "blocked-origin", "tls", "connection", "http-error"}
+# One session may propose at most this many origins to the Administrator.
+BLOCKED_ORIGIN_LIMIT = 8
 
 
 class WebSessionError(Exception):
@@ -48,7 +57,7 @@ class WebSessionHub:
                     return None
 
             try:
-                with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=30 if path == "/sessions" else 5) as response:
+                with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=WORKER_TIMEOUTS.get(path, 5)) as response:
                     body = response.read(16385)
                     if len(body) > 16384:
                         raise WebSessionError("invalid-response")
@@ -58,7 +67,8 @@ class WebSessionHub:
                     return result
             except (HTTPError, URLError, OSError, ValueError) as exc:
                 # Upstream content can contain target URLs and credentials.
-                raise WebSessionError("unavailable") from exc
+                busy = isinstance(exc, HTTPError) and exc.code == 409
+                raise WebSessionError("busy" if busy else "unavailable") from exc
 
         return await asyncio.to_thread(send)
 
@@ -72,6 +82,23 @@ class WebSessionHub:
             raise WebSessionError("invalid-response")
         return result
 
+    async def discover(self, target_url: str) -> dict:
+        """Report the origins a website redirects to, so the Administrator does
+        not have to type them. The worker returns origins only; anything else
+        in the response is rejected before it can reach the dashboard."""
+        result = await self.call("POST", "/discover", {"target_url": target_url})
+
+        def origins(name: str) -> list[str]:
+            values = result.get(name)
+            if not isinstance(values, list) or len(values) > 16 or not all(is_normalized_origin(item) for item in values):
+                raise WebSessionError("invalid-response")
+            return list(dict.fromkeys(values))
+
+        if result.get("error") not in DISCOVERY_ERRORS:
+            raise WebSessionError("invalid-response")
+        return {"navigation": origins("navigation"), "resources": origins("resources"),
+                "blocked": origins("blocked"), "error": result["error"]}
+
     async def stop_remote(self, session_id: str) -> None:
         try:
             await self.call("DELETE", "/sessions/" + session_id)
@@ -81,16 +108,31 @@ class WebSessionHub:
 
     def watch(self, session_id: str, recording: Callable[[], Path | None],
               authorize: Callable[[], bool], activate: Callable[[], Awaitable[None]],
-              closed: Callable[[str, str], Awaitable[None]]) -> None:
-        self.tasks[session_id] = asyncio.create_task(self._watch(session_id, recording, authorize, activate, closed))
+              closed: Callable[[str, str], Awaitable[None]],
+              blocked: Callable[[str, list[str]], Awaitable[None]] | None = None) -> None:
+        self.tasks[session_id] = asyncio.create_task(self._watch(session_id, recording, authorize, activate, closed, blocked))
 
-    async def _watch(self, session_id, recording, authorize, activate, closed):
+    async def report_blocked(self, session_id, state, reported, blocked) -> None:
+        values = state.get("blocked_origins")
+        if not isinstance(values, list):
+            return
+        fresh = [item for item in values if is_normalized_origin(item) and item not in reported][:BLOCKED_ORIGIN_LIMIT - len(reported)]
+        if not fresh:
+            return
+        reported.update(fresh)
+        # Advisory suggestions for the Administrator: a failure to record one
+        # must never end a recorded session that is otherwise healthy.
+        with contextlib.suppress(Exception):
+            await blocked(session_id, fresh)
+
+    async def _watch(self, session_id, recording, authorize, activate, closed, blocked=None):
         reason = "web-service-failed"
         started = time.monotonic()
         active = False
         last_size = 0
         progressed = started
         failure_stage = "web-service-failed"
+        reported: set[str] = set()
         try:
             while time.monotonic() - started < 3600:
                 failure_stage = "web-authorization-failed"
@@ -99,6 +141,8 @@ class WebSessionHub:
                     break
                 failure_stage = "web-status-unavailable"
                 state = await self.call("GET", "/sessions/" + session_id)
+                if blocked is not None:
+                    await self.report_blocked(session_id, state, reported, blocked)
                 if state.get("status") in {"closed", "failed"}:
                     reason = "closed" if state["status"] == "closed" else "web-browser-failed"
                     # Only fixed worker codes may enter the durable audit trail.
