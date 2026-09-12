@@ -81,7 +81,7 @@ async def main():
                    "-v", str(ROOT / "tests/guacamole-smoke/browser.py") + ":/fixture-browser.py:ro",
                    "-v", str(ROOT / "tests/guacamole-smoke/connected.py") + ":/fixture-connected.py:ro",
                    "-v", str(ROOT / "tests/guacamole-smoke/native-paste.py") + ":/fixture-native-paste.py:ro",
-                   "-v", str(ROOT / "deploy/guacamole/clipboard-sync/tram-clipboard-sync-v6.js") + ":/fixture-clipboard.js:ro",
+                   "-v", str(ROOT / "deploy/guacamole/clipboard-sync/tram-clipboard-sync-v7.js") + ":/fixture-clipboard.js:ro",
                    "--entrypoint", "python", "portal-guacamole-browser",
                    "/fixture-browser.py", f"http://{guacamole}:8080/guacamole")
             print(browser_output)

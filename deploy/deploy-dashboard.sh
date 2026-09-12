@@ -70,10 +70,12 @@ compose_check "Dashboard managed connections" dashboard \
   grep -Fq '＋ Thêm kết nối' /app/app/managed-targets.tsx
 compose_check "Guacamole clipboard extension" guacamole \
   test -r /etc/guacamole/extensions/tram-clipboard-sync.jar
+compose_check "Guacamole native display resize" guacamole \
+  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-display-resize-v1.js"
 compose_check "Guacamole isolated session authentication" guacamole \
   sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-session-auth-v1.js"
 compose_check "Guacamole clipboard extension version" guacamole \
-  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v6.js"
+  sh -c "jar --list --file /etc/guacamole/extensions/tram-clipboard-sync.jar | grep -Fq tram-clipboard-sync-v7.js"
 
 verify_step "Guacamole JSON authentication and SSH/RDP protocols" 75 docker compose -f compose.yaml -f "$override" exec -T --interactive=true api gosu ops python - < deploy/verify-guacamole.py
 

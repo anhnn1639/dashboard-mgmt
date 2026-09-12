@@ -36,6 +36,9 @@ async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(chromium_sandbox=True)
         try:
+            spec = importlib.util.spec_from_file_location("connected", "/fixture-connected.py")
+            connected = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(connected)
             # A synchronous clipboard API failure used to abort Angular
             # startup. A pending prompt must not stop tunnel creation.
             for protocol, clipboard in (("ssh", "throw"), ("rdp", "pending")):
@@ -50,6 +53,7 @@ async def main():
                     });
                 """)
                 page = await context.new_page()
+                await connected.prepare_late_layout(page)
                 errors, tunnels = [], []
                 page.on("pageerror", lambda error: errors.append(type(error).__name__))
                 page.on("websocket", lambda ws: tunnels.append("websocket"))
@@ -57,6 +61,7 @@ async def main():
                 identifier = base64.urlsafe_b64encode(f"fixture-{protocol}\0c\0json".encode()).decode().rstrip("=")
                 url = base_url + "/#/client/" + identifier + "?data=" + quote(encrypted_fixture(key, protocol), safe="")
                 await page.goto(url, wait_until="domcontentloaded")
+                await connected.release_late_layout(page)
                 # The closed fixture port must produce the normal visible
                 # Guacamole error. A black page cannot satisfy this check.
                 await page.get_by_text("The remote desktop server", exact=False).first.wait_for(timeout=25000)
@@ -64,9 +69,6 @@ async def main():
                 assert not errors, "Frontend raised JavaScript exceptions"
                 print("PASS: " + protocol + " frontend authenticates and shows connection failure with clipboard " + clipboard)
                 await context.close()
-            spec = importlib.util.spec_from_file_location("connected", "/fixture-connected.py")
-            connected = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(connected)
             await connected.verify_connected_ssh(browser, base_url, key, encrypted_fixture)
             spec = importlib.util.spec_from_file_location("native_paste", "/fixture-native-paste.py")
             native_paste = importlib.util.module_from_spec(spec)

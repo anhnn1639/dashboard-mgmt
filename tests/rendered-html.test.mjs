@@ -792,7 +792,7 @@ test("dashboard exposes build freshness and deployment verification", async () =
   assert.match(deployScript, /build --pull --no-cache guacamole/);
   assert.match(deployScript, /force-recreate api dashboard guacamole/);
   assert.match(deployScript, /tram-clipboard-sync\.jar/);
-  assert.match(deployScript, /tram-clipboard-sync-v6\.js/);
+  assert.match(deployScript, /tram-clipboard-sync-v7\.js/);
 });
 
 test("remote credentials are admin-managed and clipboard is paste-only", async () => {
@@ -813,16 +813,16 @@ test("Guacamole waits for the latest browser clipboard before forwarding input",
   const compose = await readFile(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = await readFile(new URL("../deploy/guacamole/Dockerfile", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../deploy/guacamole/clipboard-sync/guac-manifest.json", import.meta.url), "utf8"));
-  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v6.js", import.meta.url), "utf8");
+  const extension = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync-v7.js", import.meta.url), "utf8");
 
   assert.equal(manifest.guacamoleVersion, "1.6.0");
-  assert.equal(manifest.namespace, "tram-clipboard-sync-v6");
-  assert.deepEqual(manifest.js, ["tram-session-auth-v1.js", "tram-clipboard-sync-v6.js"]);
+  assert.equal(manifest.namespace, "tram-clipboard-sync-v7");
+  assert.deepEqual(manifest.js, ["tram-display-resize-v1.js", "tram-session-auth-v1.js", "tram-clipboard-sync-v7.js"]);
   assert.deepEqual(manifest.css, ["tram-clipboard-sync.css"]);
   const extensionCSS = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-clipboard-sync.css", import.meta.url), "utf8");
   assert.ok(extensionCSS.trim().length > 0, "CSS bundle must carry a resource with text/css MIME");
-  assert.match(dockerfile, /guac-manifest\.json tram-session-auth-v1\.js tram-clipboard-sync-v6\.js tram-clipboard-sync\.css/);
-  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.6[\s\S]*context: \.\/deploy\/guacamole/);
+  assert.match(dockerfile, /guac-manifest\.json tram-display-resize-v1\.js tram-session-auth-v1\.js tram-clipboard-sync-v7\.js tram-clipboard-sync\.css/);
+  assert.match(compose, /image: tram-guacamole:1\.6\.0-clipboard-sync\.7[\s\S]*context: \.\/deploy\/guacamole/);
   assert.match(dockerfile, /FROM guacamole\/guacamole:1\.6\.0/);
   assert.match(dockerfile, /jar --create --file \/etc\/guacamole\/extensions\/tram-clipboard-sync\.jar/);
   assert.match(extension, /browserClipboard\.readText\(\)[\s\S]*\$broadcast\('guacClipboard', new ClipboardData/);
@@ -1377,4 +1377,62 @@ test("Portal remote launches isolate authentication without revoking other tabs"
   for (const hash of ["", "#/", "#/client/fixture", "#/client/fixture?data=", "#/client/fixture?metadata=fixture"]) {
     assert.equal(tab(hash).getItem("GUAC_AUTH_TOKEN"), "old-tab-token", "Normal Guacamole authentication remains unchanged");
   }
+});
+
+test("Guacamole observes late layout and resize without embedded objects", async () => {
+  const source = await readFile(new URL("../deploy/guacamole/clipboard-sync/tram-display-resize-v1.js", import.meta.url), "utf8");
+  function fixture(available = true) {
+    let resized, destroyed, linked, observed, disconnected = false;
+    const queue = [], calls = [];
+    const originalLink = () => { throw new Error("Legacy embedded object sensor must not execute"); };
+    const definitions = [{ restrict: "A", link: originalLink, compile: () => originalLink }];
+    const node = { offsetWidth: 0, offsetHeight: 0 };
+    const scope = {
+      $eval(expression) { assert.equal(expression, "resized"); return (w, h) => calls.push([w, h]); },
+      $evalAsync(callback) { queue.push(callback); },
+      $on(event, callback) { assert.equal(event, "$destroy"); destroyed = callback; },
+    };
+    const window = available ? { ResizeObserver: class {
+      constructor(callback) { resized = callback; }
+      observe(element) { observed = element; }
+      disconnect() { disconnected = true; }
+    } } : {};
+    runInNewContext(source, { angular: {
+      extend: Object.assign,
+      module(name) {
+        assert.equal(name, "element");
+        return { config(definition) { definition.at(-1)({
+          decorator(name, definition) {
+            assert.equal(name, "guacResizeDirective");
+            linked = definition.at(-1)(definitions, window);
+          },
+        }); } };
+      },
+    } });
+    if (available) linked[0].compile()(scope, [node], { guacResize: "resized" });
+    return { node, calls, queue, definitions, linked, originalLink,
+      observed: () => observed, resized: () => resized(), destroy: () => destroyed(),
+      disconnected: () => disconnected, flush: () => { while (queue.length) queue.shift()(); } };
+  }
+  const f = fixture();
+  assert.equal(f.observed(), f.node);
+  assert.equal(f.definitions[0].link, f.originalLink, "Do not mutate original/fallback directive");
+  f.flush();
+  assert.deepEqual(f.calls, [[0, 0]]);
+  f.node.offsetWidth = 1280; f.node.offsetHeight = 720;
+  f.resized(); f.resized();
+  assert.equal(f.queue.length, 1, "Coalesce duplicate resize events");
+  f.flush();
+  assert.deepEqual(f.calls.at(-1), [1280, 720], "Visible client must receive the first usable size");
+  f.resized(); f.flush();
+  assert.equal(f.calls.length, 2, "Stable dimensions must not cause an endless digest");
+  f.node.offsetWidth = 960; f.node.offsetHeight = 600;
+  f.resized(); f.flush();
+  assert.deepEqual(f.calls.at(-1), [960, 600]);
+  f.resized(); f.destroy(); f.flush(); f.resized();
+  assert.ok(f.disconnected());
+  assert.equal(f.calls.length, 3, "Destroyed client must not reconnect");
+  assert.equal(f.queue.length, 0);
+  const fallback = fixture(false);
+  assert.equal(fallback.linked, fallback.definitions);
 });

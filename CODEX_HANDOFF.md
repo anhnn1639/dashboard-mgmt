@@ -1,6 +1,15 @@
 # Bàn giao Codex — 12/09/2026
 
-## Sửa lỗi dùng lại phiên Guacamole cũ — chờ triển khai
+## Màn hình đen sau 315642d — đã tái hiện lỗi cảm biến kích thước
+
+- User đã deploy 315642d; xác nhận HTTP production builtAt 2026-09-12T00:16:12.043Z, app.js có tách xác thực v6, toàn bộ CSS/JS đúng MIME. Công cụ CUA vẫn không khởi tạo được. Log mới: launch RDP tới Agent e6732279 thành công, stream accepted, Guacamole xác thực JSON thành công nhưng không có guacd khởi tạo phiên. Agent khác f0313169 có checkin 422/control 403; không coi lỗi máy khác là nguyên nhân phiên RDP này.
+- Kiểm public WebSocket qua Nginx/Caddy trả 101; HTTP tunnel tới Guacamole (probe không token/không đích trả lỗi thiếu GUAC_ID đúng dự kiến). Không thay đổi tuyến mạng hay chính sách xác thực.
+- Phát hiện Guacamole 1.6.0 guacResize dùng object HTML app/element/templates/blank.html. Production trả X-Frame-Options: DENY cho cả blank.html nên contentDocument của cảm biến không có. Nếu .client-main có kích thước 0 khi gắn client (tab chưa hiển thị/layout chưa hoàn tất), lần thay đổi kích thước sau không kích hoạt ManagedClient.connect.
+- Đã tái hiện bằng Chromium và chính tài nguyên frontend production, API/tunnel giả hoàn toàn: giữ viewport client 0 trong lúc auth rồi khôi phục 1280x720 → auth thành công, không JavaScript error, không socket, canvas 0x0 dù khung đã hiện. Bản vá ResizeObserver → cùng kịch bản tạo 1 socket, canvas 1024x768 đúng pixel và không object sensor, đạt granted/denied/pending clipboard. Đây là lỗi cụ thể khớp triệu chứng/log; chưa quan sát trực tiếp tab người dùng.
+- Thêm tram-display-resize-v1.js decorate guacResizeDirective bằng ResizeObserver, báo kích thước ban đầu/thay đổi trong Angular digest, gộp sự kiện, ngắt observer khi destroy. Giữ fallback của Guacamole nếu trình duyệt không có ResizeObserver. Không nới X-Frame-Options/CSP và không đổi authentication/clipboard/recording. Bump image/manifest/clipboard filename đồng bộ 7 (nội dung clipboard vẫn giống v6); deploy kiểm script mới.
+- Regression frontend thật nay ép khung 0 cho cả SSH/RDP, chặn sensor HTML như production rồi hiện lại. SSH vẫn phải nhận native paste, thay đổi kích thước cửa sổ, có hình tiếp theo, nhiều tab đúng token/cổng và bản ghi riêng. Đang chạy kiểm thử/push; chưa deploy bản vá resize.
+
+## Sửa lỗi dùng lại phiên Guacamole cũ — đã triển khai 315642d
 
 - Đã tái hiện bằng Guacamole 1.6.0 thật: ba tab cùng trình duyệt, cùng username và connection ID nhưng cấu hình JSON khác nhau đều dùng thông tin của tab đầu. CI 34658899036 ghi cả ba vào browser-granted/browser-granted.1/browser-granted.2 và cùng file kết quả. Trong Portal, cổng relay và tên bản ghi thay đổi ở mỗi lần Kết nối; dùng cấu hình cũ có thể trỏ tới relay đã đóng. Đây là lỗi đã tái hiện, chưa xác nhận trực tiếp trên tab production của người dùng.
 - Source 8bc4702 thêm tram-session-auth-v1.js: chỉ với đường dẫn client có dữ liệu launch, giữ token Guacamole trong bộ nhớ riêng của trang. Không đọc, ghi đè hoặc thu hồi token lưu chung của tab khác. Mỗi lần mở mới xác thực đúng JSON, relay và bản ghi mới; các tùy chọn Guacamole khác giữ nguyên. Không thay đổi RBAC/MFA, thời hạn link, cơ chế ghi hình hoặc mật khẩu. Áp dụng cho cả SSH/RDP/Web console.

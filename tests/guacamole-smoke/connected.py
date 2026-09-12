@@ -14,6 +14,35 @@ FRAME = """(color) => Array.from(document.querySelectorAll('canvas')).some((canv
 })"""
 
 
+async def prepare_late_layout(page):
+    await page.route("**/app/element/templates/blank.html", lambda route: route.fulfill(
+        content_type="text/html", headers={"X-Frame-Options": "DENY"}, body="<!doctype html><html></html>"))
+    # Portal popups may finish auth while their display still has zero
+    # dimensions. Guacamole must connect once layout becomes available.
+    await page.add_init_script("""
+        const observer = new MutationObserver(attach);
+        function attach() {
+            if (!document.documentElement) return;
+            observer.disconnect();
+            const style = document.createElement('style');
+            style.textContent = '.client-main { width: 0 !important; height: 0 !important; }';
+            document.documentElement.appendChild(style);
+            window.fixtureReleaseLayout = () => style.remove();
+        }
+        observer.observe(document, {childList: true});
+        attach();
+    """)
+
+
+async def release_late_layout(page):
+    # Wait for the actual zero-size client, not an arbitrary delay.
+    await page.wait_for_function("""() => {
+        const main = document.querySelector('.client-main');
+        return main && main.offsetWidth === 0 && main.querySelector('canvas');
+    }""", timeout=15000)
+    await page.evaluate("window.fixtureReleaseLayout()")
+
+
 async def verify_connected_ssh(browser, base_url, key, encrypt):
     hostname = os.environ["SSH_FIXTURE_HOST"]
     password = os.environ["SSH_FIXTURE_PASSWORD"]
@@ -45,6 +74,7 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
                 "pending": "return new Promise(() => {});",
             }[mode]
             page = await context.new_page()
+            await prepare_late_layout(page)
             await page.add_init_script("""Object.defineProperty(navigator, 'clipboard', {
                 configurable: true, value: { readText() {""" + behavior + """},
                 writeText() { return new Promise(() => {}); }
@@ -68,6 +98,7 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             identifier = base64.urlsafe_b64encode(b"fixture-ssh\0c\0json").decode().rstrip("=")
             url = base_url + "/#/client/" + identifier + "?data=" + quote(encrypt(key, "ssh", parameters), safe="")
             await page.goto(url, wait_until="domcontentloaded")
+            await release_late_layout(page)
             try:
                 await page.wait_for_function(FRAME, arg=2, timeout=20000)
             except Exception:
@@ -92,6 +123,17 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             await page.locator(".display").first.click(position={"x": 60, "y": 60})
             await page.keyboard.press("Control+v")
             await page.wait_for_function(FRAME, arg=1, timeout=10000)
+            assert await page.locator("object.resize-sensor").count() == 0, "Display still depends on an embedded HTML object"
+            prior_width = await page.locator(".client-main canvas").first.evaluate("(canvas) => canvas.width")
+            await page.set_viewport_size({"width": 1000, "height": 650})
+            await page.wait_for_function("""(priorWidth) => {
+                const main = document.querySelector('.client-main');
+                const canvas = main && main.querySelector('canvas');
+                return main && main.offsetWidth > 900 && main.offsetHeight > 500
+                    && canvas && canvas.width < priorWidth
+                    && Math.abs(canvas.width - main.offsetWidth * devicePixelRatio) < 32;
+            }""", arg=prior_width, timeout=10000)
+            await page.wait_for_function(FRAME, arg=1, timeout=5000)
             assert not errors, "Connected Guacamole frontend raised a JavaScript error"
             if previous_page is not None:
                 await previous_page.wait_for_function(FRAME, arg=1, timeout=2000)
@@ -101,6 +143,6 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
             valid = await context.request.head(base_url + "/api/session", headers=legacy_headers)
             assert valid.status in (200, 204), f"New launch revoked another tab's authentication: HTTP {valid.status}"
             previous_page = page
-            print("PASS: real SSH browser displays first frame, native paste reaches shell and next frame remains visible across shared browser auth; clipboard " + mode)
+            print("PASS: real SSH browser recovers from zero-size layout with framing blocked, resizes, displays first frame, native paste reaches shell and next frame remains visible across shared browser auth; clipboard " + mode)
     finally:
         await context.close()
