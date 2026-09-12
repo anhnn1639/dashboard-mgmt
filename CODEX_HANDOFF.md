@@ -1,13 +1,13 @@
 # Bàn giao Codex — 12/09/2026
 
-## Sửa hồi quy UI và chuẩn bị push — 12/09/2026
+## Sửa hồi quy UI — đã push, CI toàn bộ đạt — 12/09/2026
 
 - User yêu cầu sửa rồi push lên Git. Giữ bản UI Claude đã được duyệt, sửa bảy finding trong lượt review. Không chỉnh API/Agent/Guacamole/Web worker hoặc cấu hình đường truyền/ghi hình.
 - Chuông dùng chung `loadApprovals`, `approvalStatus`, `canReviewApproval`, `approvalReviewRequest` với trang Phê duyệt. Hiển thị đầy đủ đối tượng/tham số/lý do, xác nhận đúng dữ liệu trước khi duyệt; cập nhật cùng thông điệp xác nhận cho trang Phê duyệt. Phản hồi cũ/hết hạn/unmount bị bỏ, hủy request tải quá 10 giây; lỗi giữ danh sách gần nhất và báo chưa cập nhật được. Khóa thao tác khi đang duyệt/lỗi tải, xóa row và toast sau thành công, refresh cả khi lỗi 409. Poll đồng bộ toast đã xử lý từ màn hình khác. Thay tài khoản/quyền sẽ remount chuông.
 - Font Be Vietnam Pro/IBM Plex Mono: alias ở body, tên biến riêng tránh đụng Tailwind. Sửa tương phản dòng bảo mật theme sáng. Giới thiệu dùng native dialog để khóa nền/focus, Escape và trả focus; giới hạn chiều cao và cuộn. Bỏ version/giấy phép/email tạm chưa được xác nhận, giữ publisher đã duyệt; lỗi kiểm tra build không còn báo mới nhất.
 - Validation trên source sửa: build production, TypeScript, ESLint app/tests/toàn source (bỏ thư mục nháp work/.claude), diff-check đạt; UI **66/66**, gồm **13** regression hành vi mới về notifications (state/expiry/permission/confirm/error/race/unmount). Chromium build thực: **7** nhóm đạt, gồm hai theme/font/contrast/modal ở 390x380, bốn trạng thái build, và luồng thông báo với dữ liệu giả. CI Node job đã thêm cùng browser script `tests/dashboard-ui/browser.py`; không đụng dữ liệu production.
 - Các lượt review trước đó đã đạt API 164 +12 platform/DB skip, Agent111, worker49+13skip và 27 browser auto-login/capture; source các phần đó không đổi. CI sau push sẽ chạy toàn bộ bộ kiểm thử, gồm PostgreSQL và Guacamole/SSH/Web thật trong fixture. Chưa chứng minh remote đầu cuối trên production hoặc máy Windows RDP thật.
-- Chuẩn bị commit toàn bộ thay đổi UI/test/workflow liên quan; bỏ `.claude/` và `work/` khỏi Git. Sau push đối chiếu origin/main với commit mới, kiểm CI; deployment server vẫn cần pull/build bằng `bash deploy/deploy-dashboard.sh compose.test.yaml`. Không báo đã deploy khi chỉ mới push.
+- Đã commit/push source `ead49f0bdb4851fa2ffe4256d62980e71468681d` và đối chiếu remote `main` đúng hash. `.claude/` và `work/` không vào Git. CI `34672294177` SUCCESS **9/9 job** trên source `ead49f0` (Node/UI66+Chromium7 nhóm mới, API/PostgreSQL+Agent, edge, Guacamole frontend, bốn SSH profile và Web console). Toàn bộ profile Web auto-login/capture/busy-renderer/recording gate/cert/redirect/HTTP/font chậm đều đạt. Không đổi application source sau CI; commit tiếp theo chỉ cập nhật bàn giao. Deployment server vẫn cần `git pull --ff-only origin main` rồi `bash deploy/deploy-dashboard.sh compose.test.yaml`; chưa triển khai từ workspace.
 
 ## Rà soát hồi quy UI Claude — 12/09/2026
 
