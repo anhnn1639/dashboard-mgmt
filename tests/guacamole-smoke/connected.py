@@ -28,6 +28,12 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
                                         form={"data": encrypt(key, "ssh")})
     assert legacy.status == 200, "Could not seed legacy fixture authentication"
     legacy_token = (await legacy.json())["authToken"]
+    # SessionResource.checkValidity() has a void HEAD response (normally 204).
+    # Check the baseline too, so a wrong endpoint/header cannot masquerade as
+    # a later revocation failure. Neither request logs authentication data.
+    legacy_headers = {"Guacamole-Token": legacy_token}
+    valid = await context.request.head(base_url + "/api/session", headers=legacy_headers)
+    assert valid.status in (200, 204), f"Legacy fixture session is invalid: HTTP {valid.status}"
     await context.add_init_script("localStorage.setItem('GUAC_AUTH_TOKEN', JSON.stringify("
                                   + json.dumps(legacy_token) + "));")
     try:
@@ -38,13 +44,13 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
                 "denied": "return Promise.reject(new Error('fixture denial'));",
                 "pending": "return new Promise(() => {});",
             }[mode]
-            await context.add_init_script("""Object.defineProperty(navigator, 'clipboard', {
+            page = await context.new_page()
+            await page.add_init_script("""Object.defineProperty(navigator, 'clipboard', {
                 configurable: true, value: { readText() {""" + behavior + """},
                 writeText() { return new Promise(() => {}); }
             }});""")
-            page = await context.new_page()
             errors = []
-            page.on("pageerror", lambda error: errors.append(type(error).__name__))
+            page.on("pageerror", lambda error, target=errors: target.append(type(error).__name__))
             # Blue before paste, green only after the real remote shell reads it.
             command = ("printf '\\033[44m\\033[2J\\033[HSSH_READY\\n'; "
                        "IFS= read -r pasted; "
@@ -92,8 +98,8 @@ async def verify_connected_ssh(browser, base_url, key, encrypt):
                 assert not await previous_page.get_by_text("The remote desktop server", exact=False).count()
             stored = await page.evaluate("JSON.parse(localStorage.getItem('GUAC_AUTH_TOKEN'))")
             assert stored == legacy_token, "New launch overwrote another tab's persistent authentication"
-            valid = await context.request.head(base_url + "/api/session", headers={"Guacamole-Token": legacy_token})
-            assert valid.status == 200, "New launch revoked another tab's authentication"
+            valid = await context.request.head(base_url + "/api/session", headers=legacy_headers)
+            assert valid.status in (200, 204), f"New launch revoked another tab's authentication: HTTP {valid.status}"
             previous_page = page
             print("PASS: real SSH browser displays first frame, native paste reaches shell and next frame remains visible across shared browser auth; clipboard " + mode)
     finally:
