@@ -12,7 +12,7 @@ export type Approval = {
 };
 type OperationRequest = { id: string; serverName: string; action: string; parameters: Record<string, unknown>; reason: string; requestedBy: string; requestedById: string; status: string; createdAt: string; expiresAt?: string; jobId?: string; jobStatus?: string };
 type RecordingRequest = { id: string; sessions: Array<{ label: string }>; reason: string; requestedBy: string; requestedByUsername: string; status: string; createdAt: string; error?: string };
-const actionLabels: Record<string, string> = { "server.delete": "Xóa thiết bị khỏi hệ thống", "storage.delete": "Xóa vùng lưu trữ", "firewall.rule.remove": "Xóa quy tắc tường lửa", "user.delete": "Xóa tài khoản", "group.delete": "Xóa nhóm", "group.remove_user": "Xóa tài khoản khỏi nhóm" };
+export const actionLabels: Record<string, string> = { "server.delete": "Xóa thiết bị khỏi hệ thống", "storage.delete": "Xóa vùng lưu trữ", "firewall.rule.remove": "Xóa quy tắc tường lửa", "user.delete": "Xóa tài khoản", "group.delete": "Xóa nhóm", "group.remove_user": "Xóa tài khoản khỏi nhóm" };
 const statusLabels: Record<string, string> = { pending: "Chờ duyệt", approved: "Đã duyệt", rejected: "Đã từ chối", deleting: "Đang xóa", deleted: "Đã xóa", failed: "Xóa chưa hoàn tất", expired: "Hết hạn", cancelled: "Đã hủy" };
 const jobLabels: Record<string, string> = { queued: "Đang chờ thực hiện", running: "Đang thực hiện", succeeded: "Hoàn tất", failed: "Thực hiện thất bại", cancelled: "Đã hủy" };
 
@@ -28,9 +28,17 @@ export function approvalReviewRequest(item: Approval, decision: "approve" | "rej
     ? { url: `/api/v1/recording-deletion-requests/${encodeURIComponent(item.id)}/${decision}`, body: undefined }
     : { url: `/api/v1/deletion-approvals/${encodeURIComponent(item.id)}/review`, body: JSON.stringify({ decision }) };
 }
-export async function loadApprovals(token: string, permissions: string[]): Promise<Approval[]> {
+export function approvalReviewMessage(item: Approval, decision: "approve" | "reject") {
+  return [
+    `${decision === "approve" ? "Duyệt thực hiện" : "Từ chối"}: ${actionLabels[item.action] ?? item.action}`,
+    `Đối tượng: ${item.target}`,
+    item.parameters && Object.keys(item.parameters).length ? JSON.stringify(item.parameters, null, 2) : "",
+    `Lý do: ${item.reason}`,
+  ].filter(Boolean).join("\n\n");
+}
+export async function loadApprovals(token: string, permissions: string[], signal?: AbortSignal): Promise<Approval[]> {
   async function get(path: string) {
-    const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+    const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store", signal });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail ?? "Không tải được yêu cầu phê duyệt");
     return data.items ?? [];
@@ -73,7 +81,7 @@ export function ApprovalsView({ token, currentUser }: { token: string; currentUs
   }, [load]);
   async function review(item: Approval, decision: "approve" | "reject") {
     if (!canReviewApproval(item, currentUser)) return;
-    if (!window.confirm(`${decision === "approve" ? "Duyệt thực hiện" : "Từ chối"}: ${actionLabels[item.action] ?? item.action} trên ${item.target}?`)) return;
+    if (!window.confirm(approvalReviewMessage(item, decision))) return;
     setBusy(item.kind + item.id); setError("");
     try {
       const request = approvalReviewRequest(item, decision);

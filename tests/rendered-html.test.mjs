@@ -1436,3 +1436,49 @@ test("Guacamole observes late layout and resize without embedded objects", async
   const fallback = fixture(false);
   assert.equal(fallback.linked, fallback.definitions);
 });
+
+test("navigation uses drawn icons instead of typed glyphs", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  const nav = source.slice(source.indexOf("const navItems:"), source.indexOf("function navigationAllowed"));
+  assert.match(source, /const navIcons: Record<string, ReactElement>/);
+  assert.match(source, /<span className="nav-icon">\{navIcon\(item\.id\)\}<\/span>/);
+  assert.doesNotMatch(nav, /icon: "/);
+});
+
+test("top bar carries the clock, the bell and Giới thiệu, not a build hash", async () => {
+  const source = await readFile(new URL("../app/ops-console.tsx", import.meta.url), "utf8");
+  assert.match(source, /<NotificationCenter/);
+  assert.match(source, /openApprovals=\{\(\) => navigateSection\("approvals"\)\}/);
+  assert.match(source, /publisher: "AnhNN Entertaiment"/);
+  assert.match(source, /aria-labelledby="about-title"/);
+  // A source revision is build machinery; operators get product identity.
+  assert.doesNotMatch(source, /dashboard-build-id/);
+  assert.doesNotMatch(source, /CURRENT_DASHBOARD_BUILD\.slice/);
+  assert.doesNotMatch(source, /<kbd>Ctrl K<\/kbd>/);
+  // The shortcut itself stays; only its advertisement is gone.
+  assert.match(source, /event\.key\.toLowerCase\(\) === "k"/);
+});
+
+test("redesigned shell and notification surfaces stay on theme tokens", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(styles, /\.sidebar\s*\{[^}]*background: var\(--rail\)/s);
+  assert.match(styles, /html\[data-theme="light"\] \.sidebar\s*\{[^}]*background: var\(--rail\)/s);
+  // The blanket light-theme text rule must not paint rail text dark on dark.
+  assert.match(styles, /html\[data-theme="light"\] \.sidebar :where\([^)]*\)\s*\{\s*color: inherit !important/s);
+  assert.match(styles, /\.notif-panel\s*\{[^}]*background: var\(--panel\)/s);
+  assert.match(styles, /\.notif-toast\s*\{[^}]*border-left: 3px solid var\(--accent\)/s);
+  assert.match(styles, /\.about-card\s*\{[^}]*background: var\(--panel\)/s);
+  assert.match(styles, /\.status\s*\{[^}]*border-radius: 999px/s);
+  assert.match(styles, /--font-geist-sans: var\(--font-operation-ui\)/);
+});
+
+test("the interface face is drawn for Vietnamese diacritics", async () => {
+  const layout = await readFile(new URL("../app/layout.tsx", import.meta.url), "utf8");
+  assert.match(layout, /Be_Vietnam_Pro/);
+  assert.match(layout, /subsets: \["latin", "vietnamese"\]/);
+  assert.match(layout, /IBM_Plex_Mono/);
+  assert.doesNotMatch(layout, /Geist/);
+});
+
+// Behavioral coverage for the notification queue shared with Phê duyệt.
+import "./notification-center.test.mjs";

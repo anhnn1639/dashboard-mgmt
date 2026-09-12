@@ -215,3 +215,18 @@ jobs:
           pnpm exec tsc --noEmit
           pnpm lint
           pnpm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify dashboard behavior in Chromium
+        run: |
+          python -m pip install playwright==1.62.0
+          python -m playwright install --with-deps chromium
+          node node_modules/vinext/dist/cli.js start -H 127.0.0.1 -p 3107 > "$RUNNER_TEMP/dashboard-preview.log" 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:3107/build-info.json; then break; fi
+            sleep 1
+          done
+          python tests/dashboard-ui/browser.py

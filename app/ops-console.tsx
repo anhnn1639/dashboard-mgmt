@@ -1,12 +1,13 @@
 "use client";
 
 import Guacamole from "guacamole-common-js";
-import { CSSProperties, DragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, DragEvent, FormEvent, ReactElement, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccountsResourceTab, LogsResourceTab, ModalShell, ProcessesResourceTab, ServicesResourceTab, StorageResourceTab, UpdatesResourceTab } from "./server-resource-tabs";
 import { UpdateSourceSettingsView } from "./update-source-settings";
 import { RemoteCredentialsView } from "./remote-credentials";
 import { ApprovalsView, ReadOnlyWorkspace } from "./role-workspaces";
 import { ManagedTargetsView } from "./managed-targets";
+import { NotificationCenter } from "./notification-center";
 
 type OSFamily = "linux" | "windows";
 type LinuxOfflineProfile = "ubuntu-22.04" | "ubuntu-24.04" | "ol-7" | "ol-8";
@@ -97,21 +98,53 @@ type JobListRow = {
 const COOKIE_SESSION_MARKER = "cookie-session";
 const CURRENT_DASHBOARD_BUILD = typeof __TRAM_BUILD_ID__ === "string" ? __TRAM_BUILD_ID__ : "development";
 
-const navItems: Array<{ id: string; icon: string; label: string; group: string; permissions: string[]; count?: number; adminOnly?: boolean }> = [
-  { id: "overview", icon: "⌂", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
-  { id: "linux", icon: "L", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
-  { id: "windows", icon: "W", label: "Máy chủ Windows", count: 3, group: "infrastructure", permissions: ["servers.view"] },
-  { id: "network", icon: "◇", label: "Thiết bị mạng", group: "infrastructure", permissions: ["servers.view"] },
-  { id: "web", icon: "◎", label: "Web console", group: "infrastructure", permissions: ["servers.view"] },
-  { id: "sessions", icon: "↗", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
-  { id: "jobs", icon: "▶", label: "Công việc", group: "operations", permissions: ["jobs.view"] },
-  { id: "approvals", icon: "✓", label: "Phê duyệt", group: "operations", permissions: ["deletions.request", "deletions.approve", "recordings.delete"] },
-  { id: "configuration-view", icon: "⚙", label: "Xem cấu hình", group: "operations", permissions: ["configuration.view"] },
-  { id: "audit", icon: "≡", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
-  { id: "access", icon: "◎", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
-  { id: "update-settings", icon: "↥", label: "Cấu hình cập nhật", group: "administration", permissions: ["updates.manage"] },
-  { id: "remote-credentials", icon: "⌁", label: "Tài khoản xác thực", group: "administration", permissions: ["sessions.launch"], adminOnly: true },
-  { id: "agents", icon: "↓", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
+// Only publish confirmed product identity. Release and support metadata can be
+// added when provided by the publisher; a build check is not a product version.
+const PRODUCT = {
+  name: "Operation Portal",
+  publisher: "AnhNN Entertaiment",
+};
+
+const navIcons: Record<string, ReactElement> = {
+  overview: <><path d="M4 10.5 12 4l8 6.5" /><path d="M6 10v9h12v-9" /><path d="M10 19v-5h4v5" /></>,
+  linux: <><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M7 7.5h.01M7 16.5h.01" /></>,
+  windows: <><path d="M4 6.5 11 5.5v6H4z" /><path d="M13 5.2 20 4v7.5h-7z" /><path d="M4 12.5h7v6L4 17.5z" /><path d="M13 12.5h7V20l-7-1.2z" /></>,
+  network: <><rect x="3" y="9" width="18" height="6" rx="2" /><path d="M7 12h.01M11 12h.01M15 12h6" /></>,
+  web: <><circle cx="12" cy="12" r="8" /><path d="M4.5 9.5h15M4.5 14.5h15M12 4a14 14 0 0 0 0 16 14 14 0 0 0 0-16" /></>,
+  sessions: <><path d="M7 17 17 7" /><path d="M9 7h8v8" /></>,
+  jobs: <><circle cx="12" cy="12" r="8" /><path d="M10 9.5 15 12l-5 2.5z" /></>,
+  approvals: <path d="M4 12.5 9 17.5 20 6.5" />,
+  "configuration-view": <><circle cx="12" cy="12" r="3" /><path d="M19.4 13.5a7.6 7.6 0 0 0 0-3l1.8-1.4-1.9-3.2-2.1.9a7.6 7.6 0 0 0-2.6-1.5L14.3 3H9.7l-.3 2.3a7.6 7.6 0 0 0-2.6 1.5l-2.1-.9-1.9 3.2 1.8 1.4a7.6 7.6 0 0 0 0 3l-1.8 1.4 1.9 3.2 2.1-.9a7.6 7.6 0 0 0 2.6 1.5l.3 2.3h4.6l.3-2.3a7.6 7.6 0 0 0 2.6-1.5l2.1.9 1.9-3.2z" /></>,
+  audit: <path d="M4 7h16M4 12h16M4 17h10" />,
+  access: <><circle cx="9" cy="9" r="3.2" /><path d="M3.5 19c.6-3 3-4.6 5.5-4.6S13.9 16 14.5 19" /><path d="M16 8h5M16 12h5M16 16h3" /></>,
+  "update-settings": <><path d="M12 16V5" /><path d="M8 9l4-4 4 4" /><path d="M5 19h14" /></>,
+  "remote-credentials": <path d="M14.5 6.5a4 4 0 1 0-4.3 6.6L5 18.3V21h3l.6-2.2 2.2-.6.6-2.2 2-.5a4 4 0 0 0 1.1-8z" />,
+  agents: <><path d="M12 4v10" /><path d="M8 10l4 4 4-4" /><path d="M5 19h14" /></>,
+};
+
+function navIcon(id: string) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      {navIcons[id] ?? <circle cx="12" cy="12" r="7" />}
+    </svg>
+  );
+}
+
+const navItems: Array<{ id: string; label: string; group: string; permissions: string[]; count?: number; adminOnly?: boolean }> = [
+  { id: "overview", label: "Tổng quan", group: "infrastructure", permissions: ["servers.view"] },
+  { id: "linux", label: "Máy chủ Linux", count: 3, group: "infrastructure", permissions: ["servers.view"] },
+  { id: "windows", label: "Máy chủ Windows", count: 3, group: "infrastructure", permissions: ["servers.view"] },
+  { id: "network", label: "Thiết bị mạng", group: "infrastructure", permissions: ["servers.view"] },
+  { id: "web", label: "Web console", group: "infrastructure", permissions: ["servers.view"] },
+  { id: "sessions", label: "Phiên truy cập", group: "operations", permissions: ["recordings.view"] },
+  { id: "jobs", label: "Công việc", group: "operations", permissions: ["jobs.view"] },
+  { id: "approvals", label: "Phê duyệt", group: "operations", permissions: ["deletions.request", "deletions.approve", "recordings.delete"] },
+  { id: "configuration-view", label: "Xem cấu hình", group: "operations", permissions: ["configuration.view"] },
+  { id: "audit", label: "Nhật ký kiểm toán", group: "operations", permissions: ["audit.view", "recordings.view"] },
+  { id: "access", label: "Người dùng & vai trò", group: "administration", permissions: ["users.manage", "roles.manage", "ldap.manage"] },
+  { id: "update-settings", label: "Cấu hình cập nhật", group: "administration", permissions: ["updates.manage"] },
+  { id: "remote-credentials", label: "Tài khoản xác thực", group: "administration", permissions: ["sessions.launch"], adminOnly: true },
+  { id: "agents", label: "Bộ cài Agent", group: "administration", permissions: ["agents.manage"] },
 ];
 
 function navigationAllowed(item: (typeof navItems)[number], user: CurrentUser | null) {
@@ -600,6 +633,39 @@ export function OpsConsole() {
   const [systemClock, setSystemClock] = useState("--:--:--");
   const [systemTheme, setSystemTheme] = useState<SystemTheme>("dark");
   const [newDashboardBuild, setNewDashboardBuild] = useState("");
+  const [dashboardBuildCheck, setDashboardBuildCheck] = useState<"checking" | "current" | "unavailable">(
+    CURRENT_DASHBOARD_BUILD === "development" ? "unavailable" : "checking",
+  );
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const aboutDialogRef = useRef<HTMLDialogElement>(null);
+  const aboutCloseRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!aboutOpen) return;
+    const dialog = aboutDialogRef.current;
+    if (!dialog) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.showModal();
+    aboutCloseRef.current?.focus();
+    return () => {
+      dialog.close();
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [aboutOpen]);
+
+  function containAboutFocus(event: ReactKeyboardEvent<HTMLDialogElement>) {
+    if (event.key !== "Tab") return;
+    const controls = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not([disabled]):not([tabindex='-1'])"));
+    const first = controls[0];
+    const last = controls.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && (document.activeElement === first || !event.currentTarget.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
@@ -617,15 +683,26 @@ export function OpsConsole() {
   useEffect(() => {
     if (CURRENT_DASHBOARD_BUILD === "development") return;
     let active = true;
+    let checkGeneration = 0;
+    let controller: AbortController | null = null;
     const checkDashboardBuild = async () => {
+      const generation = ++checkGeneration;
+      controller?.abort();
+      const requestController = new AbortController();
+      controller = requestController;
+      const timeout = window.setTimeout(() => requestController.abort(), 10_000);
       try {
-        const response = await fetch(`/build-info.json?check=${Date.now()}`, { cache: "no-store" });
-        if (!response.ok) return;
+        const response = await fetch(`/build-info.json?check=${Date.now()}`, { cache: "no-store", signal: requestController.signal });
+        if (!response.ok) throw new Error("Build check unavailable");
         const data = await response.json() as { buildId?: unknown };
-        if (!active || typeof data.buildId !== "string") return;
+        if (typeof data.buildId !== "string" || !data.buildId.trim()) throw new Error("Invalid build information");
+        if (!active || generation !== checkGeneration) return;
         setNewDashboardBuild(data.buildId !== CURRENT_DASHBOARD_BUILD ? data.buildId : "");
+        setDashboardBuildCheck("current");
       } catch {
-        // A temporary status-check failure must not interrupt the operations console.
+        if (active && generation === checkGeneration) setDashboardBuildCheck("unavailable");
+      } finally {
+        window.clearTimeout(timeout);
       }
     };
     void checkDashboardBuild();
@@ -636,6 +713,7 @@ export function OpsConsole() {
     document.addEventListener("visibilitychange", checkWhenVisible);
     return () => {
       active = false;
+      controller?.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", checkWhenVisible);
     };
@@ -895,13 +973,6 @@ export function OpsConsole() {
   const warningCount = servers.filter((server) => server.health === "warning").length;
   const criticalCount = servers.filter((server) => ["critical", "offline"].includes(server.health)).length;
   const [healthyPercent, warningPercent, criticalPercent] = healthPercentages([healthyCount, warningCount, criticalCount]);
-  const healthStatus = criticalCount
-    ? `${criticalCount} máy cần xử lý ngay`
-    : warningCount
-      ? `${warningCount} máy cần theo dõi`
-      : servers.length
-        ? "Hệ thống ổn định"
-        : "Chưa có máy chủ";
   const navCount = (id: string, fallback?: number) =>
     id === "linux"
       ? servers.filter((server) => server.osFamily === "linux").length
@@ -1039,7 +1110,7 @@ export function OpsConsole() {
                 className={active === item.id ? "active" : ""}
                 onClick={() => navigateSection(item.id)}
               >
-                <span className="nav-icon">{item.icon}</span>
+                <span className="nav-icon">{navIcon(item.id)}</span>
                 {item.label}
                 {count !== undefined && <em>{count}</em>}
               </button>
@@ -1054,7 +1125,7 @@ export function OpsConsole() {
                 className={active === item.id ? "active" : ""}
                 onClick={() => navigateSection(item.id)}
               >
-                <span className="nav-icon">{item.icon}</span>
+                <span className="nav-icon">{navIcon(item.id)}</span>
                 {item.label}
                 {count !== undefined && <em>{count}</em>}
               </button>
@@ -1067,7 +1138,7 @@ export function OpsConsole() {
               className={active === item.id ? "active" : ""}
               onClick={() => navigateSection(item.id)}
             >
-              <span className="nav-icon">{item.icon}</span>
+              <span className="nav-icon">{navIcon(item.id)}</span>
               {item.label}
             </button>
           ))}
@@ -1129,7 +1200,6 @@ export function OpsConsole() {
               placeholder="Tìm máy chủ, IP hoặc nhãn..."
               aria-label="Tìm kiếm"
             />
-            <kbd>Ctrl K</kbd>
             {searchMatches.length > 0 && (
               <div className="search-suggestions">
                 {searchMatches.map((server) => (
@@ -1155,17 +1225,72 @@ export function OpsConsole() {
             )}
           </div>
           <div className="top-actions">
-            <span className="dashboard-build-id" title={`Bản giao diện ${CURRENT_DASHBOARD_BUILD}`}>Bản {CURRENT_DASHBOARD_BUILD.slice(0, 8)}</span>
             <span className="system-time" role="timer" aria-label={`Giờ hệ thống ${systemClock}`} title="Đồng hồ hệ thống · tự động dùng giao diện sáng từ 06:00 đến 17:59 theo giờ máy quản trị">
               <span aria-hidden="true">{systemTheme === "light" ? "☀" : "◐"}</span>
               <span><b>{systemClock}</b><small>Giờ hệ thống · giao diện {systemTheme === "light" ? "sáng" : "tối"}</small></span>
             </span>
-            <span className={`now ${criticalCount ? "critical" : warningCount ? "warning" : servers.length ? "healthy" : "neutral"}`}>
-              <i />
-              {healthStatus}
-            </span>
+            {currentUser && (
+              <NotificationCenter
+                key={`${token}:${currentUser.id}:${currentUser.role}:${currentUser.permissions.join(",")}`}
+                token={token}
+                role={currentUser.role}
+                userId={currentUser.id}
+                permissions={currentUser.permissions}
+                openApprovals={() => navigateSection("approvals")}
+                notify={notify}
+              />
+            )}
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={`Giới thiệu ${PRODUCT.name}`}
+              aria-expanded={aboutOpen}
+              onClick={() => setAboutOpen(true)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 11v5.5" /><path d="M12 7.8h.01" /></svg>
+              {newDashboardBuild && <span className="about-dot" title="Có bản cập nhật mới" />}
+            </button>
           </div>
         </header>
+
+        {aboutOpen && (
+          <dialog
+            ref={aboutDialogRef}
+            className="about-backdrop"
+            aria-labelledby="about-title"
+            onCancel={(event) => { event.preventDefault(); setAboutOpen(false); }}
+            onKeyDown={containAboutFocus}
+          >
+            <button type="button" className="about-scrim" tabIndex={-1} aria-label="Đóng giới thiệu" onClick={() => setAboutOpen(false)} />
+            <div className="about-card">
+              <div className="about-top">
+                <span className="brand-mark" aria-hidden="true">O</span>
+                <div>
+                  <h2 id="about-title">{PRODUCT.name}</h2>
+                  <p className="about-publisher">{PRODUCT.publisher}</p>
+                  <p>Cổng vận hành máy chủ tập trung: truy cập SSH, Remote Desktop và Web console qua một lối vào duy nhất, mọi phiên đều được ghi hình và ghi nhật ký kiểm toán.</p>
+                </div>
+              </div>
+              <div className="about-list">
+                <div className="about-row">
+                  <span>Cập nhật giao diện</span>
+                  {newDashboardBuild
+                    ? <span className="status warning"><i />Có bản mới</span>
+                    : dashboardBuildCheck === "current"
+                      ? <span className="status healthy"><i />Đang dùng bản triển khai hiện tại</span>
+                      : <span className="status neutral"><i />{dashboardBuildCheck === "checking" ? "Đang kiểm tra" : "Chưa kiểm tra được"}</span>}
+                </div>
+              </div>
+              <div className="about-foot">
+                <small>© {new Date().getFullYear()} {PRODUCT.publisher}</small>
+                <span className="inline-actions">
+                  {newDashboardBuild && <button type="button" className="button compact" onClick={() => window.location.reload()}>Cập nhật ngay</button>}
+                  <button ref={aboutCloseRef} type="button" className="button primary compact" onClick={() => setAboutOpen(false)}>Đóng</button>
+                </span>
+              </div>
+            </div>
+          </dialog>
+        )}
 
         <div className="content">
           {!selected && <div className="page-head">
