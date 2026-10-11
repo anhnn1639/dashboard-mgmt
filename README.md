@@ -2,6 +2,12 @@
 
 Control plane tự host để giám sát và vận hành tập trung Windows Server và Linux. Bản hiện tại là MVP có kiến trúc triển khai thực tế, API/agent chạy được và giao diện quản trị responsive. Trước khi dùng cho production quy mô lớn, cần kiểm thử trong môi trường staging, tích hợp IdP/vault của tổ chức và thực hiện pentest.
 
+## Giấy phép
+
+Mã nguồn và tài liệu gốc của dự án được phát hành theo [giấy phép MIT](LICENSE), một [giấy phép được OSI chấp thuận](https://opensource.org/license/mit).
+
+Mã của bên thứ ba, thư viện phụ thuộc, gói hệ thống trong bộ cài offline và các thành phần đi kèm bản dựng sẵn giữ nguyên giấy phép tương ứng của upstream. Riêng `web-console-worker/seccomp_profile.json` có nguồn gốc từ Microsoft Playwright vẫn theo Apache License 2.0; xem [NOTICE](web-console-worker/NOTICE.md) và [giấy phép Playwright](web-console-worker/LICENSE.playwright).
+
 ## Những gì đã có
 
 - Dashboard tách tự động **Windows** và **Linux**, không yêu cầu chọn thủ công khi cài agent.

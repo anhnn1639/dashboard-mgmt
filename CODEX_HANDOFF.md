@@ -1,5 +1,13 @@
 # Bàn giao Codex — 12/09/2026
 
+## Bổ sung giấy phép mã nguồn mở MIT — 2026-10-11
+
+- Theo yêu cầu của người dùng, thêm `LICENSE` ở thư mục gốc với nội dung MIT chuẩn, copyright `2026 dashboard-mgmt contributors`; khai báo `license: MIT` trong `package.json`, giữ `private: true`.
+- README bổ sung mục Giấy phép gần phần giới thiệu, dẫn tới giấy phép MIT được OSI chấp thuận và nêu rõ phạm vi mã nguồn/tài liệu gốc. Mã bên thứ ba, dependency, gói hệ thống offline và thành phần trong bản dựng sẵn giữ giấy phép upstream; giữ nguyên `web-console-worker/NOTICE.md`, `LICENSE.playwright` và giấy phép Apache 2.0 của seccomp profile.
+- Thay đổi chỉ gồm giấy phép, metadata và tài liệu; không sửa runtime, artifact Agent, cấu hình hoặc trạng thái deployment, không cần triển khai lại ứng dụng.
+- Bản cập nhật khắc phục việc thiếu giấy phép của dự án; không khẳng định dự án đã đủ mọi điều kiện hoặc được duyệt chương trình Claude for Open Source. Nghĩa vụ giấy phép khi phân phối các thành phần bên thứ ba/bản dựng sẵn cần được rà soát riêng; lượt này không phải kiểm toán toàn bộ việc tuân thủ phân phối.
+- Validation tập trung: đối chiếu nội dung MIT chuẩn, parse JSON và kiểm tra chỉ thêm trường license, kiểm tra liên kết tương đối của mục Giấy phép và `git diff --check`. Không chạy bộ kiểm thử ứng dụng vì không đổi code thực thi.
+
 ## Sửa hồi quy UI — đã push, CI toàn bộ đạt — 12/09/2026
 
 - User yêu cầu sửa rồi push lên Git. Giữ bản UI Claude đã được duyệt, sửa bảy finding trong lượt review. Không chỉnh API/Agent/Guacamole/Web worker hoặc cấu hình đường truyền/ghi hình.
