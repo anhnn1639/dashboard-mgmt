@@ -1,1 +1,1 @@
-{"architecture":"x86_64","artifactKind":"linux_offline_dependencies","profile":"ubuntu-24.04","schema":1,"sha256":"6b59e0036f3be8d5773b4a25500b0578255e47aece00e3ba7c8117bc3134e988","sizeBytes":44083200,"sourceCommit":"c5372b1c16070a1d61bcbe777573e84e34312d2e","version":"0.8.18"}
+{"architecture":"x86_64","artifactKind":"linux_offline_dependencies","profile":"ubuntu-24.04","schema":1,"sha256":"6b59e0036f3be8d5773b4a25500b0578255e47aece00e3ba7c8117bc3134e988","sizeBytes":44083200,"sourceCommit":"74692d8bcce2d210d8333a0bbc454c4475288de3","version":"0.8.19"}
