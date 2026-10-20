@@ -101,9 +101,11 @@ jobs:
                 echo "APT would request non-Packages indexes from the managed source" >&2
                 exit 1
               fi
-              timeout=$(apt-config -o Dir::Etc::parts=/tram-apt/apt.conf.d dump Acquire::http::Timeout)
-              echo "$timeout"
-              echo "$timeout" | grep -q "\"15\""
+              # -o is applied after apt.conf.d is read, so load the snippet
+              # explicitly to prove APT parses it.
+              apt-config -c /tram-apt/apt.conf.d/80tram-managed-sources dump > /tmp/config
+              grep -E "^Acquire::(http|https)::Timeout \"15\";$|^Acquire::Retries \"2\";$" /tmp/config
+              test "$(grep -cE "^Acquire::(http|https)::Timeout \"15\";$|^Acquire::Retries \"2\";$" /tmp/config)" -eq 3
             '
           done
 
