@@ -157,6 +157,199 @@ class AgentSecurityTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
+    def test_clock_sync_steps_large_offsets_and_signs_with_control_plane_time(self):
+        calls: list[float] = []
+        clock = tram_agent.ClockSync(setter=calls.append)
+        sent = time.time()
+        clock.observe(sent + 0.05 + 600, sent, sent + 0.1, {"enabled": True, "step_threshold_seconds": 2})
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0], time.time() + 600, delta=1)
+        self.assertEqual(clock.status, "stepped")
+        self.assertEqual(clock.offset, 0.0)
+        report = clock.report()
+        self.assertAlmostEqual(report["offset_ms"], -600000, delta=200)
+        self.assertAlmostEqual(report["last_step_ms"], 600000, delta=200)
+        self.assertIsNotNone(report["last_step_at"])
+
+        # A second, moderate offset shortly after a step means another time
+        # source is fighting; do not oscillate, but keep signing correctly.
+        sent = time.time()
+        clock.observe(sent + 0.05 + 10, sent, sent + 0.1)
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(clock.now(), time.time() + 10, delta=1)
+
+        # Large errors are corrected even inside the anti-oscillation window.
+        clock.observe(sent + 0.05 + 3600, sent, sent + 0.1)
+        self.assertEqual(len(calls), 2)
+
+        with patch.object(tram_agent, "CLOCK", tram_agent.ClockSync(setter=lambda _target: None)) as signing_clock:
+            signing_clock.offset = -900
+            config = SimpleNamespace(signing_material=lambda: ("cert", tram_agent.ec.generate_private_key(tram_agent.ec.SECP256R1())))
+            headers = tram_agent.signed_headers(config, "POST", "https://ops.example:9443/api/v1/agent/checkin", b"{}")
+            self.assertAlmostEqual(int(headers["X-Tram-Agent-Timestamp"]), time.time() - 900, delta=2)
+
+    def test_clock_sync_respects_threshold_policy_rtt_and_os_failures(self):
+        calls: list[float] = []
+        clock = tram_agent.ClockSync(setter=calls.append)
+        sent = time.time()
+        clock.observe(sent + 0.05 + 0.5, sent, sent + 0.1)
+        self.assertEqual((clock.status, calls), ("synchronized", []))
+        self.assertAlmostEqual(clock.offset, 0.5, delta=0.05)
+
+        clock.observe(sent + 0.05 + 120, sent, sent + 0.1, {"enabled": False})
+        self.assertEqual((clock.status, calls), ("disabled", []))
+        self.assertAlmostEqual(clock.offset, 120, delta=0.05)
+
+        clock.apply_policy({"enabled": True})
+        clock.observe(sent + 2.5 + 120, sent, sent + 5)
+        self.assertEqual(calls, [], "a slow round trip must not be used to step the clock")
+        self.assertAlmostEqual(clock.offset, 120, delta=0.05)
+
+        clock.observe(sent + 30, sent, sent + 40)
+        self.assertAlmostEqual(clock.offset, 120, delta=0.05, msg="implausible round trips are ignored")
+        clock.observe("2026-01-01T00:00:00+00:00", sent, sent + 0.1)
+        self.assertEqual(len(calls), 1, "ISO server_time from older control planes is accepted")
+        self.assertLess(calls[0], time.time() - 86400)
+
+        def refuse(_target: float) -> None:
+            raise PermissionError("Operation not permitted")
+
+        failing = tram_agent.ClockSync(setter=refuse)
+        failing.observe(sent + 0.05 + 300, sent, sent + 0.1)
+        self.assertEqual(failing.status, "failed")
+        self.assertIn("Operation not permitted", failing.report()["error"])
+        self.assertAlmostEqual(failing.now(), time.time() + 300, delta=1)
+
+        error = tram_agent.requests.HTTPError(response=SimpleNamespace(status_code=401))
+        self.assertTrue(tram_agent.clock_error_response(error, "Agent request timestamp is outside the allowed window"))
+        self.assertFalse(tram_agent.clock_error_response(error, "Unknown agent certificate"))
+        self.assertTrue(tram_agent.clock_error_response(tram_agent.requests.exceptions.SSLError("certificate is not yet valid"), ""))
+
+    def test_clock_probe_uses_mtls_and_survives_certificate_dates_rejected_by_a_wrong_clock(self):
+        import http.server
+        import ssl
+        import threading
+
+        ec = tram_agent.ec
+        x509 = tram_agent.x509
+        hashes = tram_agent.hashes
+        serialization = tram_agent.serialization
+        NameOID = tram_agent.NameOID
+
+        def issue(subject: str, issuer_key, issuer_name, key, *, ca: bool, not_before, not_after, server: bool = False):
+            builder = (
+                x509.CertificateBuilder()
+                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
+                .issuer_name(issuer_name or x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(not_before)
+                .not_valid_after(not_after)
+                .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+            )
+            if server:
+                builder = builder.add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            return builder.sign(issuer_key, hashes.SHA256())
+
+        def pem_cert(certificate) -> bytes:
+            return certificate.public_bytes(serialization.Encoding.PEM)
+
+        def pem_key(key) -> bytes:
+            return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+
+        current = datetime.now(UTC)
+        server_ca_key = ec.generate_private_key(ec.SECP256R1())
+        server_ca = issue("server-ca", server_ca_key, None, server_ca_key, ca=True, not_before=current - timedelta(days=30), not_after=current + timedelta(days=3650))
+        agent_ca_key = ec.generate_private_key(ec.SECP256R1())
+        agent_ca = issue("agent-ca", agent_ca_key, None, agent_ca_key, ca=True, not_before=current - timedelta(days=30), not_after=current + timedelta(days=3650))
+        agent_key = ec.generate_private_key(ec.SECP256R1())
+        agent_cert = issue("agent", agent_ca_key, agent_ca.subject, agent_key, ca=False, not_before=current - timedelta(days=1), not_after=current + timedelta(days=30))
+        policy = {"enabled": True, "step_threshold_seconds": 2}
+
+        class TimeHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/api/v1/agent/time":
+                    self.send_error(404)
+                    return
+                self.server.client_certificates.append(self.connection.getpeercert())
+                body = json.dumps({"server_time_epoch": time.time() + 7200, "time_sync": policy}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        with temporary_directory_with_windows_cleanup_retry() as directory:
+            root = Path(directory)
+            for name, content in {
+                "server-ca.crt": pem_cert(server_ca),
+                "agent-ca.crt": pem_cert(agent_ca),
+                "agent.crt": pem_cert(agent_cert),
+                "agent.key": pem_key(agent_key),
+            }.items():
+                (root / name).write_bytes(content)
+
+            def serve(not_before, not_after):
+                leaf_key = ec.generate_private_key(ec.SECP256R1())
+                leaf = issue("localhost", server_ca_key, server_ca.subject, leaf_key, ca=False, not_before=not_before, not_after=not_after, server=True)
+                (root / "leaf.crt").write_bytes(pem_cert(leaf))
+                (root / "leaf.key").write_bytes(pem_key(leaf_key))
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(str(root / "leaf.crt"), str(root / "leaf.key"))
+                context.verify_mode = ssl.CERT_REQUIRED
+                context.load_verify_locations(str(root / "agent-ca.crt"))
+                httpd = http.server.HTTPServer(("127.0.0.1", 0), TimeHandler)
+                httpd.client_certificates = []
+                httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+                threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                return httpd
+
+            config = SimpleNamespace(
+                agent_endpoint="",
+                server_ca_file=root / "server-ca.crt",
+                cert_file=root / "agent.crt",
+                key_file=root / "agent.key",
+            )
+            calls: list[float] = []
+            # The control plane's short-lived certificate already "expired"
+            # from the point of view of a wrong local clock.
+            httpd = serve(current - timedelta(days=3), current - timedelta(days=2))
+            try:
+                config.agent_endpoint = f"https://localhost:{httpd.server_address[1]}/api/v1/agent"
+                with self.assertRaises(ssl.SSLCertVerificationError) as strict:
+                    tram_agent.fetch_control_plane_time(config)
+                self.assertEqual(strict.exception.verify_code, 10)
+                with patch.object(tram_agent, "CLOCK", tram_agent.ClockSync(setter=calls.append)), patch.object(tram_agent, "ensure_server_ca"):
+                    self.assertTrue(tram_agent.resync_clock_from_control_plane(config, force=True))
+                    self.assertEqual(tram_agent.CLOCK.status, "stepped")
+                self.assertEqual(len(calls), 1)
+                self.assertAlmostEqual(calls[0], time.time() + 7200, delta=5)
+                self.assertTrue(httpd.client_certificates, "the probe must present the Agent client certificate")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+            # A certificate from a different CA is never trusted, even with
+            # validity dates ignored.
+            rogue_key = ec.generate_private_key(ec.SECP256R1())
+            rogue_ca = issue("rogue", rogue_key, None, rogue_key, ca=True, not_before=current - timedelta(days=1), not_after=current + timedelta(days=30))
+            original_server_ca = (server_ca, server_ca_key)
+            server_ca, server_ca_key = rogue_ca, rogue_key
+            httpd = serve(current - timedelta(days=3), current - timedelta(days=2))
+            server_ca, server_ca_key = original_server_ca
+            try:
+                config.agent_endpoint = f"https://localhost:{httpd.server_address[1]}/api/v1/agent"
+                rogue_calls: list[float] = []
+                with patch.object(tram_agent, "CLOCK", tram_agent.ClockSync(setter=rogue_calls.append)), patch.object(tram_agent, "ensure_server_ca"):
+                    self.assertFalse(tram_agent.resync_clock_from_control_plane(config, force=True))
+                self.assertEqual(rogue_calls, [])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_agent_version_comes_from_the_shared_version_file(self):
         expected = (MODULE_PATH.parent / "VERSION").read_text(encoding="ascii").strip()
         self.assertEqual(tram_agent.AGENT_VERSION, expected)

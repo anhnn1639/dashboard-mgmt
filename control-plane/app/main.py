@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, delete, func, inspect, or_, select, text, update
 from sqlalchemy.engine import Engine, URL
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -52,7 +53,7 @@ from .agent_packages import LINUX_AGENT_PATH, bootstrap_package_secret, LINUX_OF
 from .tunnel import TunnelHub
 from .direct_sessions import DirectSessionHub, SSHProbeError, discover_host_key
 from .managed_targets import ManagedTargetRequest, RedirectDiscoveryRequest, is_normalized_origin, origin_text, web_url_endpoint
-from .schema_migrations import detach_recording_history_users, widen_remote_session_actor, add_recording_deletion_timestamp
+from .schema_migrations import detach_recording_history_users, widen_remote_session_actor, add_recording_deletion_timestamp, add_agent_package_and_channel_columns
 from .recording_storage import deletion_files, delete_recording
 from .web_sessions import WebSessionHub, WebSessionError
 from .web_database import run_postgres
@@ -123,6 +124,14 @@ def read_release_version() -> str:
 
 
 RELEASE_VERSION = read_release_version()
+# Hard ceiling for multi-use installers; deploying a new Agent release
+# invalidates them earlier.
+REUSABLE_PACKAGE_MAX_LIFETIME = timedelta(days=365)
+AGENT_SIGNATURE_WINDOW_SECONDS = 300
+AGENT_TIME_SYNC_SETTING = "agent_time_sync"
+# Agents step the system clock only beyond this offset, so a healthy local
+# NTP client agreeing with the control plane is never disturbed.
+AGENT_TIME_SYNC_STEP_THRESHOLD_SECONDS = 2
 SELF_UPDATE_MIN_VERSION = "0.8.16"
 AGENT_UPGRADE_INSTALL_TIMEOUT = timedelta(minutes=45)
 AGENT_UPGRADE_TIMEOUT_MARKER = "agent-upgrade-install-timeout-v1"
@@ -280,6 +289,18 @@ class Server(Base):
     cert_fingerprint: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True, index=True)
     cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Enrollment goes through 443; only an authenticated 9443 check-in sets
+    # this, so "enrolled but never reached the agent channel" is detectable.
+    last_checkin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    channel_error: Mapped[str] = mapped_column(String(120), default="")
+    channel_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Latest clock report from the Agent, which keeps the endpoint clock
+    # aligned with this control plane over the authenticated 9443 channel.
+    clock_offset_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    clock_status: Mapped[str] = mapped_column(String(30), default="")
+    clock_error: Mapped[str] = mapped_column(String(240), default="")
+    clock_stepped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    clock_step_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     status: Mapped[str] = mapped_column(String(30), default="enrolling")
     cpu_percent: Mapped[float] = mapped_column(Float, default=0)
@@ -339,6 +360,15 @@ class AgentBootstrapPackage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Reusable packages stay valid for many endpoints until the deployed Agent
+    # release changes, an optional claim limit is reached, or they are revoked.
+    reusable: Mapped[bool] = mapped_column(Boolean, default=False)
+    release_version: Mapped[str] = mapped_column(String(40), default="")
+    linux_profile: Mapped[str] = mapped_column(String(20), default="")
+    claim_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_claims: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str] = mapped_column(String(80), default="")
 
 
 class AgentUninstallPolicyState(Base):
@@ -596,6 +626,17 @@ class AgentPackageRequest(BaseModel):
     os_family: Literal["windows", "linux"]
     linux_profile: Literal["ubuntu-22.04", "ubuntu-24.04", "ol-7", "ol-8"] | None = None
     expires_minutes: int = Field(default=30, ge=5, le=60)
+    reusable: bool = False
+    max_claims: int | None = Field(default=None, ge=1, le=10000)
+
+
+class AgentPackageRevokeRequest(BaseModel):
+    reason: str = Field(default="", max_length=240)
+
+
+class AgentTimeSyncUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
 
 
 class DashboardUrlUpdateRequest(BaseModel):
@@ -656,6 +697,16 @@ class Metrics(BaseModel):
     alerts: int = Field(default=0, ge=0)
 
 
+class AgentClockReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    # Endpoint clock minus control-plane clock before any correction.
+    offset_ms: int | None = Field(default=None, ge=-(10**12), le=10**12)
+    status: Literal["synchronized", "stepped", "disabled", "failed", "unmeasured"] = "unmeasured"
+    error: str = Field(default="", max_length=240)
+    last_step_at: datetime | None = None
+    last_step_ms: int | None = Field(default=None, ge=-(10**12), le=10**12)
+
+
 class CheckinRequest(BaseModel):
     agent_id: str
     agent_version: str
@@ -663,6 +714,7 @@ class CheckinRequest(BaseModel):
     active_job_ids: list[str] = Field(default_factory=list, max_length=4)
     inventory: Inventory | None = None
     metrics: Metrics
+    clock: AgentClockReport | None = None
 
     @field_validator("active_job_ids")
     @classmethod
@@ -1430,6 +1482,7 @@ def activate_database(database_url: str, *, initialize_schema: bool = True) -> E
             detach_recording_history_users(candidate)
             widen_remote_session_actor(candidate)
             add_recording_deletion_timestamp(candidate)
+            add_agent_package_and_channel_columns(candidate)
     except Exception as exc:
         if candidate is not engine:
             candidate.dispose()
@@ -1512,11 +1565,32 @@ def bootstrap_claim_failure_reason(record: AgentBootstrapPackage | None, supplie
         return "package_not_found"
     if not hmac.compare_digest(record.secret_hash, supplied_hash):
         return "secret_mismatch"
-    if record.used_at is not None:
+    if record.revoked_at is not None:
+        return "revoked"
+    if record.reusable:
+        if record.release_version != RELEASE_VERSION:
+            return "superseded"
+        if record.max_claims is not None and record.claim_count >= record.max_claims:
+            return "claim_limit_reached"
+    elif record.used_at is not None:
         return "already_used"
     if aware(record.expires_at) < now():
         return "expired"
     return None
+
+
+def agent_package_state(record: AgentBootstrapPackage) -> str:
+    if record.revoked_at is not None:
+        return "revoked"
+    if record.reusable and record.release_version != RELEASE_VERSION:
+        return "superseded"
+    if record.reusable and record.max_claims is not None and record.claim_count >= record.max_claims:
+        return "claim_limit_reached"
+    if not record.reusable and record.used_at is not None:
+        return "used"
+    if aware(record.expires_at) < now():
+        return "expired"
+    return "active"
 
 
 def job_fernet() -> Fernet:
@@ -2430,8 +2504,6 @@ def verify_agent_identity(headers: Mapping[str, str], method: str, path: str, db
         signature = base64.b64decode(headers.get("x-tram-agent-signature", ""), validate=True)
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Signed agent identity is required") from None
-    if abs(int(now().timestamp()) - timestamp) > 300:
-        raise HTTPException(status_code=401, detail="Agent request timestamp is outside the allowed window")
     fingerprint = certificate.fingerprint(hashes.SHA256()).hex()
     server = db.get(Server, agent_id)
     if not server or not server.cert_fingerprint or not hmac.compare_digest(server.cert_fingerprint, fingerprint):
@@ -2453,7 +2525,50 @@ def verify_agent_identity(headers: Mapping[str, str], method: str, path: str, db
         public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:
         raise HTTPException(status_code=401, detail="Invalid agent request signature") from None
+    # The window is checked after the signature so only the genuine Agent can
+    # record a clock-skew diagnostic; the replay window itself is unchanged.
+    skew = timestamp - int(now().timestamp())
+    if abs(skew) > AGENT_SIGNATURE_WINDOW_SECONDS:
+        record_agent_channel_error(db, server, f"clock_skew:{skew}")
+        raise HTTPException(status_code=401, detail="Agent request timestamp is outside the allowed window")
     return server
+
+
+def record_agent_channel_error(db: Session, server: Server, code: str) -> None:
+    previous_at = aware(server.channel_error_at)
+    if server.channel_error == code and previous_at and now() - previous_at < timedelta(minutes=1):
+        return
+    server.channel_error = code[:120]
+    server.channel_error_at = now()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        # Diagnostics must never turn an authentication denial into a 500.
+        db.rollback()
+
+
+def agent_channel_issue(server: Server) -> dict[str, Any] | None:
+    """Explain why an enrolled Agent is not using its 9443 channel."""
+    error_at = aware(server.channel_error_at)
+    last_checkin = aware(server.last_checkin_at)
+    if server.channel_error.startswith("clock_skew:") and error_at and (last_checkin is None or error_at > last_checkin):
+        try:
+            skew = int(server.channel_error.split(":", 1)[1])
+        except ValueError:
+            skew = 0
+        minutes = max(1, round(abs(skew) / 60))
+        direction = "nhanh" if skew > 0 else "chậm"
+        return {
+            "code": "clock_skew",
+            "skewSeconds": skew,
+            "message": f"Đồng hồ máy chủ {direction} khoảng {minutes} phút so với Operation Portal (cho phép tối đa 5 phút). Agent 0.8.19 trở lên tự chỉnh giờ theo Operation Portal qua kênh 9443; Agent cũ hơn cần chỉnh giờ máy chủ một lần (hoặc cài đè bộ cài mới) rồi sẽ tự kết nối lại.",
+        }
+    if last_checkin is None:
+        return {
+            "code": "never_checked_in",
+            "message": "Agent đã đăng ký qua cổng 443 nhưng chưa từng kết nối được kênh quản trị 9443. Kiểm tra firewall/NAT từ máy chủ tới Operation Portal cổng 9443, proxy, thiết bị SSL inspection (phải bypass 9443 vì kênh dùng mTLS) và đồng hồ hệ thống.",
+        }
+    return None
 
 
 def verify_agent(request: Request, db: Session, agent_id: str, body: bytes) -> Server:
@@ -2479,7 +2594,20 @@ def server_json(server: Server) -> dict[str, Any]:
     relative = "Chưa kết nối" if not last_seen else f"{int(age)} giây trước" if age < 60 else f"{int(age // 60)} phút trước"
     days, remainder = divmod(server.uptime_seconds, 86400)
     hours = remainder // 3600
-    return {"id": server.id, "name": server.name, "osFamily": server.os_family, "os": server.os_name, "version": server.os_version, "address": server.address, "environment": server.environment, "health": health, "agentVersion": server.agent_version, "lastSeen": relative, "cpu": round(server.cpu_percent), "memory": round(server.memory_percent), "disk": round(server.disk_percent), "uptime": f"{days} ngày {hours} giờ", "updates": server.pending_updates, "alerts": server.alerts, "services": server.services_running, "owner": server.owner, "tags": server.tags or [], "verifiedOS": server.verified_os, "tunnelOnline": tunnel_hub.is_online(server.id)}
+    return {"id": server.id, "name": server.name, "osFamily": server.os_family, "os": server.os_name, "version": server.os_version, "address": server.address, "environment": server.environment, "health": health, "agentVersion": server.agent_version, "lastSeen": relative, "cpu": round(server.cpu_percent), "memory": round(server.memory_percent), "disk": round(server.disk_percent), "uptime": f"{days} ngày {hours} giờ", "updates": server.pending_updates, "alerts": server.alerts, "services": server.services_running, "owner": server.owner, "tags": server.tags or [], "verifiedOS": server.verified_os, "tunnelOnline": tunnel_hub.is_online(server.id), "connectionIssue": agent_channel_issue(server) if health == "offline" else None, "clock": agent_clock_json(server)}
+
+
+def agent_clock_json(server: Server) -> dict[str, Any] | None:
+    if server.clock_offset_ms is None and not server.clock_status:
+        return None
+    stepped_at = aware(server.clock_stepped_at)
+    return {
+        "offsetMs": server.clock_offset_ms,
+        "status": server.clock_status or "unmeasured",
+        "error": server.clock_error,
+        "lastStepAt": stepped_at.isoformat() if stepped_at else None,
+        "lastStepMs": server.clock_step_ms,
+    }
 
 
 def sign_agent_csr(csr_pem: str, agent_id: str) -> tuple[str, str, datetime]:
@@ -2787,6 +2915,7 @@ def complete_setup(payload: SetupCompleteRequest, request: Request):
         detach_recording_history_users(candidate)
         widen_remote_session_actor(candidate)
         add_recording_deletion_timestamp(candidate)
+        add_agent_package_and_channel_columns(candidate)
         candidate_factory = sessionmaker(bind=candidate, expire_on_commit=False)
         with candidate_factory() as db:
             ensure_builtin_roles(db)
@@ -4178,6 +4307,8 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
         raise HTTPException(status_code=422, detail="Hãy chọn đúng phiên bản Linux để tạo bộ cài offline")
     if payload.os_family == "windows" and payload.linux_profile is not None:
         raise HTTPException(status_code=422, detail="Profile Linux không được dùng cho bộ cài Windows")
+    if payload.max_claims is not None and not payload.reusable:
+        raise HTTPException(status_code=422, detail="Giới hạn số máy chỉ áp dụng cho bộ cài dùng nhiều lần")
     dashboard_url = canonical_dashboard_url(db)
     ca_certificate, ca_fingerprint = read_agent_server_ca()
     bootstrap_ca_certificate = ca_certificate if settings.web_tls_trust == "internal-ca" else ""
@@ -4185,7 +4316,7 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
     package_id = str(uuid.uuid4())
     package_secret = bootstrap_package_secret()
     safe_label = safe_package_label(payload.label)
-    expires_at = now() + timedelta(minutes=payload.expires_minutes)
+    expires_at = now() + (REUSABLE_PACKAGE_MAX_LIFETIME if payload.reusable else timedelta(minutes=payload.expires_minutes))
     try:
         if payload.os_family == "linux":
             artifact = agent_release_artifact("linux")
@@ -4199,7 +4330,7 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
                 ca_fingerprint=bootstrap_tls_pin,
                 linux_profile=payload.linux_profile,
             )
-            filename = f"TramAgent-Linux-{payload.linux_profile}-{safe_label}.run"
+            filename = f"TramAgent-Linux-{payload.linux_profile}-{safe_label}{'-multi' if payload.reusable else ''}.run"
             media_type = "application/octet-stream"
         else:
             artifact = agent_release_artifact("windows")
@@ -4215,9 +4346,13 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
         expected_os_family=payload.os_family,
         created_by=user.id,
         expires_at=expires_at,
+        reusable=payload.reusable,
+        release_version=RELEASE_VERSION,
+        linux_profile=payload.linux_profile or "",
+        max_claims=payload.max_claims,
     )
     db.add(record)
-    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "linux_profile": payload.linux_profile, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url, "web_tls_trust": settings.web_tls_trust})
+    audit(db, user.username, "agent.package.create", record.id, request, detail={"label": payload.label, "os_family": payload.os_family, "linux_profile": payload.linux_profile, "expires_at": expires_at.isoformat(), "dashboard_url": dashboard_url, "web_tls_trust": settings.web_tls_trust, "reusable": payload.reusable, "max_claims": payload.max_claims, "release_version": RELEASE_VERSION})
     db.commit()
     return Response(
         content=content,
@@ -4228,8 +4363,60 @@ def create_agent_package(payload: AgentPackageRequest, request: Request, user: U
             "Pragma": "no-cache",
             "X-Content-Type-Options": "nosniff",
             "X-Tram-Package-Expires": expires_at.isoformat(),
+            "X-Tram-Package-Reusable": "true" if payload.reusable else "false",
         },
     )
+
+
+def agent_package_json(record: AgentBootstrapPackage, creators: dict[str, str]) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "label": record.label,
+        "osFamily": record.expected_os_family,
+        "linuxProfile": record.linux_profile or None,
+        "reusable": record.reusable,
+        "releaseVersion": record.release_version,
+        "claimCount": record.claim_count,
+        "maxClaims": record.max_claims,
+        "createdBy": creators.get(record.created_by, ""),
+        "createdAt": aware(record.created_at).isoformat(),
+        "expiresAt": aware(record.expires_at).isoformat(),
+        "lastClaimAt": aware(record.used_at).isoformat() if record.used_at else None,
+        "revokedAt": aware(record.revoked_at).isoformat() if record.revoked_at else None,
+        "revokedBy": record.revoked_by,
+        "state": agent_package_state(record),
+    }
+
+
+@app.get("/api/v1/agent-packages")
+def list_agent_packages(_: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    records = db.execute(
+        select(AgentBootstrapPackage)
+        .where(AgentBootstrapPackage.reusable.is_(True))
+        .order_by(AgentBootstrapPackage.created_at.desc())
+        .limit(100)
+    ).scalars().all()
+    creator_ids = {record.created_by for record in records}
+    creators = dict(db.execute(select(User.id, User.username).where(User.id.in_(creator_ids))).all()) if creator_ids else {}
+    return {"currentVersion": RELEASE_VERSION, "items": [agent_package_json(record, creators) for record in records]}
+
+
+@app.post("/api/v1/agent-packages/{package_id}/revoke")
+def revoke_agent_package(package_id: str, payload: AgentPackageRevokeRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    try:
+        uuid.UUID(package_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bộ cài") from exc
+    record = db.execute(select(AgentBootstrapPackage).where(AgentBootstrapPackage.id == package_id).with_for_update()).scalar_one_or_none()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bộ cài")
+    if record.revoked_at is None:
+        record.revoked_at = now()
+        record.revoked_by = user.username
+        audit(db, user.username, "agent.package.revoke", record.id, request, detail={"label": record.label, "os_family": record.expected_os_family, "reusable": record.reusable, "claim_count": record.claim_count, "reason": payload.reason.strip()})
+        db.commit()
+    creators = dict(db.execute(select(User.id, User.username).where(User.id == record.created_by)).all())
+    return agent_package_json(record, creators)
 
 
 @app.post("/api/v1/agent-bootstrap/claim", status_code=201)
@@ -4257,6 +4444,9 @@ def claim_agent_package(payload: AgentBootstrapClaimRequest, request: Request, d
                     "created_at": aware(record.created_at).isoformat(),
                     "expires_at": aware(record.expires_at).isoformat(),
                     "used_at": aware(record.used_at).isoformat() if record.used_at else None,
+                    "reusable": record.reusable,
+                    "release_version": record.release_version,
+                    "claim_count": record.claim_count,
                 },
             )
             db.commit()
@@ -4277,7 +4467,8 @@ def claim_agent_package(payload: AgentBootstrapClaimRequest, request: Request, d
         allow_rotation=False,
     )
     record.used_at = now()
-    audit(db, f"bootstrap:{record.id}", "agent.package.claim", payload.agent_id, request, detail={"label": record.label, "os_family": family})
+    record.claim_count += 1
+    audit(db, f"bootstrap:{record.id}", "agent.package.claim", payload.agent_id, request, detail={"label": record.label, "os_family": family, "hostname": payload.inventory.hostname, "reusable": record.reusable, "claim_number": record.claim_count})
     db.commit()
     return response
 
@@ -4374,6 +4565,63 @@ def agent_upgrade_artifact(job_id: str, request: Request, agent_id: str = Query(
             "X-Tram-SHA256": artifact["sha256"],
         },
     )
+
+
+def clamp_clock_ms(value: int | None) -> int | None:
+    # A dead RTC can be decades off; keep the report inside a 32-bit column.
+    return None if value is None else max(-2_000_000_000, min(2_000_000_000, value))
+
+
+def agent_time_sync_enabled(db: Session) -> bool:
+    setting = db.get(SystemSetting, AGENT_TIME_SYNC_SETTING)
+    return setting is None or setting.value != "disabled"
+
+
+def agent_time_sync_policy(db: Session) -> dict[str, Any]:
+    return {"enabled": agent_time_sync_enabled(db), "step_threshold_seconds": AGENT_TIME_SYNC_STEP_THRESHOLD_SECONDS}
+
+
+@app.get("/api/v1/agent/time")
+def agent_time(db: Session = Depends(db_session)):
+    """Reference clock for Agents on the 9443 mTLS listener.
+
+    It deliberately needs no request signature: signatures carry a timestamp,
+    and an Agent whose clock drifted outside the replay window must still be
+    able to learn the correct time. Caddy only serves it after verifying the
+    Agent client certificate, and it returns nothing but the clock and policy.
+    """
+    response_time = now()
+    return {"server_time": response_time.isoformat(), "server_time_epoch": response_time.timestamp(), "time_sync": agent_time_sync_policy(db)}
+
+
+def agent_time_sync_json(db: Session) -> dict[str, Any]:
+    servers = db.execute(
+        select(Server).where(Server.os_family.in_(["linux", "windows"]), Server.status != "retired")
+    ).scalars().all()
+    reported = [server for server in servers if server.clock_offset_ms is not None]
+    threshold_ms = AGENT_TIME_SYNC_STEP_THRESHOLD_SECONDS * 1000
+    return {
+        **agent_time_sync_policy(db),
+        "serverTime": now().isoformat(),
+        "totalAgents": len(servers),
+        "reportingAgents": len(reported),
+        "outOfSyncAgents": sum(1 for server in reported if abs(server.clock_offset_ms or 0) > threshold_ms and server.clock_status != "stepped"),
+        "failedAgents": sum(1 for server in reported if server.clock_status == "failed"),
+    }
+
+
+@app.get("/api/v1/settings/agent-time-sync")
+def get_agent_time_sync(_: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    return agent_time_sync_json(db)
+
+
+@app.put("/api/v1/settings/agent-time-sync")
+def update_agent_time_sync(payload: AgentTimeSyncUpdateRequest, request: Request, user: User = Depends(require_permission("agents.manage")), db: Session = Depends(db_session)):
+    previous = agent_time_sync_enabled(db)
+    db.merge(SystemSetting(key=AGENT_TIME_SYNC_SETTING, value="enabled" if payload.enabled else "disabled"))
+    audit(db, user.username, "system.agent_time_sync.update", "system", request, detail={"previous": previous, "enabled": payload.enabled})
+    db.commit()
+    return agent_time_sync_json(db)
 
 
 @app.get("/api/v1/agent-server-ca")
@@ -4564,6 +4812,20 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
         server.verified_os = verification == "verified"
     server.agent_version = payload.agent_version
     server.last_seen = now()
+    server.last_checkin_at = server.last_seen
+    server.channel_error = ""
+    server.channel_error_at = None
+    if payload.clock is not None:
+        previous_step = aware(server.clock_stepped_at)
+        server.clock_offset_ms = clamp_clock_ms(payload.clock.offset_ms)
+        server.clock_status = payload.clock.status
+        server.clock_error = payload.clock.error
+        if payload.clock.last_step_at is not None:
+            step_at = aware(payload.clock.last_step_at)
+            server.clock_stepped_at = step_at
+            server.clock_step_ms = clamp_clock_ms(payload.clock.last_step_ms)
+            if previous_step is None or step_at > previous_step + timedelta(seconds=1):
+                audit(db, f"agent:{server.id}", "agent.clock.step", server.id, request, detail={"step_ms": payload.clock.last_step_ms, "hostname": server.name})
     server.status = "online"
     server.cpu_percent = payload.metrics.cpu_percent
     server.memory_percent = payload.metrics.memory_percent
@@ -4677,7 +4939,8 @@ async def agent_checkin(payload: CheckinRequest, request: Request, db: Session =
                 state.status = "dispatched"
                 state.updated_at = now()
     db.commit()
-    return {"server_time": now().isoformat(), "checkin_interval_seconds": 5 if supports_parallel_jobs else 10, "inventory_interval_seconds": 1800, "max_concurrent_jobs": MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
+    response_time = now()
+    return {"server_time": response_time.isoformat(), "server_time_epoch": response_time.timestamp(), "time_sync": agent_time_sync_policy(db), "checkin_interval_seconds": 5 if supports_parallel_jobs else 10, "inventory_interval_seconds": 1800, "max_concurrent_jobs": MAX_CONCURRENT_AGENT_JOBS if supports_parallel_jobs else 1, "jobs": [{"id": job.id, "action": job.action, "parameters": reveal_parameters(job.parameters)} for job in jobs]}
 
 
 @app.post("/api/v1/agent/jobs/{job_id}/result")

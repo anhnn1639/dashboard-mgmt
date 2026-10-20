@@ -2278,6 +2278,7 @@ class ClassificationTests(unittest.TestCase):
                 ).scalar_one()
                 self.assertEqual(denial.result, "blocked")
                 self.assertEqual(denial.detail["reason"], "already_used")
+                self.assertFalse(denial.detail["reusable"])
                 self.assertNotIn("secret", denial.detail)
 
             windows_package = client.post(
@@ -2327,6 +2328,215 @@ class ClassificationTests(unittest.TestCase):
             confirmed_change = client.put("/api/v1/settings/dashboard-url", headers=headers, json={"dashboard_url": "https://ops-new.company.example", "confirm_existing_agents": True})
             self.assertEqual(confirmed_change.status_code, 200, confirmed_change.text)
             self.assertTrue(confirmed_change.json()["existingAgentsNeedMigration"])
+
+    def test_reusable_packages_enroll_many_servers_until_release_changes_or_revoked(self):
+        assert SessionLocal is not None
+        with SessionLocal() as db:
+            db.merge(SystemSetting(key="dashboard_url", value="https://ops.company.example"))
+            db.commit()
+
+        def claim(client: TestClient, bootstrap: dict, hostname: str):
+            agent_id = str(uuid.uuid4())
+            key = ec.generate_private_key(ec.SECP256R1())
+            csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, agent_id)])).sign(key, hashes.SHA256())
+            return client.post("/api/v1/agent-bootstrap/claim", json={
+                "package_id": bootstrap["package_id"],
+                "package_secret": bootstrap["package_secret"],
+                "agent_id": agent_id,
+                "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(),
+                "inventory": {"hostname": hostname, "os_family": "linux", "os_name": "Ubuntu 24.04", "os_version": "24.04", "distribution_id": "ubuntu", "architecture": "x86_64", "agent_version": app.version, "addresses": ["10.40.2.10"]},
+            })
+
+        def package_bootstrap(response) -> dict:
+            archive_bytes = response.content.split(b"__TRAM_AGENT_ARCHIVE__\n", 1)[1]
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+                return json.loads(archive.extractfile("bootstrap.json").read())
+
+        def latest_denial(package_id: str) -> str:
+            with SessionLocal() as db:
+                return db.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.action == "agent.package.claim.denied", AuditEvent.target == package_id)
+                    .order_by(AuditEvent.occurred_at.desc())
+                    .limit(1)
+                ).scalar_one().detail["reason"]
+
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            invalid_limit = client.post("/api/v1/agent-packages", headers=headers, json={"label": "single-limit", "os_family": "linux", "linux_profile": "ubuntu-24.04", "max_claims": 3})
+            self.assertEqual(invalid_limit.status_code, 422, invalid_limit.text)
+
+            reusable = client.post("/api/v1/agent-packages", headers=headers, json={"label": "ubuntu-fleet", "os_family": "linux", "linux_profile": "ubuntu-24.04", "reusable": True})
+            self.assertEqual(reusable.status_code, 200, reusable.text)
+            self.assertEqual(reusable.headers["x-tram-package-reusable"], "true")
+            self.assertIn("ubuntu-fleet-multi.run", reusable.headers["content-disposition"])
+            bootstrap = package_bootstrap(reusable)
+            for index in range(3):
+                claimed = claim(client, bootstrap, f"ubuntu-fleet-{index}")
+                self.assertEqual(claimed.status_code, 201, claimed.text)
+
+            listing = client.get("/api/v1/agent-packages", headers=headers)
+            self.assertEqual(listing.status_code, 200, listing.text)
+            item = next(entry for entry in listing.json()["items"] if entry["id"] == bootstrap["package_id"])
+            self.assertEqual(item["claimCount"], 3)
+            self.assertEqual(item["state"], "active")
+            self.assertEqual(item["releaseVersion"], app.version)
+            self.assertEqual(item["linuxProfile"], "ubuntu-24.04")
+            self.assertEqual(item["createdBy"], "admin")
+            self.assertNotIn(bootstrap["package_secret"], listing.text)
+
+            # A newly deployed Agent release supersedes every older multi-use installer.
+            with SessionLocal() as db:
+                db.get(AgentBootstrapPackage, bootstrap["package_id"]).release_version = "0.0.1"
+                db.commit()
+            superseded = claim(client, bootstrap, "ubuntu-fleet-old")
+            self.assertEqual(superseded.status_code, 401)
+            self.assertEqual(latest_denial(bootstrap["package_id"]), "superseded")
+            with SessionLocal() as db:
+                db.get(AgentBootstrapPackage, bootstrap["package_id"]).release_version = app.version
+                db.commit()
+
+            revoked = client.post(f"/api/v1/agent-packages/{bootstrap['package_id']}/revoke", headers=headers, json={"reason": "file leaked"})
+            self.assertEqual(revoked.status_code, 200, revoked.text)
+            self.assertEqual(revoked.json()["state"], "revoked")
+            self.assertEqual(revoked.json()["revokedBy"], "admin")
+            after_revoke = claim(client, bootstrap, "ubuntu-fleet-revoked")
+            self.assertEqual(after_revoke.status_code, 401)
+            self.assertEqual(latest_denial(bootstrap["package_id"]), "revoked")
+
+            limited = client.post("/api/v1/agent-packages", headers=headers, json={"label": "ubuntu-two", "os_family": "linux", "linux_profile": "ubuntu-24.04", "reusable": True, "max_claims": 2})
+            self.assertEqual(limited.status_code, 200, limited.text)
+            limited_bootstrap = package_bootstrap(limited)
+            self.assertEqual(claim(client, limited_bootstrap, "limited-1").status_code, 201)
+            self.assertEqual(claim(client, limited_bootstrap, "limited-2").status_code, 201)
+            self.assertEqual(claim(client, limited_bootstrap, "limited-3").status_code, 401)
+            self.assertEqual(latest_denial(limited_bootstrap["package_id"]), "claim_limit_reached")
+
+            missing = client.post(f"/api/v1/agent-packages/{uuid.uuid4()}/revoke", headers=headers, json={})
+            self.assertEqual(missing.status_code, 404)
+
+    def test_offline_server_explains_missing_agent_channel_and_clock_skew(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        assert SessionLocal is not None
+        with SessionLocal() as db:
+            db.add(Server(id=agent_id, name="never-9443", os_family="linux", os_name="Ubuntu 24.04", os_version="24.04", distribution_id="ubuntu", architecture="x86_64", agent_version=app.version, cert_fingerprint=fingerprint, status="online", last_seen=datetime.now(UTC) - timedelta(minutes=10)))
+            db.commit()
+
+        def server_item(client: TestClient, headers: dict) -> dict:
+            response = client.get(f"/api/v1/servers/{agent_id}", headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        def skewed_checkin(signing_key: ec.EllipticCurvePrivateKey, offset_seconds: int) -> tuple[bytes, dict[str, str]]:
+            timestamp = str(int(time.time()) + offset_seconds)
+            body = json.dumps(agent_checkin_payload(agent_id, app.version), sort_keys=True, separators=(",", ":")).encode()
+            message = f"{timestamp}\nPOST\n/api/v1/agent/checkin\n{hashlib.sha256(body).hexdigest()}".encode()
+            return body, {
+                "Content-Type": "application/json",
+                "X-Tram-Agent-Certificate": base64.b64encode(agent_certificate.public_bytes(serialization.Encoding.DER)).decode(),
+                "X-Tram-Agent-Timestamp": timestamp,
+                "X-Tram-Agent-Signature": base64.b64encode(signing_key.sign(message, ec.ECDSA(hashes.SHA256()))).decode(),
+            }
+
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            item = server_item(client, headers)
+            self.assertEqual(item["health"], "offline")
+            self.assertEqual(item["connectionIssue"]["code"], "never_checked_in")
+            self.assertIn("9443", item["connectionIssue"]["message"])
+
+            # A forged signature must not be able to write diagnostics.
+            forged_body, forged_headers = skewed_checkin(ec.generate_private_key(ec.SECP256R1()), 12 * 60)
+            self.assertEqual(client.post("/api/v1/agent/checkin", headers=forged_headers, content=forged_body).status_code, 401)
+            with SessionLocal() as db:
+                self.assertEqual(db.get(Server, agent_id).channel_error, "")
+
+            # The endpoint clock is 12 minutes fast: the signature is genuine but stale.
+            body, skewed_headers = skewed_checkin(agent_key, 12 * 60)
+            denied = client.post("/api/v1/agent/checkin", headers=skewed_headers, content=body)
+            self.assertEqual(denied.status_code, 401)
+            item = server_item(client, headers)
+            self.assertEqual(item["connectionIssue"]["code"], "clock_skew")
+            self.assertAlmostEqual(item["connectionIssue"]["skewSeconds"], 720, delta=10)
+            self.assertIn("nhanh", item["connectionIssue"]["message"])
+
+            ok_body, ok_headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/checkin", agent_checkin_payload(agent_id, app.version))
+            accepted = client.post("/api/v1/agent/checkin", headers=ok_headers, content=ok_body)
+            self.assertEqual(accepted.status_code, 200, accepted.text)
+            item = server_item(client, headers)
+            self.assertNotEqual(item["health"], "offline")
+            self.assertIsNone(item["connectionIssue"])
+            with SessionLocal() as db:
+                server = db.get(Server, agent_id)
+                self.assertIsNotNone(server.last_checkin_at)
+                self.assertEqual(server.channel_error, "")
+
+    def test_agent_time_sync_policy_reference_clock_and_reports(self):
+        agent_id = str(uuid.uuid4())
+        agent_key, agent_certificate, fingerprint = make_agent_identity(agent_id)
+        assert SessionLocal is not None
+        with SessionLocal() as db:
+            db.add(Server(id=agent_id, name="clock-test", os_family="linux", os_name="Ubuntu 24.04", os_version="24.04", distribution_id="ubuntu", architecture="x86_64", agent_version=app.version, cert_fingerprint=fingerprint, status="online", last_seen=datetime.now(UTC)))
+            db.commit()
+
+        def checkin(clock: dict | None) -> dict:
+            payload = agent_checkin_payload(agent_id, app.version)
+            if clock is not None:
+                payload["clock"] = clock
+            body, headers = signed_agent_request(agent_key, agent_certificate, "/api/v1/agent/checkin", payload)
+            response = client.post("/api/v1/agent/checkin", headers=headers, content=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        with TestClient(app) as client:
+            # Unsigned on purpose: an Agent with a wrong clock cannot sign.
+            before = time.time()
+            reference = client.get("/api/v1/agent/time")
+            self.assertEqual(reference.status_code, 200, reference.text)
+            self.assertAlmostEqual(reference.json()["server_time_epoch"], before, delta=5)
+            self.assertEqual(reference.json()["time_sync"], {"enabled": True, "step_threshold_seconds": 2})
+            self.assertEqual(set(reference.json()), {"server_time", "server_time_epoch", "time_sync"})
+
+            headers = {"Authorization": f"Bearer {self.login_admin(client)}"}
+            response = checkin(None)
+            self.assertAlmostEqual(response["server_time_epoch"], time.time(), delta=5)
+            self.assertTrue(response["time_sync"]["enabled"])
+
+            stepped_at = datetime.now(UTC).isoformat()
+            checkin({"offset_ms": -754000, "status": "stepped", "error": "", "last_step_at": stepped_at, "last_step_ms": 754000})
+            checkin({"offset_ms": -754000, "status": "stepped", "error": "", "last_step_at": stepped_at, "last_step_ms": 754000})
+            item = client.get(f"/api/v1/servers/{agent_id}", headers=headers).json()
+            self.assertEqual(item["clock"]["status"], "stepped")
+            self.assertEqual(item["clock"]["lastStepMs"], 754000)
+            with SessionLocal() as db:
+                steps = db.execute(select(AuditEvent).where(AuditEvent.action == "agent.clock.step", AuditEvent.target == agent_id)).scalars().all()
+                self.assertEqual(len(steps), 1, "a repeated report of the same step is audited once")
+
+            # A dead RTC decades off must not overflow storage or reject check-ins.
+            checkin({"offset_ms": -820_000_000_000, "status": "failed", "error": "PermissionError: Operation not permitted"})
+            item = client.get(f"/api/v1/servers/{agent_id}", headers=headers).json()
+            self.assertEqual(item["clock"]["offsetMs"], -2_000_000_000)
+            self.assertEqual(item["clock"]["status"], "failed")
+
+            summary = client.get("/api/v1/settings/agent-time-sync", headers=headers)
+            self.assertEqual(summary.status_code, 200, summary.text)
+            self.assertTrue(summary.json()["enabled"])
+            self.assertGreaterEqual(summary.json()["failedAgents"], 1)
+
+            disabled = client.put("/api/v1/settings/agent-time-sync", headers=headers, json={"enabled": False})
+            self.assertEqual(disabled.status_code, 200, disabled.text)
+            self.assertFalse(disabled.json()["enabled"])
+            self.assertFalse(client.get("/api/v1/agent/time").json()["time_sync"]["enabled"])
+            self.assertFalse(checkin(None)["time_sync"]["enabled"])
+            self.assertEqual(client.put("/api/v1/settings/agent-time-sync", headers=headers, json={"enabled": True, "extra": 1}).status_code, 422)
+            enabled = client.put("/api/v1/settings/agent-time-sync", headers=headers, json={"enabled": True})
+            self.assertTrue(enabled.json()["enabled"])
+            with SessionLocal() as db:
+                updates = db.execute(select(AuditEvent).where(AuditEvent.action == "system.agent_time_sync.update")).scalars().all()
+                self.assertGreaterEqual(len(updates), 2)
+
+            self.assertEqual(client.get("/api/v1/settings/agent-time-sync").status_code, 401)
 
     def test_clean_file_is_encrypted_and_queued_directly(self):
         with TestClient(app) as client:

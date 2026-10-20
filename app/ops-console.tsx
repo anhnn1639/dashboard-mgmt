@@ -77,7 +77,38 @@ type Server = {
   tags: string[];
   tunnelOnline: boolean;
   shares?: { userIds: string[]; groupIds: string[]; count: number };
+  connectionIssue?: { code: "never_checked_in" | "clock_skew"; message: string; skewSeconds?: number } | null;
+  clock?: AgentClock | null;
 };
+
+type AgentClock = {
+  offsetMs: number | null;
+  status: "synchronized" | "stepped" | "disabled" | "failed" | "unmeasured";
+  error: string;
+  lastStepAt: string | null;
+  lastStepMs: number | null;
+};
+
+function formatClockSeconds(milliseconds: number): string {
+  const seconds = milliseconds / 1000;
+  const sign = seconds > 0 ? "+" : seconds < 0 ? "−" : "";
+  const absolute = Math.abs(seconds);
+  if (absolute >= 3600) return `${sign}${(absolute / 3600).toFixed(1)} giờ`;
+  if (absolute >= 60) return `${sign}${(absolute / 60).toFixed(1)} phút`;
+  return `${sign}${absolute.toFixed(absolute < 10 ? 1 : 0)} giây`;
+}
+
+function agentClockSummary(clock: AgentClock | null | undefined): string {
+  if (!clock) return "Agent chưa báo trạng thái đồng hồ";
+  const stepped = clock.lastStepAt && clock.lastStepMs !== null
+    ? ` · lần chỉnh gần nhất ${formatClockSeconds(clock.lastStepMs)} lúc ${new Date(clock.lastStepAt).toLocaleString("vi-VN")}`
+    : "";
+  if (clock.status === "failed") return `Không chỉnh được đồng hồ: ${clock.error || "lỗi không xác định"}`;
+  if (clock.status === "disabled") return `Đồng bộ giờ đang tắt${clock.offsetMs !== null ? ` · lệch ${formatClockSeconds(clock.offsetMs)}` : ""}`;
+  if (clock.status === "stepped") return `Đã đồng bộ theo Operation Portal${stepped}`;
+  if (clock.status === "synchronized") return `Đúng giờ Operation Portal${clock.offsetMs !== null ? ` (lệch ${formatClockSeconds(clock.offsetMs)})` : ""}${stepped}`;
+  return "Đang đo độ lệch đồng hồ";
+}
 
 type PlatformGroupRow = { id: string; name: string; description: string; memberIds: string[]; memberCount: number; createdAt: string };
 
@@ -3079,6 +3110,12 @@ function ServerDrawer({
           ))}
         </nav>
         {readOnly && <p className="resource-help">Chế độ chỉ xem: dữ liệu đã thu thập. Không thể mở phiên, quét Agent hoặc thay đổi cấu hình.</p>}
+        {server.connectionIssue && (
+          <div className="warning-box connection-issue" role="status">
+            <b>{server.connectionIssue.code === "clock_skew" ? "Đồng hồ máy chủ bị lệch" : "Chưa kết nối được kênh quản trị 9443"}</b>
+            <p>{server.connectionIssue.message}</p>
+          </div>
+        )}
         <div className="drawer-body">
           {activeTab === "overview" && (
             <>
@@ -3135,6 +3172,10 @@ function ServerDrawer({
               <dd>
                 v{server.agentVersion} · {server.tunnelOnline ? "kết nối an toàn" : "mất kết nối"}
               </dd>
+            </div>
+            <div>
+              <dt>Đồng hồ hệ thống</dt>
+              <dd className={server.clock?.status === "failed" ? "clock-failed" : undefined}>{agentClockSummary(server.clock)}</dd>
             </div>
           </dl>
             </>
@@ -4370,6 +4411,43 @@ function agentManagementError(data: Record<string, unknown>, fallback: string) {
   return fallback;
 }
 
+type ReusableAgentPackage = {
+  id: string;
+  label: string;
+  osFamily: OSFamily;
+  linuxProfile: LinuxOfflineProfile | null;
+  reusable: boolean;
+  releaseVersion: string;
+  claimCount: number;
+  maxClaims: number | null;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  lastClaimAt: string | null;
+  revokedAt: string | null;
+  revokedBy: string;
+  state: "active" | "revoked" | "superseded" | "claim_limit_reached" | "used" | "expired";
+};
+
+type AgentTimeSyncStatus = {
+  enabled: boolean;
+  step_threshold_seconds: number;
+  serverTime: string;
+  totalAgents: number;
+  reportingAgents: number;
+  outOfSyncAgents: number;
+  failedAgents: number;
+};
+
+const REUSABLE_PACKAGE_STATE_LABELS: Record<string, string> = {
+  active: "Đang dùng được",
+  revoked: "Đã thu hồi",
+  superseded: "Đã có bản mới",
+  claim_limit_reached: "Đủ số máy",
+  used: "Đã dùng",
+  expired: "Hết hạn",
+};
+
 function AgentPackagesView({ token, canManageUninstallProtection }: { token: string; canManageUninstallProtection: boolean }) {
   const [status, setStatus] = useState<{
     dashboardUrl: string;
@@ -4383,6 +4461,14 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
   } | null>(null);
   const [busy, setBusy] = useState<OSFamily | null>(null);
   const [linuxProfile, setLinuxProfile] = useState<LinuxOfflineProfile>("ubuntu-24.04");
+  const [reusablePackage, setReusablePackage] = useState(true);
+  const [reusablePackages, setReusablePackages] = useState<ReusableAgentPackage[]>([]);
+  const [reusableLoadError, setReusableLoadError] = useState("");
+  const [revokingPackageId, setRevokingPackageId] = useState<string | null>(null);
+  const [timeSync, setTimeSync] = useState<AgentTimeSyncStatus | null>(null);
+  const [timeSyncBusy, setTimeSyncBusy] = useState(false);
+  const [timeSyncMessage, setTimeSyncMessage] = useState("");
+  const [timeSyncMessageIsError, setTimeSyncMessageIsError] = useState(false);
   const [message, setMessage] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
   const [upgradeStatus, setUpgradeStatus] = useState<AgentUpgradeStatus | null>(null);
@@ -4458,6 +4544,80 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
       if (!quiet) setUninstallLoading(false);
     }
   }, [token]);
+
+  const loadReusablePackages = useCallback(async () => {
+    try {
+      const response = await fetch("/api/v1/agent-packages", { headers: { Authorization: `Bearer ${token}` } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể đọc danh sách bộ cài dùng nhiều lần"));
+      setReusablePackages(Array.isArray(data.items) ? data.items : []);
+      setReusableLoadError("");
+    } catch (reason) {
+      setReusableLoadError(reason instanceof Error ? reason.message : "Không thể đọc danh sách bộ cài dùng nhiều lần");
+    }
+  }, [token]);
+
+  const loadTimeSync = useCallback(async () => {
+    try {
+      const response = await fetch("/api/v1/settings/agent-time-sync", { headers: { Authorization: `Bearer ${token}` } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể đọc cấu hình đồng bộ giờ"));
+      setTimeSync(data as AgentTimeSyncStatus);
+    } catch (reason) {
+      setTimeSyncMessageIsError(true);
+      setTimeSyncMessage(reason instanceof Error ? reason.message : "Không thể đọc cấu hình đồng bộ giờ");
+    }
+  }, [token]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadReusablePackages();
+      void loadTimeSync();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadReusablePackages, loadTimeSync]);
+
+  async function revokeReusablePackage(item: ReusableAgentPackage) {
+    if (!window.confirm(`Thu hồi bộ cài "${item.label}"? Các máy đã cài vẫn hoạt động bình thường, nhưng file này sẽ không cài thêm được máy mới.`)) return;
+    setRevokingPackageId(item.id);
+    try {
+      const response = await fetch(`/api/v1/agent-packages/${encodeURIComponent(item.id)}/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ reason: "Thu hồi từ trang Bộ cài Agent" }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể thu hồi bộ cài"));
+      setReusablePackages((current) => current.map((entry) => (entry.id === item.id ? (data as ReusableAgentPackage) : entry)));
+      setReusableLoadError("");
+    } catch (reason) {
+      setReusableLoadError(reason instanceof Error ? reason.message : "Không thể thu hồi bộ cài");
+    } finally {
+      setRevokingPackageId(null);
+    }
+  }
+
+  async function toggleTimeSync(enabled: boolean) {
+    setTimeSyncBusy(true);
+    setTimeSyncMessage("");
+    try {
+      const response = await fetch("/api/v1/settings/agent-time-sync", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(agentManagementError(data, "Không thể lưu cấu hình đồng bộ giờ"));
+      setTimeSync(data as AgentTimeSyncStatus);
+      setTimeSyncMessageIsError(false);
+      setTimeSyncMessage(enabled ? "Đã bật. Agent áp dụng ở lần check-in kế tiếp (vài giây)." : "Đã tắt. Agent ngừng chỉnh đồng hồ hệ điều hành, vẫn ký request theo giờ Operation Portal.");
+    } catch (reason) {
+      setTimeSyncMessageIsError(true);
+      setTimeSyncMessage(reason instanceof Error ? reason.message : "Không thể lưu cấu hình đồng bộ giờ");
+    } finally {
+      setTimeSyncBusy(false);
+    }
+  }
 
   useEffect(() => {
     fetch("/api/v1/agent-packages/status", {
@@ -4653,7 +4813,9 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
           label: form.get("label"),
           os_family: osFamily,
           linux_profile: osFamily === "linux" ? linuxProfile : null,
-          expires_minutes: Number(form.get("expires_minutes")),
+          ...(reusablePackage
+            ? { reusable: true, max_claims: form.get("max_claims") ? Number(form.get("max_claims")) : null }
+            : { expires_minutes: Number(form.get("expires_minutes")) }),
         }),
       });
       if (!response.ok) {
@@ -4671,11 +4833,15 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
       anchor.click();
       anchor.remove();
       URL.revokeObjectURL(url);
+      const usage = reusablePackage
+        ? `dùng cho nhiều máy đến khi có Agent bản mới (v${status?.agentVersion ?? "hiện tại"} trở lên sẽ cần tải lại) hoặc khi bị thu hồi`
+        : "dùng một lần";
       setMessage(
         osFamily === "windows"
-          ? "Đã tạo MSI dùng một lần. Giữ nguyên tên file, chép sang đúng Windows Server và chạy bằng Administrator."
-          : `Đã tạo gói offline ${LINUX_OFFLINE_PROFILE_LABELS[linuxProfile]} dùng một lần. Máy đích không cần kết nối Internet hoặc repository khi cài. Chạy: chmod +x <file>.run && sudo ./<file>.run`,
+          ? `Đã tạo MSI ${usage}. Giữ nguyên tên file, chép sang Windows Server và chạy bằng Administrator.`
+          : `Đã tạo gói offline ${LINUX_OFFLINE_PROFILE_LABELS[linuxProfile]} ${usage}. Máy đích không cần kết nối Internet hoặc repository khi cài. Chạy: chmod +x <file>.run && sudo ./<file>.run`,
       );
+      if (reusablePackage) void loadReusablePackages();
       setMessageIsError(false);
     } catch (reason) {
       setMessageIsError(true);
@@ -4711,7 +4877,8 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
           <small>Hãy mở Operation Portal bằng chính domain mới và kiểm tra kết nối HTTPS trước khi lưu.</small>
         </form>
         <ul>
-          <li>Claim hết hạn sau tối đa 60 phút và chỉ dùng được một lần.</li>
+          <li>Bộ cài dùng nhiều lần cài được cho mọi máy cùng loại đến khi Operation Portal triển khai Agent bản mới; có thể thu hồi bất kỳ lúc nào. Bộ cài một lần hết hạn sau tối đa 60 phút.</li>
+          <li>Agent tự đồng bộ giờ hệ thống theo Operation Portal qua kênh 9443, không cần mở NTP.</li>
           <li>
             Kết nối cài đặt: {status?.webTlsTrust === "system" ? "chứng thư công khai" : "chứng thư nội bộ đã xác minh"};
             kênh quản trị Agent sử dụng chứng thư riêng.
@@ -4728,22 +4895,47 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
       >
         <div className="panel-head">
           <div>
-            <h2>Tạo bộ cài riêng cho máy chủ</h2>
-            <p>Agent {status?.agentVersion ?? "…"} · chỉ quản trị viên được tạo gói cài một lần.</p>
+            <h2>Tạo bộ cài Agent</h2>
+            <p>Agent {status?.agentVersion ?? "…"} · chỉ quản trị viên được tạo bộ cài.</p>
           </div>
         </div>
+        <fieldset className="package-mode">
+          <legend>Kiểu bộ cài</legend>
+          <label className={reusablePackage ? "active" : ""}>
+            <input type="radio" name="package_mode" checked={reusablePackage} onChange={() => setReusablePackage(true)} />
+            <span>
+              Dùng cho nhiều máy
+              <small>Tải một lần, cài cho tới khi có Agent bản mới</small>
+            </span>
+          </label>
+          <label className={!reusablePackage ? "active" : ""}>
+            <input type="radio" name="package_mode" checked={!reusablePackage} onChange={() => setReusablePackage(false)} />
+            <span>
+              Một máy
+              <small>Dùng một lần, hết hạn sau tối đa 60 phút</small>
+            </span>
+          </label>
+        </fieldset>
         <label>
           Tên gợi nhớ / ticket
-          <input name="label" required minLength={3} maxLength={120} placeholder="SRV-PROD-01 hoặc CHG-1234" />
+          <input name="label" required minLength={3} maxLength={120} placeholder={reusablePackage ? "Ubuntu-Prod hoặc CHG-1234" : "SRV-PROD-01 hoặc CHG-1234"} />
         </label>
-        <label>
-          Thời hạn cài đặt
-          <select name="expires_minutes" defaultValue="30">
-            <option value="15">15 phút</option>
-            <option value="30">30 phút</option>
-            <option value="60">60 phút</option>
-          </select>
-        </label>
+        {reusablePackage ? (
+          <label>
+            Giới hạn số máy (không bắt buộc)
+            <input name="max_claims" type="number" min={1} max={10000} step={1} placeholder="Không giới hạn" />
+            <small>Để trống để cài không giới hạn cho tới khi có bản mới hoặc bị thu hồi.</small>
+          </label>
+        ) : (
+          <label>
+            Thời hạn cài đặt
+            <select name="expires_minutes" defaultValue="30">
+              <option value="15">15 phút</option>
+              <option value="30">30 phút</option>
+              <option value="60">60 phút</option>
+            </select>
+          </label>
+        )}
         <label>
           Hệ điều hành của máy Linux
           <select value={linuxProfile} onChange={(event) => setLinuxProfile(event.target.value as LinuxOfflineProfile)}>
@@ -4794,9 +4986,81 @@ function AgentPackagesView({ token, canManageUninstallProtection }: { token: str
         )}
         {message && <p className={`settings-message${messageIsError ? " error" : ""}`}>{message}</p>}
         <div className="package-security-note">
-          Không đổi tên MSI Windows: tên file chứa locator và chế độ xác minh TLS. Không gửi bộ cài qua kênh công cộng và không tái sử dụng file sau khi một máy đã claim.
+          Không đổi tên MSI Windows: tên file chứa locator và chế độ xác minh TLS. Bộ cài dùng nhiều lần cho phép đăng ký máy mới vào hệ thống: chỉ lưu ở kho nội bộ, không gửi qua kênh công cộng và thu hồi ngay nếu nghi lộ file.
         </div>
       </form>
+
+      <article className="panel reusable-packages">
+        <div className="panel-head">
+          <div>
+            <h2>Bộ cài dùng nhiều lần</h2>
+            <p>Mỗi lần cài được ghi nhật ký kiểm toán kèm hostname. Bộ cài của bản cũ tự hết hiệu lực khi triển khai Agent mới.</p>
+          </div>
+          <button className="button ghost" type="button" onClick={() => void loadReusablePackages()}>Làm mới</button>
+        </div>
+        {reusableLoadError && <p className="settings-message error">{reusableLoadError}</p>}
+        {reusablePackages.length === 0 ? (
+          <p className="resource-help">Chưa có bộ cài dùng nhiều lần.</p>
+        ) : (
+          <div className="table-scroll">
+            <table className="reusable-package-table">
+              <thead>
+                <tr>
+                  <th>Tên</th>
+                  <th>Hệ điều hành</th>
+                  <th>Phiên bản</th>
+                  <th>Đã cài</th>
+                  <th>Lần cài gần nhất</th>
+                  <th>Trạng thái</th>
+                  <th aria-label="Thao tác" />
+                </tr>
+              </thead>
+              <tbody>
+                {reusablePackages.map((item) => (
+                  <tr key={item.id}>
+                    <td><b>{item.label}</b><small>{item.createdBy} · {new Date(item.createdAt).toLocaleString("vi-VN")}</small></td>
+                    <td>{item.osFamily === "windows" ? "Windows" : item.linuxProfile ? LINUX_OFFLINE_PROFILE_LABELS[item.linuxProfile] ?? item.linuxProfile : "Linux"}</td>
+                    <td>v{item.releaseVersion}</td>
+                    <td>{item.claimCount}{item.maxClaims ? ` / ${item.maxClaims}` : ""} máy</td>
+                    <td>{item.lastClaimAt ? new Date(item.lastClaimAt).toLocaleString("vi-VN") : "—"}</td>
+                    <td><span className={`package-state ${item.state}`}>{REUSABLE_PACKAGE_STATE_LABELS[item.state] ?? item.state}</span></td>
+                    <td>
+                      {item.state !== "revoked" && (
+                        <button className="button danger" type="button" disabled={revokingPackageId !== null} onClick={() => void revokeReusablePackage(item)}>
+                          {revokingPackageId === item.id ? "Đang thu hồi…" : "Thu hồi"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </article>
+
+      <article className="panel agent-time-sync">
+        <div className="panel-head">
+          <div>
+            <h2>Đồng bộ giờ theo Operation Portal</h2>
+            <p>Agent đo giờ chuẩn qua kênh mTLS 9443 và chỉnh đồng hồ máy chủ khi lệch quá {timeSync?.step_threshold_seconds ?? 2} giây. Không cần mở NTP/UDP 123.</p>
+          </div>
+        </div>
+        <label className="time-sync-toggle">
+          <input type="checkbox" checked={timeSync?.enabled ?? true} disabled={timeSync === null || timeSyncBusy} onChange={(event) => void toggleTimeSync(event.target.checked)} />
+          <span>{timeSync?.enabled === false ? "Đang tắt" : "Đang bật"} tự động chỉnh giờ hệ điều hành</span>
+        </label>
+        {timeSync && (
+          <dl className="detail-list">
+            <div><dt>Giờ Operation Portal</dt><dd>{new Date(timeSync.serverTime).toLocaleString("vi-VN")}</dd></div>
+            <div><dt>Agent đã báo đồng hồ</dt><dd>{timeSync.reportingAgents} / {timeSync.totalAgents}</dd></div>
+            <div><dt>Còn lệch</dt><dd>{timeSync.outOfSyncAgents} máy</dd></div>
+            <div><dt>Không chỉnh được</dt><dd>{timeSync.failedAgents} máy</dd></div>
+          </dl>
+        )}
+        <p className="resource-help">Cần Agent 0.8.19 trở lên. Nếu máy chủ còn dùng nguồn giờ khác (domain controller, NTP nội bộ) lệch với Operation Portal, hãy đưa về cùng nguồn để tránh hai bên chỉnh qua lại; Agent chỉ chỉnh lại sau 5 phút trừ khi lệch trên 1 phút.</p>
+        {timeSyncMessage && <p className={`settings-message${timeSyncMessageIsError ? " error" : ""}`}>{timeSyncMessage}</p>}
+      </article>
 
       <article className="panel agent-fleet-panel">
         <div className="agent-management-head">

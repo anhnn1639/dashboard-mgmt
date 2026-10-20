@@ -215,7 +215,9 @@ class Config:
 
 
 def signed_headers(config: Config, method: str, url: str, body: bytes = b"") -> dict[str, str]:
-    timestamp = str(int(time.time()))
+    # Signed with the control-plane clock so a drifting endpoint clock cannot
+    # push requests outside the server's replay window.
+    timestamp = str(int(CLOCK.now()))
     path = urlsplit(url).path
     message = f"{timestamp}\n{method.upper()}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
     certificate_header, private_key = config.signing_material()
@@ -230,6 +232,204 @@ def signed_headers(config: Config, method: str, url: str, body: bytes = b"") -> 
 def signed_request(config: Config, method: str, url: str, payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return body, {"Content-Type": "application/json", **signed_headers(config, method, url, body)}
+
+
+TIME_SYNC_DEFAULT_THRESHOLD_SECONDS = 2.0
+# A step is only trusted when the request/response round trip bounds the
+# measurement error to half a second; signatures tolerate far coarser data.
+TIME_SYNC_MAX_STEP_RTT_SECONDS = 1.0
+TIME_SYNC_MAX_SIGNING_RTT_SECONDS = 30.0
+TIME_SYNC_MIN_STEP_INTERVAL_SECONDS = 300.0
+TIME_SYNC_PROBE_INTERVAL_SECONDS = 30.0
+# OpenSSL X509_V_FLAG_NO_CHECK_TIME: still verify the pinned chain and
+# hostname, but ignore certificate validity dates. Used only for the clock
+# probe after a strict handshake failed because the local clock is wrong.
+X509_V_FLAG_NO_CHECK_TIME = 0x200000
+CERTIFICATE_TIME_ERRORS = {9, 10}  # X509_V_ERR_CERT_NOT_YET_VALID / HAS_EXPIRED
+
+
+def set_system_clock(target_epoch: float) -> None:
+    if platform.system().lower() == "windows":
+        import ctypes
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint16) for name in ("wYear", "wMonth", "wDayOfWeek", "wDay", "wHour", "wMinute", "wSecond", "wMilliseconds")]
+
+        moment = datetime.fromtimestamp(target_epoch, UTC)
+        value = SYSTEMTIME(moment.year, moment.month, moment.isoweekday() % 7, moment.day, moment.hour, moment.minute, moment.second, moment.microsecond // 1000)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # SetSystemTime enables SE_SYSTEMTIME_NAME for LocalSystem itself.
+        if not kernel32.SetSystemTime(ctypes.byref(value)):
+            raise OSError(ctypes.get_last_error(), "SetSystemTime failed")
+        return
+    time.clock_settime(time.CLOCK_REALTIME, target_epoch)
+
+
+class ClockSync:
+    """Keep the endpoint aligned with the control-plane clock over 9443.
+
+    ``offset`` is control plane minus local time. It is applied to request
+    signatures at once, so the channel keeps working even if the operating
+    system refuses a clock change; the system clock is stepped separately.
+    """
+
+    def __init__(self, setter: Callable[[float], None] = set_system_clock) -> None:
+        self._lock = threading.Lock()
+        self._setter = setter
+        self.offset = 0.0
+        self.enabled = True
+        self.threshold = TIME_SYNC_DEFAULT_THRESHOLD_SECONDS
+        self.status = "unmeasured"
+        self.error = ""
+        self.measured_offset: float | None = None
+        self.last_step_at: str | None = None
+        self.last_step_seconds: float | None = None
+        self._last_step_monotonic: float | None = None
+        self._last_probe_monotonic: float | None = None
+
+    def now(self) -> float:
+        return time.time() + self.offset
+
+    def apply_policy(self, policy: Any) -> None:
+        if not isinstance(policy, dict):
+            return
+        if isinstance(policy.get("enabled"), bool):
+            self.enabled = policy["enabled"]
+        threshold = policy.get("step_threshold_seconds")
+        if isinstance(threshold, (int, float)) and 0.5 <= threshold <= 3600:
+            self.threshold = float(threshold)
+
+    def observe(self, server_epoch: Any, sent: float, received: float, policy: Any = None) -> None:
+        if isinstance(server_epoch, str):
+            try:
+                server_epoch = datetime.fromisoformat(server_epoch).timestamp()
+            except ValueError:
+                return
+        if not isinstance(server_epoch, (int, float)) or isinstance(server_epoch, bool):
+            return
+        rtt = received - sent
+        if rtt < 0 or rtt > TIME_SYNC_MAX_SIGNING_RTT_SECONDS:
+            return
+        offset = float(server_epoch) - (sent + received) / 2
+        with self._lock:
+            self.apply_policy(policy)
+            self.measured_offset = offset
+            self.offset = offset
+            if not self.enabled:
+                self.status = "disabled"
+                self.error = ""
+                return
+            if abs(offset) < self.threshold:
+                self.status = "synchronized"
+                self.error = ""
+                return
+            if rtt > TIME_SYNC_MAX_STEP_RTT_SECONDS:
+                return
+            monotonic = time.monotonic()
+            if (
+                self._last_step_monotonic is not None
+                and monotonic - self._last_step_monotonic < TIME_SYNC_MIN_STEP_INTERVAL_SECONDS
+                and abs(offset) < 60
+            ):
+                # Another time source is probably fighting this one; do not
+                # oscillate every check-in. Large errors are still corrected.
+                return
+            try:
+                self._setter(time.time() + offset)
+            except Exception as exc:
+                self.status = "failed"
+                self.error = f"{type(exc).__name__}: {exc}"[:240]
+                LOG.warning("system clock could not be aligned with the control plane (offset %.3fs): %s", offset, self.error)
+                return
+            self.offset = 0.0
+            self.status = "stepped"
+            self.error = ""
+            self.last_step_seconds = offset
+            self.last_step_at = datetime.now(UTC).isoformat()
+            self._last_step_monotonic = monotonic
+            LOG.info("system clock aligned with the control plane: adjusted by %+.3fs", offset)
+
+    def probe_due(self) -> bool:
+        with self._lock:
+            monotonic = time.monotonic()
+            if self._last_probe_monotonic is not None and monotonic - self._last_probe_monotonic < TIME_SYNC_PROBE_INTERVAL_SECONDS:
+                return False
+            self._last_probe_monotonic = monotonic
+            return True
+
+    def report(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                # Endpoint minus control plane, matching the server's skew sign.
+                "offset_ms": None if self.measured_offset is None else int(round(-self.measured_offset * 1000)),
+                "status": self.status,
+                "error": self.error,
+                "last_step_at": self.last_step_at,
+                "last_step_ms": None if self.last_step_seconds is None else int(round(self.last_step_seconds * 1000)),
+            }
+
+
+CLOCK = ClockSync()
+
+
+def control_plane_time_context(config: Config, check_time: bool = True) -> ssl.SSLContext:
+    if not config.server_ca_file:
+        raise RuntimeError("Control-plane CA is not installed")
+    context = ssl.create_default_context(cafile=str(config.server_ca_file))
+    context.load_cert_chain(str(config.cert_file), str(config.key_file))
+    if not check_time:
+        context.verify_flags = context.verify_flags | X509_V_FLAG_NO_CHECK_TIME
+    return context
+
+
+def fetch_control_plane_time(config: Config, check_time: bool = True) -> tuple[dict[str, Any], float, float]:
+    parsed = urlsplit(config.agent_endpoint)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise RuntimeError("Agent endpoint must use HTTPS")
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=20, context=control_plane_time_context(config, check_time))
+    try:
+        # Complete TCP/TLS first so the measured round trip covers only the
+        # HTTP exchange, keeping the midpoint estimate tight.
+        connection.connect()
+        sent = time.time()
+        connection.request("GET", parsed.path + "/time", headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        body = response.read(65536)
+        received = time.time()
+    finally:
+        connection.close()
+    if response.status != 200:
+        raise RuntimeError(f"control-plane time endpoint returned HTTP {response.status}")
+    data = json.loads(body.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("control-plane time response is invalid")
+    return data, sent, received
+
+
+def resync_clock_from_control_plane(config: Config, *, force: bool = False) -> bool:
+    """Measure the control-plane clock without a signed request."""
+    if not force and not CLOCK.probe_due():
+        return False
+    try:
+        ensure_server_ca(config)
+        try:
+            data, sent, received = fetch_control_plane_time(config)
+        except ssl.SSLCertVerificationError as exc:
+            if getattr(exc, "verify_code", None) not in CERTIFICATE_TIME_ERRORS:
+                raise
+            LOG.warning("control-plane certificate rejected by the local clock (%s); measuring time with validity dates ignored", exc.verify_message)
+            data, sent, received = fetch_control_plane_time(config, check_time=False)
+    except (OSError, RuntimeError, ValueError, http.client.HTTPException, requests.RequestException) as exc:
+        LOG.warning("control-plane clock unavailable: %s", exc)
+        return False
+    CLOCK.observe(data.get("server_time_epoch", data.get("server_time")), sent, received, data.get("time_sync"))
+    return True
+
+
+def clock_error_response(exc: requests.RequestException, detail: str) -> bool:
+    if isinstance(exc, requests.exceptions.SSLError):
+        return True
+    return exc.response is not None and exc.response.status_code == 401 and "timestamp" in detail.lower()
 
 
 def run(
@@ -5323,6 +5523,8 @@ def loop(config: Config, once: bool = False) -> None:
             control_session_stamp = material_stamp
         return control_session
 
+    # Learn the control-plane clock before the first signed request.
+    resync_clock_from_control_plane(config, force=True)
     if not once:
         threading.Thread(target=tunnel_control_loop, args=(config,), name="tram-tunnel-control", daemon=True).start()
     try:
@@ -5367,8 +5569,10 @@ def loop(config: Config, once: bool = False) -> None:
                 }
                 if not once:
                     payload["active_job_ids"] = active_job_ids
+                payload["clock"] = CLOCK.report()
                 url = config.agent_endpoint + "/checkin"
                 body, headers = signed_request(config, "POST", url, payload)
+                checkin_sent = time.time()
                 response = current_control_session().post(
                     url,
                     data=body,
@@ -5377,8 +5581,10 @@ def loop(config: Config, once: bool = False) -> None:
                     verify=config.tls_verify(),
                     timeout=240,
                 )
+                checkin_received = time.time()
                 response.raise_for_status()
                 data = response.json()
+                CLOCK.observe(data.get("server_time_epoch", data.get("server_time")), checkin_sent, checkin_received, data.get("time_sync"))
                 if send_inventory:
                     last_inventory = timestamp
                     inventory_pending = False
@@ -5421,6 +5627,10 @@ def loop(config: Config, once: bool = False) -> None:
                 LOG.warning("control plane unavailable: %s%s; retry in %ss", exc, suffix, backoff)
                 if once:
                     raise
+                if clock_error_response(exc, detail) and resync_clock_from_control_plane(config):
+                    # The clock was the problem and is now known; retry soon.
+                    time.sleep(5)
+                    continue
                 time.sleep(backoff)
                 backoff = min(300, backoff * 2)
             except Exception:
