@@ -958,10 +958,71 @@ class AgentSecurityTests(unittest.TestCase):
             for item in mappings:
                 self.assertIn(f"URIs: {item['base_url'].rstrip('/')}\nSuites: {item['id']}", managed_content)
             self.assertNotIn("noble-backports", managed_content)
+            # Pulp publishes only Packages indexes: never request Translation/DEP-11.
+            self.assertEqual(managed_content.count("Targets: Packages\nLanguages: none\nSigned-By:"), 3)
+            config = apt_root / "apt.conf.d" / tram_agent.APT_MANAGED_CONFIG_NAME
+            self.assertIn('Acquire::http::Timeout "15";', config.read_text(encoding="utf-8"))
+            self.assertEqual(tram_agent.upgrade_managed_update_sources(apt_root, root / "no-yum"), [])
+            code, _ = tram_agent.configure_ubuntu_update_source({"mode": "default"}, inventory, apt_root, state_root)
+            self.assertEqual(code, 0)
+            self.assertFalse(config.exists())
             with self.assertRaisesRegex(ValueError, "Base, Updates and Security"):
                 tram_agent.validated_ubuntu_repository_mappings(
                     {"mode": "custom", "repositories": mappings[:2]}, inventory
                 )
+
+    def test_sources_applied_by_older_agents_are_upgraded_without_touching_other_repositories(self):
+        legacy_apt = (
+            "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n"
+            "Types: deb\nURIs: http://10.64.70.15/pulp/content/ubuntu/24.04/noble\nSuites: noble\n"
+            "Components: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n"
+            "Types: deb\nURIs: http://10.64.70.15/pulp/content/ubuntu/24.04/noble-updates\nSuites: noble-updates\n"
+            "Components: main restricted universe multiverse\nLanguages: vi\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+        )
+        legacy_yum = (
+            "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n\n"
+            "[tram_ol7_latest]\nname=Tram managed ol7_latest\nbaseurl=http://pulp.internal/ol7/latest\nenabled=1\ngpgcheck=1\n\n"
+            "[tram_ol7_UEKR6]\nname=Tram managed ol7_UEKR6\nbaseurl=http://pulp.internal/ol7/uek\nenabled=1\ntimeout=60\n"
+        )
+        docker = "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apt_root = root / "apt"
+            yum_root = root / "yum"
+            (apt_root / "sources.list.d").mkdir(parents=True)
+            yum_root.mkdir()
+            managed_apt = apt_root / "sources.list.d" / tram_agent.APT_MANAGED_SOURCE_NAME
+            managed_apt.write_text(legacy_apt, encoding="utf-8")
+            (apt_root / "sources.list.d" / "docker.sources").write_text(docker, encoding="utf-8")
+            managed_yum = yum_root / tram_agent.ORACLE_MANAGED_REPOSITORY_NAME
+            managed_yum.write_text(legacy_yum, encoding="utf-8")
+
+            changed = tram_agent.upgrade_managed_update_sources(apt_root, yum_root)
+            self.assertEqual(len(changed), 3)
+            apt_content = managed_apt.read_text(encoding="utf-8")
+            self.assertTrue(apt_content.startswith("# Managed by Tram Van Hanh Agent."))
+            self.assertEqual(apt_content.count("Targets: Packages"), 2)
+            self.assertIn("Suites: noble\nComponents: main restricted universe multiverse\nTargets: Packages\nLanguages: none\nSigned-By:", apt_content)
+            self.assertIn("Languages: vi", apt_content, "an administrator's explicit value is kept")
+            self.assertEqual(apt_content.count("Languages:"), 2)
+            self.assertEqual((apt_root / "sources.list.d" / "docker.sources").read_text(encoding="utf-8"), docker)
+            self.assertTrue((apt_root / "apt.conf.d" / tram_agent.APT_MANAGED_CONFIG_NAME).is_file())
+            yum_content = managed_yum.read_text(encoding="utf-8")
+            self.assertIn("[tram_ol7_latest]\nname=Tram managed ol7_latest\nbaseurl=http://pulp.internal/ol7/latest\nenabled=1\ngpgcheck=1\ntimeout=15\nretries=2\n\n[tram_ol7_UEKR6]", yum_content)
+            self.assertIn("timeout=60\nretries=2\n", yum_content)
+            self.assertEqual(yum_content.count("timeout="), 2)
+
+            # Idempotent: a second start changes nothing.
+            self.assertEqual(tram_agent.upgrade_managed_update_sources(apt_root, yum_root), [])
+
+            parser = tram_agent.configparser.RawConfigParser(interpolation=None, strict=False)
+            parser.read_string(yum_content)
+            self.assertEqual(parser.get("tram_ol7_latest", "retries"), "2")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(tram_agent.upgrade_managed_update_sources(root / "apt", root / "yum"), [])
+            self.assertFalse((root / "apt").exists(), "hosts without a managed source are not touched")
 
     def test_ubuntu_deb822_switch_disables_only_official_stanza(self):
         content = (
@@ -1010,6 +1071,8 @@ class AgentSecurityTests(unittest.TestCase):
             managed_content = managed.read_text(encoding="utf-8")
             self.assertIn("[tram_ol8_baseos_latest]", managed_content)
             self.assertIn("https://repo.internal/ol8/appstream/$basearch", managed_content)
+            self.assertEqual(managed_content.count("timeout=15\nretries=2"), 2)
+            self.assertEqual(tram_agent.upgrade_managed_update_sources(root / "no-apt", repository_root), [])
 
             code, output = tram_agent.configure_oracle_update_source({"mode": "default"}, inventory, repository_root, state_root)
             self.assertEqual(code, 0)

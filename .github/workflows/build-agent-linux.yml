@@ -68,6 +68,45 @@ jobs:
           done
           sha256sum dist/tram-agent
 
+      - name: Verify managed Ubuntu sources request only Packages indexes
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/agent-venv
+          /tmp/agent-venv/bin/pip install --disable-pip-version-check --quiet -r agent/requirements.txt
+          for release in 22.04 24.04; do
+            codename=$([ "$release" = "22.04" ] && echo jammy || echo noble)
+            root="$RUNNER_TEMP/apt-$release"
+            mkdir -p "$root/apt" "$root/state"
+            printf 'deb http://archive.ubuntu.com/ubuntu %s main universe\n' "$codename" > "$root/apt/sources.list"
+            # Generate the file exactly as the Agent writes it for Pulp pockets.
+            /tmp/agent-venv/bin/python - "$root" "$release" "$codename" <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          root, release, codename = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          spec = importlib.util.spec_from_file_location("tram_agent", "agent/tram_agent.py")
+          agent = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(agent)
+          base = f"http://pulp.invalid/pulp/content/ubuntu/{release}"
+          mappings = [{"id": suite, "base_url": f"{base}/{suite}"} for suite in (codename, f"{codename}-updates", f"{codename}-security")]
+          code, _ = agent.configure_ubuntu_update_source({"mode": "custom", "repositories": mappings}, {"distribution_id": "ubuntu", "os_version": release}, root / "apt", root / "state")
+          assert code == 0
+          PY
+            docker run --rm -v "$root/apt:/tram-apt:ro" "ubuntu:$release" bash -lc '
+              set -euo pipefail
+              apt-get -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=/tram-apt/sources.list.d \
+                -o Dir::Etc::parts=/tram-apt/apt.conf.d indextargets --no-release-info --format "\$(CREATED_BY) \$(URI)" > /tmp/targets
+              cat /tmp/targets
+              grep -q "^Packages http://pulp.invalid/" /tmp/targets
+              if grep -v "^Packages " /tmp/targets | grep -q "pulp.invalid"; then
+                echo "APT would request non-Packages indexes from the managed source" >&2
+                exit 1
+              fi
+              timeout=$(apt-config -o Dir::Etc::parts=/tram-apt/apt.conf.d dump Acquire::http::Timeout)
+              echo "$timeout"
+              echo "$timeout" | grep -q "\"15\""
+            '
+          done
+
       - name: Write release provenance
         shell: bash
         run: |

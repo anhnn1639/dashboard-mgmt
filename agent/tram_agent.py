@@ -110,7 +110,25 @@ UPDATE_SOURCE_STATE_ROOT = Path("/var/lib/tram-agent/update-sources")
 APT_SOURCE_ROOT = Path("/etc/apt")
 YUM_REPOSITORY_ROOT = Path("/etc/yum.repos.d")
 APT_MANAGED_SOURCE_NAME = "tram-os-default.sources"
+APT_MANAGED_CONFIG_NAME = "80tram-managed-sources"
 ORACLE_MANAGED_REPOSITORY_NAME = "tram-os-default.repo"
+# Pulp and most internal mirrors publish only the Packages indexes. Without
+# these options APT also requests Translation-* and DEP-11/CNF indexes, which
+# show up as dozens of "Ign:" lines and can stall "apt update" for minutes on
+# "[Waiting for headers]". Targets/Languages are per-source Deb822 options, so
+# Docker/PPA/application repositories keep their own defaults.
+APT_MANAGED_SOURCE_OPTIONS = (("Targets", "Packages"), ("Languages", "none"))
+# Bounded network behaviour for every APT run (apt.conf has no per-source
+# timeout). Created only while a custom source is applied; removed on restore.
+APT_MANAGED_CONFIG = (
+    "// Managed by Tram Van Hanh Agent while a custom update source is applied.\n"
+    'Acquire::Retries "2";\n'
+    'Acquire::http::Timeout "15";\n'
+    'Acquire::https::Timeout "15";\n'
+)
+# YUM/DNF equivalents: fail a stalled mirror request in 15 seconds and retry
+# twice instead of the defaults (30 seconds, 10 retries) per metadata file.
+ORACLE_MANAGED_REPOSITORY_OPTIONS = (("timeout", "15"), ("retries", "2"))
 ACTIVE_TUNNELS: set[str] = set()
 ACTIVE_TUNNELS_LOCK = threading.Lock()
 MUTATION_JOB_LOCK = threading.Lock()
@@ -4222,6 +4240,8 @@ def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[s
         with contextlib.suppress(OSError):
             managed.unlink()
         with contextlib.suppress(OSError):
+            (apt_root / "apt.conf.d" / APT_MANAGED_CONFIG_NAME).unlink()
+        with contextlib.suppress(OSError):
             state_file.unlink()
         return 0, json.dumps(read_ubuntu_update_source(inventory, apt_root), ensure_ascii=False, separators=(",", ":"))
 
@@ -4247,14 +4267,65 @@ def configure_ubuntu_update_source(parameters: dict[str, Any], inventory: dict[s
             f"URIs: {mapping['base_url']}\n"
             f"Suites: {mapping['id']}\n"
             "Components: main restricted universe multiverse\n"
-            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+            + "".join(f"{key}: {value}\n" for key, value in APT_MANAGED_SOURCE_OPTIONS)
+            + "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
         )
         for mapping in repository_mappings
     ]
     managed_content = "# Managed by Tram Van Hanh Agent. Third-party repositories are not changed.\n" + "\n\n".join(stanzas) + "\n"
     atomic_write_text(managed, managed_content)
+    atomic_write_text(apt_root / "apt.conf.d" / APT_MANAGED_CONFIG_NAME, APT_MANAGED_CONFIG, 0o644)
     result = read_ubuntu_update_source(inventory, apt_root)
     return 0, json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def upgrade_managed_update_sources(apt_root: Path = APT_SOURCE_ROOT, repository_root: Path = YUM_REPOSITORY_ROOT) -> list[str]:
+    """Bring sources applied by older Agents up to the current managed options.
+
+    Only the files this Agent owns are touched: the Deb822 file gains the
+    Packages-only target and no-translation options, the APT timeout snippet is
+    recreated, and the managed YUM/DNF file gains bounded timeout/retries.
+    Values an administrator already set in those files are left alone.
+    """
+    changed: list[str] = []
+    managed_apt = apt_root / "sources.list.d" / APT_MANAGED_SOURCE_NAME
+    if managed_apt.is_file():
+        content = managed_apt.read_text(encoding="utf-8", errors="strict")
+        header, _, body = content.partition("\n") if content.startswith("#") else ("", "", content)
+        stanzas: list[str] = []
+        for stanza in re.split(r"\n\s*\n", body.strip()):
+            if re.search(r"(?mi)^URIs:\s*\S", stanza):
+                for key, value in APT_MANAGED_SOURCE_OPTIONS:
+                    if not re.search(rf"(?mi)^{key}:", stanza):
+                        signed_by = re.search(r"(?mi)^Signed-By:", stanza)
+                        line = f"{key}: {value}"
+                        stanza = stanza[:signed_by.start()] + line + "\n" + stanza[signed_by.start():] if signed_by else stanza.rstrip() + "\n" + line
+            stanzas.append(stanza)
+        upgraded = (header + "\n" if header else "") + "\n\n".join(stanzas).rstrip() + "\n"
+        if upgraded != content:
+            atomic_write_text(managed_apt, upgraded)
+            changed.append(str(managed_apt))
+        config = apt_root / "apt.conf.d" / APT_MANAGED_CONFIG_NAME
+        if not config.is_file() or config.read_text(encoding="utf-8", errors="replace") != APT_MANAGED_CONFIG:
+            atomic_write_text(config, APT_MANAGED_CONFIG, 0o644)
+            changed.append(str(config))
+    managed_yum = repository_root / ORACLE_MANAGED_REPOSITORY_NAME
+    if managed_yum.is_file():
+        content = managed_yum.read_text(encoding="utf-8", errors="strict")
+        sections = re.split(r"(?m)^(?=\[)", content)
+        upgraded_sections: list[str] = []
+        for section in sections:
+            if section.startswith("["):
+                additions = [f"{key}={value}" for key, value in ORACLE_MANAGED_REPOSITORY_OPTIONS if not re.search(rf"(?mi)^\s*{key}\s*=", section)]
+                if additions:
+                    trailing = section[len(section.rstrip()):]
+                    section = section.rstrip() + "\n" + "\n".join(additions) + (trailing or "\n")
+            upgraded_sections.append(section)
+        upgraded = "".join(upgraded_sections)
+        if upgraded != content:
+            atomic_write_text(managed_yum, upgraded)
+            changed.append(str(managed_yum))
+    return changed
 
 
 def repository_sections(repository_root: Path = YUM_REPOSITORY_ROOT) -> list[dict[str, Any]]:
@@ -4417,6 +4488,7 @@ def configure_oracle_update_source(parameters: dict[str, Any], inventory: dict[s
                 block.append(f"{key}={value}")
         if not source_values.get("gpgcheck"):
             block.append("gpgcheck=1")
+        block.extend(f"{key}={value}" for key, value in ORACLE_MANAGED_REPOSITORY_OPTIONS)
         managed_blocks.append("\n".join(block))
     atomic_write_text(managed_path, "\n\n".join(managed_blocks).rstrip() + "\n")
     return 0, json.dumps(read_oracle_update_source(inventory, repository_root), ensure_ascii=False, separators=(",", ":"))
@@ -5523,6 +5595,12 @@ def loop(config: Config, once: bool = False) -> None:
             control_session_stamp = material_stamp
         return control_session
 
+    if not windows_host:
+        try:
+            for path in upgrade_managed_update_sources():
+                LOG.info("managed update source upgraded: %s", path)
+        except (OSError, UnicodeError, ValueError) as exc:
+            LOG.warning("managed update sources could not be upgraded: %s", exc)
     # Learn the control-plane clock before the first signed request.
     resync_clock_from_control_plane(config, force=True)
     if not once:
